@@ -49,7 +49,20 @@ from ._generated.common_models import (
     ConfigUpdateResult,
     ConfigValueType,
 )
-from ._generated.models import Component, ComponentEntry, ComponentKind, ComponentStatus
+from ._generated.models import (
+    Component,
+    ComponentEntry,
+    ComponentKind,
+    ComponentStatus,
+    RuntimeSpec,
+)
+
+# Port range the watchdog assigns engine runtimes from when the operator
+# doesn't pick one. Above the component ports (8079-8083) and clear of the
+# usual ephemeral range, so an assigned port doesn't collide with an
+# outbound socket the OS handed out.
+_RUNTIME_PORT_BASE = 8090
+_RUNTIME_PORT_SPAN = 100
 
 CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
@@ -135,6 +148,11 @@ class WatchdogState:
         self._lock = threading.Lock()
         self._config: dict[str, Any] = _config_defaults()
         self._components: dict[str, ComponentEntry] = {}
+        # Engine runtimes, persisted under `runtimes:`. Kept separate from
+        # `components` because a third-party binary shares none of a
+        # component's declarative shape — see the watchdog spec's
+        # components-vs-runtimes table.
+        self._runtimes: dict[str, RuntimeSpec] = {}
         # v0.2 auth block. Persisted to disk under `auth:` in watchdog.yaml.
         # passphraseHash: Argon2id-PHC string (verifiable, not reversible)
         # masterSalt:     base64-encoded 16-byte salt used to derive the
@@ -159,10 +177,16 @@ class WatchdogState:
                 for entry in comps_raw:
                     parsed = ComponentEntry.model_validate(entry)
                     self._components[parsed.name] = parsed
+                runtimes_raw = raw.get("runtimes") or []
+                self._runtimes = {}
+                for entry in runtimes_raw:
+                    spec = RuntimeSpec.model_validate(entry)
+                    self._runtimes[spec.name] = spec
                 self._auth = dict(raw.get("auth") or {})
             else:
                 self._config = _config_defaults()
                 self._components = {}
+                self._runtimes = {}
                 self._auth = {}
                 self._write_locked()
 
@@ -283,6 +307,74 @@ class WatchdogState:
     def remove_component(self, name: str) -> bool:
         return self.remove_topology_entry(name)
 
+    # ----- runtimes (engine processes) --------------------------------
+
+    def list_runtime_specs(self) -> list[RuntimeSpec]:
+        with self._lock:
+            return list(self._runtimes.values())
+
+    def get_runtime_spec(self, name: str) -> RuntimeSpec | None:
+        with self._lock:
+            return self._runtimes.get(name)
+
+    def add_runtime(self, spec: RuntimeSpec) -> RuntimeSpec:
+        with self._lock:
+            if spec.name in self._runtimes:
+                raise KeyError(f"runtime {spec.name!r} already exists")
+            resolved = self._resolve_ports_locked(spec)
+            self._runtimes[resolved.name] = resolved
+            self._write_locked()
+            return resolved
+
+    def update_runtime(self, name: str, spec: RuntimeSpec) -> RuntimeSpec | None:
+        with self._lock:
+            if name not in self._runtimes:
+                return None
+            if spec.name != name:
+                if spec.name in self._runtimes:
+                    raise KeyError(f"runtime {spec.name!r} already exists")
+                del self._runtimes[name]
+            resolved = self._resolve_ports_locked(spec)
+            self._runtimes[resolved.name] = resolved
+            self._write_locked()
+            return resolved
+
+    def remove_runtime(self, name: str) -> bool:
+        with self._lock:
+            if name not in self._runtimes:
+                return False
+            del self._runtimes[name]
+            self._write_locked()
+            return True
+
+    def _resolve_ports_locked(self, spec: RuntimeSpec) -> RuntimeSpec:
+        """Assign a port when the operator did not pick one, and reject a
+        collision when they did.
+
+        Assignment happens here, at write time, rather than at spawn time
+        so the port is *persisted*: an engine's port ends up in a driver's
+        config, and a value that changed on every restart would be
+        useless there. With N runtimes nobody should be handing out port
+        numbers by hand.
+        """
+        taken = {
+            other.port
+            for name, other in self._runtimes.items()
+            if name != spec.name and other.port is not None
+        }
+        if spec.port is not None:
+            if spec.port in taken:
+                raise ValueError(f"port {spec.port} is already claimed by another runtime")
+            return spec
+
+        for candidate in range(_RUNTIME_PORT_BASE, _RUNTIME_PORT_BASE + _RUNTIME_PORT_SPAN):
+            if candidate not in taken:
+                return spec.model_copy(update={"port": candidate})
+        raise ValueError(
+            f"no free port in {_RUNTIME_PORT_BASE}-"
+            f"{_RUNTIME_PORT_BASE + _RUNTIME_PORT_SPAN - 1} for runtime {spec.name!r}"
+        )
+
     # ----- auth (v0.2) -----------------------------------------------
     #
     # NOT exposed via /v1/config. These are internal trust-root state:
@@ -329,6 +421,9 @@ class WatchdogState:
         out: dict[str, Any] = dict(self._config)
         out["components"] = [
             entry.model_dump(exclude_none=True, mode="json") for entry in self._components.values()
+        ]
+        out["runtimes"] = [
+            spec.model_dump(exclude_none=True, mode="json") for spec in self._runtimes.values()
         ]
         if self._auth:
             out["auth"] = dict(self._auth)

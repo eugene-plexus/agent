@@ -24,8 +24,15 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_watchdog._generated.models import ComponentEntry, ComponentStatus
+from eugene_plexus_watchdog._generated.models import (
+    ComponentEntry,
+    ComponentStatus,
+    Runtime,
+    RuntimeSpec,
+    RuntimeStatus,
+)
 from eugene_plexus_watchdog.app import create_app
+from eugene_plexus_watchdog.runtimes import RuntimeSupervisor
 from eugene_plexus_watchdog.settings import Settings
 
 TEST_PASSPHRASE = "correct horse battery staple"
@@ -72,6 +79,57 @@ class StubSupervisor:
         return ComponentStatus.unreachable, None, None, None
 
 
+class StubRuntimeSupervisor(RuntimeSupervisor):
+    """`RuntimeSupervisor` that records lifecycle calls but never spawns.
+
+    Subclasses the real thing rather than reimplementing it so route
+    tests still exercise the genuine `compose()` — url building, alias
+    defaulting, the declaration/observation pairing. Only the two methods
+    that would fork `llama-server` are replaced.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, str]] = []
+        self.started: set[str] = set()
+
+    def add_and_start(self, spec: RuntimeSpec) -> None:
+        self.calls.append(("add_and_start", spec.name))
+        if spec.autoStart is not False:
+            self.started.add(spec.name)
+
+    async def remove_and_stop(self, name: str) -> None:
+        self.calls.append(("remove_and_stop", name))
+        self.started.discard(name)
+
+    async def restart(self, name: str) -> bool:
+        self.calls.append(("restart", name))
+        return name in self.started
+
+    async def stop_one(self, name: str) -> None:
+        self.calls.append(("stop_one", name))
+        self.started.discard(name)
+
+    async def stop_all(self) -> None:
+        self.calls.append(("stop_all", ""))
+        self.started.clear()
+
+    async def start_readiness_loop(self, _get_specs: Any) -> None:
+        self.calls.append(("start_readiness_loop", ""))
+
+    def is_running(self, name: str) -> bool:
+        return name in self.started
+
+    def compose(self, spec: RuntimeSpec) -> Runtime:
+        runtime = super().compose(spec)
+        # No real process exists, so the parent reports `stopped`. Report
+        # `starting` for anything this stub was asked to start, which is
+        # what a just-created runtime actually looks like.
+        if spec.name in self.started:
+            return runtime.model_copy(update={"status": RuntimeStatus.starting})
+        return runtime
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(config_file=tmp_path / "watchdog.yaml")
@@ -83,9 +141,19 @@ def stub_supervisor() -> StubSupervisor:
 
 
 @pytest.fixture
-def app(settings: Settings, stub_supervisor: StubSupervisor) -> FastAPI:
+def stub_runtime_supervisor() -> StubRuntimeSupervisor:
+    return StubRuntimeSupervisor()
+
+
+@pytest.fixture
+def app(
+    settings: Settings,
+    stub_supervisor: StubSupervisor,
+    stub_runtime_supervisor: StubRuntimeSupervisor,
+) -> FastAPI:
     app = create_app(settings=settings)
     app.state.supervisor = stub_supervisor
+    app.state.runtime_supervisor = stub_runtime_supervisor
     return app
 
 

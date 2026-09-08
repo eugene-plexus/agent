@@ -413,6 +413,11 @@ class SupervisedProcess:
         """Whether the plan currently running is a reduced-mode one. Set
         from `SpawnPlan.degraded` at each spawn; read by the mapping
         layer (a component reports `safe_mode`)."""
+        self.last_argv: list[str] | None = None
+        """The argv of the most recent spawn. Reported read-only on
+        `Runtime.argv`: the first question anyone debugging a local engine
+        asks is what command actually ran, and every tool that hides the
+        answer makes that debugging worse."""
         self.last_error: str | None = None
         self.last_restart: datetime | None = None
 
@@ -616,6 +621,7 @@ class SupervisedProcess:
 
         self.state = ProcessState.starting
         self.degraded = plan.degraded
+        self.last_argv = list(plan.argv)
         self.last_restart = datetime.now(UTC)
         self.last_error = None
 

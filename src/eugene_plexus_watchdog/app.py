@@ -31,6 +31,8 @@ from .routes import auth as auth_routes
 from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
+from .routes import runtimes as runtimes_routes
+from .runtimes import RuntimeSupervisor
 from .settings import Settings, load_settings
 from .state import WatchdogState
 from .supervisor import Supervisor
@@ -103,14 +105,36 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_supervisor = False
     app.state.supervisor = supervisor
 
+    # Engine runtimes get their own supervisor. Same injection pattern,
+    # and deliberately a separate object: it owns the readiness polling
+    # that only engines have, and nothing about a component's health
+    # story applies to a foreign binary.
+    if not hasattr(app.state, "runtime_supervisor"):
+        runtime_supervisor = RuntimeSupervisor(log=log)
+        owns_runtimes = True
+    else:
+        runtime_supervisor = app.state.runtime_supervisor
+        owns_runtimes = False
+    app.state.runtime_supervisor = runtime_supervisor
+
     if not settings.safe_mode and owns_supervisor:
         for entry in state.list_topology_entries():
             supervisor.add_and_start(entry)
         await supervisor.start_health_loop(state.list_topology_entries)
 
+    if not settings.safe_mode and owns_runtimes:
+        for spec in state.list_runtime_specs():
+            runtime_supervisor.add_and_start(spec)
+        await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
+
     try:
         yield
     finally:
+        # Engines first: they are the ones holding GPU memory, and a
+        # driver briefly outliving its engine is harmless while the
+        # reverse leaves requests hitting a dead port.
+        if owns_runtimes:
+            await runtime_supervisor.stop_all()
         if owns_supervisor:
             await supervisor.stop_all()
 
@@ -140,5 +164,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # only. A blanket router dependency would force operator-only on the
     # GETs too, which is the v0.2.1 bug we're fixing.
     app.include_router(components_routes.router)
+    # Same per-route auth split as components, for the same reason: the
+    # gateway resolves what is running with a service token, while
+    # starting or stopping a process that holds a GPU stays operator-only.
+    app.include_router(runtimes_routes.router)
 
     return app
