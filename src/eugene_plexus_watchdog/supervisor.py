@@ -35,8 +35,10 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, NamedTuple
+from enum import StrEnum
+from typing import Any, NamedTuple, Protocol
 from urllib.parse import urlparse
 
 import httpx
@@ -149,12 +151,107 @@ def _format_log_prefix(kind: ComponentKind, name: str) -> str:
     return f"[{short}: {name}] "
 
 
-class SupervisedProcess:
-    """One supervised child: its declared topology entry plus live state.
+class ProcessState(StrEnum):
+    """State of one supervision loop, independent of *what* it supervises.
 
-    The supervision loop is a long-running task (`_run`) that spawns the
-    child, awaits its exit, applies the back-off rules, and respawns —
-    until `stop()` is called or the crash threshold trips.
+    Deliberately neither `ComponentStatus` nor `RuntimeStatus`. Both of
+    those are wire enums carrying members this loop has no opinion about:
+    `safe_mode` is a component's config concern, `loading` is an engine's
+    readiness concern, `unreachable` describes remote entries the loop
+    never spawns at all. Each API surface maps this state plus its own
+    observations onto its own enum, which is what lets one loop supervise
+    both a Python module and a foreign binary.
+    """
+
+    starting = "starting"
+    """Spawned, but not yet observed doing useful work. Whoever maps this
+    decides what "useful" means — a component answering /healthz, an
+    engine finishing its model load."""
+
+    exited = "exited"
+    """Exited cleanly (rc=0); a respawn is in flight. Transient."""
+
+    crashed = "crashed"
+    """Spawn failed, or the child exited non-zero. Becomes terminal once
+    the loop gives up (see `SpawnPlanner.on_crash_threshold`)."""
+
+    not_spawnable = "not_spawnable"
+    """Nothing to launch — the declaration describes something this
+    watchdog does not own, so there is no process and no error."""
+
+
+class SpawnPlanError(Exception):
+    """The declaration is present but cannot be turned into a launch.
+
+    Distinct from `plan()` returning None: None means "nothing to launch
+    here, and that's fine" (a remote entry), while this means "you asked
+    for something I can't build", which counts as a crash.
+    """
+
+
+@dataclass(frozen=True)
+class SpawnPlan:
+    """One resolved launch. Everything `SupervisedProcess` needs and
+    nothing it has to interpret."""
+
+    argv: list[str]
+    """Exact command line. Built by the planner, never assembled here —
+    this is what makes an engine binary and `python -m <module>` the same
+    kind of thing to the loop."""
+
+    env: dict[str, str]
+    """Complete environment for the child, already merged."""
+
+    cwd: str | None = None
+    """Working directory, or None to inherit the watchdog's."""
+
+    degraded: bool = False
+    """True when this plan deliberately launches a reduced mode (a
+    component's safe mode). Surfaced back out so the mapping layer can
+    report it; the loop itself only records it."""
+
+
+class SpawnPlanner(Protocol):
+    """Knows what to launch, and what to do when launching keeps failing.
+
+    The two methods beyond `plan()` exist because recovery policy is
+    kind-specific: a component can fall back to safe mode so its config
+    endpoint stays reachable, whereas an engine that will not start has
+    nothing equivalent to fall back to.
+    """
+
+    @property
+    def name(self) -> str:
+        """Operator-facing name, used in logs and task names."""
+
+    @property
+    def log_prefix(self) -> str:
+        """The `[...] ` stamp for each captured output line."""
+
+    def plan(self) -> SpawnPlan | None:
+        """Build the next launch. None means nothing to launch.
+
+        Raises `SpawnPlanError` if the declaration is unusable.
+        """
+
+    def on_crash_threshold(self) -> bool:
+        """Called when consecutive crashes hit the threshold.
+
+        Return True to say "I've changed something, keep trying" (the
+        crash counter is reset); False to give up.
+        """
+
+    def reset(self) -> None:
+        """Operator asked for a manual restart — drop any degraded state
+        so the next plan is a normal one."""
+
+
+class _ComponentPlanner:
+    """Launch plans for one Eugene Plexus component.
+
+    Owns the env threading (config path, bind port, safe-mode flag, the
+    auth trio) and the safe-mode escalation, neither of which means
+    anything to an engine process.
     """
 
     def __init__(
@@ -165,26 +262,173 @@ class SupervisedProcess:
     ) -> None:
         self.entry = entry
         self._log = log
-        # v0.2: auth_state is the source of the per-restart JWT signing
-        # key + (post-login) master key + service token issuance. Optional
-        # for test ergonomics — supervisor tests that don't care about
-        # auth can pass None and get the v0.1 env-var set only.
+        # auth_state is the source of the per-restart JWT signing key +
+        # (post-login) master key + service token issuance. Optional for
+        # test ergonomics — tests that don't care about auth pass None
+        # and get the env-var set without the auth trio.
         self._auth_state = auth_state
+        # Set once the crash threshold trips: subsequent plans force
+        # SAFE_MODE=1 regardless of the topology's flag, so /v1/config
+        # stays reachable for operator repair.
+        self._auto_safe_mode_engaged = False
+
+    @property
+    def name(self) -> str:
+        return self.entry.name
+
+    @property
+    def log_prefix(self) -> str:
+        return _format_log_prefix(self.entry.kind, self.entry.name)
+
+    def reset(self) -> None:
+        """Manual restart returns the component to normal-mode operation.
+        The operator's intent on hitting Restart is "try again with the
+        config I just fixed", not "stay in safe mode forever"."""
+        self._auto_safe_mode_engaged = False
+
+    def plan(self) -> SpawnPlan | None:
+        spawn = self.entry.spawn
+        if spawn is None:
+            # Remote entry: watched for reachability, never launched.
+            self._log.warning("%s has no spawn block; skipping", self.entry.name)
+            return None
+
+        spec = _COMPONENT_SPECS.get(self.entry.kind)
+        if spec is None:
+            raise SpawnPlanError(
+                f"no spawn spec for kind {self.entry.kind.value!r} — either the "
+                f"topology names a retired component kind or this watchdog "
+                f"predates it"
+            )
+
+        env = os.environ.copy()
+        prefix = spec.env_prefix
+        env[f"{prefix}_CONFIG_FILE"] = str(spawn.configFile)
+        port = urlparse(str(self.entry.url)).port
+        if port is not None:
+            env[f"{prefix}_BIND_PORT"] = str(port)
+
+        # Two sources of "boot in safe mode": the operator's explicit
+        # topology toggle (`ComponentEntry.safeMode`) AND the auto-
+        # fallback after the crash threshold. Either forces SAFE_MODE=1.
+        degraded = bool(self.entry.safeMode) or self._auto_safe_mode_engaged
+        env[f"{prefix}_SAFE_MODE"] = "1" if degraded else "0"
+
+        # Auth env vars. Children read these to (a) validate inbound
+        # bearer tokens against the shared signing key, (b) present a
+        # service token of their own on outbound calls, and (c) decrypt
+        # at-rest secrets like apiKey.
+        if self._auth_state is not None:
+            kind_value = self.entry.kind.value  # "gateway", "inference-driver"
+            env[f"{prefix}_AUTH_SIGNING_KEY"] = base64.b64encode(
+                self._auth_state.signing_key
+            ).decode("ascii")
+            env[f"{prefix}_SERVICE_TOKEN"] = security.issue_service_token(
+                signing_key=self._auth_state.signing_key,
+                kind=kind_value,
+            )
+            if self._auth_state.master_key is not None:
+                env[f"{prefix}_MASTER_KEY"] = base64.b64encode(self._auth_state.master_key).decode(
+                    "ascii"
+                )
+            else:
+                # Be explicit about absence so a child running stale env
+                # from a previous shell can't pick up an unrelated value.
+                env.pop(f"{prefix}_MASTER_KEY", None)
+
+        if spawn.env:
+            env.update({k: str(v) for k, v in spawn.env.items()})
+
+        # Force unbuffered Python output. Without this, redirecting the
+        # child's stdout to a pipe makes Python switch to block-buffered
+        # mode, so log lines arrive in 4KB chunks instead of immediately
+        # — exactly when you want the opposite (debugging a hang where
+        # ANY line emitted before the stall is the clue).
+        env["PYTHONUNBUFFERED"] = "1"
+
+        return SpawnPlan(
+            argv=[sys.executable, "-m", spec.module],
+            env=env,
+            degraded=degraded,
+        )
+
+    def on_crash_threshold(self) -> bool:
+        """Two-stage: fall back to safe mode once, then give up.
+
+        The first trip is almost always bad operator config, and safe
+        mode keeps /v1/config reachable so it can be fixed from the UI
+        without knowing about env vars or YAML. A second trip means safe
+        mode itself won't boot, which is a real bug — and unrecoverable
+        from the UI, since the config endpoint is down.
+        """
+        if not self._auto_safe_mode_engaged:
+            self._log.error(
+                "%s crashed %d times in a row; falling back to "
+                "SAFE MODE so /v1/config stays reachable for "
+                "repair. The component will respawn with "
+                "SAFE_MODE=1 — UI Components tab will show the "
+                "safe_mode badge; fix config there and Restart to "
+                "return to normal mode.",
+                self.entry.name,
+                _CRASH_BACKOFF_THRESHOLD,
+            )
+            self._auto_safe_mode_engaged = True
+            return True
+
+        self._log.error(
+            "%s crashed %d times in a row even in SAFE MODE; giving "
+            "up. POST /v1/components/%s/restart to reset after fixing "
+            "whatever is preventing safe-mode startup.",
+            self.entry.name,
+            _CRASH_BACKOFF_THRESHOLD,
+            self.entry.name,
+        )
+        return False
+
+
+class SupervisedProcess:
+    """One supervised child: spawn, watch, respawn, back off, capture output.
+
+    Knows nothing about *what* it is launching. A `SpawnPlanner` answers
+    that on every iteration, which is what lets the same loop supervise a
+    Eugene Plexus component (`python -m <module>`, env-threaded auth) and
+    a third-party engine binary (adapter-built argv) without either kind
+    leaking into the other.
+
+    The loop is a long-running task (`_run`) that spawns the child, awaits
+    its exit, applies the back-off rules, and respawns — until `stop()` is
+    called or the planner declines to recover.
+    """
+
+    def __init__(self, planner: SpawnPlanner, log: logging.Logger) -> None:
+        self._planner = planner
+        self._log = log
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop_requested = False
         self._consecutive_crashes = 0
-        # Set to True when the supervisor decides to fall back to safe
-        # mode after the crash threshold trips — see `_run`. Subsequent
-        # spawns force-set SAFE_MODE=1 in env regardless of the
-        # topology's `safeMode` flag, so /v1/config stays reachable for
-        # operator repair. Cleared on manual restart() (operator wants
-        # to try normal mode again after fixing the underlying issue).
-        self._auto_safe_mode_engaged = False
 
-        self.status: ComponentStatus = ComponentStatus.starting
+        self.state: ProcessState = ProcessState.starting
+        self.degraded = False
+        """Whether the plan currently running is a reduced-mode one. Set
+        from `SpawnPlan.degraded` at each spawn; read by the mapping
+        layer (a component reports `safe_mode`)."""
         self.last_error: str | None = None
         self.last_restart: datetime | None = None
+
+    @classmethod
+    def for_component(
+        cls,
+        entry: ComponentEntry,
+        log: logging.Logger,
+        auth_state: AuthState | None = None,
+    ) -> SupervisedProcess:
+        """Supervise one Eugene Plexus component."""
+        return cls(_ComponentPlanner(entry, log, auth_state), log)
+
+    @property
+    def name(self) -> str:
+        return self._planner.name
 
     # --- public lifecycle --------------------------------------------------
 
@@ -193,22 +437,19 @@ class SupervisedProcess:
         runs in the background until `stop()` is called."""
         self._stop_requested = False
         self._consecutive_crashes = 0
-        self._task = asyncio.create_task(self._run(), name=f"supervise:{self.entry.name}")
+        self._task = asyncio.create_task(self._run(), name=f"supervise:{self.name}")
 
     async def restart(self) -> None:
-        """SIGTERM the child; the supervision loop respawns it. Clears
-        the crash counter AND the auto-safe-mode flag so a manual
-        restart returns the component to normal-mode operation —
-        operator's intent on hitting Restart is "try again with the
-        config I just fixed", not "stay in safe mode forever."
-        """
+        """SIGTERM the child; the supervision loop respawns it. Clears the
+        crash counter and asks the planner to drop any degraded state, so
+        a manual restart returns the child to normal operation."""
         self._consecutive_crashes = 0
-        self._auto_safe_mode_engaged = False
+        self._planner.reset()
         proc = self._proc
         if proc is not None and proc.returncode is None:
             self._log.info(
                 "restart requested for %s; terminating pid %d",
-                self.entry.name,
+                self.name,
                 proc.pid,
             )
             with contextlib.suppress(ProcessLookupError):
@@ -227,7 +468,7 @@ class SupervisedProcess:
             except TimeoutError:
                 self._log.warning(
                     "%s did not exit within %.1fs of terminate; killing",
-                    self.entry.name,
+                    self.name,
                     _TERM_TIMEOUT_SECONDS,
                 )
                 with contextlib.suppress(ProcessLookupError):
@@ -260,7 +501,7 @@ class SupervisedProcess:
         """
         if stream is None:
             return
-        prefix = _format_log_prefix(self.entry.kind, self.entry.name)
+        prefix = self._planner.log_prefix
         try:
             while True:
                 line = await stream.readline()
@@ -288,134 +529,62 @@ class SupervisedProcess:
             # Never let a reader crash bring down the supervision loop;
             # the worst-case fallback is "we lose log prefixing for this
             # child", which is strictly better than the watchdog dying.
-            self._log.warning("output-pipe reader for %s crashed: %s", self.entry.name, e)
+            self._log.warning("output-pipe reader for %s crashed: %s", self.name, e)
 
     async def _run(self) -> None:
         """Spawn-watch-respawn loop.
 
-        Two-stage backoff: the FIRST time the crash threshold trips
-        (component bad-config or similar), we automatically fall back
-        to SAFE MODE so the operator can repair via /v1/config without
-        having to know about env vars or YAML edits. The second time
-        the threshold trips (safe mode itself is crashing — config
-        endpoint is unreachable; this should be rare and indicates a
-        real bug rather than bad operator config), we give up for real.
-        Exits cleanly on `stop_requested`.
+        When consecutive crashes hit the threshold the planner decides
+        what happens next: it may change something and ask to keep going
+        (a component engaging safe mode), or decline, in which case this
+        gives up and leaves the child `crashed` until an operator
+        restarts it. Recovery policy is kind-specific, so it does not
+        live here. Exits cleanly on `stop_requested`.
         """
         while not self._stop_requested:
             await self._spawn_once()
             if self._stop_requested:
                 return
+            if self.state == ProcessState.not_spawnable:
+                # There is nothing to launch, so there is nothing to
+                # supervise — end the loop instead of re-asking forever.
+                # Worth being explicit: the back-off below is derived from
+                # the crash count, and "nothing to launch" is not a crash,
+                # so falling through would sleep zero seconds and spin the
+                # event loop hot. (Latent before this refactor too, but
+                # unreachable — `Supervisor.add_and_start` never built a
+                # process for a spawn-less entry. Making `plan() -> None`
+                # a first-class outcome makes it reachable.)
+                return
             if self._consecutive_crashes >= _CRASH_BACKOFF_THRESHOLD:
-                if not self._auto_safe_mode_engaged:
-                    # First trip: engage auto-safe-mode, reset the
-                    # counter, continue. Next spawn forces SAFE_MODE=1
-                    # regardless of topology so /v1/config is reachable.
-                    self._log.error(
-                        "%s crashed %d times in a row; falling back to "
-                        "SAFE MODE so /v1/config stays reachable for "
-                        "repair (last error: %s). The component will "
-                        "respawn with SAFE_MODE=1 — UI Components tab "
-                        "will show the safe_mode badge; fix config "
-                        "there and Restart to return to normal mode.",
-                        self.entry.name,
-                        self._consecutive_crashes,
-                        self.last_error,
-                    )
-                    self._auto_safe_mode_engaged = True
-                    self._consecutive_crashes = 0
-                else:
-                    # Second trip: safe mode itself can't boot. This is
-                    # a real bug (or fundamentally broken environment) —
-                    # the operator can't recover via the UI because
-                    # the config endpoint isn't up. Give up for real.
-                    self._log.error(
-                        "%s crashed %d times in a row even in SAFE MODE "
-                        "(last error: %s); giving up. POST /v1/components"
-                        "/%s/restart to reset after fixing whatever is "
-                        "preventing safe-mode startup.",
-                        self.entry.name,
-                        self._consecutive_crashes,
-                        self.last_error,
-                        self.entry.name,
-                    )
-                    self.status = ComponentStatus.crashed
+                self._log.error(
+                    "%s crash threshold reached (last error: %s)",
+                    self.name,
+                    self.last_error,
+                )
+                if not self._planner.on_crash_threshold():
+                    self.state = ProcessState.crashed
                     return
+                self._consecutive_crashes = 0
             await asyncio.sleep(min(2.0 * self._consecutive_crashes, 10.0))
 
     async def _spawn_once(self) -> None:
-        """One spawn / wait / mark-status iteration."""
-        spawn = self.entry.spawn
-        if spawn is None:
-            self._log.warning("%s has no spawn block; skipping", self.entry.name)
-            self.status = ComponentStatus.unreachable
-            return
-
-        spec = _COMPONENT_SPECS.get(self.entry.kind)
-        if spec is None:
-            self._log.error(
-                "%s has kind %r, which this watchdog has no spawn spec for; "
-                "refusing to spawn. Either the topology names a retired "
-                "component kind or this watchdog predates it.",
-                self.entry.name,
-                self.entry.kind.value,
-            )
-            self.status = ComponentStatus.crashed
-            self.last_error = f"no spawn spec for kind {self.entry.kind.value!r}"
+        """One spawn / wait / mark-state iteration."""
+        try:
+            plan = self._planner.plan()
+        except SpawnPlanError as e:
+            self._log.error("refusing to spawn %s: %s", self.name, e)
+            self.state = ProcessState.crashed
+            self.last_error = str(e)
             self._consecutive_crashes += 1
             return
 
-        env = os.environ.copy()
-        prefix = spec.env_prefix
-        env[f"{prefix}_CONFIG_FILE"] = str(spawn.configFile)
-        port = urlparse(str(self.entry.url)).port
-        if port is not None:
-            env[f"{prefix}_BIND_PORT"] = str(port)
-        # Two sources of "boot in safe mode": the operator's explicit
-        # topology toggle (`ComponentEntry.safeMode`) AND the
-        # supervisor's auto-fallback after the crash threshold (see
-        # `_run`). Either one forces SAFE_MODE=1 in env.
-        safe_mode_effective = self.entry.safeMode or self._auto_safe_mode_engaged
-        env[f"{prefix}_SAFE_MODE"] = "1" if safe_mode_effective else "0"
+        if plan is None:
+            # Nothing to launch, and that is not an error.
+            self.state = ProcessState.not_spawnable
+            return
 
-        # v0.2 auth env vars. Children that have implemented the v0.2
-        # auth surface (currently watchdog itself; gateway/drivers
-        # memory follow in subsequent commits) read these to (a) validate
-        # inbound bearer tokens against the shared signing key, (b)
-        # present a service token of their own on outbound calls, and
-        # (c) decrypt at-rest secrets like apiKey. Children unaware of
-        # these env vars simply ignore them — fully backward-compatible
-        # rollout.
-        if self._auth_state is not None:
-            kind_value = self.entry.kind.value  # "gateway", "inference-driver"
-            env[f"{prefix}_AUTH_SIGNING_KEY"] = base64.b64encode(
-                self._auth_state.signing_key
-            ).decode("ascii")
-            env[f"{prefix}_SERVICE_TOKEN"] = security.issue_service_token(
-                signing_key=self._auth_state.signing_key,
-                kind=kind_value,
-            )
-            if self._auth_state.master_key is not None:
-                env[f"{prefix}_MASTER_KEY"] = base64.b64encode(self._auth_state.master_key).decode(
-                    "ascii"
-                )
-            else:
-                # Be explicit about absence so a child running stale env
-                # from a previous shell can't pick up an unrelated value.
-                env.pop(f"{prefix}_MASTER_KEY", None)
-
-        if spawn.env:
-            env.update({k: str(v) for k, v in spawn.env.items()})
-
-        # Force unbuffered Python output. Without this, redirecting the
-        # child's stdout to a pipe (below) makes Python switch to block-
-        # buffered mode, so child log lines arrive in 4KB chunks instead
-        # of immediately — exactly when you want the opposite (debugging
-        # a hang where ANY line emitted before the stall is the clue).
-        env["PYTHONUNBUFFERED"] = "1"
-
-        cmd = [sys.executable, "-m", spec.module]
-        self._log.info("spawning %s: %s", self.entry.name, " ".join(cmd))
+        self._log.info("spawning %s: %s", self.name, " ".join(plan.argv))
 
         try:
             # Pipe stdout + stderr through us so we can prefix every line
@@ -424,15 +593,16 @@ class SupervisedProcess:
             # identification — making "Waiting for application startup"
             # ambiguous when several children are booting concurrently.
             self._proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                env=env,
+                *plan.argv,
+                env=plan.env,
+                cwd=plan.cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 **orphan_kill.kwargs_for_platform(),
             )
         except OSError as e:
-            self._log.error("failed to spawn %s: %s", self.entry.name, e)
-            self.status = ComponentStatus.crashed
+            self._log.error("failed to spawn %s: %s", self.name, e)
+            self.state = ProcessState.crashed
             self.last_error = f"spawn failed: {e}"
             self._consecutive_crashes += 1
             return
@@ -444,7 +614,8 @@ class SupervisedProcess:
         if win_job is not None and self._proc.pid is not None:
             win_job.assign(self._proc.pid)
 
-        self.status = ComponentStatus.safe_mode if safe_mode_effective else ComponentStatus.starting
+        self.state = ProcessState.starting
+        self.degraded = plan.degraded
         self.last_restart = datetime.now(UTC)
         self.last_error = None
 
@@ -454,7 +625,7 @@ class SupervisedProcess:
         # block writing into a full pipe buffer and never exit.
         reader_task = asyncio.create_task(
             self._pipe_child_output(self._proc.stdout),
-            name=f"output-pipe:{self.entry.name}",
+            name=f"output-pipe:{self.name}",
         )
 
         try:
@@ -471,23 +642,35 @@ class SupervisedProcess:
         self._proc = None
 
         if self._stop_requested:
-            self.status = ComponentStatus.exited
+            self.state = ProcessState.exited
             return
 
         if return_code == 0:
-            self._log.info("%s exited cleanly (rc=0); respawning", self.entry.name)
-            self.status = ComponentStatus.exited
+            self._log.info("%s exited cleanly (rc=0); respawning", self.name)
+            self.state = ProcessState.exited
             self._consecutive_crashes = 0
         else:
             self._consecutive_crashes += 1
             self.last_error = f"exited with code {return_code}"
             self._log.warning(
                 "%s exited rc=%d (consecutive crashes: %d)",
-                self.entry.name,
+                self.name,
                 return_code,
                 self._consecutive_crashes,
             )
-            self.status = ComponentStatus.crashed
+            self.state = ProcessState.crashed
+
+
+# How the supervision loop's kind-agnostic state reads on the component
+# wire enum. `not_spawnable` maps to `unreachable` because that is what a
+# component with nothing to launch has always reported — the watchdog can
+# see it or it cannot, and it does not own the process either way.
+_COMPONENT_STATUS_BY_STATE: dict[ProcessState, ComponentStatus] = {
+    ProcessState.starting: ComponentStatus.starting,
+    ProcessState.exited: ComponentStatus.exited,
+    ProcessState.crashed: ComponentStatus.crashed,
+    ProcessState.not_spawnable: ComponentStatus.unreachable,
+}
 
 
 class Supervisor:
@@ -535,7 +718,7 @@ class Supervisor:
             # reachability, but no SupervisedProcess.
             self._reachable[entry.name] = False
             return
-        sp = SupervisedProcess(entry, self._log, auth_state=self._auth_state)
+        sp = SupervisedProcess.for_component(entry, self._log, auth_state=self._auth_state)
         self._processes[entry.name] = sp
         sp.start()
 
@@ -623,9 +806,9 @@ class Supervisor:
     ) -> tuple[ComponentStatus, str | None, datetime | None, int | None]:
         """Return (status, lastError, lastRestart, pid) for one component.
 
-        For spawned children: derives status from process state +
-        /healthz observations (running, starting, safe_mode, exited,
-        crashed).
+        For spawned children: maps the supervision loop's
+        `ProcessState` plus /healthz observations onto the wire enum
+        (running, starting, safe_mode, exited, crashed).
 
         For remote entries (`has_spawn=False`): derives from the last
         /healthz poll only — `running` if the URL is answering,
@@ -633,13 +816,20 @@ class Supervisor:
         """
         sp = self._processes.get(name)
         if sp is not None:
-            base = sp.status
-            if base == ComponentStatus.starting and self._reachable.get(name, False):
-                base = (
-                    ComponentStatus.safe_mode
-                    if self._safe_mode_observed.get(name)
-                    else ComponentStatus.running
-                )
+            base = _COMPONENT_STATUS_BY_STATE[sp.state]
+            if base == ComponentStatus.starting:
+                if sp.degraded and not self._reachable.get(name, False):
+                    # Launched into safe mode but not yet answering. Report
+                    # safe_mode straight away rather than `starting`, so the
+                    # UI's badge appears as soon as the decision is made
+                    # instead of one health poll later.
+                    base = ComponentStatus.safe_mode
+                elif self._reachable.get(name, False):
+                    base = (
+                        ComponentStatus.safe_mode
+                        if self._safe_mode_observed.get(name)
+                        else ComponentStatus.running
+                    )
             return base, sp.last_error, sp.last_restart, sp.pid
         if not has_spawn:
             reachable = self._reachable.get(name, False)

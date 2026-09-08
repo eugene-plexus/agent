@@ -31,10 +31,15 @@ from eugene_plexus_watchdog._generated.models import (
 from eugene_plexus_watchdog.auth_state import AuthState
 from eugene_plexus_watchdog.supervisor import (
     _COMPONENT_SPECS,
+    _COMPONENT_STATUS_BY_STATE,
     _HEALTHZ_2XX_LINE,
+    ProcessState,
+    SpawnPlan,
+    SpawnPlanError,
     SupervisedProcess,
     Supervisor,
     _colorize_alerts,
+    _ComponentPlanner,
     _format_log_prefix,
 )
 
@@ -96,7 +101,7 @@ async def test_spawn_invokes_correct_command_and_env(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    sp = SupervisedProcess(driver_entry, logging.getLogger("test"))
+    sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"))
     sp.start()
 
     # Give the supervision loop one tick to spawn.
@@ -130,7 +135,7 @@ async def test_safe_mode_threads_env_var(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
     safe_entry = driver_entry.model_copy(update={"safeMode": True})
-    sp = SupervisedProcess(safe_entry, logging.getLogger("test"))
+    sp = SupervisedProcess.for_component(safe_entry, logging.getLogger("test"))
     sp.start()
 
     for _ in range(50):
@@ -157,7 +162,7 @@ async def test_clean_exit_triggers_respawn(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    sp = SupervisedProcess(driver_entry, logging.getLogger("test"))
+    sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"))
     sp.start()
 
     # Wait for first spawn, then simulate clean exit.
@@ -257,7 +262,7 @@ async def test_auth_state_threads_signing_key_and_service_token(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
     auth = AuthState(signing_key=security.generate_signing_key())
-    sp = SupervisedProcess(driver_entry, logging.getLogger("test"), auth_state=auth)
+    sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"), auth_state=auth)
     sp.start()
 
     for _ in range(50):
@@ -298,7 +303,7 @@ async def test_master_key_threaded_after_login(
     auth = AuthState(signing_key=security.generate_signing_key())
     auth.set_master_key(b"\x55" * 32)
 
-    sp = SupervisedProcess(driver_entry, logging.getLogger("test"), auth_state=auth)
+    sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"), auth_state=auth)
     sp.start()
 
     for _ in range(50):
@@ -343,7 +348,7 @@ async def test_every_spawnable_kind_gets_its_own_prefix_and_audience(
             spawn=SpawnConfig(configFile=f"/tmp/{kind.value}/config.yaml"),
             safeMode=False,
         )
-        sp = SupervisedProcess(entry, logging.getLogger("test"), auth_state=auth)
+        sp = SupervisedProcess.for_component(entry, logging.getLogger("test"), auth_state=auth)
         sp.start()
         procs.append(sp)
 
@@ -448,7 +453,7 @@ async def test_auto_safe_mode_after_crash_threshold(
 
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
 
-    sp = SupervisedProcess(driver_entry, logging.getLogger("test"))
+    sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"))
     sp.start()
 
     # Drive 5 consecutive crashes (matches _CRASH_BACKOFF_THRESHOLD).
@@ -482,8 +487,11 @@ async def test_auto_safe_mode_after_crash_threshold(
     assert captured_envs[5]["EUGENE_PLEXUS_DRIVER_SAFE_MODE"] == "1", (
         "spawn after threshold should be SAFE_MODE=1"
     )
-    # Status reflects the fall-back, not `crashed`.
-    assert sp.status == ComponentStatus.safe_mode
+    # The loop is still cycling, not given up — and the plan it is now
+    # running is the degraded one. `Supervisor.status_for` is what turns
+    # that pair into ComponentStatus.safe_mode on the wire.
+    assert sp.state == ProcessState.starting
+    assert sp.degraded is True
 
 
 async def test_manual_restart_clears_auto_safe_mode(
@@ -503,10 +511,12 @@ async def test_manual_restart_clears_auto_safe_mode(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    sp = SupervisedProcess(driver_entry, logging.getLogger("test"))
-    # Skip the crash dance — pre-engage the flag and confirm the next
-    # spawn is safe mode, then restart and confirm it's back to normal.
-    sp._auto_safe_mode_engaged = True
+    # Skip the crash dance by driving the planner's escalation directly —
+    # that is the same call the supervision loop makes when the threshold
+    # trips, so this exercises the real seam rather than poking a flag.
+    planner = _ComponentPlanner(driver_entry, logging.getLogger("test"))
+    assert planner.on_crash_threshold() is True, "first trip should engage safe mode"
+    sp = SupervisedProcess(planner, logging.getLogger("test"))
     sp.start()
 
     for _ in range(100):
@@ -550,3 +560,207 @@ def test_log_prefix_disambiguates_renamed_components() -> None:
 
     # A driver an operator named "gateway" still reports as a driver.
     assert _format_log_prefix(ComponentKind.inference_driver, "gateway") == ("[driver: gateway] ")
+
+
+# --------------------------------------------------------------------------- #
+# The planner seam
+#
+# These are the tests that make the abstraction load-bearing rather than
+# decorative: the loop must supervise something that is NOT a Eugene
+# Plexus component, since that is the whole reason it was split out.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeEnginePlanner:
+    """Stands in for the engine adapters that don't exist yet.
+
+    Deliberately shares nothing with `_ComponentPlanner`: an arbitrary
+    argv, a working directory, no env threading, and no recovery — an
+    engine that will not start has no safe mode to fall back to.
+    """
+
+    def __init__(self, argv: list[str], cwd: str | None = None) -> None:
+        self._argv = argv
+        self._cwd = cwd
+        self.reset_calls = 0
+        self.threshold_calls = 0
+
+    @property
+    def name(self) -> str:
+        return "qwen3-30b"
+
+    @property
+    def log_prefix(self) -> str:
+        return "[engine: qwen3-30b] "
+
+    def plan(self) -> SpawnPlan:
+        return SpawnPlan(argv=list(self._argv), env={"CUDA_VISIBLE_DEVICES": "1"}, cwd=self._cwd)
+
+    def on_crash_threshold(self) -> bool:
+        self.threshold_calls += 1
+        return False
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+
+
+async def test_loop_spawns_an_arbitrary_argv_from_a_non_component_planner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An engine is a foreign binary with flags, not `python -m <module>`.
+
+    The loop must pass the planner's argv through verbatim, honour its
+    working directory (prebuilt llama.cpp releases need it to find their
+    bundled shared libraries), and use its env as given rather than
+    layering component env vars on top.
+    """
+    captured: dict[str, Any] = {}
+
+    async def fake_create(*args: Any, **kwargs: Any) -> _FakeProcess:
+        captured["argv"] = list(args)
+        captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    argv = [
+        "/opt/llama.cpp/llama-server",
+        "--model",
+        "/models/qwen3-30b-Q4_K_M.gguf",
+        "--port",
+        "8091",
+    ]
+    planner = _FakeEnginePlanner(argv, cwd="/opt/llama.cpp")
+    sp = SupervisedProcess(planner, logging.getLogger("test"))
+    sp.start()
+
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if "argv" in captured:
+            break
+    await sp.stop()
+
+    assert captured["argv"] == argv, "engine argv must pass through verbatim"
+    assert captured["cwd"] == "/opt/llama.cpp"
+    # Exactly the planner's env — no component vars leaked in.
+    assert captured["env"] == {"CUDA_VISIBLE_DEVICES": "1"}
+    assert "EUGENE_PLEXUS_DRIVER_CONFIG_FILE" not in (captured["env"] or {})
+    assert sp.name == "qwen3-30b"
+    assert sp.degraded is False
+
+
+async def test_loop_gives_up_when_planner_declines_to_recover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery policy belongs to the planner. A planner that returns
+    False from `on_crash_threshold` must end the loop as `crashed`,
+    rather than the loop assuming a safe-mode fallback exists."""
+
+    async def fake_create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        proc = _FakeProcess()
+        proc._finish(1)  # non-zero: counts as a crash
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    # Cap every sleep at 10ms so the escalating between-crash backoff
+    # (2s, 4s, ... up to 10s) doesn't cost this test half a minute.
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(seconds: float) -> None:
+        await original_sleep(min(seconds, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    planner = _FakeEnginePlanner(["/opt/llama.cpp/llama-server"])
+    sp = SupervisedProcess(planner, logging.getLogger("test"))
+    sp.start()
+
+    for _ in range(500):
+        await original_sleep(0.01)
+        if sp.state == ProcessState.crashed and planner.threshold_calls:
+            break
+    await sp.stop()
+
+    assert planner.threshold_calls == 1, "threshold should be offered exactly once"
+    assert sp.state == ProcessState.crashed
+    assert sp.last_error == "exited with code 1"
+
+
+async def test_plan_error_is_a_crash_but_nothing_to_launch_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`plan()` has two non-launch outcomes and they mean opposite things.
+
+    Returning None is a remote entry — nothing to run, no error. Raising
+    SpawnPlanError is a declaration this watchdog cannot build, which
+    counts as a crash so the back-off and the operator both hear about it.
+    """
+    spawned = False
+
+    async def fake_create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        nonlocal spawned
+        spawned = True
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    class _NothingToLaunch(_FakeEnginePlanner):
+        def plan(self) -> SpawnPlan | None:
+            return None
+
+    class _Unbuildable(_FakeEnginePlanner):
+        def plan(self) -> SpawnPlan | None:
+            raise SpawnPlanError("no adapter for engine 'mlx'")
+
+    quiet = SupervisedProcess(_NothingToLaunch([]), logging.getLogger("test"))
+    await quiet._spawn_once()
+    assert quiet.state == ProcessState.not_spawnable
+    assert quiet.last_error is None
+    assert spawned is False
+
+    broken = SupervisedProcess(_Unbuildable([]), logging.getLogger("test"))
+    await broken._spawn_once()
+    assert broken.state == ProcessState.crashed
+    assert broken.last_error == "no adapter for engine 'mlx'"
+    assert spawned is False
+
+
+def test_every_process_state_maps_onto_component_status() -> None:
+    """The mapping table is exhaustive by test, not by hope. Adding a
+    ProcessState member without a mapping entry would otherwise surface
+    as a KeyError from `status_for` at runtime."""
+    assert set(_COMPONENT_STATUS_BY_STATE) == set(ProcessState)
+
+
+async def test_nothing_to_launch_ends_the_loop_instead_of_spinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`plan() -> None` must end supervision, not retry in a tight loop.
+
+    The between-attempt back-off is derived from the crash count, and
+    "nothing to launch" is not a crash — so a loop that fell through
+    would sleep zero seconds and spin the event loop hot forever.
+    """
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def counting_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await original_sleep(min(seconds, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", counting_sleep)
+
+    class _NothingToLaunch(_FakeEnginePlanner):
+        def plan(self) -> SpawnPlan | None:
+            return None
+
+    sp = SupervisedProcess(_NothingToLaunch([]), logging.getLogger("test"))
+    sp.start()
+    await original_sleep(0.05)
+
+    assert sp.state == ProcessState.not_spawnable
+    assert sp._task is not None and sp._task.done(), "loop should have exited"
+    assert sleeps == [], "should not have entered the back-off at all"
+    await sp.stop()
