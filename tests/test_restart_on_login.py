@@ -183,7 +183,7 @@ async def test_restart_all_terminates_each_supervised_process(
     entries = [
         ComponentEntry(
             name=name,
-            kind=ComponentKind.hemisphere_driver,
+            kind=ComponentKind.inference_driver,
             url=f"http://127.0.0.1:{port}",  # type: ignore[arg-type]
             spawn=SpawnConfig(configFile=f"/tmp/{name}/config.yaml"),
             safeMode=False,
@@ -223,7 +223,7 @@ async def test_restart_all_survives_one_failing_restart(
     for name, port in [("good", 8081), ("bad", 8082)]:
         entry = ComponentEntry(
             name=name,
-            kind=ComponentKind.hemisphere_driver,
+            kind=ComponentKind.inference_driver,
             url=f"http://127.0.0.1:{port}",  # type: ignore[arg-type]
             spawn=SpawnConfig(configFile=f"/tmp/{name}/config.yaml"),
             safeMode=False,
@@ -277,7 +277,7 @@ async def test_respawn_after_master_key_set_includes_master_key_env_var(
 
     entry = ComponentEntry(
         name="left",
-        kind=ComponentKind.hemisphere_driver,
+        kind=ComponentKind.inference_driver,
         url="http://127.0.0.1:8081",  # type: ignore[arg-type]
         spawn=SpawnConfig(configFile="/tmp/left/config.yaml"),
         safeMode=False,
@@ -285,7 +285,7 @@ async def test_respawn_after_master_key_set_includes_master_key_env_var(
     sup.add_and_start(entry)
     await _wait_for(lambda: len(captured_envs) >= 1)
     # First spawn: no master_key.
-    assert "EUGENE_PLEXUS_HD_MASTER_KEY" not in captured_envs[0]
+    assert "EUGENE_PLEXUS_DRIVER_MASTER_KEY" not in captured_envs[0]
 
     # Operator logs in: master_key becomes available.
     auth.set_master_key(b"\x55" * 32)
@@ -294,6 +294,6 @@ async def test_respawn_after_master_key_set_includes_master_key_env_var(
     # Wait for the respawn to land.
     await _wait_for(lambda: len(captured_envs) >= 2)
     # Second spawn: master_key threaded.
-    assert "EUGENE_PLEXUS_HD_MASTER_KEY" in captured_envs[1]
+    assert "EUGENE_PLEXUS_DRIVER_MASTER_KEY" in captured_envs[1]
 
     await sup.stop_all()

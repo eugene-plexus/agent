@@ -1,16 +1,17 @@
-"""Subprocess supervisor for Eugene Plexus body components.
+"""Subprocess supervisor for Eugene Plexus.
 
 Spawns child processes per the topology in `watchdog.yaml`, threads the
 right env vars through (config-file path, bind port parsed from the
 component's URL, safe-mode flag), and respawns any child that exits.
-The "I'll restart Eugene's heart for you" piece — the watchdog's whole
-reason to exist in v0.1.
 
-Long-term (v0.2+) the orchestrator absorbs this responsibility because
-process supervision IS interoception in the brain analogy. See
-`project_supervisor_as_interoception` in the project memory directory.
-For now, the watchdog is the medulla — autonomic reflex layer that
-keeps things running without thinking.
+Supervising things it does not own is the watchdog's whole reason to
+exist, and it covers two kinds of child. **Components** are Eugene
+Plexus processes — the gateway, the drivers — spawned as
+`sys.executable -m <module>` from `_COMPONENT_SPECS`. **Runtimes** are
+third-party engine binaries spawned from an argv an engine adapter
+builds. They share every mechanic in this module (spawn, watch,
+respawn, crash back-off, log capture) and none of their declarations,
+which is why they are separate surfaces on the API.
 
 ## Cross-platform notes
 
@@ -18,8 +19,10 @@ keeps things running without thinking.
 we use on every supervised exit. On POSIX that maps to SIGTERM (children
 get a chance to flush logs and answer their last in-flight request). On
 Windows it's `TerminateProcess`, which is a hard kill — no graceful
-window. Living with that for v0.1 personal-use; Windows is primarily a
-dev surface, real installs are Linux/Mac/Docker.
+window. Living with that for now; Windows is primarily a dev surface,
+real installs are Linux/Mac/Docker. This matters more for engines than
+for components: a hard-killed `llama-server` can leave a GPU context to
+be reclaimed by the driver.
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ import re
 import sys
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import httpx
@@ -96,70 +99,51 @@ def _colorize_alerts(text: str) -> str:
     return _ALERT_WORD_RE.sub(_wrap, text)
 
 
-# Module name to spawn for each body-component kind. The watchdog uses
-# `sys.executable -m <module>` so it spawns whichever Python interpreter
-# the watchdog itself is running under — production installs that put
-# all components in one venv work out of the box; dev setups with
-# per-component venvs need every component installed into the watchdog's
-# venv (or a shared one).
-_KIND_TO_MODULE: dict[ComponentKind, str] = {
-    ComponentKind.orchestrator: "eugene_plexus_orchestrator",
-    ComponentKind.hemisphere_driver: "eugene_plexus_hemisphere_driver",
-    ComponentKind.memory: "eugene_plexus_memory",
-    ComponentKind.identity: "eugene_plexus_identity",
-    ComponentKind.connector: "eugene_plexus_connector",
-    ComponentKind.coordinator: "eugene_plexus_coordinator",
-    ComponentKind.trainer: "eugene_plexus_trainer",
-    ComponentKind.data: "eugene_plexus_data",
-    ComponentKind.eval: "eugene_plexus_eval",
-    ComponentKind.inference: "eugene_plexus_inference",
-    ComponentKind.cluster: "eugene_plexus_cluster",
-}
+# Everything the supervisor needs to know to spawn one component kind.
+#
+# Was three parallel dicts keyed by the same enum, which is three places
+# to forget when a kind is added. One table means adding `library` is one
+# line and cannot half-land.
+class _ComponentSpec(NamedTuple):
+    module: str
+    """Spawned as `sys.executable -m <module>`, so components run under
+    whichever interpreter the watchdog itself is running. Production
+    installs sharing one venv work out of the box; dev setups with
+    per-component venvs must install every component into the
+    watchdog's venv (or a shared one) or the import fails at spawn."""
 
-# Env-var prefix per component kind, matching what each component's
-# pydantic-settings `env_prefix` already expects.
-_KIND_TO_ENV_PREFIX: dict[ComponentKind, str] = {
-    ComponentKind.orchestrator: "EUGENE_PLEXUS_ORCH",
-    ComponentKind.hemisphere_driver: "EUGENE_PLEXUS_HD",
-    ComponentKind.memory: "EUGENE_PLEXUS_MEM",
-    ComponentKind.identity: "EUGENE_PLEXUS_IDENTITY",
-    ComponentKind.connector: "EUGENE_PLEXUS_CONNECTOR",
-    ComponentKind.coordinator: "EUGENE_PLEXUS_CRD",
-    ComponentKind.trainer: "EUGENE_PLEXUS_TRN",
-    ComponentKind.data: "EUGENE_PLEXUS_DAT",
-    ComponentKind.eval: "EUGENE_PLEXUS_EVAL",
-    ComponentKind.inference: "EUGENE_PLEXUS_INF",
-    ComponentKind.cluster: "EUGENE_PLEXUS_CLU",
-}
+    env_prefix: str
+    """Matches the component's own pydantic-settings `env_prefix`."""
 
-# Short, log-friendly label per component kind. Used by the output reader
-# to disambiguate user-chosen names: drivers are named "left"/"right" by
-# convention but operators can rename them to anything (including
-# "memory" or "connector"), so a bare `[left]` prefix is ambiguous about
-# the kind. When `name != short_label`, the prefix becomes
-# `[<short_label>: <name>]` (e.g. `[driver: left]`); when they match
-# (the default for orchestrator/memory/identity/connector), we keep the
-# shorter `[<name>]` form to avoid `[memory: memory]`-style redundancy.
-_KIND_SHORT_LABEL: dict[ComponentKind, str] = {
-    ComponentKind.orchestrator: "orchestrator",
-    ComponentKind.hemisphere_driver: "driver",
-    ComponentKind.memory: "memory",
-    ComponentKind.identity: "identity",
-    ComponentKind.connector: "connector",
-    ComponentKind.coordinator: "coordinator",
-    ComponentKind.trainer: "trainer",
-    ComponentKind.data: "data",
-    ComponentKind.eval: "eval",
-    ComponentKind.inference: "inference",
-    ComponentKind.cluster: "cluster",
+    log_label: str
+    """Short, kind-identifying label for the output reader. Operators can
+    name a component anything, so a bare `[left]` prefix is ambiguous
+    about what kind of thing is talking. When the operator's name differs
+    from this label the prefix becomes `[<label>: <name>]` (e.g.
+    `[driver: left]`); when they match we keep the shorter `[<name>]` to
+    avoid `[gateway: gateway]`-style redundancy."""
+
+
+_COMPONENT_SPECS: dict[ComponentKind, _ComponentSpec] = {
+    ComponentKind.gateway: _ComponentSpec(
+        module="eugene_plexus_gateway",
+        env_prefix="EUGENE_PLEXUS_GATEWAY",
+        log_label="gateway",
+    ),
+    ComponentKind.inference_driver: _ComponentSpec(
+        module="eugene_plexus_inference_driver",
+        env_prefix="EUGENE_PLEXUS_DRIVER",
+        log_label="driver",
+    ),
 }
 
 
 def _format_log_prefix(kind: ComponentKind, name: str) -> str:
     """Build the `[<...>] ` prefix the supervisor stamps on each child
     line. `[<name>]` when the name matches the kind's short label,
-    `[<kind>: <name>]` otherwise — see `_KIND_SHORT_LABEL`."""
-    short = _KIND_SHORT_LABEL.get(kind, kind.value)
+    `[<kind>: <name>]` otherwise — see `_ComponentSpec.log_label`."""
+    spec = _COMPONENT_SPECS.get(kind)
+    short = spec.log_label if spec is not None else kind.value
     if name == short:
         return f"[{name}] "
     return f"[{short}: {name}] "
@@ -367,8 +351,22 @@ class SupervisedProcess:
             self.status = ComponentStatus.unreachable
             return
 
+        spec = _COMPONENT_SPECS.get(self.entry.kind)
+        if spec is None:
+            self._log.error(
+                "%s has kind %r, which this watchdog has no spawn spec for; "
+                "refusing to spawn. Either the topology names a retired "
+                "component kind or this watchdog predates it.",
+                self.entry.name,
+                self.entry.kind.value,
+            )
+            self.status = ComponentStatus.crashed
+            self.last_error = f"no spawn spec for kind {self.entry.kind.value!r}"
+            self._consecutive_crashes += 1
+            return
+
         env = os.environ.copy()
-        prefix = _KIND_TO_ENV_PREFIX[self.entry.kind]
+        prefix = spec.env_prefix
         env[f"{prefix}_CONFIG_FILE"] = str(spawn.configFile)
         port = urlparse(str(self.entry.url)).port
         if port is not None:
@@ -381,7 +379,7 @@ class SupervisedProcess:
         env[f"{prefix}_SAFE_MODE"] = "1" if safe_mode_effective else "0"
 
         # v0.2 auth env vars. Children that have implemented the v0.2
-        # auth surface (currently watchdog itself; orchestrator/drivers/
+        # auth surface (currently watchdog itself; gateway/drivers
         # memory follow in subsequent commits) read these to (a) validate
         # inbound bearer tokens against the shared signing key, (b)
         # present a service token of their own on outbound calls, and
@@ -389,7 +387,7 @@ class SupervisedProcess:
         # these env vars simply ignore them — fully backward-compatible
         # rollout.
         if self._auth_state is not None:
-            kind_value = self.entry.kind.value  # "orchestrator", "hemisphere-driver", "memory"
+            kind_value = self.entry.kind.value  # "gateway", "inference-driver"
             env[f"{prefix}_AUTH_SIGNING_KEY"] = base64.b64encode(
                 self._auth_state.signing_key
             ).decode("ascii")
@@ -416,8 +414,7 @@ class SupervisedProcess:
         # a hang where ANY line emitted before the stall is the clue).
         env["PYTHONUNBUFFERED"] = "1"
 
-        module = _KIND_TO_MODULE[self.entry.kind]
-        cmd = [sys.executable, "-m", module]
+        cmd = [sys.executable, "-m", spec.module]
         self._log.info("spawning %s: %s", self.entry.name, " ".join(cmd))
 
         try:

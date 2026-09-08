@@ -286,11 +286,10 @@ def issue_service_token(
     restart rotates the signing key anyway, so the effective
     lifetime is bounded by watchdog uptime.
 
-    The `kind` is the component class (`orchestrator`, `hemisphere-driver`,
-    `memory`, `identity`, `connector`). Encoded as `aud:
-    "service:<kind>"` so components can additionally check the
-    audience matches their own kind on inbound calls — a leaked
-    memory service token can't be used against an orchestrator.
+    The `kind` is the component class (`gateway`, `inference-driver`).
+    Encoded as `aud: "service:<kind>"` so components can additionally
+    check the audience matches their own kind on inbound calls — a
+    leaked driver service token can't be used against the gateway.
     """
     issued_at = now if now is not None else int(time.time())
     ttl = ttl_seconds if ttl_seconds is not None else 365 * 24 * 3600

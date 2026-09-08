@@ -12,11 +12,17 @@ The on-disk shape:
     uiTheme: auto
     uiFontSize: medium
     components:
-      - name: orchestrator
-        kind: orchestrator
+      - name: gateway
+        kind: gateway
         url: http://127.0.0.1:8080
         spawn:
-          configFile: ~/.eugene-plexus/orchestrator/config.yaml
+          configFile: ~/.eugene-plexus/gateway/config.yaml
+        safeMode: false
+      - name: qwen3-30b
+        kind: inference-driver
+        url: http://127.0.0.1:8081
+        spawn:
+          configFile: ~/.eugene-plexus/drivers/qwen3-30b.yaml
         safeMode: false
       - ...
 

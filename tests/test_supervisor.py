@@ -30,6 +30,7 @@ from eugene_plexus_watchdog._generated.models import (
 )
 from eugene_plexus_watchdog.auth_state import AuthState
 from eugene_plexus_watchdog.supervisor import (
+    _COMPONENT_SPECS,
     _HEALTHZ_2XX_LINE,
     SupervisedProcess,
     Supervisor,
@@ -76,7 +77,7 @@ class _FakeProcess:
 def driver_entry() -> ComponentEntry:
     return ComponentEntry(
         name="left",
-        kind=ComponentKind.hemisphere_driver,
+        kind=ComponentKind.inference_driver,
         url="http://127.0.0.1:8081",  # type: ignore[arg-type]
         spawn=SpawnConfig(configFile="/tmp/left/config.yaml"),
         safeMode=False,
@@ -109,12 +110,12 @@ async def test_spawn_invokes_correct_command_and_env(
     assert "args" in captured, "subprocess was never invoked"
     assert captured["args"][0] == sys.executable
     assert captured["args"][1] == "-m"
-    assert captured["args"][2] == "eugene_plexus_hemisphere_driver"
+    assert captured["args"][2] == "eugene_plexus_inference_driver"
 
     env = captured["env"]
-    assert env["EUGENE_PLEXUS_HD_CONFIG_FILE"] == "/tmp/left/config.yaml"
-    assert env["EUGENE_PLEXUS_HD_BIND_PORT"] == "8081"
-    assert env["EUGENE_PLEXUS_HD_SAFE_MODE"] == "0"
+    assert env["EUGENE_PLEXUS_DRIVER_CONFIG_FILE"] == "/tmp/left/config.yaml"
+    assert env["EUGENE_PLEXUS_DRIVER_BIND_PORT"] == "8081"
+    assert env["EUGENE_PLEXUS_DRIVER_SAFE_MODE"] == "0"
 
 
 async def test_safe_mode_threads_env_var(
@@ -138,7 +139,7 @@ async def test_safe_mode_threads_env_var(
             break
     await sp.stop()
 
-    assert captured["env"]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "1"
+    assert captured["env"]["EUGENE_PLEXUS_DRIVER_SAFE_MODE"] == "1"
 
 
 async def test_clean_exit_triggers_respawn(
@@ -213,10 +214,13 @@ async def test_remote_entry_does_not_spawn(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
+    # A driver on a remote GPU host is the real instance of this case:
+    # it belongs next to its engine, so the watchdog watches it but does
+    # not own its lifecycle.
     remote_entry = ComponentEntry(
-        name="memory",
-        kind=ComponentKind.memory,
-        url="http://memory.lan:8083",  # type: ignore[arg-type]
+        name="rtx5090",
+        kind=ComponentKind.inference_driver,
+        url="http://gpu-box.tailnet:8081",  # type: ignore[arg-type]
         # No spawn block => remote, watchdog must not try to launch it.
         safeMode=False,
     )
@@ -228,7 +232,7 @@ async def test_remote_entry_does_not_spawn(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert spawned is False
     # Status is reported as `unreachable` because no health probe ran.
-    status, _, _, pid = sup.status_for("memory", has_spawn=False)
+    status, _, _, pid = sup.status_for("rtx5090", has_spawn=False)
     assert status == ComponentStatus.unreachable
     assert pid is None
 
@@ -264,17 +268,17 @@ async def test_auth_state_threads_signing_key_and_service_token(
 
     env = captured["env"]
     # Signing key is the shared base64-encoded HMAC key.
-    assert base64.b64decode(env["EUGENE_PLEXUS_HD_AUTH_SIGNING_KEY"]) == auth.signing_key
+    assert base64.b64decode(env["EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY"]) == auth.signing_key
     # Service token must validate against the same signing key with the
     # correct service audience.
     payload = security.decode_token(
-        token=env["EUGENE_PLEXUS_HD_SERVICE_TOKEN"],
+        token=env["EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN"],
         signing_key=auth.signing_key,
-        expected_audience="service:hemisphere-driver",
+        expected_audience="service:inference-driver",
     )
-    assert payload.sub == "hemisphere-driver"
+    assert payload.sub == "inference-driver"
     # Master key absent because the operator hasn't logged in yet.
-    assert "EUGENE_PLEXUS_HD_MASTER_KEY" not in env
+    assert "EUGENE_PLEXUS_DRIVER_MASTER_KEY" not in env
 
 
 async def test_master_key_threaded_after_login(
@@ -304,26 +308,26 @@ async def test_master_key_threaded_after_login(
     await sp.stop()
 
     env = captured["env"]
-    assert base64.b64decode(env["EUGENE_PLEXUS_HD_MASTER_KEY"]) == auth.master_key
+    assert base64.b64decode(env["EUGENE_PLEXUS_DRIVER_MASTER_KEY"]) == auth.master_key
 
 
-async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
+async def test_every_spawnable_kind_gets_its_own_prefix_and_audience(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Service-token audience + env-var prefix must follow the kind.
 
-    Exercises every spawnable kind so a future enum addition is caught
-    by an obvious mismatch in this test rather than by a silent
-    unsupported-kind KeyError at spawn time.
+    Driven off `_COMPONENT_SPECS` rather than a hand-written list, so
+    adding a kind (library, next) fails here loudly if its spec is
+    incomplete instead of surfacing as an unsupported-kind refusal at
+    spawn time.
     """
     captured: dict[str, dict[str, str]] = {}
 
     async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
-        # Tag captures by the kind we expect (read off CONFIG_FILE).
         env = kwargs.get("env") or {}
-        for kind_prefix in ("ORCH", "HD", "MEM", "IDENTITY", "CONNECTOR"):
-            if f"EUGENE_PLEXUS_{kind_prefix}_CONFIG_FILE" in env:
-                captured[kind_prefix] = env
+        for kind, spec in _COMPONENT_SPECS.items():
+            if f"{spec.env_prefix}_CONFIG_FILE" in env:
+                captured[kind.value] = env
                 break
         return _FakeProcess()
 
@@ -331,17 +335,12 @@ async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
 
     auth = AuthState(signing_key=security.generate_signing_key())
     procs: list[SupervisedProcess] = []
-    for kind, prefix, port in [
-        (ComponentKind.orchestrator, "ORCH", 8080),
-        (ComponentKind.memory, "MEM", 8083),
-        (ComponentKind.identity, "IDENTITY", 8084),
-        (ComponentKind.connector, "CONNECTOR", 8085),
-    ]:
+    for port, kind in enumerate(_COMPONENT_SPECS, start=9000):
         entry = ComponentEntry(
-            name=prefix.lower(),
+            name=kind.value,
             kind=kind,
             url=f"http://127.0.0.1:{port}",  # type: ignore[arg-type]
-            spawn=SpawnConfig(configFile=f"/tmp/{prefix}/config.yaml"),
+            spawn=SpawnConfig(configFile=f"/tmp/{kind.value}/config.yaml"),
             safeMode=False,
         )
         sp = SupervisedProcess(entry, logging.getLogger("test"), auth_state=auth)
@@ -350,36 +349,23 @@ async def test_orchestrator_and_memory_kinds_get_correct_prefixes(
 
     for _ in range(100):
         await asyncio.sleep(0.01)
-        if {"ORCH", "MEM", "IDENTITY", "CONNECTOR"}.issubset(captured.keys()):
+        if {k.value for k in _COMPONENT_SPECS}.issubset(captured.keys()):
             break
 
     for sp in procs:
         await sp.stop()
 
-    payload_orch = security.decode_token(
-        token=captured["ORCH"]["EUGENE_PLEXUS_ORCH_SERVICE_TOKEN"],
-        signing_key=auth.signing_key,
-        expected_audience="service:orchestrator",
+    assert {k.value for k in _COMPONENT_SPECS} == set(captured), (
+        "every spawnable kind should have been captured"
     )
-    assert payload_orch.sub == "orchestrator"
-    payload_mem = security.decode_token(
-        token=captured["MEM"]["EUGENE_PLEXUS_MEM_SERVICE_TOKEN"],
-        signing_key=auth.signing_key,
-        expected_audience="service:memory",
-    )
-    assert payload_mem.sub == "memory"
-    payload_identity = security.decode_token(
-        token=captured["IDENTITY"]["EUGENE_PLEXUS_IDENTITY_SERVICE_TOKEN"],
-        signing_key=auth.signing_key,
-        expected_audience="service:identity",
-    )
-    assert payload_identity.sub == "identity"
-    payload_connector = security.decode_token(
-        token=captured["CONNECTOR"]["EUGENE_PLEXUS_CONNECTOR_SERVICE_TOKEN"],
-        signing_key=auth.signing_key,
-        expected_audience="service:connector",
-    )
-    assert payload_connector.sub == "connector"
+    for kind, spec in _COMPONENT_SPECS.items():
+        env = captured[kind.value]
+        payload = security.decode_token(
+            token=env[f"{spec.env_prefix}_SERVICE_TOKEN"],
+            signing_key=auth.signing_key,
+            expected_audience=f"service:{kind.value}",
+        )
+        assert payload.sub == kind.value
 
 
 # --------------------------------------------------------------------------- #
@@ -488,12 +474,12 @@ async def test_auto_safe_mode_after_crash_threshold(
     )
     # First 5 spawns: normal mode (topology safeMode=False).
     for i in range(5):
-        assert captured_envs[i]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "0", (
+        assert captured_envs[i]["EUGENE_PLEXUS_DRIVER_SAFE_MODE"] == "0", (
             f"spawn {i} should have been normal mode, "
-            f"got SAFE_MODE={captured_envs[i]['EUGENE_PLEXUS_HD_SAFE_MODE']}"
+            f"got SAFE_MODE={captured_envs[i]['EUGENE_PLEXUS_DRIVER_SAFE_MODE']}"
         )
     # Spawn 6 onward: auto-engaged safe mode.
-    assert captured_envs[5]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "1", (
+    assert captured_envs[5]["EUGENE_PLEXUS_DRIVER_SAFE_MODE"] == "1", (
         "spawn after threshold should be SAFE_MODE=1"
     )
     # Status reflects the fall-back, not `crashed`.
@@ -527,7 +513,7 @@ async def test_manual_restart_clears_auto_safe_mode(
         await asyncio.sleep(0.01)
         if captured_envs:
             break
-    assert captured_envs[0]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "1"
+    assert captured_envs[0]["EUGENE_PLEXUS_DRIVER_SAFE_MODE"] == "1"
 
     # Manual restart: clears the flag, terminates the proc, supervisor
     # respawns. _FakeProcess.terminate() calls _finish(0) (clean exit),
@@ -541,28 +527,26 @@ async def test_manual_restart_clears_auto_safe_mode(
     await sp.stop()
 
     assert len(captured_envs) >= 2
-    assert captured_envs[1]["EUGENE_PLEXUS_HD_SAFE_MODE"] == "0", (
+    assert captured_envs[1]["EUGENE_PLEXUS_DRIVER_SAFE_MODE"] == "0", (
         "post-restart spawn should be back to normal mode"
     )
 
 
 def test_log_prefix_disambiguates_renamed_components() -> None:
-    """User-chosen component names can collide with kind names ("left"
-    is conventional for a driver but nothing stops an operator naming a
-    driver "memory"). When name == the kind's short label, the prefix
-    stays `[name]`; otherwise it expands to `[short_label: name]`."""
-    # Default-name cases: short and clean.
-    assert _format_log_prefix(ComponentKind.orchestrator, "orchestrator") == "[orchestrator] "
-    assert _format_log_prefix(ComponentKind.memory, "memory") == "[memory] "
-    assert _format_log_prefix(ComponentKind.identity, "identity") == "[identity] "
-    assert _format_log_prefix(ComponentKind.connector, "connector") == "[connector] "
+    """Operators name drivers whatever they like, so a bare `[name]`
+    prefix is ambiguous about what kind of thing is talking. When name ==
+    the kind's short label the prefix stays `[name]`; otherwise it
+    expands to `[label: name]`."""
+    # Name matches the kind's label: keep it short, no `[gateway: gateway]`.
+    assert _format_log_prefix(ComponentKind.gateway, "gateway") == "[gateway] "
 
-    # Driver-with-conventional-name: disambiguation prefix kicks in,
-    # since the kind's short label ("driver") differs from the name.
-    assert _format_log_prefix(ComponentKind.hemisphere_driver, "left") == "[driver: left] "
-    assert _format_log_prefix(ComponentKind.hemisphere_driver, "right") == "[driver: right] "
+    # Drivers are named after what they serve, so the label differs and
+    # the disambiguating prefix kicks in. This is the common case now —
+    # there are N drivers and their names carry the real information.
+    assert _format_log_prefix(ComponentKind.inference_driver, "qwen3-30b") == (
+        "[driver: qwen3-30b] "
+    )
+    assert _format_log_prefix(ComponentKind.inference_driver, "claude") == "[driver: claude] "
 
-    # User-renamed components that collide with another kind's label
-    # still get disambiguated by their actual kind.
-    assert _format_log_prefix(ComponentKind.connector, "discord") == "[connector: discord] "
-    assert _format_log_prefix(ComponentKind.memory, "vault") == "[memory: vault] "
+    # A driver an operator named "gateway" still reports as a driver.
+    assert _format_log_prefix(ComponentKind.inference_driver, "gateway") == ("[driver: gateway] ")

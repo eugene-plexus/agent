@@ -176,7 +176,7 @@ def test_service_token_rejected_for_operator_routes(client: TestClient) -> None:
     # The signing key lives on the running app's auth_state — pull it
     # off so the forged token IS validly signed but audience-wrong.
     signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    svc = security.issue_service_token(signing_key=signing_key, kind="orchestrator")
+    svc = security.issue_service_token(signing_key=signing_key, kind="gateway")
     client.headers["Authorization"] = f"Bearer {svc}"
     assert client.get("/v1/config").status_code == 401
 

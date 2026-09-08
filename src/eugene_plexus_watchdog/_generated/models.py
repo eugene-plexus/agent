@@ -3,264 +3,81 @@
 
 from __future__ import annotations
 
-from enum import IntEnum, StrEnum
+from enum import StrEnum
 from typing import Any
-from uuid import UUID
 
 from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class ComponentKind(StrEnum):
     """
-    Which Eugene Plexus component class a topology entry represents.
-    Lives in `common.yaml` because multiple components reference it:
-    the watchdog's `/v1/components`, and (via `ConfigField.
-    componentKindHint`) any component declaring a config field that
-    points at a peer of a specific kind. v0.1 covered three body
-    parts (orchestrator, hemisphere-driver, memory); v0.2 adds
-    `identity` (Default Mode Network analogue) and `connector`
-    (external sense organs).
+    Which Eugene Plexus component class a topology entry
+    represents. Lives in `common.yaml` because more than one
+    component references it: the watchdog's `/v1/components`, and
+    (via `ConfigField.componentKindHint`) any component declaring
+    a config field that points at a peer of a specific kind.
 
-    v0.3 adds the local-LLM-platform components: `coordinator`
-    (owns the `TrainingProject` aggregate and sequences pipeline
-    runs across the others), `trainer` (executes training runs +
-    owns checkpoints), `data` (datasets + tokenizers),
-    `eval` (eval suites + results), `inference` (OpenAI-compatible
-    local serving), and `cluster` (deferred; multi-host workers).
+    A component is a **Eugene Plexus process**. Engine processes
+    are not components and are not named here — they are runtimes,
+    declared separately on the watchdog, because a third-party
+    binary shares none of a component's declarative shape (no
+    module, no config trio, no service token). See the watchdog's
+    `GET /v1/runtimes`.
+
+    `gateway` is the one OpenAI-compatible front door and there is
+    exactly one. `inference-driver` instances are the per-backend
+    wrappers and there are N — one per backend, wherever that
+    backend lives.
 
     """
 
-    orchestrator = 'orchestrator'
-    hemisphere_driver = 'hemisphere-driver'
-    memory = 'memory'
-    identity = 'identity'
-    connector = 'connector'
-    coordinator = 'coordinator'
-    trainer = 'trainer'
-    data = 'data'
-    eval = 'eval'
-    inference = 'inference'
-    cluster = 'cluster'
+    gateway = 'gateway'
+    inference_driver = 'inference-driver'
 
 
 class Role(StrEnum):
     """
-    The speaker of a single message in a conversation. `tool` carries
-    the result(s) of a tool / region call fed back into deliberation
-    (see ToolResult) — its own kind of utterance, distinct from the
-    `user` who originally spoke.
+    The speaker of a single message in a conversation. Matches the
+    OpenAI / Anthropic chat roles so adapters never re-shape on a hop.
 
     """
 
     system = 'system'
     user = 'user'
     assistant = 'assistant'
-    hemisphere = 'hemisphere'
-    tool = 'tool'
 
 
-class ToolChannel(StrEnum):
+class Message(BaseModel):
     """
-    Direction a tool moves information relative to Eugene — the spine
-    of the perception/action model.
-
-    * `afferent` — brings world-state IN. Senses and reads: web
-      fetch, a connector delivering an inbound message, memory
-      recall, reading a file. Changes nothing in the world.
-    * `efferent` — acts ON the world. Send, write, delete, pay — and
-      notably *speaking to the user* (the Broca / voice-pass
-      effector; the user-facing reply is an efferent tool, not a
-      privileged final output). `effect` is consulted only for this
-      channel.
-    * `internal` — a regimented call to another region rather than
-      the outside world: emotion-read of an inbound message (feeds
-      NT), agreement scoring, summarization, topic-shift detection.
-      No external contact; the result typically updates internal
-      state. Reuses the same envelope so region-to-region cognition
-      threads through the identical `role: tool` machinery.
+    A single message in a conversation. Deliberately close to the
+    OpenAI / Anthropic chat message format so drivers don't have to
+    re-shape on every hop.
 
     """
 
-    afferent = 'afferent'
-    efferent = 'efferent'
-    internal = 'internal'
-
-
-class ToolEffect(StrEnum):
-    """
-    Reversibility class of an `efferent` tool — drives the
-    System-1/System-2 escalation gate. Ignored for `afferent` /
-    `internal` tools, which commit nothing to the world (treat as
-    `read_only`).
-
-    * `read_only` — no world-effect (a pure read). Reflexive-eligible:
-      a single pre-deliberation stream may fire it without bicameral
-      agreement.
-    * `reversible` — an undoable side effect (compose a draft, write a
-      scratch file). The action taken *pre*-deliberation that produces
-      the artifact deliberation then edits — e.g. banging out an email
-      draft before studying it.
-    * `irreversible` — cannot be undone (send, delete, pay, post
-      publicly). Always *post*-deliberation: requires deliberation
-      plus bicameral agreement before the singular effector executes.
-
-    Reversibility is the static property; whether an action fires pre-
-    or post-deliberation is the runtime routing the gate derives from
-    it plus live NT state (anxiety can escalate even a read into
-    deliberation). Conservative default: anything not provably
-    reversible registers `irreversible`. Promotion is explicit, never
-    inferred.
-
-    """
-
-    read_only = 'read_only'
-    reversible = 'reversible'
-    irreversible = 'irreversible'
-
-
-class ToolDefinition(BaseModel):
-    """
-    A capability Eugene can invoke, normalized across backends. The
-    orchestrator owns the catalog; each hemisphere-driver adapter
-    translates this into its backend's native mechanism (Anthropic
-    tool-use blocks, OpenAI function-calling, or Hermes-style
-    `<tool_call>` text for `openai_compat_http` models without native
-    support).
-
-    """
-
-    name: str = Field(
+    role: Role
+    content: str = Field(
         ...,
-        description='Stable tool identifier. Echoed in `ToolCall.name`.',
-        pattern='^[a-zA-Z0-9_-]{1,64}$',
+        description='Message text. Text-only for now; multimodal extensions deferred.',
     )
-    description: str | None = Field(
-        None,
-        description='What the tool does, in model-facing language. This is prompt\nmaterial — the model reads it to decide when to call.\n',
-    )
-    inputSchema: dict[str, Any] = Field(
-        ...,
-        description='JSON Schema (draft 2020-12) for the arguments. Passed to the\nbackend verbatim; adapters needing another dialect translate\nit.\n',
-    )
-    channel: ToolChannel
-    effect: ToolEffect | None = 'read_only'
-
-
-class ToolCall(BaseModel):
-    """
-    A model's request to invoke a tool, surfaced in
-    `GenerateResponse.toolCalls` and carried back in `Message` for the
-    next pass. The driver only surfaces the request; the
-    orchestrator — never the driver — decides whether to execute it,
-    after the reflexive/deliberative gate and (for `irreversible`
-    efferent effects) bicameral agreement.
-
-    """
-
-    id: str = Field(
-        ...,
-        description="Call id, unique within a turn; correlates a `ToolResult` back\nto this call. Adapters map their backend's native id\n(Anthropic `tool_use.id`, OpenAI `tool_call.id`) to/from this.\n",
-    )
-    name: str = Field(
-        ..., description='Tool name, matching a registered `ToolDefinition.name`.'
-    )
-    arguments: dict[str, Any] = Field(
-        ...,
-        description="Arguments object conforming to the tool's `inputSchema`.\nAdapters parse the backend's argument representation (often a\nJSON string) into this object before returning.\n",
-    )
-
-
-class ToolResult(BaseModel):
-    """
-    The outcome of executing a `ToolCall`, produced by the singular
-    tool-runner (one effector for the whole organism — two
-    hemispheres, one set of hands) and fed back into BOTH hemispheres
-    on the next pass as a `role: tool` message.
-
-    """
-
-    callId: str = Field(..., description='The `ToolCall.id` this result answers.')
-    content: str | None = Field(
-        None,
-        description='Result as text — human-readable, or JSON rendered as a string\nfor models that only consume text. Large results may be\ntruncated by the runner before feeding back.\n',
-    )
-    structuredContent: dict[str, Any] | None = Field(
-        None,
-        description="Typed result payload, for `internal` regimented calls and\nstructured tool outputs — e.g. an emotion-read returning\n`{joy: 0.1, anger: 0.7, ...}` that the orchestrator routes\ninto the NT system. Mirrors MCP's `structuredContent`. When\nboth are present, `content` is the text rendering of this.\n",
-    )
-    isError: bool | None = Field(
-        False,
-        description="True if the tool failed; the error text goes in `content`. The\nmodel sees the failure and can react (retry, pick another\ntool, give up) — like a person whose action didn't work.\n",
-    )
-
-
-class NTLevel(BaseModel):
-    """
-    Per-NT level + its baseline + per-second decay rate. The level
-    decays toward baseline at `decay` units per second between
-    observations; observations push it up or down based on the
-    orchestrator's observation→NT mapping (see orchestrator spec).
-
-    """
-
-    level: float = Field(
-        ..., description='Current instantaneous value.', ge=0.0, le=1.0
-    )
-    baseline: float = Field(
-        ..., description='Resting-state target the level decays toward.', ge=0.0, le=1.0
-    )
-    decay: float = Field(
-        ...,
-        description='Per-second decay rate toward baseline. Larger values =\nfaster return to baseline after a stimulus.\n',
-        ge=0.0,
-        le=1.0,
-    )
-
-
-class DriverEntry(BaseModel):
-    """
-    One operator-configured hemisphere-driver *slot* in the
-    orchestrator's topology. The orchestrator owns the `name`
-    (free-form, used for labelling messages and UI tabs); drivers
-    themselves are anonymous and report only their backend / model
-    identity. The bicameral loop requires exactly two slots.
-
-    A slot is a **priority list** of backends (`backends`), not a
-    single backend. Each entry is the NAME of a hemisphere-driver
-    entry in the watchdog topology (`GET /v1/components`,
-    `kind: hemisphere-driver`); the orchestrator resolves names to
-    URLs at startup. This keeps backend URLs in exactly one place
-    (the watchdog topology) instead of duplicating them into the
-    orchestrator's config (v0.2.1).
-
-    On each chat turn the orchestrator tries `backends[0]`; if it
-    fails in a cascade-eligible way (transport error / 5xx /
-    timeout) it falls through to `backends[1]`, and so on. A 4xx
-    fails the slot HARD without cascading — a 4xx is a
-    request/auth/config bug that the next backend would hit
-    identically, and cascading past it would mask the real problem.
-    Stock installs run one backend per slot.
-
-    """
-
-    name: str = Field(
-        ...,
-        description='Operator-supplied label (e.g. `"left"`, `"right"`, or any\nfree-form string). Stamped onto every message this slot\nproduces and surfaced in the UI as the tab/column label.\n',
-        min_length=1,
-    )
-    backends: list[str] = Field(
-        ...,
-        description='Ordered priority list of watchdog-topology hemisphere-driver\nentry NAMES that back this slot. The orchestrator resolves\neach name to a URL via `GET /v1/components` at startup and\ntries them in order on each turn, cascading to the next on\ntransport error / 5xx / timeout (but not on 4xx). At least\none entry is required. (Not a URL — a topology entry name.)\n',
-        min_length=1,
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
     )
 
 
 class BackendKind(StrEnum):
     """
-    Which adapter the hemisphere-driver instance is configured to use.
-    Reported by `/v1/info` so the orchestrator can log and the UI can
-    render a label. `claude_code_cli` and `codex_cli` shell out to the
-    respective CLIs (primary mode for personal installations).
+    Which wire protocol an inference-driver instance speaks to its
+    backend. Reported by the driver's `/v1/info` so the gateway can
+    log it and the UI can render a label.
+
+    `openai_compat_http` covers every local engine we care about
+    (llama.cpp's `llama-server`, vLLM, LM Studio, Ollama) as well as
+    hosted OpenAI-compatible services — the protocol is shared even
+    though the providers are not, so `DriverInfo.provider` is what
+    distinguishes them. `claude_code_cli` and `codex_cli` shell out
+    to the respective CLIs, which is how a subscription the operator
+    already pays for becomes just another backend.
 
     """
 
@@ -293,7 +110,7 @@ class Problem(BaseModel):
     )
     component: str | None = Field(
         None,
-        description='Eugene Plexus component name that originated the error\n(e.g. `"orchestrator"`, `"hemisphere-driver:left"`).\n',
+        description='Eugene Plexus component name that originated the error\n(e.g. `"gateway"`, `"inference-driver:left"`).\n',
     )
 
 
@@ -311,7 +128,7 @@ class Health(BaseModel):
     status: Status
     version: str | None = Field(None, description='Component version (semver).')
     component: str | None = Field(
-        None, description='Component identifier (e.g. `"hemisphere-driver"`).'
+        None, description='Component identifier (e.g. `"inference-driver"`).'
     )
     safeMode: bool | None = Field(
         False,
@@ -439,10 +256,10 @@ class ConfigTestRequest(BaseModel):
 class ConfigTestResult(BaseModel):
     """
     Result of a `POST /v1/config/test` invocation. Components decide
-    what "test" means for their own surface: hemisphere-driver runs
-    a minimal `generate()` round-trip; orchestrator probes its
-    configured hemispheres + memory; memory verifies the store
-    backend is reachable.
+    what "test" means for their own surface: an inference-driver runs
+    a minimal `generate()` round-trip against its backend; the
+    gateway probes every driver it can route to; the library checks
+    that its configured model directories are readable.
 
     """
 
@@ -462,7 +279,7 @@ class ConfigTestResult(BaseModel):
     )
     sampleOutput: str | None = Field(
         None,
-        description="Brief sample of the data the test produced — e.g. assistant\ntext from a hemisphere-driver `generate()` round-trip. May be\ntruncated to keep the response small. Omitted when there's\nnothing useful to show.\n",
+        description="Brief sample of the data the test produced — e.g. assistant\ntext from an inference-driver `generate()` round-trip. May be\ntruncated to keep the response small. Omitted when there's\nnothing useful to show.\n",
     )
     error: str | None = Field(
         None,
@@ -565,321 +382,6 @@ class MasterKeyEnvelope(BaseModel):
     ciphertext: str = Field(..., description='Base64-encoded ciphertext + auth tag.')
 
 
-class PersonRef(BaseModel):
-    """
-    Reference to a person Eugene knows. The `personId` is the
-    identity component's stable key (UUID). Each person has zero
-    or more platform aliases linking external IDs back to this
-    person; the operator approves aliasing via the pending-links
-    flow.
-
-    v0.2 distinguishes between the operator (always known, defined
-    by the wizard) and other persons (introduced via connector
-    adapters). The operator's `personId` is special-cased in some
-    endpoints — e.g. the UI's chat surface always sends as the
-    operator.
-
-    """
-
-    personId: UUID
-    displayName: str | None = Field(
-        None, description='Operator-supplied or auto-from-platform display name.'
-    )
-    isOperator: bool | None = Field(
-        False, description="True iff this person is the install's operator."
-    )
-
-
-class PlatformAlias(BaseModel):
-    """
-    One external-platform identity that maps to a person. The
-    union of (platform, accountId) is globally unique. Created
-    when the operator approves a pending identity link.
-
-    """
-
-    platform: str = Field(
-        ...,
-        description='Platform identifier (e.g. `"discord"`, `"slack"`,\n`"matrix"`, `"ui"`). The `ui` platform is reserved for\nthe local UI session; the operator is always\n`(platform=ui, accountId=operator)`.\n',
-    )
-    accountId: str = Field(
-        ...,
-        description="Platform-stable account identifier (Discord user ID,\nMatrix MXID, Slack member ID, etc.). MUST be the\nplatform's immutable id, not a mutable handle.\n",
-    )
-    handle: str | None = Field(
-        None, description='Username / handle on the platform (mutable).'
-    )
-    displayName: str | None = Field(
-        None, description='Platform display name (mutable).'
-    )
-    avatarUrl: AnyUrl | None = Field(
-        None, description='Avatar image URL on the platform.'
-    )
-    linkedAt: AwareDatetime
-
-
-class Status1(StrEnum):
-    pending = 'pending'
-    approved = 'approved'
-    rejected = 'rejected'
-
-
-class PendingIdentityLink(BaseModel):
-    """
-    An unknown identity that wants to interact with Eugene. The
-    connector adapter creates these when a new platform user
-    @mentions Eugene or DMs for the first time. The operator
-    approves or rejects from the UI; until then the identity has
-    no relationship context and Eugene treats it as a stranger.
-
-    Universal fields only — every plausible future platform
-    (Slack, Matrix, Telegram, Gmail, Signal) supplies these.
-    Platform-specific extras live in `adapterPrivate` and are
-    NOT promoted to the operator-facing UI unless the operator
-    drills in.
-
-    """
-
-    linkId: UUID
-    platform: str
-    accountId: str
-    displayName: str | None = None
-    handle: str | None = None
-    avatarUrl: AnyUrl | None = None
-    firstSeen: AwareDatetime
-    triggeringMessage: str = Field(
-        ...,
-        description='The text of the message that triggered the link request,\ntruncated. Gives the operator context for the approval\ndecision.\n',
-    )
-    status: Status1
-    adapterPrivate: dict[str, Any] | None = Field(
-        None,
-        description='Platform-specific metadata the adapter stored alongside\nthis link. UI may render this in a drill-down view but\ndoes not promote it to the main approval surface. Use\nfor things like Teams UPN/tenant, Slack workspace,\nMatrix homeserver.\n',
-    )
-
-
-class LinkApprovalRequest(BaseModel):
-    """
-    Operator action on a pending identity link. To link the
-    unknown identity to an existing person (typically the
-    operator themselves or a known third party), supply
-    `linkAsPersonId`. To create a new person record for this
-    identity, omit `linkAsPersonId` and supply `displayName`
-    and optionally `relationshipNote`.
-
-    """
-
-    linkAsPersonId: UUID | None = Field(
-        None,
-        description='Existing person to alias this identity onto. Mutually\nexclusive with `displayName` / `relationshipNote`.\n',
-    )
-    displayName: str | None = Field(
-        None,
-        description='Display name for the new person record. Required when\n`linkAsPersonId` is omitted.\n',
-    )
-    relationshipNote: str | None = Field(
-        None,
-        description='Optional initial relationship context for the new person\n(e.g. "my wife", "Discord regular"). Only used when\n`linkAsPersonId` is omitted.\n',
-    )
-
-
-class Constitution(BaseModel):
-    """
-    The immutable / declarative half of Eugene's identity — the
-    "I am Eugene" facts. Operator-editable from the UI; Eugene
-    cannot modify this. Anatomically: medial prefrontal cortex
-    (mPFC) node of the Default Mode Network.
-
-    v0.2 reserves three structured keys (`name`, `pronouns`,
-    `coreValues`) that the orchestrator reads programmatically
-    when constructing hemisphere prompts. The `freeText` field is
-    operator-owned free-form context (markdown / YAML / plain)
-    that's included verbatim in every prompt. Future versions
-    may promote stable patterns out of `freeText` into structured
-    fields, but the operator-flexibility-first design choice was
-    deliberate (we can't enumerate all immutable identity data
-    yet).
-
-    """
-
-    name: str = Field(
-        ...,
-        description="Eugene's name. Operator may rename (e.g. if they want\ntheir consciousness called something else). Used in\nevery hemisphere system prompt and in UI chrome.\n",
-        min_length=1,
-    )
-    pronouns: str | None = Field(
-        None,
-        description='Eugene\'s pronouns (e.g. "he/him", "they/them"). Used\nin hemisphere prompts for self-reference consistency.\n',
-    )
-    coreValues: list[str] | None = Field(
-        None,
-        description='Short list of operator-supplied core values. Each is a\nshort phrase ("honesty", "intellectual humility",\n"patience with confusion"). Included in every\nhemisphere prompt.\n',
-    )
-    freeText: str | None = Field(
-        None,
-        description="Operator-owned free-form context — markdown or plain\ntext. Included verbatim in every hemisphere prompt\nafter the structured fields. Use for backstory, voice\nguidance, anything that doesn't fit a structured field\nyet.\n",
-    )
-
-
-class SelfModelEntry(BaseModel):
-    """
-    One entry in Eugene's self-model — the autobiographical
-    / mutable half of identity. Anatomically: posterior cingulate
-    cortex (PCC) / precuneus node of the Default Mode Network.
-
-    Self-model entries are written by Eugene's reflection process
-    (v0.2: manually triggered via `POST /v1/identity/self-model/reflect`;
-    v0.3: autonomous when NT state is in reflection mode).
-    They're queried by topic relevance and injected into
-    hemisphere prompts when relevant.
-
-    """
-
-    id: UUID
-    topic: str = Field(
-        ...,
-        description='Short topic key for retrieval (e.g. "creative-tasks",\n"user-troy", "uncertainty-handling").\n',
-    )
-    content: str = Field(
-        ...,
-        description="The reflection itself. Free-form prose written by\nEugene's reflection process. Typically 1-3 sentences.\n",
-    )
-    relatedPersonIds: list[UUID] | None = Field(
-        None, description='Persons this reflection involves, if any.\n'
-    )
-    createdAt: AwareDatetime
-    sourceConversationIds: list[UUID] | None = Field(
-        None,
-        description='Conversation ids that fed into this reflection. Lets the\nUI offer "show me the conversations that produced this\nself-model entry" drill-down.\n',
-    )
-
-
-class MemoryBackendKind(StrEnum):
-    """
-    Which storage backend the memory component is using. Set in
-    the memory component's config. v0.2 ships one option; future
-    versions add adapters following the same pattern as
-    `hemisphere-driver`'s provider registry.
-
-    """
-
-    local_sqlite = 'local_sqlite'
-
-
-class MemoryEmbeddingSource(StrEnum):
-    """
-    How the memory component generates embeddings for similarity
-    search. `local` uses sentence-transformers (offline, ~100MB
-    model download on first install). `api` calls a vendor
-    (OpenAI / Voyage / Cohere) and requires network + an API
-    key. Lives inside `local_sqlite`'s adapter-specific config.
-
-    """
-
-    local = 'local'
-    api = 'api'
-
-
-class MemorySearchRequest(BaseModel):
-    """
-    Reactive memory search. Called by the orchestrator when its
-    topic-shift detector (v0.3) flags that the current
-    conversation references something outside recent history,
-    or when the operator explicitly requests retrieval. v0.2
-    ships the endpoint; the trigger is v0.3.
-
-    """
-
-    query: str = Field(..., description='Free-form query text to embed and search.')
-    personId: UUID | None = Field(
-        None,
-        description='Optionally restrict search to entries involving this\nperson.\n',
-    )
-    conversationId: UUID | None = Field(
-        None, description='Optionally restrict search to a specific conversation.\n'
-    )
-    limit: int | None = Field(10, ge=1, le=100)
-    minScore: float | None = Field(
-        None,
-        description='Minimum similarity score to include. Backends define\ntheir own scoring scale; 0.5 is a reasonable default\nfor cosine-similarity embedding backends.\n',
-        ge=0.0,
-        le=1.0,
-    )
-
-
-class AdapterKind(StrEnum):
-    """
-    Which external platform adapter is configured. v0.2 ships
-    one; later versions add slack, matrix, telegram, gmail, etc.
-
-    """
-
-    discord = 'discord'
-
-
-class AdapterEntry(BaseModel):
-    """
-    One configured platform adapter inside the connector. Like
-    hemisphere-driver's `drivers` config but for outbound
-    platforms. Each entry runs its own adapter loop (Discord
-    Gateway WS connection, Slack RTM, etc.) and bridges
-    incoming/outgoing messages between the platform and the
-    orchestrator.
-
-    """
-
-    name: str = Field(
-        ...,
-        description='Operator-supplied label (e.g. `"work-discord"`,\n`"family-slack"`). Used in logs and the UI.\n',
-        min_length=1,
-    )
-    kind: AdapterKind
-    adapterConfig: dict[str, Any] | None = Field(
-        None,
-        description="Adapter-specific config (bot token, channel allowlist,\netc.). Schema is adapter-defined; the connector's\n`GET /v1/adapters/{name}/config/schema` returns the\nschema for the current adapter so the UI can render\nan editor.\n",
-    )
-    enabled: bool | None = True
-
-
-class MessageSource(BaseModel):
-    """
-    Where a message came from. Lets the orchestrator and UI
-    distinguish "operator typing in the local UI" from
-    "Discord channel mention" without needing
-    adapter-specific code paths.
-
-    """
-
-    platform: str = Field(
-        ...,
-        description='Same identifiers used in `PlatformAlias.platform`\n(`"ui"`, `"discord"`, etc.).\n',
-    )
-    channelId: str | None = Field(
-        None,
-        description="Platform channel identifier (Discord channel id,\nSlack channel id, Matrix room id, etc.). Omitted for\nDMs or where the platform doesn't expose channels.\n",
-    )
-    channelName: str | None = Field(
-        None, description='Human-readable channel name (mutable).'
-    )
-    isDirectMessage: bool | None = False
-
-
-class ChannelContextEntry(BaseModel):
-    """
-    One message from the channel that precedes Eugene's
-    invocation. Used by adapters to provide grounding context
-    for channel mentions. Not persisted to memory.
-
-    """
-
-    author: str = Field(
-        ...,
-        description="Platform display name of the speaker. Free-form;\nEugene doesn't try to resolve to known persons (would\nrequire trust-establishing flows that v0.2 doesn't\nhave for non-mention authors).\n",
-    )
-    content: str
-    timestamp: AwareDatetime
-
-
 class RestartResult(BaseModel):
     """
     Acknowledgement returned by `POST /v1/admin/restart`. The
@@ -906,531 +408,6 @@ class RestartResult(BaseModel):
         None,
         description='Optional human-readable note (e.g. "logs flushed, exiting\nnow"). UI may display this in the restart-progress dialog.\n',
     )
-
-
-class Kind(StrEnum):
-    """
-    Discriminates the payload. Extensible — future afferent
-    modalities (timer, sensor, …) add an enum value + a payload
-    field without changing the envelope.
-
-    """
-
-    message = 'message'
-    presence = 'presence'
-
-
-class Change(StrEnum):
-    """
-    The occupancy transition observed.
-    """
-
-    entered = 'entered'
-    left = 'left'
-
-
-class PresenceEvent(BaseModel):
-    """
-    Afferent perception of the social environment's *occupancy* —
-    who entered or left an environment — distinct from message
-    content. This is the external trigger that lets Eugene
-    *initiate* (not just respond): the continuous loop + speak-as-a-
-    decision give the ability to start talking; presence gives the
-    social cue to.
-
-    Presence is a LOSSY, NT-modulated salience signal, NOT a queue:
-    most occupancy churn is low-salience and never attended (the
-    loop drops it), the same way a person doesn't consciously track
-    everyone's comings and goings. Salience is gated by NT state —
-    wary attends to strangers, relaxed attends to known persons.
-    Restraint about acting on presence is *learned*, not a policy
-    knob.
-
-    Actor resolution ties into identity: an enter/leave resolves to
-    a `personId` when known, otherwise to a `PlatformAlias` / the
-    pending-link flow. "X entered" only means something once X is a
-    known person.
-
-    """
-
-    change: Change = Field(..., description='The occupancy transition observed.')
-    environment: MessageSource = Field(
-        ...,
-        description='The environment (platform / channel) whose occupancy\nchanged. Reuses `MessageSource` addressing.\n',
-    )
-    personId: UUID | None = Field(
-        None,
-        description='The actor, resolved to a known person. Omitted when the\nactor is unknown — see `alias`.\n',
-    )
-    alias: PlatformAlias | None = Field(
-        None,
-        description='Set instead of `personId` when the actor is an unrecognized\nplatform user (routes to the pending-link flow rather than\nto relationship-aware behavior).\n',
-    )
-
-
-class EfferentSpeechAct(BaseModel):
-    """
-    An efferent (act-out) utterance Eugene has *decided* to emit.
-    Speech is not a privileged terminal step — it is an efferent
-    action the gate elects when speaking has higher anticipated
-    reward than continuing to think or staying silent. Silence is a
-    valid outcome and simply produces no `EfferentSpeechAct`.
-
-    Routed to a destination by the speak effector: a reply in a
-    Discord channel goes to the connector's outbound API for that
-    channel; a reply in the UI goes to the UI's speech stream;
-    *initiated* speech (no triggering event) picks its destination
-    from social context. `destination` reuses `MessageSource`
-    addressing — the mirror of an `AfferentEvent.source`.
-
-    """
-
-    destination: MessageSource = Field(
-        ...,
-        description='Where the utterance is delivered (mirror of afferent `source`).',
-    )
-    content: str
-    inResponseTo: UUID | None = Field(
-        None,
-        description='The `AfferentEvent.eventId` this utterance reacts to, when\nreactive. Omitted for self-initiated speech (mind-wandering,\npresence-triggered) — Eugene speaking on its own initiative,\nnot in reply to a specific event.\n',
-    )
-    conversationId: UUID | None = Field(
-        None,
-        description='Conversation thread the utterance belongs to, when applicable.',
-    )
-    timestamp: AwareDatetime
-
-
-class TrainingGoal(StrEnum):
-    """
-    Mirrors the wizard's "what do you want to do" screen. Drives which
-    recipe/fields the UI surfaces (via showWhen) and which defaults apply.
-
-    """
-
-    pretrain_from_scratch = 'pretrain_from_scratch'
-    continue_pretraining = 'continue_pretraining'
-    finetune = 'finetune'
-    train_adapter = 'train_adapter'
-    evaluate = 'evaluate'
-    serve = 'serve'
-
-
-class ModelType(StrEnum):
-    decoder_only = 'decoder_only'
-
-
-class Activation(StrEnum):
-    relu = 'relu'
-    leaky_relu = 'leaky_relu'
-    gelu = 'gelu'
-    elu = 'elu'
-    swiglu = 'swiglu'
-
-
-class AttentionVariant(StrEnum):
-    gqa = 'gqa'
-    differential = 'differential'
-
-
-class Type(StrEnum):
-    dense = 'dense'
-    moe = 'moe'
-
-
-class Ffn(BaseModel):
-    """
-    Replaces CLLM's cognitive/hemisphere FFN with a generic dense|moe choice.
-    """
-
-    type: Type | None = 'dense'
-    nExperts: int | None = Field(None, ge=1)
-    topK: int | None = Field(None, ge=1)
-    useSharedExpert: bool | None = False
-    auxLossWeight: float | None = None
-
-
-class MixtureOfDepths(BaseModel):
-    enabled: bool | None = False
-    capacityFactor: float | None = None
-    auxLossWeight: float | None = None
-
-
-class Mode(StrEnum):
-    none = 'none'
-    ntk = 'ntk'
-    yarn = 'yarn'
-
-
-class ContextExtension(BaseModel):
-    mode: Mode | None = 'none'
-    maxFactor: float | None = None
-
-
-class ArchitectureConfig(BaseModel):
-    """
-    Generic decoder-only transformer config. Lifted from CLLM's
-    architecture package with all NT/hemisphere/cognitive fields removed.
-    See §10: cognitive.use_moe -> generic ffn.type; mood_vector dropped.
-
-    """
-
-    modelType: ModelType
-    nLayer: int = Field(..., ge=1)
-    nHead: int = Field(..., ge=1)
-    nKvHead: int | None = Field(None, description='GQA KV heads; omit for full MHA.')
-    nEmbd: int = Field(..., description='Must be divisible by nHead.', ge=1)
-    blockSize: int = Field(..., description='Training context length.', ge=1)
-    vocabSize: int = Field(..., ge=1)
-    activation: Activation | None = 'swiglu'
-    ropeBase: float | None = 500000
-    useQkNorm: bool | None = False
-    attentionVariant: AttentionVariant | None = 'gqa'
-    ffn: Ffn | None = Field(
-        None,
-        description="Replaces CLLM's cognitive/hemisphere FFN with a generic dense|moe choice.",
-    )
-    mixtureOfDepths: MixtureOfDepths | None = None
-    blockAttnResGroupSize: int | None = Field(0, description='0 = disabled.')
-    contextExtension: ContextExtension | None = None
-    weightTying: bool | None = True
-
-
-class Kind1(StrEnum):
-    pretraining = 'pretraining'
-    continued_pretraining = 'continued_pretraining'
-    sft = 'sft'
-    lora = 'lora'
-    qlora = 'qlora'
-    dpo = 'dpo'
-
-
-class Adapter(BaseModel):
-    """
-    LoRA/QLoRA adapter config (kind in [lora, qlora]).
-    """
-
-    rank: int | None = Field(None, ge=1)
-    alpha: float | None = None
-    dropout: float | None = None
-    targetModules: list[str] | None = None
-
-
-class Bits(IntEnum):
-    integer_4 = 4
-    integer_8 = 8
-
-
-class ComputeDtype(StrEnum):
-    bf16 = 'bf16'
-    fp16 = 'fp16'
-
-
-class Quantization(BaseModel):
-    """
-    QLoRA base-weight quantization (kind == qlora).
-    """
-
-    bits: Bits | None = None
-    computeDtype: ComputeDtype | None = None
-
-
-class Kind2(StrEnum):
-    adamw = 'adamw'
-    sgd = 'sgd'
-    adadelta = 'adadelta'
-    adabelief = 'adabelief'
-    muon = 'muon'
-
-
-class Optimizer(BaseModel):
-    kind: Kind2
-    learningRate: float
-    weightDecay: float | None = None
-    betas: list[float] | None = Field(None, max_length=2, min_length=2)
-    eps: float | None = None
-    fused: bool | None = True
-
-
-class Kind3(StrEnum):
-    wsd = 'wsd'
-    epoch = 'epoch'
-    plateau = 'plateau'
-    cosine = 'cosine'
-
-
-class DecayType(StrEnum):
-    cosine = 'cosine'
-    linear = 'linear'
-
-
-class Scheduler(BaseModel):
-    kind: Kind3 | None = 'wsd'
-    warmupSteps: int | None = None
-    maxLr: float | None = None
-    minLr: float | None = None
-    totalSteps: int | None = Field(None, description='Omit to derive via chinchilla.')
-    chinchillaTokensPerParam: float | None = Field(
-        None, description='Auto total_steps when totalSteps null.'
-    )
-    decayType: DecayType | None = None
-    decayFraction: float | None = None
-
-
-class Dtype(StrEnum):
-    auto = 'auto'
-    bf16 = 'bf16'
-    fp16 = 'fp16'
-    fp32 = 'fp32'
-
-
-class GradScaler(StrEnum):
-    auto = 'auto'
-    always = 'always'
-    never = 'never'
-
-
-class Precision(BaseModel):
-    dtype: Dtype | None = 'auto'
-    gradScaler: GradScaler | None = 'auto'
-
-
-class GradientClip(BaseModel):
-    percentile: float | None = 0.9
-    historySize: int | None = 100
-    maxClipValue: float | None = None
-    minClipValue: float | None = None
-
-
-class CollapseStop(BaseModel):
-    """
-    Mode-collapse early stop (CLLM SampledTokenTracker, de-consciousness'd).
-    """
-
-    minLogitEntropy: float | None = None
-    warmupGraceSteps: int | None = None
-
-
-class Hyperparameters(BaseModel):
-    """
-    Every output-affecting knob, grouped. Sourced from CLLM's training config.
-    """
-
-    batchSize: int | None = Field(None, ge=1)
-    gradAccumSteps: int | None = Field(1, ge=1)
-    maxSteps: int | None = Field(
-        None, description='Omit to derive from maxEpochs / dataset size.'
-    )
-    maxEpochs: int | None = None
-    seed: int | None = 1337
-    optimizer: Optimizer | None = None
-    scheduler: Scheduler | None = None
-    precision: Precision | None = None
-    gradientClip: GradientClip | None = None
-    collapseStop: CollapseStop | None = Field(
-        None,
-        description="Mode-collapse early stop (CLLM SampledTokenTracker, de-consciousness'd).",
-    )
-
-
-class Mode1(StrEnum):
-    cpu = 'cpu'
-    single_gpu = 'single_gpu'
-    multi_gpu = 'multi_gpu'
-    multi_node = 'multi_node'
-
-
-class Backend(StrEnum):
-    nccl = 'nccl'
-    gloo = 'gloo'
-
-
-class Node(BaseModel):
-    host: str | None = None
-    gpuCount: int | None = None
-    nodeRank: int | None = None
-
-
-class CheckpointStrategy(StrEnum):
-    master_only = 'master_only'
-    all_nodes = 'all_nodes'
-
-
-class Distributed(BaseModel):
-    """
-    Present for multi_gpu / multi_node.
-    """
-
-    backend: Backend | None = 'nccl'
-    masterAddr: str | None = None
-    masterPort: int | None = None
-    nodes: list[Node] | None = None
-    findUnusedParameters: bool | None = False
-    bucketCapMb: int | None = None
-    gradientAsBucketView: bool | None = None
-    staticGraph: bool | None = None
-    checkpointStrategy: CheckpointStrategy | None = 'master_only'
-
-
-class HardwareTopology(BaseModel):
-    """
-    How a run is placed on hardware. Sourced from CLLM gpu_manager +
-    distributed_config (torchrun/DDP env generation).
-
-    """
-
-    mode: Mode1
-    gpuIndices: list[int] | None = None
-    excludeGpus: list[int] | None = None
-    minMemoryGb: float | None = None
-    distributed: Distributed | None = Field(
-        None, description='Present for multi_gpu / multi_node.'
-    )
-
-
-class RunStatus(StrEnum):
-    """
-    queued -> preparing (build model/data/optimizer) -> running -> completed.
-    paused/resumed are operator actions; failed carries lastError; cancelled
-    is operator-initiated stop. Note: these are RUN states owned by the
-    trainer service, distinct from the watchdog's ComponentStatus for the
-    trainer PROCESS.
-
-    """
-
-    queued = 'queued'
-    preparing = 'preparing'
-    running = 'running'
-    paused = 'paused'
-    completed = 'completed'
-    failed = 'failed'
-    cancelled = 'cancelled'
-
-
-class TrainingMetricPoint(BaseModel):
-    """
-    One sampled point of training health. Streamed over SSE + persisted for curves.
-    """
-
-    step: int = Field(..., ge=0)
-    timestamp: AwareDatetime | None = None
-    loss: float | None = None
-    valLoss: float | None = None
-    learningRate: float | None = None
-    gradNorm: float | None = None
-    gradClipValue: float | None = None
-    tokensPerSec: float | None = None
-    vramGb: float | None = None
-    tokenEntropy: float | None = Field(
-        None, description='Sampled-token Shannon entropy (collapse monitor).'
-    )
-
-
-class Checkpoint(BaseModel):
-    """
-    A saved model state produced by a run. Consumed by eval + inference.
-    """
-
-    checkpointId: UUID
-    runId: UUID
-    projectId: UUID | None = None
-    step: int = Field(..., ge=0)
-    epoch: int | None = Field(None, ge=0)
-    createdAt: AwareDatetime
-    path: str | None = Field(None, description='Filesystem path on the trainer host.')
-    sizeBytes: int | None = None
-    valLoss: float | None = None
-    isLatest: bool | None = False
-    isBest: bool | None = False
-    tags: list[str] | None = None
-
-
-class CheckpointRef(BaseModel):
-    """
-    Lightweight reference to a checkpoint (id + enough to display).
-    """
-
-    checkpointId: UUID
-    runId: UUID | None = None
-    step: int | None = None
-    label: str | None = None
-
-
-class DatasetRef(BaseModel):
-    """
-    Reference to a dataset MANIFEST owned by the data component, plus the
-    per-project curriculum settings (weight + min-iteration gate) sourced
-    from CLLM's datasets.json schema.
-
-    """
-
-    datasetId: UUID
-    name: str | None = None
-    samplingWeight: float | None = Field(
-        1, description='Oversample(>1)/subsample(<1) factor.'
-    )
-    minIteration: int | None = Field(
-        0, description='Curriculum gate; introduce at this step.'
-    )
-
-
-class TokenizerRef(BaseModel):
-    """
-    Reference to a tokenizer owned by the data component (+ its vocab fingerprint).
-    """
-
-    tokenizerId: UUID
-    name: str | None = None
-    vocabSize: int | None = None
-    vocabFingerprint: str | None = Field(
-        None, description='SHA256; must match dataset pretokenization.'
-    )
-
-
-class EvalSuiteRef(BaseModel):
-    evalSuiteId: UUID
-    name: str | None = None
-
-
-class Format(StrEnum):
-    native = 'native'
-    safetensors = 'safetensors'
-    gguf = 'gguf'
-
-
-class ExportSettings(BaseModel):
-    """
-    How/where a finished model is served. Points at the inference component.
-    """
-
-    autoServeOnComplete: bool | None = False
-    target: str | None = Field(
-        None,
-        description='Inference endpoint name. Rendered as a componentKindHint dropdown\n(kind: inference) in the UI; saved value is the peer URL.\n',
-    )
-    format: Format | None = 'native'
-
-
-class Kind4(StrEnum):
-    data_prep = 'data_prep'
-    tokenizer = 'tokenizer'
-    training = 'training'
-    eval = 'eval'
-    serve = 'serve'
-
-
-class PipelineStatus(StrEnum):
-    """
-    Per-stage and overall status. skipped = stage not requested for this project.
-    """
-
-    pending = 'pending'
-    running = 'running'
-    paused = 'paused'
-    completed = 'completed'
-    failed = 'failed'
-    cancelled = 'cancelled'
-    skipped = 'skipped'
 
 
 class SpawnConfig(BaseModel):
@@ -1473,6 +450,170 @@ class ComponentStatus(StrEnum):
     unreachable = 'unreachable'
 
 
+class EngineKind(StrEnum):
+    """
+    Which engine adapter constructs the argv and interprets
+    readiness. Deliberately a closed enum rather than a free string:
+    an engine is supported exactly when an adapter exists for it,
+    and without an adapter there is nothing that knows how to start
+    it or tell when it is ready.
+
+    `llama_cpp` drives upstream `llama-server`. vLLM is a second
+    adapter later, and MLX after that. We never ship an engine — all
+    three are upstream projects we wrap and track.
+
+    """
+
+    llama_cpp = 'llama_cpp'
+
+
+class Origin(StrEnum):
+    """
+    Where the binary came from.
+
+    * `managed` — fetched and verified by us. The one-click
+      path; not implemented until engine acquisition lands.
+    * `configured` — an explicit path the operator set, because
+      they build llama.cpp themselves or want a specific build.
+    * `path` — found on `PATH`.
+
+    """
+
+    managed = 'managed'
+    configured = 'configured'
+    path = 'path'
+
+
+class RuntimeSpec(BaseModel):
+    """
+    Declarative half of a Runtime — what the operator asked for.
+    Used for create and update bodies; observed fields are
+    server-owned and excluded.
+
+    Note what is *not* here: a command line. The operator declares
+    intent (this engine, this model, these flags) and the adapter
+    builds the argv. Letting a topology entry carry raw argv would
+    make every engine "supported" while making none of them
+    knowable — no readiness probe, no flag validation, no version
+    story. The resolved argv is reported back on `Runtime.argv` for
+    debugging, which is the half of raw-argv access that is
+    genuinely useful.
+
+    """
+
+    name: str = Field(
+        ...,
+        description="Operator-supplied label, unique per install. Referenced by\nan inference-driver's config to say which runtime it fronts.\n",
+        min_length=1,
+    )
+    engine: EngineKind
+    modelPath: str = Field(
+        ...,
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n",
+    )
+    modelAlias: str | None = Field(
+        None,
+        description='The model id this runtime serves under, and therefore what a\nclient asks the gateway for. Defaults to the model\nfilename with its extension stripped — plainly-named files\nmean the obvious name is already the right one, so this is\nan override, not a requirement.\n',
+    )
+    host: str | None = Field(
+        '127.0.0.1',
+        description="Address the engine binds. Defaults to loopback: an engine\nhas no auth of its own, so it must not be exposed directly.\nReaching a model from another machine is the gateway's job,\nand the gateway has auth.\n",
+    )
+    port: int | None = Field(
+        None,
+        description='Port the engine binds. Assigned from an ephemeral range when\nomitted — with N runtimes the operator should not have to\nhand out port numbers.\n',
+        ge=1,
+        le=65535,
+    )
+    autoStart: bool | None = Field(
+        True,
+        description='Whether the watchdog spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM.\n',
+    )
+    flags: dict[str, Any] | None = Field(
+        None,
+        description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n',
+    )
+    extraArgs: list[str] | None = Field(
+        None,
+        description='Verbatim extra arguments, appended after everything the\nadapter generated. The escape hatch for the long tail of\nflags a curated surface will always miss.\n\nUnvalidated by definition, so the UI must present it as the\nadvanced option it is: a bad value here surfaces as an\nengine that refuses to start, and the resolved `argv` plus\nthe captured engine output are how it gets diagnosed.\n',
+    )
+    env: dict[str, str] | None = Field(
+        None,
+        description='Extra environment variables for the engine process. Needed\nmore often than for a component — accelerator selection\n(`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`) is how a\nruntime is pinned to one GPU, which is what makes two\nreplicas on two cards possible.\n',
+    )
+    workingDirectory: str | None = Field(
+        None,
+        description="Working directory for the engine process. Defaults to the\nbinary's own directory, which is what prebuilt llama.cpp\nreleases need to find their bundled shared libraries.\n",
+    )
+    binary: str | None = Field(
+        None,
+        description='Override the binary for this one runtime, ignoring whatever\nthe adapter discovered. For running one model on a custom\nbuild without disturbing the rest of the install.\n',
+    )
+
+
+class RuntimeStatus(StrEnum):
+    """
+    Operational state of an engine process. Distinct from
+    `ComponentStatus`: an engine has no safe mode (nothing to
+    recover a config from), and it has a model-load phase that a
+    component does not.
+
+    * `starting` — spawned, not yet answering its readiness probe
+      at all.
+    * `loading` — answering, but reporting the model is still being
+      read into memory. Worth its own state rather than folding
+      into `starting`: a large quant off a spinning disk can sit
+      here for minutes, and an operator staring at a dashboard
+      needs to know the difference between "working on it" and
+      "wedged". This is exactly what a per-engine readiness probe
+      buys — llama-server distinguishes the two on `/health` and a
+      generic TCP check could not.
+    * `ready` — model loaded and serving. The only state in which
+      the gateway will route to it.
+    * `stopped` — deliberately stopped, or declared with
+      `autoStart: false`. Not an error; the respawn loop is
+      suppressed.
+    * `exited` — exited cleanly and is being respawned (transient).
+    * `crashed` — exited non-zero repeatedly and the watchdog has
+      given up. `lastError` and the captured engine output say why;
+      `POST .../restart` retries.
+
+    """
+
+    starting = 'starting'
+    loading = 'loading'
+    ready = 'ready'
+    stopped = 'stopped'
+    exited = 'exited'
+    crashed = 'crashed'
+
+
+class RuntimeCapabilities(BaseModel):
+    """
+    What the running engine reports about itself, read back after it
+    becomes ready rather than inferred from the declaration. The
+    gateway keys routing decisions off these; the UI displays them.
+
+    """
+
+    contextLength: int | None = Field(
+        None,
+        description='Effective context window of the loaded model, as the engine\nresolved it — which is not necessarily what was asked for.\nA requested context larger than the model or the available\nmemory gets clamped by the engine, and the clamped value is\nthe true one.\n',
+        ge=0,
+    )
+    parallelSlots: int | None = Field(
+        None,
+        description='Concurrent requests this runtime can serve. The unit of\ncapacity the gateway divides work across, so a single\nruntime with several slots and several runtimes with one\neach are the same kind of thing to the layer above.\n',
+        ge=1,
+    )
+    embeddings: bool | None = Field(
+        None, description='Whether this runtime was started in embedding mode.'
+    )
+    multimodal: bool | None = Field(
+        None, description='Whether a projector was loaded alongside the model.'
+    )
+
+
 class Component(BaseModel):
     """
     Combined declarative + operational view of one supervised
@@ -1485,7 +626,7 @@ class Component(BaseModel):
 
     name: str = Field(
         ...,
-        description="Operator-supplied label, also used in the orchestrator's `drivers` list.",
+        description="Operator-supplied label, also used in the gateway's `drivers` list.",
     )
     kind: ComponentKind
     url: AnyUrl = Field(
@@ -1512,86 +653,6 @@ class Component(BaseModel):
         None,
         description="Most recent error observed for this component. Reset to null\non successful restart. Useful for surfacing why a component\nkeeps crashing in the UI's Components tab.\n",
     )
-
-
-class Message(BaseModel):
-    """
-    A single message in an Eugene Plexus conversation. The shape is
-    deliberately close to the OpenAI / Anthropic chat message format so
-    that adapters don't have to re-shape on every hop, but `role` includes
-    `hemisphere` for messages emitted by one of the parallel drivers
-    during a bicameral pass (visible to corpus callosum and UI debug
-    views, not normally to the end user).
-
-    """
-
-    role: Role
-    content: str = Field(
-        ...,
-        description='Message text. v0.1 is text-only; multimodal extensions deferred.',
-    )
-    driverName: str | None = Field(
-        None,
-        description='When `role == "hemisphere"`, the operator-supplied name of\nthe driver that produced this message (e.g. `"left"`,\n`"right"`, or any free-form label set by the orchestrator\'s\n`drivers` config). Omitted otherwise. Identity is owned by\nthe orchestrator\'s topology config — drivers themselves do\nnot know their position in the pair.\n',
-    )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
-    )
-    passIndex: int | None = Field(
-        None,
-        description='Zero-based index of the bicameral pass that produced this message.\nPass 0 is the initial hemisphere response; subsequent passes are\nre-prompts after corpus-callosum disagreement.\n',
-        ge=0,
-    )
-    toolCalls: list[ToolCall] | None = Field(
-        None,
-        description='Tool-invocation requests emitted by this message. Present on\n`assistant` / `hemisphere` messages that asked for tools;\ncarried in history so the next pass sees what was requested.\n',
-    )
-    toolResults: list[ToolResult] | None = Field(
-        None,
-        description='Tool / region-call outcomes carried by a `role: tool` message\nand fed back into the next pass. A single `tool` message\nbundles the results of the calls from the preceding turn.\n',
-    )
-
-
-class Conversation(BaseModel):
-    """
-    An ordered list of messages constituting a conversation history.
-    """
-
-    id: UUID | None = Field(None, description='Server-assigned conversation id.')
-    messages: list[Message]
-
-
-class NTState(BaseModel):
-    """
-    A snapshot of Eugene's neurotransmitter state. v0.2 introduces real
-    modulation: the orchestrator updates this from observations each
-    chat turn, and the bicameral loop reads it to set `max_passes`,
-    `temperature`, and blend weights. CLLM-inspired anxiety-driven
-    termination is the load-bearing behavior.
-
-    Six NTs in v0.2 (cortisol replaces v0.1's glutamate — cortisol is
-    directly observable from chat patterns like sustained divergence
-    and time pressure; glutamate's lower-level activation modeling
-    waits for v0.3). All values in [0, 1]; `level` carries the current
-    instantaneous value, `baseline` the resting state the field decays
-    toward, `decay` the per-second decay rate.
-
-    v0.3+ adds: full 12-NT shape (oxytocin, endorphins, melatonin,
-    adenosine, histamine, orexin), per-driver NT modulation, drives
-    feeding NT, NT-driven autonomous-thinking triggers.
-
-    """
-
-    lastUpdated: AwareDatetime = Field(
-        ...,
-        description='When NT levels were last updated. Used by the orchestrator\nto compute elapsed-time decay on the next tick.\n',
-    )
-    dopamine: NTLevel
-    serotonin: NTLevel
-    norepinephrine: NTLevel
-    gaba: NTLevel
-    cortisol: NTLevel
-    acetylcholine: NTLevel
 
 
 class ConfigField(BaseModel):
@@ -1626,7 +687,7 @@ class ConfigField(BaseModel):
     )
     componentKindHint: ComponentKind | None = Field(
         None,
-        description="Declarative rendering hint: this field references a peer\ncomponent of the given kind. UIs render any kind-hinted\nfield as a dropdown sourced from the watchdog's\n`/v1/components` (filtered by kind), with `(off)` as the\nfirst option (saves an empty string). For single-instance\nkinds (memory, identity, etc.) the dropdown UX collapses\nto effectively a toggle; for multi-instance kinds\n(hemisphere-driver) the operator picks one. Pairs with a\nstring/url `valueType` — the saved value is still the\npeer's URL, the hint only changes how the UI looks it up.\nAvoids the OpenClaw trap of duplicating topology into\nfree-text URL fields the operator has to type by hand.\n",
+        description="Declarative rendering hint: this field references a peer\ncomponent of the given kind. UIs render any kind-hinted\nfield as a dropdown sourced from the watchdog's\n`/v1/components` (filtered by kind), with `(off)` as the\nfirst option (saves an empty string). For single-instance\nkinds (memory, identity, etc.) the dropdown UX collapses\nto effectively a toggle; for multi-instance kinds\n(inference-driver) the operator picks one. Pairs with a\nstring/url `valueType` — the saved value is still the\npeer's URL, the hint only changes how the UI looks it up.\nAvoids the OpenClaw trap of duplicating topology into\nfree-text URL fields the operator has to type by hand.\n",
     )
     enumLabels: list[str] | None = Field(
         None,
@@ -1669,263 +730,13 @@ class ConfigSchema(BaseModel):
     """
 
     component: str = Field(
-        ..., description='Component identifier (e.g. `"hemisphere-driver"`).'
+        ..., description='Component identifier (e.g. `"inference-driver"`).'
     )
     fields: list[ConfigField]
     categories: dict[str, str] | None = Field(
         None,
         description='Map from category key (used in `ConfigField.category`) to\na human-readable section label. Optional; UIs may fall back\nto the raw key.\n',
     )
-
-
-class Person(BaseModel):
-    """
-    Full record of a known person. The identity component owns
-    these. `aliases` lists all platform identities that have been
-    approved as belonging to this person. The relationship summary
-    is rebuilt on-demand by the memory component from raw turns
-    in v0.2; v0.3 adds reactive synthesis via the topic-shift
-    detector.
-
-    """
-
-    personId: UUID
-    displayName: str
-    isOperator: bool | None = False
-    createdAt: AwareDatetime
-    aliases: list[PlatformAlias] | None = None
-    relationshipNote: str | None = Field(
-        None,
-        description='Optional free-form operator-supplied note about who this\nperson is to Eugene (e.g. "my wife", "the dev-banter\nchannel regular"). Surfaced into hemisphere prompts as\ntop-level relationship context.\n',
-    )
-
-
-class MemoryEntry(BaseModel):
-    """
-    One stored message + the cognitive metadata it was produced
-    with. Memory writes typically happen at the end of each
-    bicameral turn: the user's message and Eugene's final
-    response each become entries. Hemisphere intermediate
-    outputs are NOT persisted by default — they're debug
-    artifacts.
-
-    """
-
-    entryId: UUID
-    personId: UUID = Field(
-        ...,
-        description="The person this entry is *with* (the user side of the\nexchange, even for Eugene's responses — they're\nresponses to that person).\n",
-    )
-    conversationId: UUID
-    role: Role
-    content: str
-    timestamp: AwareDatetime
-    ntStateSnapshot: NTState | None = Field(
-        None,
-        description="Eugene's NT state at the time this entry was produced.\nLets later analysis correlate output style with NT\nstate. Optional — not all entries carry one.\n",
-    )
-    hemisphereAttribution: str | None = Field(
-        None,
-        description='For Eugene\'s responses: which hemisphere(s) produced\nthis. Free-form (e.g. "left-only", "blended", or a\ndriver name). Omitted for user messages.\n',
-    )
-
-
-class MemorySearchHit(BaseModel):
-    entry: MemoryEntry
-    score: float = Field(
-        ...,
-        description="Backend-defined similarity score. Higher = more\nrelevant. Scale depends on the backend; for\n`local_sqlite` it's cosine similarity in [0, 1].\n",
-    )
-
-
-class RelationshipSummary(BaseModel):
-    """
-    Per-person context the orchestrator injects into hemisphere
-    prompts so Eugene speaks differently to different people.
-    v0.2: built on-demand from raw recent turns with this person
-    (skip-extraction approach). v0.3: synthesized via reactive
-    memory extraction.
-
-    """
-
-    personId: UUID
-    summary: str | None = Field(
-        None,
-        description='Short paragraph Eugene\'s hemispheres see before each\nturn (e.g. "Sarah is your wife. You talk about 3\ntimes a day, mostly casual, frequent jokes. She works\nin product."). Omitted when there\'s no synthesized\nsummary; the orchestrator will then build context\nfrom raw recent turns.\n',
-    )
-    turnCount: int | None = Field(
-        None,
-        description='How many turns Eugene has shared with this person.\nSurfaced in UI to give the operator a sense of how\nwell Eugene knows them.\n',
-        ge=0,
-    )
-    lastUpdated: AwareDatetime
-    recentTurns: list[MemoryEntry] | None = Field(
-        None,
-        description="Raw recent turns with this person, included alongside\n(or instead of) the synthesized summary. v0.2's\ndefault mode is recentTurns-only; v0.3 fills in\n`summary` reactively.\n",
-    )
-
-
-class IncomingMessage(BaseModel):
-    """
-    Normalized message shape an adapter posts to the
-    orchestrator, wrapped in an `AfferentEvent` (`kind: message`)
-    to `POST /v1/events`. Adapter-specific platform details
-    collapse to this universal shape; the orchestrator never sees
-    Discord-specific or Slack-specific fields.
-
-    """
-
-    personId: UUID = Field(
-        ...,
-        description="Sender's `personId` in the identity component. If the\nadapter received a message from an unrecognized\nplatform user, it MUST file a `PendingIdentityLink`\nand not post the event — Eugene only responds to\nknown people.\n",
-    )
-    conversationId: UUID | None = Field(
-        None,
-        description='Conversation thread id. Adapters maintain a stable\nmapping from (platform_channel_id, platform_thread_id)\n→ conversationId. Omitted starts a new conversation.\n',
-    )
-    content: str
-    source: MessageSource
-    channelContext: list[ChannelContextEntry] | None = Field(
-        None,
-        description="For channel-mention adapters (Discord channel\nmentions, Slack channels): recent platform messages\npreceding the mention, included for conversational\ngrounding. The orchestrator may surface these to\nhemispheres as ambient context, but only the actual\nmention/reply gets persisted to memory (privacy\ndefault: don't store messages from people who didn't\ninvoke Eugene).\n",
-    )
-
-
-class AfferentEvent(BaseModel):
-    """
-    A single afferent (perception-in) event injected into the
-    orchestrator's continuous loop via `POST /v1/events`. The
-    unified envelope for everything Eugene perceives — a person's
-    message, a presence change, and future sensory inputs all arrive
-    as one shape, differing only by `kind` and the typed payload.
-
-    Injection is fire-and-forget: the endpoint enqueues the event
-    and returns `202` immediately. Whether, when, and how Eugene
-    responds is the loop's decision, not this call's — there is no
-    synchronous reply (the request-response `/v1/chat` surface was
-    removed). Speech leaves asynchronously; see `EfferentSpeechAct`
-    and `GET /v1/stream/consciousness`.
-
-    An unsolicited event arriving keeps `role: user` semantics —
-    Eugene did not "call hear." Only Eugene's *interpretation* of it
-    (and any solicited perception) is an afferent tool cycle.
-
-    """
-
-    eventId: UUID = Field(
-        ...,
-        description="Caller-minted id. Echoed by any resulting `EfferentSpeechAct`\nin `inResponseTo` when Eugene's reply is reactive to this\nevent, for correlation.\n",
-    )
-    kind: Kind = Field(
-        ...,
-        description='Discriminates the payload. Extensible — future afferent\nmodalities (timer, sensor, …) add an enum value + a payload\nfield without changing the envelope.\n',
-    )
-    source: MessageSource = Field(
-        ..., description='Where the event came from (platform / channel).'
-    )
-    timestamp: AwareDatetime
-    message: IncomingMessage | None = Field(
-        None, description='Present when `kind` is `message`.'
-    )
-    presence: PresenceEvent | None = Field(
-        None, description='Present when `kind` is `presence`.'
-    )
-
-
-class ModelTemplate(BaseModel):
-    """
-    A named preset of an ArchitectureConfig (e.g. "small-test-20L",
-    "deep-medium-40L" — the migrated CLLM config presets become built-ins).
-    Custom templates are clones with overrides.
-
-    """
-
-    name: str
-    displayName: str | None = None
-    description: str | None = None
-    builtin: bool | None = False
-    architecture: ArchitectureConfig
-    estimatedParamCount: int | None = Field(
-        None, description='Read-only; computed from architecture.'
-    )
-
-
-class TrainingRecipe(BaseModel):
-    """
-    What KIND of training and its method-specific params. UI uses
-    ConfigField.showWhen to reveal adapter/quantization blocks only for
-    the relevant kind.
-
-    """
-
-    kind: Kind1
-    baseCheckpoint: CheckpointRef | None = Field(
-        None,
-        description='Required for continued_pretraining / sft / lora / qlora / dpo.',
-    )
-    adapter: Adapter | None = Field(
-        None, description='LoRA/QLoRA adapter config (kind in [lora, qlora]).'
-    )
-    quantization: Quantization | None = Field(
-        None, description='QLoRA base-weight quantization (kind == qlora).'
-    )
-    dpoBeta: float | None = Field(None, description='DPO temperature (kind == dpo).')
-
-
-class TrainingRun(BaseModel):
-    """
-    One execution of a TrainingProject. Lives inside the trainer service (§2).
-    """
-
-    runId: UUID
-    projectId: UUID
-    status: RunStatus
-    createdAt: AwareDatetime
-    startedAt: AwareDatetime | None = None
-    finishedAt: AwareDatetime | None = None
-    currentStep: int | None = Field(None, ge=0)
-    totalSteps: int | None = None
-    currentEpoch: int | None = Field(None, ge=0)
-    tokensSeen: int | None = Field(None, ge=0)
-    progressFraction: float | None = Field(None, ge=0.0, le=1.0)
-    latestMetrics: TrainingMetricPoint | None = None
-    bestValLoss: float | None = None
-    checkpointCount: int | None = Field(None, ge=0)
-    lastError: str | None = Field(None, description='Populated when status == failed.')
-
-
-class PipelineStage(BaseModel):
-    """
-    One stage of a PipelineRun, delegated to a peer component.
-    """
-
-    kind: Kind4
-    status: PipelineStatus
-    component: ComponentKind | None = None
-    resourceId: str | None = Field(
-        None, description='Id of the underlying resource (e.g. a trainer runId).'
-    )
-    startedAt: AwareDatetime | None = None
-    finishedAt: AwareDatetime | None = None
-    detail: str | None = None
-
-
-class TrainingRunRequest(BaseModel):
-    """
-    The resolved training spec the coordinator (or UI, for ad-hoc runs)
-    hands to the trainer's POST /v1/trainer/runs. Carries everything the
-    trainer needs to execute without owning project config; projectId is
-    for back-reference / single-active-run enforcement only.
-
-    """
-
-    projectId: UUID | None = None
-    architecture: ArchitectureConfig
-    recipe: TrainingRecipe
-    hyperparameters: Hyperparameters
-    hardware: HardwareTopology
-    tokenizer: TokenizerRef
-    datasets: list[DatasetRef]
 
 
 class ComponentEntry(BaseModel):
@@ -1942,6 +753,83 @@ class ComponentEntry(BaseModel):
     safeMode: bool | None = False
 
 
+class EngineDescriptor(BaseModel):
+    """
+    One engine adapter, plus what the watchdog found on this host.
+
+    """
+
+    engine: EngineKind
+    available: bool = Field(
+        ...,
+        description='True iff a usable binary was found and successfully\nversion-probed. When false, `error` says why and runtimes\nfor this engine will fail to spawn.\n',
+    )
+    binaryPath: str | None = Field(
+        None, description='Absolute path to the binary the adapter would spawn.'
+    )
+    version: str | None = Field(
+        None,
+        description='Version string as reported by the binary itself (for\nllama.cpp, the build number). Surfaced so an operator can\ntell what they are actually running, and so a flag that\nstopped working after an upgrade is diagnosable.\n',
+    )
+    origin: Origin | None = Field(
+        None,
+        description='Where the binary came from.\n\n* `managed` — fetched and verified by us. The one-click\n  path; not implemented until engine acquisition lands.\n* `configured` — an explicit path the operator set, because\n  they build llama.cpp themselves or want a specific build.\n* `path` — found on `PATH`.\n',
+    )
+    flagSchema: ConfigSchema | None = Field(
+        None,
+        description='The **curated** flag surface for this engine, as a standard\n`ConfigSchema` so the generic config editor renders it with\nno engine-specific UI code.\n\nCurated, not complete: `llama-server` has hundreds of flags\nand exposing them wholesale would produce a form nobody can\nuse. What is here is what a person actually turns —\ncontext size, GPU layers, batch size, parallel slots, flash\nattention. Anything omitted is still reachable through\n`RuntimeSpec.extraArgs`.\n',
+    )
+    error: str | None = Field(None, description='Populated when `available: false`.')
+
+
+class Runtime(BaseModel):
+    """
+    Combined declarative + operational view of one engine process.
+    The declarative half is `RuntimeSpec` and is persisted; the
+    operational half is observed and is not.
+
+    """
+
+    name: str
+    engine: EngineKind
+    modelPath: str
+    modelAlias: str | None = Field(
+        None,
+        description='Resolved alias — the declared value, or the derived filename.',
+    )
+    host: str | None = None
+    port: int | None = Field(
+        None, description='Resolved port, including one assigned by the watchdog.'
+    )
+    autoStart: bool | None = None
+    flags: dict[str, Any] | None = None
+    extraArgs: list[str] | None = None
+    env: dict[str, str] | None = None
+    workingDirectory: str | None = None
+    binary: str | None = None
+    status: RuntimeStatus
+    url: AnyUrl | None = Field(
+        None,
+        description="Where this engine is actually listening\n(`http://<host>:<port>`). This is the value an\ninference-driver's `baseUrl` points at, and the reason a\ndriver never needs to know about ports or argv.\n",
+    )
+    argv: list[str] | None = Field(
+        None,
+        description='The exact command line the watchdog spawned, as the adapter\nresolved it. Read-only and reported deliberately: the first\nquestion anyone debugging a local engine asks is "what\ncommand did you actually run", and every tool that hides the\nanswer makes that debugging worse. Copy-pasteable.\n',
+    )
+    pid: int | None = Field(
+        None, description='OS process id. Set only while the engine is alive.'
+    )
+    engineVersion: str | None = Field(
+        None, description='Version reported by the binary that is actually running.'
+    )
+    capabilities: RuntimeCapabilities | None = None
+    lastRestart: AwareDatetime | None = None
+    lastError: str | None = Field(
+        None,
+        description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
+    )
+
+
 class ComponentList(BaseModel):
     components: list[Component] = Field(
         ...,
@@ -1949,61 +837,9 @@ class ComponentList(BaseModel):
     )
 
 
-class MemorySearchResult(BaseModel):
-    """
-    Ranked list of matching memory entries.
-    """
-
-    entries: list[MemorySearchHit]
+class EngineList(BaseModel):
+    engines: list[EngineDescriptor]
 
 
-class TrainingProject(BaseModel):
-    """
-    The key user-facing abstraction. A reusable, persisted description of
-    "a model you are building": what to train, from what data, with which
-    recipe and hyperparameters, on which hardware, evaluated how, exported
-    where. Runs are executions of a project (one project -> many runs).
-
-    """
-
-    projectId: UUID
-    name: str = Field(..., min_length=1)
-    description: str | None = None
-    goal: TrainingGoal
-    createdAt: AwareDatetime
-    updatedAt: AwareDatetime | None = None
-    modelTemplate: ModelTemplate | None = None
-    tokenizer: TokenizerRef | None = None
-    datasets: list[DatasetRef] | None = Field(
-        None,
-        description='Ordered dataset selection (with per-dataset weight + curriculum gate).',
-    )
-    recipe: TrainingRecipe | None = None
-    hyperparameters: Hyperparameters | None = None
-    hardware: HardwareTopology | None = None
-    evalSuites: list[EvalSuiteRef] | None = None
-    exportSettings: ExportSettings | None = None
-    latestRunId: UUID | None = None
-    latestRunStatus: RunStatus | None = None
-
-
-class PipelineRun(BaseModel):
-    """
-    One end-to-end execution of a TrainingProject's pipeline, owned by the
-    coordinator. Sequences stages across components (data prep -> tokenizer
-    -> training -> eval -> serve), each delegating to a peer component and
-    tracking the underlying resource id. One active pipeline per project.
-
-    """
-
-    pipelineRunId: UUID
-    projectId: UUID
-    status: PipelineStatus
-    createdAt: AwareDatetime
-    startedAt: AwareDatetime | None = None
-    finishedAt: AwareDatetime | None = None
-    currentStage: str | None = Field(
-        None, description='Kind of the stage currently executing.'
-    )
-    stages: list[PipelineStage]
-    lastError: str | None = None
+class RuntimeList(BaseModel):
+    runtimes: list[Runtime]

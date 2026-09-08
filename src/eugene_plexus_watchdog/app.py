@@ -90,8 +90,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
     # Supervisor injection: tests can pre-populate `app.state.supervisor`
-    # with a stub before the lifespan runs (mirroring the orchestrator's
-    # pattern with hemisphere clients and memory). Production builds the
+    # with a stub before the lifespan runs (mirroring the gateway's
+    # pattern with its driver clients). Production builds the
     # real one here, sharing the AuthState so each spawn can issue a
     # service token, forward the signing key, and (if logged in)
     # forward the master key.
