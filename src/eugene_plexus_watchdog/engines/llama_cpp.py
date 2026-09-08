@@ -16,12 +16,23 @@ from pathlib import Path
 import httpx
 
 from .._generated.models import (
+    Accelerator,
+    Arch,
     ConfigField,
     ConfigSchema,
     ConfigValueType,
     EngineKind,
+    HostAccelerator,
+    Os,
     RuntimeCapabilities,
     RuntimeSpec,
+)
+from .acquisition import (
+    AcquisitionPlan,
+    GitHubReleases,
+    Release,
+    ReleaseAsset,
+    Unavailable,
 )
 from .base import (
     DiscoveredBinary,
@@ -34,8 +45,17 @@ from .base import (
 
 log = logging.getLogger(__name__)
 
-# `llama-server --version` writes something like
-# `version: 4589 (a1b2c3d4)` / `build: 4589 (a1b2c3d4) with ...` to stderr.
+# `llama-server --version` writes to stderr, and upstream changed the
+# format mid-2026:
+#     version: 9846 (f708a5b2c)                          <= through ~b10000
+#     version: 0.4.0-dev (build 10867, commit f3f1a8f27)  <= b10867 onward
+#
+# The build number is the useful half of both, and it is what the release
+# tags and a managed install record. Scraping the newer line the old way
+# yields `0.4.0-dev`, which answers none of the questions this field
+# exists for and disagrees with the `bNNNN` beside it on the same screen.
+# Try the parenthesised build number first.
+_BUILD_IN_PARENS_RE = re.compile(r"\bbuild\s+(\d+)")
 _VERSION_RE = re.compile(r"\b(?:version|build):\s*(\S+)")
 
 # How long to wait on a version probe. Generous enough for a cold binary on
@@ -46,6 +66,29 @@ _VERSION_TIMEOUT_SECONDS = 10.0
 # Readiness probes run on the supervisor's poll cadence, so they must be
 # quick and must never be the thing that blocks a poll round.
 _PROBE_TIMEOUT_SECONDS = 2.0
+
+# --- acquisition ---------------------------------------------------------
+
+LLAMA_CPP_REPO = "ggml-org/llama.cpp"
+
+# Builds are `bNNNN` tags. This matters more than it looks: the repository's
+# `releases/latest` points at a `v0.4.0` tag that is not a server build at
+# all, so resolving "newest" by asking GitHub for the latest release gets
+# you something that has none of the assets you want. List and match.
+_BUILD_TAG_RE = re.compile(r"^b(\d+)$")
+
+# `llama-b10867-bin-win-cuda-13.3-x64.zip` -> variant `win-cuda-13.3-x64`.
+_ASSET_RE = re.compile(r"^llama-b\d+-bin-(?P<variant>.+)\.(?:zip|tar\.gz)$")
+
+# Windows CUDA is a two-asset install: the server zip carries no CUDA
+# runtime, and the DLLs live in a companion archive whose filename has no
+# build number even though it sits under the same release tag. Installing
+# only the first produces a binary that dies on a missing cudart DLL.
+_CUDART_RE = re.compile(r"^cudart-llama-bin-(?P<variant>.+)\.(?:zip|tar\.gz)$")
+
+# `win-cuda-13.3-x64` -> ('13', '3'). Used to pick the highest published
+# CUDA build the installed driver can actually load.
+_CUDA_VARIANT_RE = re.compile(r"^win-cuda-(?P<major>\d+)\.(?P<minor>\d+)-(?P<arch>x64|arm64)$")
 
 
 class LlamaCppAdapter(EngineAdapter):
@@ -74,10 +117,62 @@ class LlamaCppAdapter(EngineAdapter):
             return None
 
         for stream in (proc.stderr or "", proc.stdout or ""):
+            build = _BUILD_IN_PARENS_RE.search(stream)
+            if build:
+                return build.group(1)
             match = _VERSION_RE.search(stream)
             if match:
                 return match.group(1)
         return None
+
+    # --- acquisition ------------------------------------------------------
+
+    releases = GitHubReleases(LLAMA_CPP_REPO)
+
+    def latest_release(self, *, force: bool = False) -> Release | None:
+        """Newest published build.
+
+        Sorted by build number rather than by publish order: the tag IS a
+        monotonic counter, and trusting it beats trusting a timestamp on a
+        repository that publishes several releases an hour.
+        """
+        builds = [
+            (int(m.group(1)), release)
+            for release in self.releases.list_releases(force=force)
+            if (m := _BUILD_TAG_RE.match(release.version))
+        ]
+        if not builds:
+            return None
+        return max(builds, key=lambda pair: pair[0])[1]
+
+    def plan_acquisition(
+        self, host: HostAccelerator, release: Release
+    ) -> AcquisitionPlan | Unavailable:
+        """Which assets to fetch for this host, or why we cannot.
+
+        Returning `Unavailable` is a real answer. Upstream publishes no
+        CUDA build for Linux at all — not one that is hard to find, one
+        that does not exist — so a Linux box with an NVIDIA GPU has nothing
+        we can honestly install. It gets told that, rather than handed the
+        Vulkan build: Vulkan runs on NVIDIA but is materially slower at
+        prompt processing, and substituting it silently means the operator
+        concludes the product is slow rather than that they need to build
+        from source.
+        """
+        variant = _variant_for(host)
+        if isinstance(variant, Unavailable):
+            return variant
+
+        assets = _match_assets(release, variant)
+        if isinstance(assets, Unavailable):
+            return assets
+
+        return AcquisitionPlan(
+            version=release.version,
+            variant=variant,
+            assets=assets,
+            binary_name=self.binary_name,
+        )
 
     # --- launching --------------------------------------------------------
 
@@ -415,3 +510,166 @@ _FLAG_FIELDS: list[ConfigField] = [
         requiresRestart=True,
     ),
 ]
+
+
+def _variant_for(host: HostAccelerator) -> str | Unavailable:
+    """Map a detected host to the asset variant that fits it."""
+    if host.os is None or host.arch is None:
+        return Unavailable(
+            reason=(
+                "could not identify this operating system or CPU architecture, so "
+                "there is no way to tell which build would run here. Point `binary` "
+                "at a llama-server you trust."
+            )
+        )
+
+    accelerator = host.accelerator or Accelerator.none
+
+    if host.os is Os.macos:
+        # Metal is compiled into the plain macOS build; there is no separate
+        # accelerator variant to choose.
+        return "macos-arm64" if host.arch is Arch.arm64 else "macos-x64"
+
+    if host.os is Os.windows:
+        if accelerator is Accelerator.cuda:
+            return _cuda_variant(host)
+        if accelerator is Accelerator.rocm:
+            return f"win-rocm-10.0-{host.arch.value}"
+        return f"win-cpu-{host.arch.value}"
+
+    # Linux.
+    if accelerator is Accelerator.cuda:
+        return Unavailable(
+            reason=(
+                "llama.cpp publishes no prebuilt CUDA build for Linux, so there is "
+                "nothing to install for an NVIDIA GPU here. Build llama.cpp from "
+                "source with GGML_CUDA=ON, or use the official CUDA container, then "
+                "set `binary` on the runtime to the llama-server you built. A Vulkan "
+                "build would install cleanly and run on this card, but it is "
+                "materially slower at prompt processing and we will not substitute "
+                "it for CUDA without being asked."
+            )
+        )
+    if accelerator is Accelerator.rocm:
+        return f"ubuntu-rocm-10.0-{host.arch.value}"
+    if accelerator is Accelerator.sycl:
+        return "ubuntu-sycl-fp16-x64"
+    return f"ubuntu-{host.arch.value}" if host.arch is Arch.arm64 else "ubuntu-x64"
+
+
+def _cuda_variant(host: HostAccelerator) -> str | Unavailable:
+    """The highest published CUDA build this driver can load.
+
+    CUDA guarantees minor-version compatibility within a major, so a build
+    for 13.3 runs on a 13.4 driver but not on a 12.x one. Pick the highest
+    published minor whose major matches and whose minor does not exceed the
+    driver's ceiling; never cross a major boundary upward.
+    """
+    published = _published_cuda_variants(host.arch or Arch.x64)
+    if not published:
+        return Unavailable(reason="no Windows CUDA build is published for this architecture.")
+
+    driver = host.acceleratorVersion
+    if driver is None:
+        # An NVIDIA card whose driver would not report a version. Refusing
+        # is better than guessing: install the wrong major and the binary
+        # fails at load with a message about the driver, not about us.
+        return Unavailable(
+            reason=(
+                "an NVIDIA GPU is present but `nvidia-smi` did not report a CUDA "
+                "version, so there is no safe way to choose between the published "
+                "CUDA builds. Update the driver, or set `binary` on the runtime by "
+                "hand."
+            )
+        )
+
+    try:
+        major, _, minor = driver.partition(".")
+        driver_major, driver_minor = int(major), int(minor or 0)
+    except ValueError:
+        return Unavailable(reason=f"could not read the reported CUDA version {driver!r}.")
+
+    usable = [
+        (mj, mn, variant)
+        for mj, mn, variant in published
+        if mj == driver_major and mn <= driver_minor
+    ]
+    if not usable:
+        newest = max(published, key=lambda t: (t[0], t[1]))
+        return Unavailable(
+            reason=(
+                f"this driver supports CUDA up to {driver}, and the closest published "
+                f"build needs {newest[0]}.{newest[1]}. Update the NVIDIA driver, or set "
+                f"`binary` on the runtime to a build you compiled."
+            )
+        )
+    return max(usable, key=lambda t: (t[0], t[1]))[2]
+
+
+# The published Windows CUDA matrix, as of build b10867. Hardcoded on
+# purpose: this is the *candidate* list, and every entry is checked against
+# the actual release assets before anything is downloaded — so a stale entry
+# fails loudly at match time instead of silently selecting nothing.
+_PUBLISHED_CUDA: tuple[tuple[int, int, str], ...] = (
+    (12, 4, "win-cuda-12.4-x64"),
+    (13, 3, "win-cuda-13.3-x64"),
+    (13, 4, "win-cuda-13.4-arm64"),
+)
+
+
+def _published_cuda_variants(arch: Arch) -> list[tuple[int, int, str]]:
+    suffix = f"-{arch.value}"
+    return [entry for entry in _PUBLISHED_CUDA if entry[2].endswith(suffix)]
+
+
+def _match_assets(release: Release, variant: str) -> tuple[ReleaseAsset, ...] | Unavailable:
+    """Find the asset(s) for a variant in a release.
+
+    Loud on failure, by design. Upstream's asset naming is not a contract —
+    `linux-` became `ubuntu-`, ROCm and OpenVINO versions are baked into
+    filenames — so when nothing matches, say what was wanted and list what
+    was there. Falling back to a near-miss installs the wrong
+    accelerator's build and reports success.
+    """
+    main = next(
+        (
+            asset
+            for asset in release.assets
+            if (m := _ASSET_RE.match(asset.name)) and m.group("variant") == variant
+        ),
+        None,
+    )
+    if main is None:
+        available = sorted(
+            m.group("variant") for asset in release.assets if (m := _ASSET_RE.match(asset.name))
+        )
+        return Unavailable(
+            reason=(
+                f"release {release.version} has no asset for {variant!r}. "
+                f"Published variants: {', '.join(available) or '(none)'}."
+            )
+        )
+
+    assets = [main]
+
+    # Windows CUDA needs the companion runtime archive.
+    if variant.startswith("win-cuda-"):
+        cudart = next(
+            (
+                asset
+                for asset in release.assets
+                if (m := _CUDART_RE.match(asset.name)) and m.group("variant") == variant
+            ),
+            None,
+        )
+        if cudart is None:
+            return Unavailable(
+                reason=(
+                    f"release {release.version} has the {variant!r} server build but not "
+                    f"its cudart companion archive. Installing one without the other "
+                    f"produces a binary that cannot start."
+                )
+            )
+        assets.append(cudart)
+
+    return tuple(assets)

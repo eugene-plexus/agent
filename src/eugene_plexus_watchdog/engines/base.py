@@ -27,6 +27,7 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimeSpec,
 )
+from .acquisition import ManagedStore, engine_root
 
 
 @dataclass(frozen=True)
@@ -115,18 +116,40 @@ class EngineAdapter(abc.ABC):
         found = self.discover()
         if found is None:
             raise EngineUnavailableError(
-                f"no {self.binary_name!r} found for engine {self.kind.value!r} — set "
-                f"`binary` on the runtime, or put it on PATH"
+                f"no {self.binary_name!r} found for engine {self.kind.value!r} — install "
+                f"one with POST /v1/engines/{self.kind.value}/install, set `binary` on "
+                f"the runtime, or put it on PATH"
             )
         return found
+
+    def managed_store(self) -> ManagedStore:
+        """Where builds this install fetched for itself live."""
+        return ManagedStore(engine_root(), self.kind)
 
     def discover(self) -> DiscoveredBinary | None:
         """Look for a usable binary without a specific runtime in hand.
 
         Backs `GET /v1/engines`, which the UI reads to decide whether to
-        offer the "add a runtime" form at all. PATH only for now; engine
-        acquisition adds the managed location ahead of it.
+        offer the "add a runtime" form at all.
+
+        A managed build beats one on PATH. The operator asked us to
+        manage this engine, so a stray `llama-server` that happens to be
+        on PATH — an old system package, something another tool
+        installed — must not quietly win over the build we fetched and
+        verified. An explicit `binary` on a runtime still beats both;
+        see `resolve_binary`.
         """
+        managed = self.managed_store().current()
+        if managed is not None:
+            return DiscoveredBinary(
+                path=managed.binary,
+                origin=Origin.managed,
+                # The recorded build number, not a re-probe: it came off
+                # the release we installed, and spawning the binary on
+                # every /v1/engines call to re-learn it would be silly.
+                version=managed.version,
+            )
+
         which = shutil.which(self.binary_name)
         if which is None:
             return None

@@ -32,7 +32,7 @@ from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
 from .routes import runtimes as runtimes_routes
-from .runtimes import RuntimeSupervisor
+from .runtimes import RuntimeSupervisor, close_installers
 from .settings import Settings, load_settings
 from .state import WatchdogState
 from .supervisor import Supervisor
@@ -130,7 +130,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Engines first: they are the ones holding GPU memory, and a
+        # An in-flight engine download is the cheapest thing here to
+        # abandon and the only one holding a half-written directory, so
+        # it goes first.
+        await close_installers()
+        # Engines next: they are the ones holding GPU memory, and a
         # driver briefly outliving its engine is harmless while the
         # reverse leaves requests hitting a dead port.
         if owns_runtimes:

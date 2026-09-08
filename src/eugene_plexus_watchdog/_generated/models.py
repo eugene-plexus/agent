@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, SecretStr
 
 
 class ComponentKind(StrEnum):
@@ -467,6 +467,166 @@ class EngineKind(StrEnum):
     llama_cpp = 'llama_cpp'
 
 
+class AuthStatus(BaseModel):
+    """
+    Whether this install has been through first-run setup.
+
+    """
+
+    initialized: bool = Field(
+        ...,
+        description='True once a passphrase has been set. False means every\nendpoint except this one, `/healthz` and\n`POST /v1/auth/initialize` will refuse.\n',
+    )
+
+
+class AuthInitializeRequest(BaseModel):
+    passphrase: SecretStr = Field(
+        ...,
+        description='The operator passphrase. Hashed with Argon2id and used to\nderive the master key that at-rest secrets are sealed\nunder, so losing it means losing every stored credential —\nthere is no recovery path by design.\n',
+        min_length=1,
+    )
+
+
+class ManagedEngine(BaseModel):
+    """
+    A build this install fetched and owns, as opposed to one found on
+    PATH or pointed at by hand. Present only when we installed it.
+
+    """
+
+    version: str = Field(
+        ...,
+        description='Upstream build identifier - for llama.cpp a `bNNNN` tag, not\na semver. Copied verbatim from the release, because the only\nuseful thing to do with it is compare it to what upstream\nhas.\n',
+    )
+    binaryPath: str = Field(
+        ..., description='Absolute path to the executable inside the managed directory.'
+    )
+    variant: str = Field(
+        ...,
+        description='Which asset was chosen, e.g. `win-cuda-13.3-x64`. Recorded\nbecause it is the answer to "why is this slow" often enough\nto be worth surfacing: a host that fell back to a CPU build\nlooks identical from the outside otherwise.\n',
+    )
+    installedAt: AwareDatetime | None = None
+    sizeBytes: int | None = Field(
+        None,
+        description='On-disk size of this build. A Windows CUDA install is roughly\nhalf a gigabyte unpacked and we retain two, so this is worth\nshowing before someone asks where their disk went.\n',
+    )
+    previousVersion: str | None = Field(
+        None,
+        description='The build retained alongside this one, if any. Retention is\ncurrent plus previous: keeping every build is not viable at\nthis size, and keeping only the newest leaves a bad upgrade\nwith no way back.\n',
+    )
+
+
+class Os(StrEnum):
+    windows = 'windows'
+    linux = 'linux'
+    macos = 'macos'
+
+
+class Arch(StrEnum):
+    x64 = 'x64'
+    arm64 = 'arm64'
+
+
+class Accelerator(StrEnum):
+    """
+    `metal` is reported on Apple silicon even though there is no
+    separate Metal asset - the plain macOS build has it compiled
+    in, and saying `none` there would read as "no GPU".
+
+    """
+
+    none = 'none'
+    cuda = 'cuda'
+    rocm = 'rocm'
+    metal = 'metal'
+    sycl = 'sycl'
+
+
+class HostAccelerator(BaseModel):
+    """
+    What the watchdog detected about this machine, insofar as it
+    decides which engine build to fetch. Not a general hardware
+    inventory - the VRAM-and-quant-fit surface that M3 needs belongs
+    to the library component, not here.
+
+    """
+
+    os: Os | None = None
+    arch: Arch | None = None
+    accelerator: Accelerator | None = Field(
+        None,
+        description='`metal` is reported on Apple silicon even though there is no\nseparate Metal asset - the plain macOS build has it compiled\nin, and saying `none` there would read as "no GPU".\n',
+    )
+    acceleratorVersion: str | None = Field(
+        None,
+        description='For CUDA, the highest version the installed driver supports.\nSelection takes the highest published build whose major\nmatches and whose minor is no greater than this; a higher\nmajor is never chosen.\n',
+    )
+
+
+class EngineInstallRequest(BaseModel):
+    version: str | None = Field(
+        None,
+        description='A specific upstream build to install. Omit for the newest.\nPresent so an operator who found a regression can pin the\nbuild that worked, which is the whole reason we record the\nversion rather than just "installed".\n',
+    )
+
+
+class State(StrEnum):
+    """
+    * `resolving` - asking upstream which build and which asset.
+    * `downloading` - fetching. On Windows with CUDA this is two
+      assets, the binary and a separate CUDA runtime, and the
+      byte counters cover both.
+    * `verifying` - comparing the SHA-256 the releases API
+      reported for the asset. Upstream publishes no checksum
+      file; the digest arrives with the asset metadata, so
+      there is no excuse for skipping this.
+    * `extracting` - unpacking into a new versioned directory.
+    * `done` / `failed` / `cancelled` - terminal, and retained
+      until the next install starts.
+
+    """
+
+    resolving = 'resolving'
+    downloading = 'downloading'
+    verifying = 'verifying'
+    extracting = 'extracting'
+    done = 'done'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class EngineInstall(BaseModel):
+    """
+    Progress of one install. Phases are named rather than reduced to
+    a percentage because they fail differently and the operator
+    needs to know which one they are in: a stall in `downloading` is
+    the network, a stall in `extracting` is the disk, and a failure
+    in `verifying` is the one that means do not run this.
+
+    """
+
+    engine: EngineKind
+    state: State = Field(
+        ...,
+        description='* `resolving` - asking upstream which build and which asset.\n* `downloading` - fetching. On Windows with CUDA this is two\n  assets, the binary and a separate CUDA runtime, and the\n  byte counters cover both.\n* `verifying` - comparing the SHA-256 the releases API\n  reported for the asset. Upstream publishes no checksum\n  file; the digest arrives with the asset metadata, so\n  there is no excuse for skipping this.\n* `extracting` - unpacking into a new versioned directory.\n* `done` / `failed` / `cancelled` - terminal, and retained\n  until the next install starts.\n',
+    )
+    version: str | None = Field(
+        None, description='The build being installed, once resolved.'
+    )
+    variant: str | None = None
+    bytesDownloaded: int | None = None
+    bytesTotal: int | None = Field(
+        None,
+        description='Total across every asset this install needs. Absent until\n`resolving` finishes.\n',
+    )
+    message: str | None = Field(
+        None, description='What is happening now, for a status line.'
+    )
+    error: str | None = Field(None, description='Populated when `state: failed`.')
+    startedAt: AwareDatetime | None = None
+    finishedAt: AwareDatetime | None = None
+
+
 class Origin(StrEnum):
     """
     Where the binary came from.
@@ -753,6 +913,39 @@ class ComponentEntry(BaseModel):
     safeMode: bool | None = False
 
 
+class EngineAcquisition(BaseModel):
+    """
+    Whether this host can be given a build of this engine, and which
+    one. Answers the question before the operator commits to a
+    several-hundred-megabyte download.
+
+    """
+
+    installable: bool = Field(
+        ...,
+        description='False means no published asset fits this host and `reason`\nsays why. This is a real outcome, not an error: upstream\npublishes no CUDA build for Linux, so a Linux box with an\nNVIDIA GPU cannot be served automatically and is told so\nrather than quietly handed a slower Vulkan build it never\nasked for.\n',
+    )
+    variant: str | None = Field(
+        None, description='The asset variant that would be fetched, when installable.'
+    )
+    reason: str | None = Field(
+        None,
+        description='Why not, when `installable: false`. Written for the operator,\nnaming the way forward - build from source, use a container,\nor point `binary` at an existing build.\n',
+    )
+    detected: HostAccelerator | None = None
+    latestVersion: str | None = Field(
+        None, description='Newest upstream build we know of.'
+    )
+    latestPublishedAt: AwareDatetime | None = Field(
+        None,
+        description='When that build shipped. Deliberately the age of the newest\nbuild rather than a count of builds behind: llama.cpp\npublishes several a day, so "1,021 builds behind" is noise\nand "your build is three weeks old" is information.\n',
+    )
+    checkedAt: AwareDatetime | None = Field(
+        None,
+        description='When we last asked upstream. Checked at most daily and never\non the request path; a failed check leaves this stale rather\nthan raising anything.\n',
+    )
+
+
 class EngineDescriptor(BaseModel):
     """
     One engine adapter, plus what the watchdog found on this host.
@@ -780,6 +973,8 @@ class EngineDescriptor(BaseModel):
         description='The **curated** flag surface for this engine, as a standard\n`ConfigSchema` so the generic config editor renders it with\nno engine-specific UI code.\n\nCurated, not complete: `llama-server` has hundreds of flags\nand exposing them wholesale would produce a form nobody can\nuse. What is here is what a person actually turns —\ncontext size, GPU layers, batch size, parallel slots, flash\nattention. Anything omitted is still reachable through\n`RuntimeSpec.extraArgs`.\n',
     )
     error: str | None = Field(None, description='Populated when `available: false`.')
+    managed: ManagedEngine | None = None
+    acquisition: EngineAcquisition | None = None
 
 
 class Runtime(BaseModel):

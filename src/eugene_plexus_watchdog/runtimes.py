@@ -20,8 +20,11 @@ import os
 from datetime import datetime
 
 from ._generated.models import (
+    EngineAcquisition,
     EngineDescriptor,
+    EngineInstall,
     EngineKind,
+    ManagedEngine,
     Runtime,
     RuntimeCapabilities,
     RuntimeSpec,
@@ -36,7 +39,16 @@ from .engines import (
     adapter_for,
     default_model_alias,
 )
+from .engines.acquisition import (
+    AcquisitionError,
+    AcquisitionPlan,
+    EngineInstaller,
+    Release,
+    Unavailable,
+)
 from .engines.base import DiscoveredBinary
+from .engines.host import detect_host
+from .engines.llama_cpp import LlamaCppAdapter
 from .supervisor import (
     ProcessState,
     SpawnPlan,
@@ -342,26 +354,151 @@ class RuntimeSupervisor:
             self._readiness[spec.name] = None
 
 
+# One installer per engine, created on demand and kept for the life of the
+# process so a terminal install state survives long enough for a UI that
+# reconnects afterwards to read how it ended.
+_INSTALLERS: dict[EngineKind, EngineInstaller] = {}
+
+
+def installer_for(kind: EngineKind) -> EngineInstaller | None:
+    adapter = adapter_for(kind)
+    if adapter is None:
+        return None
+    existing = _INSTALLERS.get(kind)
+    if existing is None:
+        existing = EngineInstaller(adapter.managed_store(), kind)
+        _INSTALLERS[kind] = existing
+    return existing
+
+
+async def close_installers() -> None:
+    """Cancel anything in flight at shutdown."""
+    for installer in list(_INSTALLERS.values()):
+        await installer.aclose()
+    _INSTALLERS.clear()
+
+
+def plan_for(kind: EngineKind, *, version: str | None = None) -> AcquisitionPlan | Unavailable:
+    """What we would fetch for this host, or why we cannot.
+
+    Adapter-specific by necessity — asset naming is engine knowledge, the
+    same kind as argv construction — so this dispatches rather than
+    generalising over an interface that has exactly one implementation.
+    Widen it when a second engine ships prebuilt binaries; vLLM will not.
+    """
+    adapter = adapter_for(kind)
+    if not isinstance(adapter, LlamaCppAdapter):
+        return Unavailable(
+            reason=f"engine {kind.value!r} has no managed-install support in this build"
+        )
+
+    if version is None:
+        release = adapter.latest_release()
+    else:
+        release = next(
+            (r for r in adapter.releases.list_releases() if r.version == version),
+            None,
+        )
+        if release is None:
+            return Unavailable(
+                reason=(
+                    f"build {version!r} is not among the recent releases of "
+                    f"{adapter.binary_name}; only recent builds can be installed"
+                )
+            )
+    if release is None:
+        return Unavailable(
+            reason=(
+                "could not reach the upstream release list. Check network access, or "
+                "set `binary` on the runtime to a build you already have."
+            )
+        )
+    return adapter.plan_acquisition(detect_host(), release)
+
+
+def _acquisition_for(kind: EngineKind) -> EngineAcquisition:
+    """The acquisition half of an `EngineDescriptor`.
+
+    Never raises and never blocks on the network beyond the release cache:
+    this backs `GET /v1/engines`, which the UI polls, and a failed upstream
+    check has to leave the panel stale rather than turn it into an error.
+    """
+    adapter = adapter_for(kind)
+    latest: Release | None = None
+    checked_at: datetime | None = None
+    # Inline isinstance rather than a hoisted flag: mypy narrows on the
+    # former and not the latter, and `latest_release` lives on the
+    # llama.cpp adapter, not the base one.
+    if isinstance(adapter, LlamaCppAdapter):
+        latest = adapter.latest_release()
+        checked_at = adapter.releases.checked_at
+    plan = plan_for(kind)
+
+    detected = detect_host()
+    if isinstance(plan, Unavailable):
+        return EngineAcquisition(
+            installable=False,
+            reason=plan.reason,
+            detected=detected,
+            latestVersion=latest.version if latest else None,
+            latestPublishedAt=latest.published_at if latest else None,
+            checkedAt=checked_at,
+        )
+    return EngineAcquisition(
+        installable=True,
+        variant=plan.variant,
+        detected=detected,
+        latestVersion=latest.version if latest else None,
+        latestPublishedAt=latest.published_at if latest else None,
+        checkedAt=checked_at,
+    )
+
+
+def _managed_for(adapter: EngineAdapter) -> ManagedEngine | None:
+    builds = adapter.managed_store().list_builds()
+    if not builds:
+        return None
+    current = builds[0]
+    return ManagedEngine(
+        version=current.version,
+        binaryPath=str(current.binary),
+        variant=current.variant,
+        installedAt=current.installed_at,
+        sizeBytes=current.size_bytes,
+        previousVersion=builds[1].version if len(builds) > 1 else None,
+    )
+
+
 def describe_engines() -> list[EngineDescriptor]:
     """What this watchdog knows how to start, and what it found on disk.
 
-    Backs `GET /v1/engines`. `available: false` means the adapter exists
-    but no binary was found — until engine acquisition lands the fix is
-    to set `binary` on the runtime by hand.
+    Backs `GET /v1/engines`. Note what `available` does and does not mean:
+    it answers "is a binary discoverable on this host", by managed install
+    or PATH. A runtime carrying an explicit `binary` bypasses discovery
+    entirely and runs happily against an engine reported here as
+    unavailable — which reads as a contradiction on a dashboard and is
+    worth saying out loud in the `error` text.
     """
     out: list[EngineDescriptor] = []
     for kind, adapter in ADAPTERS.items():
         found = adapter.discover()
+        acquisition = _acquisition_for(kind)
+        managed = _managed_for(adapter)
+
         if found is None:
+            hint = (
+                f"install one with POST /v1/engines/{kind.value}/install"
+                if acquisition.installable
+                else "set `binary` on a runtime to point at an existing build"
+            )
             out.append(
                 EngineDescriptor(
                     engine=kind,
                     available=False,
-                    error=(
-                        f"no {adapter.binary_name!r} on PATH — set `binary` on a "
-                        f"runtime to point at an existing build"
-                    ),
+                    error=f"no {adapter.binary_name!r} installed or on PATH — {hint}",
                     flagSchema=adapter.flag_schema(),
+                    managed=managed,
+                    acquisition=acquisition,
                 )
             )
             continue
@@ -373,6 +510,8 @@ def describe_engines() -> list[EngineDescriptor]:
                 version=found.version,
                 origin=found.origin,
                 flagSchema=adapter.flag_schema(),
+                managed=managed,
+                acquisition=acquisition,
             )
         )
     return out
@@ -405,8 +544,13 @@ def _default_alias(spec: RuntimeSpec) -> str:
 
 
 __all__ = [
+    "AcquisitionError",
+    "EngineInstall",
     "EngineKind",
     "RuntimeSupervisor",
+    "close_installers",
     "describe_engines",
+    "installer_for",
+    "plan_for",
     "validate_spec",
 ]

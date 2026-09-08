@@ -13,13 +13,23 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import (
+    EngineInstall,
+    EngineInstallRequest,
+    EngineKind,
     EngineList,
     Runtime,
     RuntimeList,
     RuntimeSpec,
 )
 from ..dependencies import require_operator_or_service, require_operator_session
-from ..runtimes import RuntimeSupervisor, describe_engines, validate_spec
+from ..engines.acquisition import AcquisitionError, Unavailable
+from ..runtimes import (
+    RuntimeSupervisor,
+    describe_engines,
+    installer_for,
+    plan_for,
+    validate_spec,
+)
 from ..state import WatchdogState
 
 router = APIRouter()
@@ -74,6 +84,127 @@ def _compose(spec: RuntimeSpec, supervisor: RuntimeSupervisor | None) -> Runtime
 @router.get("/v1/engines", response_model=EngineList, tags=["engines"], dependencies=_read_auth)
 async def list_engines() -> EngineList:
     return EngineList(engines=describe_engines())
+
+
+def _engine_kind(engine: str) -> EngineKind:
+    try:
+        return EngineKind(engine)
+    except ValueError:
+        raise _problem(
+            code=status.HTTP_404_NOT_FOUND,
+            slug="unknown-engine",
+            title="Unknown engine",
+            detail=(
+                f"{engine!r} is not an engine this watchdog implements. "
+                f"GET /v1/engines lists what it does."
+            ),
+        ) from None
+
+
+@router.post(
+    "/v1/engines/{engine}/install",
+    response_model=EngineInstall,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["engines"],
+    dependencies=_write_auth,
+)
+async def install_engine(engine: str, body: EngineInstallRequest | None = None) -> EngineInstall:
+    """Fetch, verify and unpack an engine build.
+
+    Returns immediately. The download is hundreds of megabytes — on
+    Windows with CUDA it is two assets totalling about half a gigabyte —
+    and holding a request open for it buys nothing while losing the
+    progress the operator actually wants to watch.
+    """
+    kind = _engine_kind(engine)
+    installer = installer_for(kind)
+    if installer is None:
+        raise _problem(
+            code=status.HTTP_404_NOT_FOUND,
+            slug="unknown-engine",
+            title="Unknown engine",
+            detail=f"No adapter for engine {engine!r} in this build.",
+        )
+    if installer.running:
+        raise _problem(
+            code=status.HTTP_409_CONFLICT,
+            slug="install-in-flight",
+            title="Install already running",
+            detail=(
+                f"An install is already in flight for {engine!r}. Wait for it, or "
+                f"DELETE this path to cancel it."
+            ),
+        )
+
+    plan = plan_for(kind, version=body.version if body else None)
+    if isinstance(plan, Unavailable):
+        # 422, not 404 or 500: the request was well-formed and the engine
+        # exists — this host simply has nothing installable, which on
+        # Linux with an NVIDIA GPU is a permanent and legitimate answer
+        # rather than a transient failure worth retrying.
+        raise _problem(
+            code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            slug="nothing-installable",
+            title="Nothing installable for this host",
+            detail=plan.reason,
+        )
+
+    try:
+        return installer.start(plan)
+    except AcquisitionError as e:
+        raise _problem(
+            code=status.HTTP_409_CONFLICT,
+            slug="install-in-flight",
+            title="Install already running",
+            detail=str(e),
+        ) from e
+
+
+@router.get(
+    "/v1/engines/{engine}/install",
+    response_model=EngineInstall,
+    tags=["engines"],
+    dependencies=_read_auth,
+)
+async def get_engine_install(engine: str) -> EngineInstall:
+    """Progress of the current or most recent install."""
+    kind = _engine_kind(engine)
+    installer = installer_for(kind)
+    snapshot = installer.snapshot() if installer else None
+    if snapshot is None:
+        raise _problem(
+            code=status.HTTP_404_NOT_FOUND,
+            slug="no-install",
+            title="No install",
+            detail=f"No install has been started for {engine!r} in this process.",
+        )
+    return snapshot
+
+
+@router.delete(
+    "/v1/engines/{engine}/install",
+    response_model=EngineInstall,
+    tags=["engines"],
+    dependencies=_write_auth,
+)
+async def cancel_engine_install(engine: str) -> EngineInstall:
+    """Cancel an install in flight.
+
+    Cancels an *install*; it does not uninstall an engine. A build that
+    already finished is untouched.
+    """
+    kind = _engine_kind(engine)
+    installer = installer_for(kind)
+    if installer is None or not installer.running:
+        raise _problem(
+            code=status.HTTP_409_CONFLICT,
+            slug="nothing-to-cancel",
+            title="Nothing in flight",
+            detail=f"No install is running for {engine!r}.",
+        )
+    snapshot = await installer.cancel()
+    assert snapshot is not None  # running implies a snapshot exists
+    return snapshot
 
 
 # --------------------------------------------------------------------------- #
