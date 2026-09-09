@@ -62,6 +62,30 @@ def test_engines_lists_every_adapter_with_its_flag_schema(authed_client: TestCli
         assert llama["error"]
 
 
+def test_engines_declare_which_model_formats_they_load(authed_client: TestClient) -> None:
+    """The engine half of a join the UI performs: the library reports
+    what format each model *is*, this reports what each engine can
+    *load*. Without it a safetensors model gets a launch button that
+    fails instead of one greyed out with a reason.
+
+    `llama_cpp` is GGUF-only, so at M2 a safetensors model has nowhere
+    to run at all — vLLM at M4 is what changes that answer, with no
+    library change.
+    """
+    engines = authed_client.get("/v1/engines").json()["engines"]
+    llama = next(e for e in engines if e["engine"] == "llama_cpp")
+
+    assert llama["modelFormats"] == ["gguf"]
+
+
+def test_model_formats_do_not_depend_on_availability(authed_client: TestClient) -> None:
+    """A property of the engine, not of this host. An operator with no
+    binary installed still needs to know what it would be able to
+    load."""
+    for engine in authed_client.get("/v1/engines").json()["engines"]:
+        assert engine["modelFormats"], f"{engine['engine']} declared no formats"
+
+
 # --------------------------------------------------------------------------- #
 # CRUD
 # --------------------------------------------------------------------------- #

@@ -23,6 +23,7 @@ from pathlib import Path
 from .._generated.models import (
     ConfigSchema,
     EngineKind,
+    ModelFormat,
     Origin,
     RuntimeCapabilities,
     RuntimeSpec,
@@ -92,6 +93,19 @@ class EngineAdapter(abc.ABC):
 
     #: Executable name looked for on PATH when no explicit binary is set.
     binary_name: str
+
+    #: On-disk model formats this engine can load. A property of the
+    #: engine, not of this host — it does not change with availability.
+    #:
+    #: The engine half of a join the UI performs: the library reports
+    #: what format each model *is*, this reports what each engine can
+    #: *load*, and between them the UI can grey out a launch button and
+    #: name the missing engine instead of offering one that fails.
+    #:
+    #: It lives here because engine knowledge lives here. Putting format
+    #: support on the library would give the library a copy of it, and
+    #: the copy would be the one that went stale.
+    model_formats: tuple[ModelFormat, ...]
 
     # --- discovery --------------------------------------------------------
 

@@ -27,12 +27,15 @@ class ComponentKind(StrEnum):
     `gateway` is the one OpenAI-compatible front door and there is
     exactly one. `inference-driver` instances are the per-backend
     wrappers and there are N — one per backend, wherever that
-    backend lives.
+    backend lives. `library` scans the operator's model
+    directories and holds per-model launch profiles; there is
+    exactly one, and it is deliberately not in the request path.
 
     """
 
     gateway = 'gateway'
     inference_driver = 'inference-driver'
+    library = 'library'
 
 
 class Role(StrEnum):
@@ -86,6 +89,59 @@ class BackendKind(StrEnum):
     claude_code_cli = 'claude_code_cli'
     codex_cli = 'codex_cli'
     openai_compat_http = 'openai_compat_http'
+
+
+class EngineKind(StrEnum):
+    """
+    Which engine adapter constructs the argv and interprets
+    readiness. Deliberately a closed enum rather than a free string:
+    an engine is supported exactly when an adapter exists for it,
+    and without an adapter there is nothing that knows how to start
+    it or tell when it is ready.
+
+    `llama_cpp` drives upstream `llama-server`. vLLM is a second
+    adapter later, and MLX after that. We never ship an engine — all
+    three are upstream projects we wrap and track.
+
+    Lives here rather than on the watchdog because two components
+    reference it: the watchdog's engines and runtimes, and a
+    library `ModelProfile`, which names the engine its launch flags
+    are written for.
+
+    """
+
+    llama_cpp = 'llama_cpp'
+
+
+class ModelFormat(StrEnum):
+    """
+    On-disk format of a model. A dimension of the data model rather
+    than an assumption (locked 2026-09-08): both are implemented at
+    v0.1, and the differences are load-bearing rather than
+    cosmetic.
+
+    * `gguf` — a single file, quantized, carrying its own metadata
+      and tokenizer. Large models may be **split** into
+      `…-00001-of-0000N.gguf` shards, of which only the first is
+      named on a launch line. A multimodal GGUF ships its vision
+      projector as a separate file in the same directory, which is
+      not itself a model.
+    * `safetensors` — a directory: `config.json` plus one or more
+      weight files plus tokenizer files. Unquantized in practice,
+      so **no quant tier** — a safetensors model is sized, not
+      tiered, and the quant fields exist only on the GGUF side.
+
+    Shared because it appears on both sides of a join: a library
+    entry declares what a model *is*, and
+    `EngineDescriptor.modelFormats` declares what an engine can
+    *load*. Nothing can serve a safetensors model until the vLLM
+    adapter lands, and that answer comes from the engine's
+    descriptor rather than from anything the library knows.
+
+    """
+
+    gguf = 'gguf'
+    safetensors = 'safetensors'
 
 
 class Problem(BaseModel):
@@ -144,6 +200,17 @@ class ConfigValueType(StrEnum):
     The kind of value a config field holds. The UI uses this to pick
     a renderer (text input, dropdown, password field, etc.).
 
+    Two of these hold more than a scalar. `path_list` is an ordered
+    JSON array of directory paths on the component host — the
+    library's model roots are the first and so far only user — and
+    the UI renders it as an add/remove list of directory pickers
+    rather than a text field, because asking someone to
+    comma-separate Windows paths is asking for a bug report. Order
+    is preserved and meaningful: it is the order the operator sees,
+    and M3's downloader offers the first entry as the default
+    destination. `driver_list` stays reserved for M5's ordered
+    model→driver priority lists.
+
     """
 
     string = 'string'
@@ -153,6 +220,7 @@ class ConfigValueType(StrEnum):
     enum = 'enum'
     secret = 'secret'
     file_path = 'file_path'
+    path_list = 'path_list'
     url = 'url'
     duration = 'duration'
     driver_list = 'driver_list'
@@ -450,23 +518,6 @@ class ComponentStatus(StrEnum):
     unreachable = 'unreachable'
 
 
-class EngineKind(StrEnum):
-    """
-    Which engine adapter constructs the argv and interprets
-    readiness. Deliberately a closed enum rather than a free string:
-    an engine is supported exactly when an adapter exists for it,
-    and without an adapter there is nothing that knows how to start
-    it or tell when it is ready.
-
-    `llama_cpp` drives upstream `llama-server`. vLLM is a second
-    adapter later, and MLX after that. We never ship an engine — all
-    three are upstream projects we wrap and track.
-
-    """
-
-    llama_cpp = 'llama_cpp'
-
-
 class AuthStatus(BaseModel):
     """
     Whether this install has been through first-run setup.
@@ -669,7 +720,7 @@ class RuntimeSpec(BaseModel):
     engine: EngineKind
     modelPath: str = Field(
         ...,
-        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n",
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n",
     )
     modelAlias: str | None = Field(
         None,
@@ -956,6 +1007,10 @@ class EngineDescriptor(BaseModel):
     available: bool = Field(
         ...,
         description='True iff a usable binary was found and successfully\nversion-probed. When false, `error` says why and runtimes\nfor this engine will fail to spawn.\n',
+    )
+    modelFormats: list[ModelFormat] = Field(
+        ...,
+        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf` only, so a safetensors model in the library has\nnowhere to run until the vLLM adapter lands, and the UI can\nsay so — naming the missing engine — instead of offering a\nlaunch button that fails.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n",
     )
     binaryPath: str | None = Field(
         None, description='Absolute path to the binary the adapter would spawn.'

@@ -495,6 +495,7 @@ def describe_engines() -> list[EngineDescriptor]:
                 EngineDescriptor(
                     engine=kind,
                     available=False,
+                    modelFormats=list(adapter.model_formats),
                     error=f"no {adapter.binary_name!r} installed or on PATH — {hint}",
                     flagSchema=adapter.flag_schema(),
                     managed=managed,
@@ -506,6 +507,7 @@ def describe_engines() -> list[EngineDescriptor]:
             EngineDescriptor(
                 engine=kind,
                 available=True,
+                modelFormats=list(adapter.model_formats),
                 binaryPath=str(found.path),
                 version=found.version,
                 origin=found.origin,

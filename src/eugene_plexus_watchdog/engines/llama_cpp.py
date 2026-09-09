@@ -23,6 +23,7 @@ from .._generated.models import (
     ConfigValueType,
     EngineKind,
     HostAccelerator,
+    ModelFormat,
     Os,
     RuntimeCapabilities,
     RuntimeSpec,
@@ -94,6 +95,12 @@ _CUDA_VARIANT_RE = re.compile(r"^win-cuda-(?P<major>\d+)\.(?P<minor>\d+)-(?P<arc
 class LlamaCppAdapter(EngineAdapter):
     kind = EngineKind.llama_cpp
     binary_name = "llama-server"
+
+    # GGUF only. A safetensors model in the library therefore has
+    # nowhere to run until the vLLM adapter lands at M4 — stated here
+    # rather than discovered by an operator whose launch button did
+    # nothing.
+    model_formats = (ModelFormat.gguf,)
 
     # --- discovery --------------------------------------------------------
 

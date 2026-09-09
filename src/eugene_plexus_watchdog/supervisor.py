@@ -137,6 +137,11 @@ _COMPONENT_SPECS: dict[ComponentKind, _ComponentSpec] = {
         env_prefix="EUGENE_PLEXUS_DRIVER",
         log_label="driver",
     ),
+    ComponentKind.library: _ComponentSpec(
+        module="eugene_plexus_library",
+        env_prefix="EUGENE_PLEXUS_LIBRARY",
+        log_label="library",
+    ),
 }
 
 
