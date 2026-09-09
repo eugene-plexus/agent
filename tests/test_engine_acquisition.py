@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from eugene_plexus_watchdog._generated.models import (
+from eugene_plexus_agent._generated.models import (
     Accelerator,
     Arch,
     EngineKind,
@@ -25,8 +25,8 @@ from eugene_plexus_watchdog._generated.models import (
     Os,
     State,
 )
-from eugene_plexus_watchdog.engines import acquisition as acq
-from eugene_plexus_watchdog.engines.acquisition import (
+from eugene_plexus_agent.engines import acquisition as acq
+from eugene_plexus_agent.engines.acquisition import (
     AcquisitionError,
     EngineInstaller,
     ManagedStore,
@@ -34,7 +34,7 @@ from eugene_plexus_watchdog.engines.acquisition import (
     ReleaseAsset,
     Unavailable,
 )
-from eugene_plexus_watchdog.engines.llama_cpp import LlamaCppAdapter
+from eugene_plexus_agent.engines.llama_cpp import LlamaCppAdapter
 
 # --------------------------------------------------------------------------- #
 # A real release, trimmed. Names and the two-asset CUDA shape are verbatim.

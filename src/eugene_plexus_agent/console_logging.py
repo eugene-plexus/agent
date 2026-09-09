@@ -1,8 +1,8 @@
-"""Console capture: mirror watchdog stdout/stderr to a rotating log file.
+"""Console capture: mirror agent stdout/stderr to a rotating log file.
 
-The watchdog process is the single point where every supervised body
+The agent process is the single point where every supervised body
 component's output flows through (via `supervisor.SupervisedProcess.
-_pipe_child_output`), alongside the watchdog's own uvicorn logs. That
+_pipe_child_output`), alongside the agent's own uvicorn logs. That
 combined stream is by far the most useful diagnostic surface — but
 in an interactive terminal it scrolls off, and operators can't share
 it with bug reports unless they remembered to redirect output at
@@ -17,8 +17,8 @@ stripped so it renders cleanly in any text editor or Slack paste.
 
 Defaults are hardcoded and require no operator action:
 
-  - Path: `<config_file dir>/logs/watchdog.log`
-    (i.e. next to `watchdog.yaml`, wherever the operator chose to put it)
+  - Path: `<config_file dir>/logs/agent.log`
+    (i.e. next to `agent.yaml`, wherever the operator chose to put it)
   - 10 MB per file, 5 backups (50 MB max disk per stream)
 
 Tuning these would mean adding fields to the config_store + UI controls
@@ -107,17 +107,17 @@ def install_console_capture(
     log file under `log_dir`. Returns the resolved log file path.
 
     Idempotent: a second call within the same process is a no-op so
-    test fixtures that import the watchdog module repeatedly don't
+    test fixtures that import the agent module repeatedly don't
     stack handlers. Call as early as possible in main() — anything
     that writes to stdout before this runs is missed in the file copy.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "watchdog.log"
+    log_path = log_dir / "agent.log"
 
     # Dedicated logger — not propagated to root, so unrelated library
     # calls don't accidentally leak into the file copy, and the file
     # copy doesn't double-echo to anything attached to root.
-    capture = logging.getLogger("eugene_plexus_watchdog._console_capture")
+    capture = logging.getLogger("eugene_plexus_agent._console_capture")
     capture.propagate = False
     if any(isinstance(h, RotatingFileHandler) for h in capture.handlers):
         return log_path

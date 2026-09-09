@@ -23,7 +23,7 @@ Service-token verification is a separate dependency
     token. Mutating topology routes stay operator-only. (v0.2.1: before
     this, the whole `/v1/components` router was operator-only, so every
     peer auto-resolve silently fell back to localhost defaults —
-    project_watchdog_components_auth_mismatch.)
+    project_agent_components_auth_mismatch.)
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from . import security
 from ._generated.common_models import Problem
 from .auth_state import AuthState
-from .state import WatchdogState
+from .state import AgentState
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -44,20 +44,20 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail=Problem(
-            type=f"https://github.com/eugene-plexus/watchdog#{title.replace(' ', '-').lower()}",
+            type=f"https://github.com/eugene-plexus/agent#{title.replace(' ', '-').lower()}",
             title=title,
             status=status_code,
             detail=detail,
-            component="watchdog",
+            component="agent",
         ).model_dump(exclude_none=True),
     )
 
 
-def require_initialized(request: Request) -> WatchdogState:
-    """Returns the watchdog state, ONLY if the operator has set a
+def require_initialized(request: Request) -> AgentState:
+    """Returns the agent state, ONLY if the operator has set a
     passphrase. Otherwise short-circuits with 503 directing the
     wizard to call POST /v1/auth/initialize first."""
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     if not state.has_passphrase():
         raise _problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -163,7 +163,7 @@ def require_service_token(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> security.TokenPayload:
     """Validate a service-audience bearer token. Used by future
-    operator-internal endpoints. Not applied to any v0.2 watchdog
+    operator-internal endpoints. Not applied to any v0.2 agent
     route yet — defined here so other components can mirror the
     shape when they wire their own auth in."""
     if creds is None or not creds.credentials:

@@ -1,4 +1,4 @@
-"""Pytest fixtures shared across the watchdog test suite.
+"""Pytest fixtures shared across the agent test suite.
 
 Tests run with a no-op stub supervisor injected on `app.state.supervisor`
 so the routes layer's spawn / restart / stop calls become observable
@@ -24,16 +24,16 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_watchdog._generated.models import (
+from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentStatus,
     Runtime,
     RuntimeSpec,
     RuntimeStatus,
 )
-from eugene_plexus_watchdog.app import create_app
-from eugene_plexus_watchdog.runtimes import RuntimeSupervisor
-from eugene_plexus_watchdog.settings import Settings
+from eugene_plexus_agent.app import create_app
+from eugene_plexus_agent.runtimes import RuntimeSupervisor
+from eugene_plexus_agent.settings import Settings
 
 TEST_PASSPHRASE = "correct horse battery staple"
 
@@ -132,7 +132,7 @@ class StubRuntimeSupervisor(RuntimeSupervisor):
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(config_file=tmp_path / "watchdog.yaml")
+    return Settings(config_file=tmp_path / "agent.yaml")
 
 
 @pytest.fixture

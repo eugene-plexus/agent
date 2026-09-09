@@ -1,6 +1,6 @@
 """Cross-platform orphan-prevention for supervised children.
 
-Without this, hard-killing the watchdog (SIGKILL on POSIX,
+Without this, hard-killing the agent (SIGKILL on POSIX,
 TerminateProcess on Windows, OS crash, power loss) leaves spawned
 children orphaned. They keep running until manually terminated, which
 on a personal-use install is at best annoying (port still bound) and
@@ -13,11 +13,11 @@ Two approaches, picked per-platform:
   child whenever its parent dies, regardless of how. Implemented via
   `ctypes` to avoid pulling in a third-party prctl wrapper.
 
-- **Windows**: the watchdog creates a Job Object with the
+- **Windows**: the agent creates a Job Object with the
   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` flag and assigns each spawned
-  child to it. When the watchdog process exits (any way), the kernel
+  child to it. When the agent process exits (any way), the kernel
   closes the job handle, which kills every assigned child. This
-  generalizes cleanly to "the watchdog is the root of a process tree
+  generalizes cleanly to "the agent is the root of a process tree
   the OS will tear down for us."
 
 - **macOS**: macOS has no direct equivalent of pdeathsig. We could use
@@ -52,7 +52,7 @@ def linux_pdeathsig_preexec() -> None:
 
     Runs in the forked child between fork() and exec(). Registers
     PR_SET_PDEATHSIG so the kernel sends SIGTERM to this child if its
-    parent (the watchdog) dies. Best-effort: prctl failures are logged
+    parent (the agent) dies. Best-effort: prctl failures are logged
     but don't block the spawn.
     """
     try:
@@ -68,8 +68,8 @@ def linux_pdeathsig_preexec() -> None:
 class WindowsJobObject:
     """Wraps a Windows Job Object configured to kill its members on close.
 
-    The watchdog creates one of these at startup and assigns every
-    spawned child to it. When the watchdog process exits (graceful,
+    The agent creates one of these at startup and assigns every
+    spawned child to it. When the agent process exits (graceful,
     crash, hard kill, OS reboot — any reason), the kernel closes the
     last reference to the job handle, which triggers KILL_ON_JOB_CLOSE
     and reaps every child.
@@ -227,7 +227,7 @@ def kwargs_for_platform() -> dict[str, Any]:
 
 def is_orphan_kill_supported() -> bool:
     """True if we expect children to be reaped automatically when the
-    watchdog dies hard. Useful for log lines and the operator-facing
+    agent dies hard. Useful for log lines and the operator-facing
     docs that explain the v0.1 behavior."""
     if sys.platform.startswith("linux"):
         return True
@@ -236,7 +236,7 @@ def is_orphan_kill_supported() -> bool:
     return False
 
 
-# Module-level singleton: created once when the watchdog process boots.
+# Module-level singleton: created once when the agent process boots.
 # `Supervisor` reaches into this for the assign-pid call after each
 # spawn. None on non-Windows or when init failed.
 _windows_job: WindowsJobObject | None = None

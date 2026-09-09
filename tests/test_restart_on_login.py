@@ -1,7 +1,7 @@
 """Tests for Phase 7 — restart-on-login signal.
 
 When the operator unlocks the install (initialize on first run, or
-login on a fresh process), the watchdog's AuthState gains the master
+login on a fresh process), the agent's AuthState gains the master
 key. Children spawned BEFORE that moment ran without MASTER_KEY in
 their env — they can read but not decrypt the at-rest envelopes on
 disk. Phase 7 closes that gap by asking the supervisor to respawn
@@ -22,13 +22,13 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_watchdog._generated.models import (
+from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentKind,
     SpawnConfig,
 )
-from eugene_plexus_watchdog.auth_state import AuthState
-from eugene_plexus_watchdog.supervisor import Supervisor
+from eugene_plexus_agent.auth_state import AuthState
+from eugene_plexus_agent.supervisor import Supervisor
 from tests.conftest import TEST_PASSPHRASE, StubSupervisor
 
 # --------------------------------------------------------------------------- #
@@ -82,7 +82,7 @@ def test_login_after_fresh_process_signals_restart_all(
     process run must trigger restart_all."""
     from fastapi.testclient import TestClient as Client
 
-    from eugene_plexus_watchdog.app import create_app
+    from eugene_plexus_agent.app import create_app
 
     # First app run: set the passphrase. This populates the disk state.
     first_app = create_app(settings=settings)  # type: ignore[arg-type]
@@ -270,7 +270,7 @@ async def test_respawn_after_master_key_set_includes_master_key_env_var(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    from eugene_plexus_watchdog import security
+    from eugene_plexus_agent import security
 
     auth = AuthState(signing_key=security.generate_signing_key())
     sup = Supervisor(log=logging.getLogger("test"), auth_state=auth)

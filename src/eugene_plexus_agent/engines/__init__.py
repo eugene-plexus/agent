@@ -1,4 +1,4 @@
-"""Engine adapters: the registry of engines this watchdog can start.
+"""Engine adapters: the registry of engines this agent can start.
 
 `EngineKind` is a closed enum in the contract for exactly this reason —
 an engine is supported when an adapter exists here and not otherwise, so
@@ -28,7 +28,7 @@ def adapter_for(kind: EngineKind) -> EngineAdapter | None:
     """The adapter for one engine kind, or None if unsupported here.
 
     None is possible even though `EngineKind` is closed: a topology
-    written by a newer watchdog can name a kind this build doesn't
+    written by a newer agent can name a kind this build doesn't
     implement.
     """
     return ADAPTERS.get(kind)

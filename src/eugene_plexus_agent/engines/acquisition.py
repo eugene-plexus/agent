@@ -220,7 +220,7 @@ class GitHubReleases:
             url,
             headers={
                 "Accept": "application/vnd.github+json",
-                "User-Agent": "eugene-plexus-watchdog",
+                "User-Agent": "eugene-plexus-agent",
             },
         )
         with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
@@ -507,7 +507,7 @@ class EngineInstaller:
 
 
 def _download(asset: ReleaseAsset, target: Path, progress: _Progress) -> None:
-    request = urllib.request.Request(asset.url, headers={"User-Agent": "eugene-plexus-watchdog"})
+    request = urllib.request.Request(asset.url, headers={"User-Agent": "eugene-plexus-agent"})
     try:
         with (
             urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response,
@@ -616,7 +616,7 @@ def engine_root() -> Path:
     Overridable for tests and for operators who keep this project off their
     home volume — half a gigabyte per Windows CUDA build, retained twice.
     """
-    override = os.environ.get("EUGENE_PLEXUS_WATCHDOG_ENGINE_ROOT")
+    override = os.environ.get("EUGENE_PLEXUS_AGENT_ENGINE_ROOT")
     return Path(override).expanduser() if override else DEFAULT_ENGINE_ROOT
 
 

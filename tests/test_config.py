@@ -9,7 +9,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
     response = authed_client.get("/v1/config/schema")
     assert response.status_code == 200
     body = response.json()
-    assert body["component"] == "watchdog"
+    assert body["component"] == "agent"
     keys = {f["key"] for f in body["fields"]}
     assert keys == {"firstRunComplete", "securityMode", "uiTheme", "uiFontSize"}
 
@@ -29,7 +29,7 @@ def test_patch_config_applies_valid_change(authed_client: TestClient) -> None:
     body = response.json()
     assert "uiTheme" in body["applied"]
     assert body["rejected"] == []
-    # Watchdog config never requires restart in v0.1 — UI prefs can apply live.
+    # Agent config never requires restart in v0.1 — UI prefs can apply live.
     assert body["requiresRestart"] is False
 
     follow = authed_client.get("/v1/config")

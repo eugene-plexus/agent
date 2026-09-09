@@ -1,6 +1,6 @@
-"""File-backed state for the watchdog: UI prefs + topology, one YAML file.
+"""File-backed state for the agent: UI prefs + topology, one YAML file.
 
-Owns the persistent contents of `watchdog.yaml`. Two facades read through
+Owns the persistent contents of `agent.yaml`. Two facades read through
 this — `ConfigStore` (the standard config trio for UI prefs +
 firstRunComplete) and `TopologyStore` (the components list under
 `/v1/components`). Both share one lock and one on-disk file so concurrent
@@ -57,7 +57,7 @@ from ._generated.models import (
     RuntimeSpec,
 )
 
-# Port range the watchdog assigns engine runtimes from when the operator
+# Port range the agent assigns engine runtimes from when the operator
 # doesn't pick one. Above the component ports (8079-8083) and clear of the
 # usual ephemeral range, so an assigned port doesn't collide with an
 # outbound socket the OS handed out.
@@ -82,7 +82,7 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="securityMode",
         label="Security mode",
         description=(
-            "How the watchdog handles its master encryption key "
+            "How the agent handles its master encryption key "
             "between restarts. Set during the wizard, editable later. "
             "'Prompt on startup' keeps the master key in process "
             "memory only (passphrase required every restart). "
@@ -131,8 +131,8 @@ def _config_defaults() -> dict[str, Any]:
     return {f.key: f.default for f in CONFIG_FIELDS if f.default is not None}
 
 
-class WatchdogState:
-    """Threadsafe owner of `watchdog.yaml`. Single lock, single file write.
+class AgentState:
+    """Threadsafe owner of `agent.yaml`. Single lock, single file write.
 
     Holds three things:
       * The flat config dict exposed via `/v1/config` (`firstRunComplete`,
@@ -150,10 +150,10 @@ class WatchdogState:
         self._components: dict[str, ComponentEntry] = {}
         # Engine runtimes, persisted under `runtimes:`. Kept separate from
         # `components` because a third-party binary shares none of a
-        # component's declarative shape — see the watchdog spec's
+        # component's declarative shape — see the agent spec's
         # components-vs-runtimes table.
         self._runtimes: dict[str, RuntimeSpec] = {}
-        # v0.2 auth block. Persisted to disk under `auth:` in watchdog.yaml.
+        # v0.2 auth block. Persisted to disk under `auth:` in agent.yaml.
         # passphraseHash: Argon2id-PHC string (verifiable, not reversible)
         # masterSalt:     base64-encoded 16-byte salt used to derive the
         #                 master key from the passphrase via Argon2id raw.
@@ -230,7 +230,7 @@ class WatchdogState:
 
     def as_config_schema(self) -> ConfigSchema:
         return ConfigSchema(
-            component="watchdog",
+            component="agent",
             fields=list(CONFIG_FIELDS),
             categories=CATEGORY_LABELS,
         )
@@ -242,7 +242,7 @@ class WatchdogState:
     # ----- topology ---------------------------------------------------
     #
     # `list_topology_entries` returns the declarative half — what the
-    # operator wrote in `watchdog.yaml`. The routes layer combines this
+    # operator wrote in `agent.yaml`. The routes layer combines this
     # with live state from the Supervisor (status, pid, lastRestart,
     # lastError) to produce the full `Component` view.
 
@@ -434,7 +434,7 @@ class WatchdogState:
 def _to_component(entry: ComponentEntry) -> Component:
     """Compose a Component from a topology entry, with placeholder status.
 
-    Used by the legacy `WatchdogState.list_components` etc. methods —
+    Used by the legacy `AgentState.list_components` etc. methods —
     when no Supervisor is available the status is hard-coded to
     `unreachable`. The routes layer overrides this with live state from
     the Supervisor when one is wired up."""
@@ -463,4 +463,4 @@ def _validate(field: ConfigField, value: Any) -> str | None:
         if value not in allowed:
             return f"must be one of {allowed}"
         return None
-    return f"unsupported valueType for watchdog config: {vt}"
+    return f"unsupported valueType for agent config: {vt}"

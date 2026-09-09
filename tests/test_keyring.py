@@ -34,10 +34,10 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from eugene_plexus_watchdog import keyring_store, security
-from eugene_plexus_watchdog.app import create_app
-from eugene_plexus_watchdog.auth_state import AuthState
-from eugene_plexus_watchdog.settings import Settings
+from eugene_plexus_agent import keyring_store, security
+from eugene_plexus_agent.app import create_app
+from eugene_plexus_agent.auth_state import AuthState
+from eugene_plexus_agent.settings import Settings
 from tests.conftest import TEST_PASSPHRASE, StubSupervisor
 
 # --------------------------------------------------------------------------- #
@@ -150,9 +150,9 @@ def test_keyring_store_get_handles_wrong_length(fake_keyring: _FakeKeyring) -> N
 
 
 def _seed_install(tmp_path: Path, *, security_mode: str) -> tuple[Settings, bytes]:
-    """Build a watchdog.yaml with a passphrase set + the operator's
+    """Build a agent.yaml with a passphrase set + the operator's
     chosen securityMode. Returns (settings, derived_master_key)."""
-    settings = Settings(config_file=tmp_path / "watchdog.yaml")
+    settings = Settings(config_file=tmp_path / "agent.yaml")
     app1 = create_app(settings=settings)
     app1.state.supervisor = StubSupervisor()
     with TestClient(app1) as c:
@@ -162,7 +162,7 @@ def _seed_install(tmp_path: Path, *, security_mode: str) -> tuple[Settings, byte
         if security_mode != "prompt_on_startup":
             patch = c.patch("/v1/config", json={"securityMode": security_mode})
             assert patch.status_code == 200
-    salt_b64 = yaml.safe_load((tmp_path / "watchdog.yaml").read_text())["auth"]["masterSalt"]
+    salt_b64 = yaml.safe_load((tmp_path / "agent.yaml").read_text())["auth"]["masterSalt"]
     salt = base64.b64decode(salt_b64)
     return settings, security.derive_master_key(TEST_PASSPHRASE, salt)
 
@@ -228,9 +228,9 @@ def test_lifespan_no_auto_unlock_when_no_passphrase_set(
 ) -> None:
     """Pre-init install (no passphrase yet). The keyring check should
     be skipped entirely — there's no install to unlock."""
-    settings = Settings(config_file=tmp_path / "watchdog.yaml")
+    settings = Settings(config_file=tmp_path / "agent.yaml")
     # Pre-seed a key as if from an earlier install (operator wiped
-    # watchdog.yaml but forgot to clear the keyring).
+    # agent.yaml but forgot to clear the keyring).
     isolated_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
         b"\x33" * 32
     ).decode("ascii")
@@ -254,15 +254,15 @@ def test_initialize_persists_master_key_when_in_keyring_mode(
     """First-run flow: wizard's initialize call should write the master
     key to the OS keyring IF the operator opted into os_keyring mode
     before initializing. The default mode is prompt_on_startup, so
-    this test forces the mode via direct WatchdogState manipulation."""
-    settings = Settings(config_file=tmp_path / "watchdog.yaml")
+    this test forces the mode via direct AgentState manipulation."""
+    settings = Settings(config_file=tmp_path / "agent.yaml")
     app = create_app(settings=settings)
     app.state.supervisor = StubSupervisor()
     # Pre-set securityMode in the on-disk YAML so initialize sees it.
     # Direct dict manipulation rather than going through PATCH is fine —
     # the wizard's actual order is set-mode-then-initialize in some
     # designs and initialize-then-set-mode in others.
-    config_path = tmp_path / "watchdog.yaml"
+    config_path = tmp_path / "agent.yaml"
     config_path.write_text(yaml.safe_dump({"securityMode": "os_keyring"}), encoding="utf-8")
 
     with TestClient(app) as c:
@@ -282,7 +282,7 @@ def test_login_persists_master_key_when_in_keyring_mode(
 
     # Same operator now flips into keyring mode. Don't persist on flip
     # (operator hasn't been asked to re-auth yet); next login does it.
-    config_path = tmp_path / "watchdog.yaml"
+    config_path = tmp_path / "agent.yaml"
     on_disk = yaml.safe_load(config_path.read_text())
     on_disk["securityMode"] = "os_keyring"
     config_path.write_text(yaml.safe_dump(on_disk), encoding="utf-8")

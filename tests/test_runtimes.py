@@ -13,13 +13,13 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_watchdog import security
-from eugene_plexus_watchdog._generated.models import RuntimeSpec, RuntimeStatus
-from eugene_plexus_watchdog.engines import LlamaCppAdapter
-from eugene_plexus_watchdog.engines.base import Loading, Ready
-from eugene_plexus_watchdog.runtimes import RuntimeSupervisor, _RuntimePlanner
-from eugene_plexus_watchdog.state import WatchdogState
-from eugene_plexus_watchdog.supervisor import ProcessState, SpawnPlanError
+from eugene_plexus_agent import security
+from eugene_plexus_agent._generated.models import RuntimeSpec, RuntimeStatus
+from eugene_plexus_agent.engines import LlamaCppAdapter
+from eugene_plexus_agent.engines.base import Loading, Ready
+from eugene_plexus_agent.runtimes import RuntimeSupervisor, _RuntimePlanner
+from eugene_plexus_agent.state import AgentState
+from eugene_plexus_agent.supervisor import ProcessState, SpawnPlanError
 
 from .conftest import StubRuntimeSupervisor
 
@@ -309,7 +309,7 @@ def test_runtimes_require_auth(client: TestClient) -> None:
 def test_runtimes_round_trip_through_the_yaml_file(
     authed_client: TestClient, settings: Any
 ) -> None:
-    """A runtime must survive a watchdog restart, and its assigned port
+    """A runtime must survive a agent restart, and its assigned port
     must survive with it — that port ends up in a driver's config, and a
     value that changed on every boot would be useless there."""
     created = authed_client.post(
@@ -317,7 +317,7 @@ def test_runtimes_round_trip_through_the_yaml_file(
         json=_runtime(flags={"contextSize": 8192}, env={"CUDA_VISIBLE_DEVICES": "1"}),
     ).json()
 
-    reloaded = WatchdogState(settings.config_file)
+    reloaded = AgentState(settings.config_file)
     reloaded.load()
     specs = reloaded.list_runtime_specs()
     assert [s.name for s in specs] == ["qwen3-30b"]

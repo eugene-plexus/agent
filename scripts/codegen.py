@@ -3,7 +3,7 @@
 Reads `SPECS_REF` (a single line: the git SHA of `eugene-plexus/specs`),
 downloads the OpenAPI tree at that SHA, and runs `datamodel-code-generator`
 to produce Pydantic v2 models under
-`src/eugene_plexus_watchdog/_generated/`.
+`src/eugene_plexus_agent/_generated/`.
 
 The generated files are committed to the repo so builds are reproducible
 without network access. CI re-runs this script and fails the build if the
@@ -27,19 +27,23 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SPECS_REF_FILE = REPO_ROOT / "SPECS_REF"
-GENERATED_DIR = REPO_ROOT / "src" / "eugene_plexus_watchdog" / "_generated"
+GENERATED_DIR = REPO_ROOT / "src" / "eugene_plexus_agent" / "_generated"
 WORKING_DIR = REPO_ROOT / ".codegen-cache"
 
 SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{ref}.tar.gz"
 
-# Two inputs: watchdog.yaml for our own schemas (Component, ComponentList,
+# Two inputs: the agent spec for our own schemas (Component, ComponentList,
 # etc.) and common.yaml for the shared protocol schemas (Health,
 # ConfigDocument, RestartResult, …). datamodel-code-generator follows
-# local $refs, but watchdog.yaml's references to common schemas live in
+# local $refs, but the agent spec's references to common schemas live in
 # the `paths` block (operation responses), not in its own
 # `components.schemas`, so the generator doesn't pull them in
 # transitively. Generating common.yaml directly fixes that.
 SPECS_TO_GENERATE = [
+    # NOTE: this path is a coordinate inside the SPECS_REF snapshot, not a
+    # name of a current thing. `openapi/watchdog.yaml` was renamed to
+    # `openapi/agent.yaml` in specs 76f9090; this pin predates that, so the
+    # old path is the correct one here. Move both together, never one.
     ("openapi/watchdog.yaml", "models.py"),
     ("openapi/components/common.yaml", "common_models.py"),
 ]

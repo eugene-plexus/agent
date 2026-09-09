@@ -15,7 +15,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from eugene_plexus_watchdog.console_logging import (
+from eugene_plexus_agent.console_logging import (
     _ANSI_SGR_RE,
     _TeeStream,
     install_console_capture,
@@ -77,14 +77,14 @@ def test_tee_buffers_partial_lines_until_newline(tmp_path: Path) -> None:
 
 def test_install_is_idempotent_within_a_process(tmp_path: Path) -> None:
     """A second `install_console_capture()` call must not stack a second
-    RotatingFileHandler — tests that import the watchdog package
+    RotatingFileHandler — tests that import the agent package
     multiple times shouldn't end up with N handlers writing N copies."""
     log_dir = tmp_path / "logs"
     first = install_console_capture(log_dir=log_dir)
     second = install_console_capture(log_dir=log_dir)
     assert first == second
 
-    capture = logging.getLogger("eugene_plexus_watchdog._console_capture")
+    capture = logging.getLogger("eugene_plexus_agent._console_capture")
     rotating = [h for h in capture.handlers if isinstance(h, RotatingFileHandler)]
     assert len(rotating) == 1, (
         f"expected one RotatingFileHandler, got {len(rotating)} — "

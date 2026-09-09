@@ -36,7 +36,7 @@ from .._generated.common_models import (
 )
 from ..auth_state import AuthState
 from ..dependencies import require_operator_session
-from ..state import WatchdogState
+from ..state import AgentState
 
 log = logging.getLogger(__name__)
 
@@ -56,11 +56,11 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail=Problem(
-            type=f"https://github.com/eugene-plexus/watchdog#{title.replace(' ', '-').lower()}",
+            type=f"https://github.com/eugene-plexus/agent#{title.replace(' ', '-').lower()}",
             title=title,
             status=status_code,
             detail=detail,
-            component="watchdog",
+            component="agent",
         ).model_dump(exclude_none=True),
     )
 
@@ -74,7 +74,7 @@ async def auth_status(request: Request) -> dict[str, bool]:
     login attempt. Returns one boolean only; no secrets, no per-IP
     behavior, no rate limit — safe to call on every page load.
     """
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     return {"initialized": state.has_passphrase()}
 
 
@@ -91,11 +91,11 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
     v0.3+, not this endpoint).
 
     On success: persists the Argon2id-PHC passphrase hash and master-key
-    salt to `watchdog.yaml`, derives the master key into memory, and
+    salt to `agent.yaml`, derives the master key into memory, and
     issues an operator session token so the wizard can continue without
     a separate login round-trip.
     """
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     auth: AuthState = request.app.state.auth_state
 
     if state.has_passphrase():
@@ -104,7 +104,7 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
             "Already initialized",
             "This install already has a passphrase set. Use the change-"
             "passphrase flow (planned v0.3) or reset the install by "
-            "removing watchdog.yaml's auth block by hand.",
+            "removing agent.yaml's auth block by hand.",
         )
 
     # Hash the passphrase (for verification on future logins) and
@@ -147,7 +147,7 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
 async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     """Verify the passphrase, issue a session token, and cache the
     derived master key. Rate-limited per source IP."""
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     auth: AuthState = request.app.state.auth_state
     remote = request.client.host if request.client else "unknown"
 
@@ -195,7 +195,7 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Corrupt auth state",
             "Passphrase hash present but master-key salt missing. Restore "
-            "watchdog.yaml from a known-good backup or re-initialize.",
+            "agent.yaml from a known-good backup or re-initialize.",
         )
     salt = base64.b64decode(salt_b64)
     had_master_key = auth.has_master_key()
@@ -228,7 +228,7 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     )
 
 
-def _persist_master_key_if_keyring_mode(state: WatchdogState, master_key: bytes) -> None:
+def _persist_master_key_if_keyring_mode(state: AgentState, master_key: bytes) -> None:
     """Save the master key to the OS keyring when the operator opted in.
 
     Best-effort: keyring write failures log a warning but don't block

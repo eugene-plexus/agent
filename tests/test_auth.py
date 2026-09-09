@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from eugene_plexus_watchdog import security
+from eugene_plexus_agent import security
 
 from .conftest import TEST_PASSPHRASE
 
@@ -75,7 +75,7 @@ def test_initialize_rejects_empty_passphrase(client: TestClient) -> None:
 
 def test_initialize_persists_passphrase_for_subsequent_login(client: TestClient) -> None:
     """The passphrase hash + master-key salt must round-trip to disk so
-    a watchdog restart (modelled here by a second login on the same
+    a agent restart (modelled here by a second login on the same
     state) verifies against the same hash."""
     client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     # Don't reuse the initialize-issued token; do a fresh login.
@@ -160,7 +160,7 @@ def test_bogus_token_rejected(client: TestClient) -> None:
 
 
 def test_token_signed_with_wrong_key_rejected(client: TestClient) -> None:
-    """A JWT signed with a key different from the watchdog's
+    """A JWT signed with a key different from the agent's
     in-memory signing key must fail signature verification."""
     client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     bogus, _ = security.issue_operator_token(signing_key=b"\x00" * 32)

@@ -1,24 +1,24 @@
-"""v0.2 security primitives for the watchdog.
+"""v0.2 security primitives for the agent.
 
-The watchdog is the install's trust root. This module owns:
+The agent is the install's trust root. This module owns:
 
   - **Passphrase verification** via Argon2id. The operator's passphrase
     set in the first-run wizard is hashed (Argon2id) and stored in
-    `watchdog.yaml`. Login compares against this hash.
+    `agent.yaml`. Login compares against this hash.
 
   - **Master-key derivation** via Argon2id raw mode. The same
     passphrase, with a separately-stored salt, deterministically
-    derives a 32-byte key the watchdog uses to encrypt sensitive
+    derives a 32-byte key the agent uses to encrypt sensitive
     config fields on each child component (libsodium secretbox).
     The master key NEVER lands on disk in plaintext — it lives in
     process memory after derivation, and (optionally) in the OS
     secret store when `securityMode == os_keyring`.
 
   - **Session token issuance + validation** via JWT-HS256. The
-    watchdog generates a per-restart signing key, distributes it to
+    agent generates a per-restart signing key, distributes it to
     spawned children via env var, and every component validates
     bearer tokens independently using the shared key. Restarting
-    the watchdog rotates signing keys which invalidates all
+    the agent rotates signing keys which invalidates all
     existing tokens — good-enough revocation for v0.2.
 
   - **Service token issuance** for component-internal calls.
@@ -29,7 +29,7 @@ The watchdog is the install's trust root. This module owns:
   - **At-rest envelope encryption** via libsodium secretbox.
     `seal()` produces `MasterKeyEnvelope` records; `open()` inverts.
     Used by children to encrypt apiKey-style fields on disk; the
-    watchdog itself doesn't store anything sensitive that needs
+    agent itself doesn't store anything sensitive that needs
     this (the master key is in memory, the passphrase hash isn't
     reversible).
 """
@@ -63,7 +63,7 @@ _ARGON2_HASH_LEN = 32  # bytes — drives the secretbox key length
 
 # JWT algorithm + lifetime. HS256 because the signing key is shared
 # with children that need to validate independently; asymmetric
-# would force every child to do a watchdog roundtrip or hold a
+# would force every child to do a agent roundtrip or hold a
 # public key, neither of which simplifies the v0.2 model.
 _JWT_ALG = "HS256"
 _DEFAULT_SESSION_TTL_SECONDS = 14 * 24 * 3600  # 14 days
@@ -117,7 +117,7 @@ def verify_passphrase(passphrase: str, stored_hash: str) -> bool:
 
 def generate_master_key_salt() -> bytes:
     """16 random bytes. Stored alongside the passphrase hash in
-    `watchdog.yaml` as base64. Per-install; persists across
+    `agent.yaml` as base64. Per-install; persists across
     restarts so the master key derived from the same passphrase is
     stable."""
     return secrets.token_bytes(16)
@@ -128,7 +128,7 @@ def derive_master_key(passphrase: str, salt: bytes) -> bytes:
 
     Same input always produces the same output, so the master key
     is recoverable from the operator's passphrase without anything
-    secret on disk. The watchdog runs this once at startup and
+    secret on disk. The agent runs this once at startup and
     holds the result in memory.
     """
     if not passphrase:
@@ -239,9 +239,9 @@ class TokenPayload:
 def generate_signing_key() -> bytes:
     """32 random bytes — used as the HMAC key for JWT signing.
 
-    The watchdog generates one of these at every startup and
+    The agent generates one of these at every startup and
     distributes it to children via env var. Restarting the
-    watchdog rotates the key, invalidating all existing tokens
+    agent rotates the key, invalidating all existing tokens
     (good-enough v0.2 revocation)."""
     return secrets.token_bytes(32)
 
@@ -282,9 +282,9 @@ def issue_service_token(
 
     Threaded via env var to spawned children. Lifetime defaults to
     one year — long enough that a child can run without forced
-    re-auth, short enough that a leaked one expires. Watchdog
+    re-auth, short enough that a leaked one expires. Agent
     restart rotates the signing key anyway, so the effective
-    lifetime is bounded by watchdog uptime.
+    lifetime is bounded by agent uptime.
 
     The `kind` is the component class (`gateway`, `inference-driver`).
     Encoded as `aud: "service:<kind>"` so components can additionally

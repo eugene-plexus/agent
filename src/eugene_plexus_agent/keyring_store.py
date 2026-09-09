@@ -1,6 +1,6 @@
 """Thin wrapper around the `keyring` library for OS-managed secret storage.
 
-Used only when `securityMode == "os_keyring"`. The watchdog stores the
+Used only when `securityMode == "os_keyring"`. The agent stores the
 derived master key under (`service`, `username`) so a power outage or
 service restart auto-recovers without the operator re-typing the
 passphrase. The OS-level boundary on that store is whatever the
@@ -14,7 +14,7 @@ underlying backend provides:
 The library auto-selects the highest-priority available backend; on
 headless Linux without an unlocked secret service the active backend
 becomes a `fail` one. Every call here is wrapped in a broad except
-so a missing/locked backend never crashes the watchdog — the
+so a missing/locked backend never crashes the agent — the
 operator just falls through to the passphrase-prompt path.
 
 Storage shape: master key is 32 random bytes (derived via Argon2id);
@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 # Service name shown in the OS keyring UI (Credential Manager / Keychain
 # / Secret Service). Stable across installs of the same machine so an
 # operator can recognize what's storing the key.
-SERVICE = "eugene-plexus-watchdog"
+SERVICE = "eugene-plexus-agent"
 
 # Username slot under that service. v0.2 is single-operator; v0.3+
 # multi-operator would shift to per-operator usernames here.

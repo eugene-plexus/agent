@@ -1,4 +1,4 @@
-"""Standard config trio for the watchdog: UI prefs + firstRunComplete only.
+"""Standard config trio for the agent: UI prefs + firstRunComplete only.
 
 Topology lives under /v1/components, deliberately NOT here — editing UI
 prefs in the generic config editor must never accidentally restructure
@@ -22,7 +22,7 @@ from .._generated.common_models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
 )
-from ..state import WatchdogState
+from ..state import AgentState
 
 log = logging.getLogger(__name__)
 
@@ -31,13 +31,13 @@ router = APIRouter(tags=["config"])
 
 @router.get("/v1/config", response_model=ConfigDocument)
 async def get_config(request: Request) -> ConfigDocument:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     return state.as_config_document()
 
 
 @router.get("/v1/config/schema", response_model=ConfigSchema)
 async def get_config_schema(request: Request) -> ConfigSchema:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     return state.as_config_schema()
 
 
@@ -46,7 +46,7 @@ async def test_config(
     request: Request,
     body: ConfigTestRequest | None = None,
 ) -> ConfigTestResult:
-    """Probe the watchdog's effective config without committing.
+    """Probe the agent's effective config without committing.
 
     Most config fields here (UI prefs, firstRunComplete) have no
     external dependency to verify, so they always succeed. The
@@ -62,7 +62,7 @@ async def test_config(
     `securityMode` override; other fields are no-ops.
     """
     start = time.perf_counter()
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     overrides: dict[str, Any] = (
         body.overrides.model_dump() if body is not None and body.overrides is not None else {}
     )
@@ -83,7 +83,7 @@ async def test_config(
             elapsed_ms = int((time.perf_counter() - start) * 1000)
             return ConfigTestResult(
                 ok=False,
-                component="watchdog",
+                component="agent",
                 latencyMs=elapsed_ms,
                 error=(
                     f"OS keyring probe raised {type(e).__name__}: {e}. "
@@ -97,7 +97,7 @@ async def test_config(
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         return ConfigTestResult(
             ok=True,
-            component="watchdog",
+            component="agent",
             latencyMs=elapsed_ms,
             summary=(
                 "OS keyring backend is reachable. Auto-unlock will work "
@@ -110,7 +110,7 @@ async def test_config(
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     return ConfigTestResult(
         ok=True,
-        component="watchdog",
+        component="agent",
         latencyMs=elapsed_ms,
         summary=(
             f"securityMode={effective_mode}; no external dependency to "
@@ -122,7 +122,7 @@ async def test_config(
 
 @router.patch("/v1/config", response_model=ConfigUpdateResult)
 async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpdateResult:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
 
     # Snapshot the prior securityMode so we can react to a transition.
     # The keyring side-effects (write on flip to os_keyring, delete on

@@ -1,6 +1,6 @@
 """End-to-end runtime supervision against a real subprocess.
 
-This is M0's watchdog acceptance test: a runtime is declared, the
+This is M0's agent acceptance test: a runtime is declared, the
 supervisor spawns an actual process, the adapter's real `/health` probe
 watches it, and `GET /v1/runtimes` reports `loading` and then `ready`.
 
@@ -26,10 +26,10 @@ from typing import Any
 
 import pytest
 
-from eugene_plexus_watchdog._generated.models import Origin, RuntimeSpec, RuntimeStatus
-from eugene_plexus_watchdog.engines.base import DiscoveredBinary
-from eugene_plexus_watchdog.engines.llama_cpp import LlamaCppAdapter
-from eugene_plexus_watchdog.runtimes import RuntimeSupervisor
+from eugene_plexus_agent._generated.models import Origin, RuntimeSpec, RuntimeStatus
+from eugene_plexus_agent.engines.base import DiscoveredBinary
+from eugene_plexus_agent.engines.llama_cpp import LlamaCppAdapter
+from eugene_plexus_agent.runtimes import RuntimeSupervisor
 
 # A minimal llama-server impersonator. Reports `loading model` for its
 # first few polls, then `ok` — so the test observes the real transition
@@ -154,7 +154,7 @@ async def _await_status(
 
 
 async def test_runtime_goes_starting_then_loading_then_ready(fake_engine: Path) -> None:
-    """The M0 chain for the watchdog: declare, spawn, observe.
+    """The M0 chain for the agent: declare, spawn, observe.
 
     Asserts the `loading` state is actually reached rather than skipped,
     because that distinction is the reason readiness is per-engine — an
@@ -167,7 +167,7 @@ async def test_runtime_goes_starting_then_loading_then_ready(fake_engine: Path) 
     adapter = _FakeEngineAdapter(fake_engine, ready_after=3.0)
 
     # Point the registry at the stand-in for the duration of the test.
-    from eugene_plexus_watchdog import runtimes as runtimes_module
+    from eugene_plexus_agent import runtimes as runtimes_module
 
     original = runtimes_module.ADAPTERS.copy()
     runtimes_module.ADAPTERS[spec.engine] = adapter
@@ -212,7 +212,7 @@ async def test_stop_releases_the_process(fake_engine: Path) -> None:
     supervisor = RuntimeSupervisor(log=logging.getLogger("test"))
     adapter = _FakeEngineAdapter(fake_engine, ready_after=0.0)
 
-    from eugene_plexus_watchdog import runtimes as runtimes_module
+    from eugene_plexus_agent import runtimes as runtimes_module
 
     original = runtimes_module.ADAPTERS.copy()
     runtimes_module.ADAPTERS[spec.engine] = adapter

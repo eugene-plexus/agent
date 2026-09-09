@@ -1,6 +1,6 @@
 """Topology endpoints: /v1/components and /v1/components/{name}.
 
-Combines the declarative topology (from `WatchdogState`) with live state
+Combines the declarative topology (from `AgentState`) with live state
 from the `Supervisor` (status, pid, lastRestart, lastError) at request
 time. Topology mutations through PATCH/POST/DELETE keep the supervisor
 in sync — adding a component spawns it, removing one stops it,
@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import Component, ComponentEntry, ComponentList, ComponentStatus
 from ..dependencies import require_operator_or_service, require_operator_session
-from ..state import WatchdogState
+from ..state import AgentState
 from ..supervisor import Supervisor
 
 router = APIRouter(tags=["components"])
@@ -31,11 +31,11 @@ def _not_found(name: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=Problem(
-            type="https://github.com/eugene-plexus/watchdog#component-not-found",
+            type="https://github.com/eugene-plexus/agent#component-not-found",
             title="Component not found",
             status=404,
             detail=f"No component named {name!r} in the topology.",
-            component="watchdog",
+            component="agent",
         ).model_dump(exclude_none=True),
     )
 
@@ -44,11 +44,11 @@ def _name_conflict(name: str) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail=Problem(
-            type="https://github.com/eugene-plexus/watchdog#component-name-conflict",
+            type="https://github.com/eugene-plexus/agent#component-name-conflict",
             title="Name already in use",
             status=409,
             detail=f"Component {name!r} already exists.",
-            component="watchdog",
+            component="agent",
         ).model_dump(exclude_none=True),
     )
 
@@ -85,7 +85,7 @@ def _supervisor(request: Request) -> Supervisor | None:
 
 @router.get("/v1/components", response_model=ComponentList, dependencies=_read_auth)
 async def list_components(request: Request) -> ComponentList:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     return ComponentList(
         components=[_compose(e, supervisor) for e in state.list_topology_entries()],
@@ -94,7 +94,7 @@ async def list_components(request: Request) -> ComponentList:
 
 @router.post("/v1/components", response_model=Component, status_code=201, dependencies=_write_auth)
 async def create_component(request: Request, body: ComponentEntry) -> Component:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     try:
         entry = state.add_topology_entry(body)
@@ -107,7 +107,7 @@ async def create_component(request: Request, body: ComponentEntry) -> Component:
 
 @router.get("/v1/components/{name}", response_model=Component, dependencies=_read_auth)
 async def get_component(request: Request, name: str) -> Component:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     entry = state.get_topology_entry(name)
     if entry is None:
         raise _not_found(name)
@@ -116,7 +116,7 @@ async def get_component(request: Request, name: str) -> Component:
 
 @router.patch("/v1/components/{name}", response_model=Component, dependencies=_write_auth)
 async def update_component(request: Request, name: str, body: ComponentEntry) -> Component:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     try:
         updated = state.update_topology_entry(name, body)
@@ -139,7 +139,7 @@ async def update_component(request: Request, name: str, body: ComponentEntry) ->
 
 @router.delete("/v1/components/{name}", status_code=204, dependencies=_write_auth)
 async def delete_component(request: Request, name: str) -> Response:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     if not state.remove_topology_entry(name):
         raise _not_found(name)
@@ -155,25 +155,25 @@ async def delete_component(request: Request, name: str) -> Response:
     dependencies=_write_auth,
 )
 async def restart_component(request: Request, name: str) -> RestartResult:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     entry = state.get_topology_entry(name)
     if entry is None:
         raise _not_found(name)
-    # Remote components have no spawn lifecycle the watchdog can act on.
+    # Remote components have no spawn lifecycle the agent can act on.
     # Per the spec: 409 Conflict.
     if entry.spawn is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=Problem(
-                type="https://github.com/eugene-plexus/watchdog#cannot-restart-remote",
+                type="https://github.com/eugene-plexus/agent#cannot-restart-remote",
                 title="Cannot restart remote component",
                 status=409,
                 detail=(
                     f"Component {name!r} is remote (no spawn block); the "
-                    "watchdog cannot restart what it does not own."
+                    "agent cannot restart what it does not own."
                 ),
-                component="watchdog",
+                component="agent",
             ).model_dump(exclude_none=True),
         )
     if supervisor is None:
@@ -182,7 +182,7 @@ async def restart_component(request: Request, name: str) -> RestartResult:
         return RestartResult(
             scheduled=False,
             delayMs=0,
-            message="No supervisor is attached to this watchdog instance.",
+            message="No supervisor is attached to this agent instance.",
         )
     restarted = await supervisor.restart(name)
     if not restarted:

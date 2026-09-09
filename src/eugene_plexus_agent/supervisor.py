@@ -1,10 +1,10 @@
 """Subprocess supervisor for Eugene Plexus.
 
-Spawns child processes per the topology in `watchdog.yaml`, threads the
+Spawns child processes per the topology in `agent.yaml`, threads the
 right env vars through (config-file path, bind port parsed from the
 component's URL, safe-mode flag), and respawns any child that exits.
 
-Supervising things it does not own is the watchdog's whole reason to
+Supervising things it does not own is the agent's whole reason to
 exist, and it covers two kinds of child. **Components** are Eugene
 Plexus processes — the gateway, the drivers — spawned as
 `sys.executable -m <module>` from `_COMPONENT_SPECS`. **Runtimes** are
@@ -48,7 +48,7 @@ from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 from .auth_state import AuthState
 
 # How long an exiting child gets to finish flushing before we SIGKILL it
-# during watchdog shutdown. Long enough for a /v1/admin/restart-style
+# during agent shutdown. Long enough for a /v1/admin/restart-style
 # response body to flush over loopback, short enough that a hung child
 # doesn't drag shutdown out for the operator.
 _TERM_TIMEOUT_SECONDS = 5.0
@@ -59,7 +59,7 @@ _TERM_TIMEOUT_SECONDS = 5.0
 # light enough not to drown the loopback in HTTP traffic.
 _HEALTH_POLL_SECONDS = 1.5
 
-# After how many consecutive crashes (non-zero exits) does the watchdog
+# After how many consecutive crashes (non-zero exits) does the agent
 # stop respawning a component? Without this, a misconfigured driver that
 # exits immediately would respawn-storm forever. Operator must POST to
 # /v1/components/<name>/restart to clear the crashed state.
@@ -109,10 +109,10 @@ def _colorize_alerts(text: str) -> str:
 class _ComponentSpec(NamedTuple):
     module: str
     """Spawned as `sys.executable -m <module>`, so components run under
-    whichever interpreter the watchdog itself is running. Production
+    whichever interpreter the agent itself is running. Production
     installs sharing one venv work out of the box; dev setups with
     per-component venvs must install every component into the
-    watchdog's venv (or a shared one) or the import fails at spawn."""
+    agent's venv (or a shared one) or the import fails at spawn."""
 
     env_prefix: str
     """Matches the component's own pydantic-settings `env_prefix`."""
@@ -182,7 +182,7 @@ class ProcessState(StrEnum):
 
     not_spawnable = "not_spawnable"
     """Nothing to launch — the declaration describes something this
-    watchdog does not own, so there is no process and no error."""
+    agent does not own, so there is no process and no error."""
 
 
 class SpawnPlanError(Exception):
@@ -208,7 +208,7 @@ class SpawnPlan:
     """Complete environment for the child, already merged."""
 
     cwd: str | None = None
-    """Working directory, or None to inherit the watchdog's."""
+    """Working directory, or None to inherit the agent's."""
 
     degraded: bool = False
     """True when this plan deliberately launches a reduced mode (a
@@ -302,7 +302,7 @@ class _ComponentPlanner:
         if spec is None:
             raise SpawnPlanError(
                 f"no spawn spec for kind {self.entry.kind.value!r} — either the "
-                f"topology names a retired component kind or this watchdog "
+                f"topology names a retired component kind or this agent "
                 f"predates it"
             )
 
@@ -506,7 +506,7 @@ class SupervisedProcess:
 
         Bytes are decoded with `errors="replace"` so a child that writes
         non-UTF-8 to stdout (rare but possible — a Windows native CRT
-        diagnostic, say) doesn't kill the reader and leave the watchdog
+        diagnostic, say) doesn't kill the reader and leave the agent
         deaf to subsequent output.
         """
         if stream is None:
@@ -530,7 +530,7 @@ class SupervisedProcess:
                 text = _colorize_alerts(text)
                 # Lines from `readline()` include the trailing newline;
                 # use `end=""` so we don't double it. flush=True keeps
-                # output snappy even when watchdog stdout is itself a pipe
+                # output snappy even when agent stdout is itself a pipe
                 # (e.g. running under a VS Code task with output capture).
                 print(prefix + text, end="", flush=True)
         except asyncio.CancelledError:
@@ -538,7 +538,7 @@ class SupervisedProcess:
         except Exception as e:
             # Never let a reader crash bring down the supervision loop;
             # the worst-case fallback is "we lose log prefixing for this
-            # child", which is strictly better than the watchdog dying.
+            # child", which is strictly better than the agent dying.
             self._log.warning("output-pipe reader for %s crashed: %s", self.name, e)
 
     async def _run(self) -> None:
@@ -598,7 +598,7 @@ class SupervisedProcess:
 
         try:
             # Pipe stdout + stderr through us so we can prefix every line
-            # with `[<name>]`. Without this the watchdog inherits the
+            # with `[<name>]`. Without this the agent inherits the
             # parent terminal and child output interleaves with no source
             # identification — making "Waiting for application startup"
             # ambiguous when several children are booting concurrently.
@@ -617,8 +617,8 @@ class SupervisedProcess:
             self._consecutive_crashes += 1
             return
 
-        # Windows: assign to the watchdog's Job Object so the OS reaps
-        # the child if the watchdog dies hard. POSIX uses preexec_fn
+        # Windows: assign to the agent's Job Object so the OS reaps
+        # the child if the agent dies hard. POSIX uses preexec_fn
         # (handled in kwargs above), no post-spawn step needed.
         win_job = orphan_kill.windows_job()
         if win_job is not None and self._proc.pid is not None:
@@ -631,7 +631,7 @@ class SupervisedProcess:
         self.last_error = None
 
         # Background reader: drains the child's stdout pipe and re-emits
-        # each line with a `[<name>]` prefix on the watchdog's own stdout.
+        # each line with a `[<name>]` prefix on the agent's own stdout.
         # MUST be running before we await proc.wait() or the child can
         # block writing into a full pipe buffer and never exit.
         reader_task = asyncio.create_task(
@@ -674,7 +674,7 @@ class SupervisedProcess:
 
 # How the supervision loop's kind-agnostic state reads on the component
 # wire enum. `not_spawnable` maps to `unreachable` because that is what a
-# component with nothing to launch has always reported — the watchdog can
+# component with nothing to launch has always reported — the agent can
 # see it or it cannot, and it does not own the process either way.
 _COMPONENT_STATUS_BY_STATE: dict[ProcessState, ComponentStatus] = {
     ProcessState.starting: ComponentStatus.starting,

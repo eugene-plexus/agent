@@ -1,9 +1,9 @@
 """Engine-runtime endpoints: /v1/engines and /v1/runtimes.
 
 Mirrors the shape of the components routes — declaration from
-`WatchdogState`, live state from the supervisor at request time — but
+`AgentState`, live state from the supervisor at request time — but
 against a separate collection, because an engine binary shares none of a
-component's declarative shape. See the watchdog spec's
+component's declarative shape. See the agent spec's
 components-vs-runtimes table.
 """
 
@@ -30,7 +30,7 @@ from ..runtimes import (
     plan_for,
     validate_spec,
 )
-from ..state import WatchdogState
+from ..state import AgentState
 
 router = APIRouter()
 
@@ -46,11 +46,11 @@ def _problem(*, code: int, slug: str, title: str, detail: str) -> HTTPException:
     return HTTPException(
         status_code=code,
         detail=Problem(
-            type=f"https://github.com/eugene-plexus/watchdog#{slug}",
+            type=f"https://github.com/eugene-plexus/agent#{slug}",
             title=title,
             status=code,
             detail=detail,
-            component="watchdog",
+            component="agent",
         ).model_dump(exclude_none=True),
     )
 
@@ -95,7 +95,7 @@ def _engine_kind(engine: str) -> EngineKind:
             slug="unknown-engine",
             title="Unknown engine",
             detail=(
-                f"{engine!r} is not an engine this watchdog implements. "
+                f"{engine!r} is not an engine this agent implements. "
                 f"GET /v1/engines lists what it does."
             ),
         ) from None
@@ -214,7 +214,7 @@ async def cancel_engine_install(engine: str) -> EngineInstall:
 
 @router.get("/v1/runtimes", response_model=RuntimeList, tags=["runtimes"], dependencies=_read_auth)
 async def list_runtimes(request: Request) -> RuntimeList:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     return RuntimeList(
         runtimes=[_compose(s, supervisor) for s in state.list_runtime_specs()],
@@ -229,7 +229,7 @@ async def list_runtimes(request: Request) -> RuntimeList:
     dependencies=_write_auth,
 )
 async def create_runtime(request: Request, body: RuntimeSpec) -> Runtime:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
 
     # Validate before persisting: a declaration that can only fail at
@@ -268,7 +268,7 @@ async def create_runtime(request: Request, body: RuntimeSpec) -> Runtime:
     "/v1/runtimes/{name}", response_model=Runtime, tags=["runtimes"], dependencies=_read_auth
 )
 async def get_runtime(request: Request, name: str) -> Runtime:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     spec = state.get_runtime_spec(name)
     if spec is None:
         raise _not_found(name)
@@ -279,7 +279,7 @@ async def get_runtime(request: Request, name: str) -> Runtime:
     "/v1/runtimes/{name}", response_model=Runtime, tags=["runtimes"], dependencies=_write_auth
 )
 async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runtime:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
 
     if (reason := validate_spec(body)) is not None:
@@ -320,7 +320,7 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
 
 @router.delete("/v1/runtimes/{name}", status_code=204, tags=["runtimes"], dependencies=_write_auth)
 async def delete_runtime(request: Request, name: str) -> Response:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     if supervisor is not None:
         await supervisor.remove_and_stop(name)
@@ -339,7 +339,7 @@ async def delete_runtime(request: Request, name: str) -> Response:
     dependencies=_write_auth,
 )
 async def restart_runtime(request: Request, name: str) -> RestartResult:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     spec = state.get_runtime_spec(name)
     if spec is None:
         raise _not_found(name)
@@ -367,7 +367,7 @@ async def restart_runtime(request: Request, name: str) -> RestartResult:
     dependencies=_write_auth,
 )
 async def stop_runtime(request: Request, name: str) -> RestartResult:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     if state.get_runtime_spec(name) is None:
         raise _not_found(name)
     supervisor = _supervisor(request)
@@ -391,7 +391,7 @@ async def stop_runtime(request: Request, name: str) -> RestartResult:
     dependencies=_write_auth,
 )
 async def start_runtime(request: Request, name: str) -> RestartResult:
-    state: WatchdogState = request.app.state.watchdog_state
+    state: AgentState = request.app.state.agent_state
     spec = state.get_runtime_spec(name)
     if spec is None:
         raise _not_found(name)

@@ -186,7 +186,7 @@ class EngineAdapter(abc.ABC):
         """Turn declared intent into a command line.
 
         `port` is passed in already resolved rather than read off the
-        spec, because the watchdog assigns one when the operator didn't
+        spec, because the agent assigns one when the operator didn't
         pick it — with N runtimes nobody should be handing out port
         numbers by hand.
         """

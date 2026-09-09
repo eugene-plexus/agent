@@ -15,17 +15,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="EUGENE_PLEXUS_WATCHDOG_",
+        env_prefix="EUGENE_PLEXUS_AGENT_",
         env_file=None,
         case_sensitive=False,
     )
 
-    config_file: Path = Path("watchdog.yaml")
+    config_file: Path = Path("agent.yaml")
     """Where the persistent state lives — UI prefs, firstRunComplete, and the
     components topology. Single file by deliberate choice; per the OpenClaw
     lesson, mistakes in one component's config can't wedge the whole Plexus
     because each body component owns its own separate file. This file is
-    only the watchdog's own state."""
+    only the agent's own state."""
 
     bind_host: str = "127.0.0.1"
     """Network interface to bind. Override to 0.0.0.0 for tailnet exposure."""
@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     safe_mode: bool = False
     """If true, skip loading the persistent state file at startup and run on
     built-in defaults — empty topology, default UI prefs. Provides a recovery
-    path when watchdog.yaml itself is malformed. PATCH /v1/config still
+    path when agent.yaml itself is malformed. PATCH /v1/config still
     writes to the on-disk file normally."""
 
 

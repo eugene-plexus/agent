@@ -21,15 +21,15 @@ from typing import Any
 
 import pytest
 
-from eugene_plexus_watchdog import security
-from eugene_plexus_watchdog._generated.models import (
+from eugene_plexus_agent import security
+from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentKind,
     ComponentStatus,
     SpawnConfig,
 )
-from eugene_plexus_watchdog.auth_state import AuthState
-from eugene_plexus_watchdog.supervisor import (
+from eugene_plexus_agent.auth_state import AuthState
+from eugene_plexus_agent.supervisor import (
     _COMPONENT_SPECS,
     _COMPONENT_STATUS_BY_STATE,
     _HEALTHZ_2XX_LINE,
@@ -220,13 +220,13 @@ async def test_remote_entry_does_not_spawn(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
     # A driver on a remote GPU host is the real instance of this case:
-    # it belongs next to its engine, so the watchdog watches it but does
+    # it belongs next to its engine, so the agent watches it but does
     # not own its lifecycle.
     remote_entry = ComponentEntry(
         name="rtx5090",
         kind=ComponentKind.inference_driver,
         url="http://gpu-box.tailnet:8081",  # type: ignore[arg-type]
-        # No spawn block => remote, watchdog must not try to launch it.
+        # No spawn block => remote, agent must not try to launch it.
         safeMode=False,
     )
     sup = Supervisor(log=logging.getLogger("test"))
@@ -401,7 +401,7 @@ def test_colorize_alerts_wraps_just_the_word(
     """Only the alert WORD gets wrapped — coloring the whole line makes
     red-on-dark unreadable. Case must be preserved."""
     # Force-enable color regardless of NO_COLOR in the test env.
-    monkeypatch.setattr("eugene_plexus_watchdog.supervisor._USE_COLOR", True)
+    monkeypatch.setattr("eugene_plexus_agent.supervisor._USE_COLOR", True)
 
     err = _colorize_alerts("ERROR: something broke\n")
     assert err.startswith("\x1b[31mERROR\x1b[0m: something broke")
@@ -422,7 +422,7 @@ def test_colorize_alerts_wraps_just_the_word(
 def test_colorize_alerts_respects_no_color(monkeypatch: pytest.MonkeyPatch) -> None:
     """NO_COLOR is a documented opt-out (https://no-color.org). When set,
     the helper returns the original text unchanged."""
-    monkeypatch.setattr("eugene_plexus_watchdog.supervisor._USE_COLOR", False)
+    monkeypatch.setattr("eugene_plexus_agent.supervisor._USE_COLOR", False)
     assert _colorize_alerts("ERROR boom\n") == "ERROR boom\n"
 
 
@@ -694,7 +694,7 @@ async def test_plan_error_is_a_crash_but_nothing_to_launch_is_not(
     """`plan()` has two non-launch outcomes and they mean opposite things.
 
     Returning None is a remote entry — nothing to run, no error. Raising
-    SpawnPlanError is a declaration this watchdog cannot build, which
+    SpawnPlanError is a declaration this agent cannot build, which
     counts as a crash so the back-off and the operator both hear about it.
     """
     spawned = False

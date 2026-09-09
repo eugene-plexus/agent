@@ -8,15 +8,15 @@ from typing import Any
 import httpx
 import pytest
 
-from eugene_plexus_watchdog._generated.models import (
+from eugene_plexus_agent._generated.models import (
     ConfigValueType,
     EngineKind,
     Origin,
     RuntimeSpec,
 )
-from eugene_plexus_watchdog.engines import EngineUnavailableError, LlamaCppAdapter, adapter_for
-from eugene_plexus_watchdog.engines.base import DiscoveredBinary, Loading, NotAnswering, Ready
-from eugene_plexus_watchdog.engines.llama_cpp import default_model_alias
+from eugene_plexus_agent.engines import EngineUnavailableError, LlamaCppAdapter, adapter_for
+from eugene_plexus_agent.engines.base import DiscoveredBinary, Loading, NotAnswering, Ready
+from eugene_plexus_agent.engines.llama_cpp import default_model_alias
 
 
 @pytest.fixture
@@ -67,7 +67,7 @@ def test_argv_carries_model_host_port_and_alias(
 def test_argv_uses_the_resolved_port_not_the_declared_one(
     adapter: LlamaCppAdapter, binary: DiscoveredBinary
 ) -> None:
-    """The watchdog assigns ports, so the caller's resolved value wins."""
+    """The agent assigns ports, so the caller's resolved value wins."""
     argv = adapter.build_argv(_spec(port=9999), binary, port=8090)
     assert argv[argv.index("--port") + 1] == "8090"
     assert "9999" not in argv
@@ -322,7 +322,7 @@ def test_flag_schema_is_a_standard_config_schema(adapter: LlamaCppAdapter) -> No
 def test_every_schema_flag_has_a_cli_mapping(adapter: LlamaCppAdapter) -> None:
     """A flag in the schema with no CLI name would render in the UI and
     then KeyError at spawn."""
-    from eugene_plexus_watchdog.engines.llama_cpp import _FLAG_CLI_NAMES
+    from eugene_plexus_agent.engines.llama_cpp import _FLAG_CLI_NAMES
 
     assert {f.key for f in adapter.flag_schema().fields} == set(_FLAG_CLI_NAMES)
 

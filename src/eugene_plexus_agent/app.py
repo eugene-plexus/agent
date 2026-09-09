@@ -1,6 +1,6 @@
 """FastAPI app factory.
 
-The supervisor is wired into the lifespan: at startup the watchdog reads
+The supervisor is wired into the lifespan: at startup the agent reads
 its topology config and asks the supervisor to spawn every spawned-mode
 child; on shutdown it stops them in turn (SIGTERM with timeout, then
 SIGKILL). The /v1/components routes layer delegates real-time status
@@ -34,7 +34,7 @@ from .routes import health as health_routes
 from .routes import runtimes as runtimes_routes
 from .runtimes import RuntimeSupervisor, close_installers
 from .settings import Settings, load_settings
-from .state import WatchdogState
+from .state import AgentState
 from .supervisor import Supervisor
 
 log = logging.getLogger(__name__)
@@ -43,17 +43,17 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
-    state = WatchdogState(settings.config_file)
+    state = AgentState(settings.config_file)
     if settings.safe_mode:
         log.warning(
-            "starting in SAFE MODE (EUGENE_PLEXUS_WATCHDOG_SAFE_MODE=1); ignoring "
-            "%s and running on defaults. Fix watchdog state via /v1/config or "
+            "starting in SAFE MODE (EUGENE_PLEXUS_AGENT_SAFE_MODE=1); ignoring "
+            "%s and running on defaults. Fix agent state via /v1/config or "
             "/v1/components, then restart without the env var.",
             settings.config_file,
         )
     else:
         state.load()
-    app.state.watchdog_state = state
+    app.state.agent_state = state
     app.state.safe_mode = settings.safe_mode
 
     # v0.2 auth state. Tests can pre-populate before the lifespan runs.
@@ -84,10 +84,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
 
     if state.has_passphrase():
-        log.info("watchdog initialized; operator may log in via POST /v1/auth/login")
+        log.info("agent initialized; operator may log in via POST /v1/auth/login")
     else:
         log.info(
-            "watchdog has no passphrase set; first-run wizard must call "
+            "agent has no passphrase set; first-run wizard must call "
             "POST /v1/auth/initialize before other endpoints become available",
         )
 
@@ -148,7 +148,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
 
     app = FastAPI(
-        title="Eugene Plexus — watchdog",
+        title="Eugene Plexus — agent",
         description="Process supervisor and UI host for an Eugene Plexus install.",
         version=__version__,
         lifespan=_lifespan,

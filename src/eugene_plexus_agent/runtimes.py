@@ -8,7 +8,7 @@ readiness probe, and a status that distinguishes "still loading the
 model" from "not answering at all".
 
 Nothing here knows how to *talk* to an engine. That is the driver's job;
-see the watchdog spec's note on where engine knowledge lives.
+see the agent spec's note on where engine knowledge lives.
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ class _RuntimePlanner:
             # but planning is where it would bite, so say so clearly.
             raise SpawnPlanError(
                 f"runtime {self.spec.name!r} has no port assigned; "
-                f"re-save it so the watchdog can allocate one"
+                f"re-save it so the agent can allocate one"
             )
 
         argv = self._adapter.build_argv(self.spec, binary, port)
@@ -181,8 +181,7 @@ class RuntimeSupervisor:
         adapter = adapter_for(spec.engine)
         if adapter is None:
             self._log.error(
-                "runtime %s names engine %r, which this watchdog has no adapter "
-                "for; not starting it.",
+                "runtime %s names engine %r, which this agent has no adapter for; not starting it.",
                 spec.name,
                 spec.engine.value,
             )
@@ -470,7 +469,7 @@ def _managed_for(adapter: EngineAdapter) -> ManagedEngine | None:
 
 
 def describe_engines() -> list[EngineDescriptor]:
-    """What this watchdog knows how to start, and what it found on disk.
+    """What this agent knows how to start, and what it found on disk.
 
     Backs `GET /v1/engines`. Note what `available` does and does not mean:
     it answers "is a binary discoverable on this host", by managed install

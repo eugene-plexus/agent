@@ -43,14 +43,14 @@ config.yaml
 .codegen-cache/
 
 # --- Runtime artifacts ---
-# Console-capture log files live next to watchdog.yaml by default
+# Console-capture log files live next to agent.yaml by default
 # (see console_logging.py). Operator-local, not source.
 logs/
 
 # Wizard/first-run generated topology + per-component configs and the
 # component databases. All operator-local install state — a fresh clone
 # regenerates them. Never source, and may hold secrets (API keys).
-watchdog.yaml
+/agent.yaml
 adapters.yaml
 constitution.yaml
 component-configs/

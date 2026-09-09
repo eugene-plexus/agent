@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to Eugene Plexus / watchdog! -->
+<!-- Thanks for contributing to Eugene Plexus / agent! -->
 
 ## Summary
 

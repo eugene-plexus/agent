@@ -12,7 +12,7 @@ import sys
 
 import pytest
 
-from eugene_plexus_watchdog import orphan_kill
+from eugene_plexus_agent import orphan_kill
 
 
 def test_kwargs_for_platform_includes_preexec_on_linux(monkeypatch: pytest.MonkeyPatch) -> None:

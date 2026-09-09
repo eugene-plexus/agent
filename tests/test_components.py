@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from eugene_plexus_watchdog import security
+from eugene_plexus_agent import security
 
 
 def _service_token(client: TestClient) -> str:
@@ -127,7 +127,7 @@ def test_restart_component_returns_202_and_calls_supervisor(
 
 
 def test_restart_component_409_for_remote(authed_client: TestClient) -> None:
-    """Per the spec: the watchdog cannot restart something it doesn't own."""
+    """Per the spec: the agent cannot restart something it doesn't own."""
     remote_entry = {
         "name": "rtx5090",
         "kind": "inference-driver",
@@ -155,7 +155,7 @@ def test_topology_persists_across_state_reloads(
     # to spawn the orchestrator package for real.
     from fastapi.testclient import TestClient as FreshClient
 
-    from eugene_plexus_watchdog.app import create_app
+    from eugene_plexus_agent.app import create_app
 
     from .conftest import StubSupervisor
 
@@ -180,7 +180,7 @@ def test_topology_persists_across_state_reloads(
 # --------------------------------------------------------------------------- #
 # v0.2.1: service tokens may READ topology but never mutate it.
 # Fixes the auth mismatch where peer auto-resolve silently no-op'd because
-# the whole router was operator-only. (project_watchdog_components_auth_mismatch)
+# the whole router was operator-only. (project_agent_components_auth_mismatch)
 # --------------------------------------------------------------------------- #
 
 

@@ -1,6 +1,6 @@
-"""In-memory auth state for the watchdog process.
+"""In-memory auth state for the agent process.
 
-Holds runtime secrets the watchdog should never persist:
+Holds runtime secrets the agent should never persist:
 
   * `signing_key` — 32 random bytes generated at every startup. HMAC
     signs all JWTs (session + service tokens). Rotating at every
@@ -35,7 +35,7 @@ class AuthState:
     signing_key: bytes
     # 32-byte master key derived from the operator's passphrase. None
     # until the passphrase has been verified (login) or recovered from
-    # the OS keyring; the watchdog refuses to spawn children that need
+    # the OS keyring; the agent refuses to spawn children that need
     # encrypted secrets until it has one.
     master_key: bytes | None = None
     # Revoked session tokens — set of full token strings. Logout

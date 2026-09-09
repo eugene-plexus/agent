@@ -10,6 +10,6 @@ def test_healthz_reports_ok(client: TestClient) -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["component"] == "watchdog"
+    assert body["component"] == "agent"
     assert body["safeMode"] is False
     assert body["version"]
