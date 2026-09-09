@@ -41,10 +41,10 @@ SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{re
 # transitively. Generating common.yaml directly fixes that.
 SPECS_TO_GENERATE = [
     # NOTE: this path is a coordinate inside the SPECS_REF snapshot, not a
-    # name of a current thing. `openapi/watchdog.yaml` was renamed to
+    # name of a current thing. `openapi/agent.yaml` was renamed to
     # `openapi/agent.yaml` in specs 76f9090; this pin predates that, so the
     # old path is the correct one here. Move both together, never one.
-    ("openapi/watchdog.yaml", "models.py"),
+    ("openapi/agent.yaml", "models.py"),
     ("openapi/components/common.yaml", "common_models.py"),
 ]
 

@@ -344,9 +344,40 @@ def test_context_size_has_no_default(adapter: LlamaCppAdapter) -> None:
     assert field.valueType == ConfigValueType.integer
 
 
+# Engine kinds whose contract has landed but whose adapter has not. Empty is
+# the correct steady state; an entry here is a debt with a name.
+#
+# `vllm` arrived in EngineKind with specs 811112b (M4), whose implementation
+# was paused for M5's multi-host and trust work. Registering the vLLM adapter
+# is the first thing M4's implementation has to do, and deleting the entry
+# below is how that gets proved.
+CONTRACTED_WITHOUT_ADAPTER = {EngineKind.vllm}
+
+
 def test_registry_covers_every_engine_kind() -> None:
     """EngineKind is a closed enum precisely because an engine is
     supported when an adapter exists. The enum and the registry are two
-    views of the same fact, so they must not drift."""
+    views of the same fact, so they must not drift.
+
+    Drift is tolerated only for kinds named in
+    `CONTRACTED_WITHOUT_ADAPTER`, so a gap has to be written down
+    deliberately rather than discovered by a red build.
+    """
     for kind in EngineKind:
+        if kind in CONTRACTED_WITHOUT_ADAPTER:
+            continue
         assert adapter_for(kind) is not None, f"no adapter registered for {kind}"
+
+
+def test_the_contracted_without_adapter_list_is_honest() -> None:
+    """Every excused kind must actually be missing an adapter.
+
+    Without this, the allowlist above would silently keep excusing an
+    engine after its adapter landed, and the parity check it exists to
+    weaken would stay weakened forever.
+    """
+    for kind in CONTRACTED_WITHOUT_ADAPTER:
+        assert adapter_for(kind) is None, (
+            f"{kind} has an adapter now — remove it from "
+            "CONTRACTED_WITHOUT_ADAPTER so parity is enforced again"
+        )
