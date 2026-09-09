@@ -33,6 +33,7 @@ from eugene_plexus_agent.supervisor import (
     _COMPONENT_SPECS,
     _COMPONENT_STATUS_BY_STATE,
     _HEALTHZ_2XX_LINE,
+    _TRUST_ROOT_KINDS,
     ProcessState,
     SpawnPlan,
     SpawnPlanError,
@@ -322,9 +323,13 @@ async def test_every_spawnable_kind_gets_its_own_prefix_and_audience(
     """Service-token audience + env-var prefix must follow the kind.
 
     Driven off `_COMPONENT_SPECS` rather than a hand-written list, so
-    adding a kind (library, next) fails here loudly if its spec is
-    incomplete instead of surfacing as an unsupported-kind refusal at
-    spawn time.
+    adding a kind fails here loudly if its spec is incomplete instead of
+    surfacing as an unsupported-kind refusal at spawn time.
+
+    `_TRUST_ROOT_KINDS` is excluded from the *audience* half, not from
+    the spawning half: the control root is supervised like anything
+    else, and is the one kind that mints its own credentials rather than
+    being handed ours. See the test below.
     """
     captured: dict[str, dict[str, str]] = {}
 
@@ -365,12 +370,68 @@ async def test_every_spawnable_kind_gets_its_own_prefix_and_audience(
     )
     for kind, spec in _COMPONENT_SPECS.items():
         env = captured[kind.value]
+        if kind in _TRUST_ROOT_KINDS:
+            continue
         payload = security.decode_token(
             token=env[f"{spec.env_prefix}_SERVICE_TOKEN"],
             signing_key=auth.signing_key,
             expected_audience=f"service:{kind.value}",
         )
         assert payload.sub == kind.value
+
+
+async def test_the_control_root_is_spawned_without_the_auth_trio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The trust root is not handed a key by the thing it supervises.
+
+    `control` derives the master key from the operator's passphrase and
+    mints the install's signing key itself. Threading ours in would give
+    it a key it did not choose, seal its secrets under a key that dies
+    with this process, and quietly recreate the single-host trust model
+    M5 exists to replace — while looking like every other component's
+    spawn and failing nothing.
+
+    It still gets the three bootstrap values every child gets: where its
+    config lives, which port to bind, whether to boot in safe mode.
+    """
+    captured: dict[str, str] = {}
+
+    async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        captured.update(kwargs.get("env") or {})
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    auth = AuthState(signing_key=security.generate_signing_key())
+    auth.set_master_key(b"m" * 32)
+    entry = ComponentEntry(
+        name="control",
+        kind=ComponentKind.control,
+        url="http://127.0.0.1:8083",  # type: ignore[arg-type]
+        spawn=SpawnConfig(configFile="/tmp/control/control.yaml"),
+        safeMode=False,
+    )
+    sp = SupervisedProcess.for_component(entry, logging.getLogger("test"), auth_state=auth)
+    sp.start()
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if "EUGENE_PLEXUS_CONTROL_CONFIG_FILE" in captured:
+            break
+    await sp.stop()
+
+    assert captured["EUGENE_PLEXUS_CONTROL_BIND_PORT"] == "8083"
+    assert captured["EUGENE_PLEXUS_CONTROL_SAFE_MODE"] == "0"
+    for absent in (
+        "EUGENE_PLEXUS_CONTROL_AUTH_SIGNING_KEY",
+        "EUGENE_PLEXUS_CONTROL_SERVICE_TOKEN",
+        "EUGENE_PLEXUS_CONTROL_MASTER_KEY",
+    ):
+        assert absent not in captured, (
+            f"{absent} was threaded into the control root. It is the trust root: it mints "
+            "the signing key and derives the master key from the operator's passphrase, "
+            "and being handed one by its supervisor is the single-host model returning."
+        )
 
 
 # --------------------------------------------------------------------------- #

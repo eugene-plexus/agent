@@ -142,7 +142,30 @@ _COMPONENT_SPECS: dict[ComponentKind, _ComponentSpec] = {
         env_prefix="EUGENE_PLEXUS_LIBRARY",
         log_label="library",
     ),
+    # The control root is supervised like anything else, and that is the
+    # point of the M5 split rather than an accident of it: if the control
+    # root supervised processes it would need a second copy of this
+    # machinery, and "components share schemas, not code" means a real
+    # second copy. One supervisor implementation, running on every host;
+    # one control root, spawned by whichever agent's topology declares it.
+    #
+    # It is the one component that receives no auth trio. It *is* the
+    # trust root — it mints the signing key and derives the master key
+    # from the operator's passphrase — so threading a key into it would
+    # be this process handing the trust root a key the trust root is
+    # supposed to own. See `_ComponentPlanner.plan`.
+    ComponentKind.control: _ComponentSpec(
+        module="eugene_plexus_control",
+        env_prefix="EUGENE_PLEXUS_CONTROL",
+        log_label="control",
+    ),
 }
+
+# Kinds that mint their own credentials rather than being handed ours.
+# A set of one today, and a set rather than an `if` because the question
+# it answers — "does this child get the auth trio?" — is about the kind,
+# not about this particular kind.
+_TRUST_ROOT_KINDS: frozenset[ComponentKind] = frozenset({ComponentKind.control})
 
 
 def _format_log_prefix(kind: ComponentKind, name: str) -> str:
@@ -323,7 +346,14 @@ class _ComponentPlanner:
         # bearer tokens against the shared signing key, (b) present a
         # service token of their own on outbound calls, and (c) decrypt
         # at-rest secrets like apiKey.
-        if self._auth_state is not None:
+        #
+        # The control root gets none of them, and must not. It is the
+        # trust root: it derives the master key from the operator's
+        # passphrase and mints the install's signing key itself. Handing
+        # it ours would give it a key it did not choose, seal its secrets
+        # under a key that dies with this process, and quietly recreate
+        # the single-host trust model M5 exists to replace.
+        if self._auth_state is not None and self.entry.kind not in _TRUST_ROOT_KINDS:
             kind_value = self.entry.kind.value  # "gateway", "inference-driver"
             env[f"{prefix}_AUTH_SIGNING_KEY"] = base64.b64encode(
                 self._auth_state.signing_key
