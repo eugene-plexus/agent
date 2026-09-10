@@ -62,9 +62,12 @@ log = logging.getLogger(__name__)
 # mistakes it for arithmetic.
 FILE_SIZE_ALLOWANCE = 0.10
 
-# llama.cpp: `--n-gpu-layers` at or above this is "everything", which is
-# what every profile that means full offload writes.
-FULL_OFFLOAD_LAYERS = 999
+# llama.cpp: `--n-gpu-layers` at or above this is "everything". 99 is the
+# idiom — no model this project has met has 99 layers, `-ngl 99` is what
+# every profile here writes, and upstream's own examples use it. The
+# first live run had 999 here and admitted a 36 GiB launch as "partial
+# offload the operator chose" because the spec said 99.
+FULL_OFFLOAD_LAYERS = 99
 
 # The library answers from memory; anything slower is the library being
 # down, and admission should fall back rather than wait on it.
@@ -231,10 +234,11 @@ def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeD
 def wants_full_offload(spec: RuntimeSpec) -> bool:
     """Whether the spec asks for the whole model on the accelerator.
 
-    llama.cpp with `gpuLayers` unset or at/above 999 is full offload;
-    below is the operator choosing partial offload knowingly, which is
-    what turns `tight` and `split` from refusals into admits. vLLM has no
-    partial offload, so it is always full.
+    llama.cpp with `gpuLayers` unset, negative (`-1` is "all" upstream),
+    or at/above 99 is full offload; below is the operator choosing
+    partial offload knowingly, which is what turns `tight` and `split`
+    from refusals into admits. vLLM has no partial offload, so it is
+    always full.
     """
     if spec.engine is not EngineKind.llama_cpp:
         return True
@@ -243,9 +247,10 @@ def wants_full_offload(spec: RuntimeSpec) -> bool:
     if layers is None:
         return True
     try:
-        return int(layers) >= FULL_OFFLOAD_LAYERS
+        count = int(layers)
     except (TypeError, ValueError):
         return True
+    return count < 0 or count >= FULL_OFFLOAD_LAYERS
 
 
 def model_size_bytes(model_path: str) -> int | None:

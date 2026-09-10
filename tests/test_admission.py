@@ -100,6 +100,10 @@ def test_a_host_with_no_accelerator_targets_the_cpu() -> None:
 def test_full_offload_is_the_default_and_partial_is_a_choice() -> None:
     assert wants_full_offload(_spec("/m")) is True
     assert wants_full_offload(_spec("/m", flags={"gpuLayers": 999})) is True
+    # llama.cpp's idiom for everything, and what every profile writes.
+    assert wants_full_offload(_spec("/m", flags={"gpuLayers": 99})) is True
+    assert wants_full_offload(_spec("/m", flags={"gpuLayers": -1})) is True
+    assert wants_full_offload(_spec("/m", flags={"gpuLayers": 98})) is False
     assert wants_full_offload(_spec("/m", flags={"gpuLayers": 20})) is False
     # vLLM has no partial offload.
     assert wants_full_offload(_spec("/m", engine="vllm", flags={"gpuLayers": 20})) is True
