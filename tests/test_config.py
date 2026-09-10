@@ -11,13 +11,26 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
     body = response.json()
     assert body["component"] == "agent"
     keys = {f["key"] for f in body["fields"]}
-    assert keys == {"firstRunComplete", "securityMode", "uiTheme", "uiFontSize", "vllmBinary"}
+    assert keys == {
+        "firstRunComplete",
+        "securityMode",
+        "uiTheme",
+        "uiFontSize",
+        "vllmBinary",
+        "advertiseUrl",
+    }
     # `vllmBinary` is a plain config field on purpose — the generic editor
     # renders a `file_path` with no engine-specific UI code.
     vllm_binary = next(f for f in body["fields"] if f["key"] == "vllmBinary")
     assert vllm_binary["valueType"] == "file_path"
     assert vllm_binary["category"] == "engines"
     assert "engines" in body["categories"]
+    # `advertiseUrl` (M7) is a `url` under its own category, so the editor
+    # groups where-other-hosts-reach-me apart from engines and appearance.
+    advertise = next(f for f in body["fields"] if f["key"] == "advertiseUrl")
+    assert advertise["valueType"] == "url"
+    assert advertise["category"] == "node"
+    assert "node" in body["categories"]
 
 
 def test_get_config_returns_defaults_on_first_run(authed_client: TestClient) -> None:

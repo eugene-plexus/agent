@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__, companions, keyring_store, security
+from . import __version__, companions, keyring_store, node_identity, security
 from .auth_state import AuthState
 from .dependencies import require_operator_session
 from .routes import auth as auth_routes
@@ -57,12 +57,33 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.agent_state = state
     app.state.safe_mode = settings.safe_mode
 
-    # v0.2 auth state. Tests can pre-populate before the lifespan runs.
-    # Production builds a fresh signing key here; rotating at every
-    # startup is the v0.2 revocation story (good-enough for one-operator
-    # personal-use installs).
+    # This host's identity in the install (M7): node.yaml beside
+    # agent.yaml. Loaded before auth state, because an enrolled agent
+    # verifies tokens with THE INSTALL'S signing key from the first
+    # request and hands that key to every child it spawns — a restart
+    # is not a re-key. An agent that has not enrolled mints a random
+    # per-restart key, which is the single-host behaviour unchanged.
+    identity = node_identity.NodeIdentityStore(
+        settings.config_file.resolve().parent / node_identity.NODE_FILE
+    )
+    try:
+        identity.load()
+    except ValueError as exc:
+        # Degraded, not dead: supervision needs no identity. The agent
+        # comes up unenrolled and says why.
+        log.error("node identity file could not be read (%s); running unenrolled", exc)
+    app.state.node_identity = identity
+
+    # Tests can pre-populate auth state before the lifespan runs.
     if not hasattr(app.state, "auth_state"):
-        app.state.auth_state = AuthState(signing_key=security.generate_signing_key())
+        install_key = identity.record.signing_key_bytes
+        app.state.auth_state = AuthState(signing_key=install_key or security.generate_signing_key())
+        if install_key is not None:
+            log.info(
+                "verifying tokens with the install's signing key (generation %s) as node %r",
+                identity.record.signing_key_id,
+                identity.record.name,
+            )
 
     # OS keyring auto-unlock — only when the operator opted into it
     # AND a passphrase has been set (so we know which install's key
@@ -99,7 +120,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # service token, forward the signing key, and (if logged in)
     # forward the master key.
     if not hasattr(app.state, "supervisor"):
-        supervisor = Supervisor(log=log, auth_state=app.state.auth_state)
+        supervisor = Supervisor(
+            log=log,
+            auth_state=app.state.auth_state,
+            shared_child_env=lambda: shared_child_env(settings, state, identity),
+        )
         owns_supervisor = True
     else:
         supervisor = app.state.supervisor
@@ -119,6 +144,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime_supervisor = app.state.runtime_supervisor
         owns_runtimes = False
     app.state.runtime_supervisor = runtime_supervisor
+    # `Runtime.node`, from the agent's own identity and nowhere else.
+    runtime_supervisor.node_name_provider = lambda: (
+        identity.record.name if identity.record.enrolled else None
+    )
 
     if not settings.safe_mode and owns_supervisor:
         for entry in state.list_topology_entries():
@@ -151,6 +180,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await runtime_supervisor.stop_all()
         if owns_supervisor:
             await supervisor.stop_all()
+
+
+def shared_child_env(
+    settings: Settings, state: AgentState, identity: node_identity.NodeIdentityStore
+) -> dict[str, str]:
+    """Env values (suffix -> value) every spawned component gets, prefixed
+    per kind by the planner.
+
+    `AGENT_URL` is this agent's own *local* address: a companion's agent
+    is always on the same host, and the loopback default was only ever
+    wrong about the port. `BIND_HOST` is `0.0.0.0` only when this node
+    advertises a non-loopback address — a component that must be
+    reached from another host cannot bind only to this one — and is
+    otherwise left to each component's own loopback default. Engines are
+    not components and are never widened."""
+    env = {
+        "AGENT_URL": node_identity.local_agent_url(settings.bind_host, int(settings.bind_port)),
+    }
+    advertise = node_identity.effective_advertise_url(
+        state.get_config("advertiseUrl"), identity.record.advertise_url
+    )
+    if not node_identity.is_loopback_host(node_identity.advertise_host(advertise)):
+        env["BIND_HOST"] = "0.0.0.0"
+    return env
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

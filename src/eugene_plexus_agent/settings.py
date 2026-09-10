@@ -30,6 +30,14 @@ class Settings(BaseSettings):
     bind_host: str = "127.0.0.1"
     """Network interface to bind. Override to 0.0.0.0 for tailnet exposure."""
 
+    bind_port: int = 8079
+    """Port to bind. 8079 unless told otherwise, so the UI ships pointed at a
+    known target. A setting rather than a literal from M7, because two agents
+    sharing one box for a same-host acceptance run need two ports, and because
+    every component this agent spawns is told where its agent is
+    (`EUGENE_PLEXUS_<KIND>_AGENT_URL`) from this value rather than from a
+    loopback:8079 assumption that was only ever wrong about the port."""
+
     safe_mode: bool = False
     """If true, skip loading the persistent state file at startup and run on
     built-in defaults — empty topology, default UI prefs. Provides a recovery

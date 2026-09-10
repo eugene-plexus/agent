@@ -636,6 +636,31 @@ class EnrollRequest(BaseModel):
     )
 
 
+class RekeyRequest(BaseModel):
+    """
+    A new signing key, or a new epoch, from the control root. The
+    credential is `signature`; see `POST /v1/node/rekey`.
+
+    """
+
+    signingKey: str = Field(
+        ...,
+        description="The install's service-token signing key, base64. During a\npromotion's announcement this is the key the agent already\nholds.\n",
+    )
+    signingKeyId: str = Field(
+        ..., description="The key's generation, as `Snapshot.signingKeyId` names it."
+    )
+    epoch: int = Field(
+        ...,
+        description="The control root's current epoch. The agent refuses a value\nbelow the highest it has recorded.\n",
+        ge=0,
+    )
+    signature: str = Field(
+        ...,
+        description='Detached Ed25519 signature, base64, by the control root\'s\nidentity key over the **canonical message**: the UTF-8 bytes of\nthe JSON object `{"epoch": <epoch>, "signingKey":\n"<signingKey>", "signingKeyId": "<signingKeyId>"}` with keys\nsorted and no whitespace — `json.dumps(obj, sort_keys=True,\nseparators=(",", ":"))`. Verified against the\n`controlPublicKey` the agent recorded at enrollment. Three\nfields, one serializer, stated here so both sides implement it\nfrom the same sentence.\n',
+    )
+
+
 class AuthStatus(BaseModel):
     """
     Whether this install has been through first-run setup.
@@ -1164,6 +1189,10 @@ class Component(BaseModel):
         ...,
         description='Canonical address. For spawned components the agent\nparses the port out of this URL and passes it via env var\n(`EUGENE_PLEXUS_<KIND>_BIND_PORT`); for remote components\nthis is what the agent probes.\n',
     )
+    advertiseUrl: AnyUrl | None = Field(
+        None,
+        description="Where a **peer on another host** reaches this component: the\nagent's advertise host with this component's port. Derived,\nnever declared, and present only for a component this agent\nspawns on an agent that has an advertise address\n(`NodeIdentity.advertiseUrl`). `url` keeps its one meaning —\nwhat the agent binds and probes — and the gateway prefers this\nfield and falls back to `url`, which is the whole of what makes\na companion driver on one host routable from a gateway on\nanother. Absent on a single-host install, where the two would\nsay the same thing.\n",
+    )
     spawn: SpawnConfig | None = Field(
         None,
         description="Present iff this component runs locally under agent\nsupervision. Absence means it's remote (the agent only\nmonitors reachability).\n",
@@ -1348,6 +1377,18 @@ class NodeIdentity(BaseModel):
         None,
         description='Highest control-root epoch this agent has acknowledged. **It\nrefuses any root presenting a lower one**, which fences a\nsuperseded control root without an election, without quorum,\nand without agreeing with any other agent.\n',
         ge=0,
+    )
+    advertiseUrl: AnyUrl | None = Field(
+        None,
+        description="Where other hosts reach this agent — the `advertiseUrl` config\nfield, or the value derived at enrollment when none was set.\nWhat the control root holds as this node's `Node.url`.\n",
+    )
+    signingKeyId: str | None = Field(
+        None,
+        description='The generation of the install signing key this agent holds,\nas the control root named it. During a rotation, the answer\nto "which host is stale" from the host itself.\n',
+    )
+    controlPublicKey: str | None = Field(
+        None,
+        description="The identity public key of the control root this agent\nenrolled with, recorded then and checked against every\n`POST /v1/node/rekey` since. A dashboard can compare it with\nthe root's own `Snapshot.controlPublicKey`.\n",
     )
     os: Os | None = None
     arch: Arch | None = None

@@ -27,11 +27,11 @@ def main() -> None:
     if not settings.safe_mode:
         bootstrap_state.load()
 
-    # Agent port is fixed at 8079 in v0.1 so the UI ships with a
-    # known target. If a future release makes it configurable the
-    # value will move into agent.yaml — the pattern would mirror
-    # how the body components handle their own bind ports.
-    port = 8079
+    # 8079 unless EUGENE_PLEXUS_AGENT_BIND_PORT says otherwise. A
+    # bootstrap setting rather than a config field: it has to be known
+    # before there is a config to read, and it is what lets two agents
+    # share one box.
+    port = settings.bind_port
     log_level = "info"
 
     app = create_app(settings)

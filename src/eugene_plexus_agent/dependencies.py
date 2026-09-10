@@ -182,6 +182,31 @@ def require_operator_or_gateway(
     )
 
 
+def require_operator_or_control(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> security.TokenPayload:
+    """Accept an operator session token OR the control root's service token.
+
+    For declaring a runtime. The control root forwards declarations to
+    the node that will run them (`control.yaml`, `POST /v1/runtimes`)
+    with `service:control`, and the trust root's token is what every
+    other credential in the install reduces to. Checked exactly: a
+    leaked driver or library token still cannot declare a runtime, which
+    was the reason this stayed operator-only through M6."""
+    payload = require_operator_or_service(request, creds)
+    if payload.aud == security.AUDIENCE_OPERATOR:
+        return payload
+    if payload.aud == f"{security.SERVICE_AUDIENCE_PREFIX}control":
+        return payload
+    raise _problem(
+        status.HTTP_401_UNAUTHORIZED,
+        "Wrong audience",
+        f"Token audience {payload.aud!r} may not declare a runtime; only the operator or "
+        "the control root (service:control) may.",
+    )
+
+
 def require_service_token(
     request: Request,
     expected_kind: str,

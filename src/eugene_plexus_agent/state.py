@@ -136,12 +136,34 @@ CONFIG_FIELDS: list[ConfigField] = [
         category="engines",
         valueType=ConfigValueType.file_path,
     ),
+    ConfigField(
+        key="advertiseUrl",
+        label="Advertise address",
+        description=(
+            "The address at which OTHER HOSTS reach this agent — for example "
+            "`http://100.64.0.7:8079` on a tailnet. Sent to the control root at "
+            "enrollment as this node's URL, and stamped onto every component this "
+            "agent spawns (same host, that component's port) so a gateway on "
+            "another host can reach a companion driver here. Leave empty on a "
+            "single-host install; when empty, enrollment derives it from the "
+            "interface this agent used to reach the control root and GET /v1/node "
+            "shows what it derived. Setting a host that is not loopback also makes "
+            "spawned components bind 0.0.0.0 instead of loopback, because a "
+            "component that must be reached from another host cannot bind only "
+            "to this one; engines are never widened. Read at the next spawn and "
+            "at the next enrollment; the control root keeps the URL it was told "
+            "at enrollment until this node re-enrolls."
+        ),
+        category="node",
+        valueType=ConfigValueType.url,
+    ),
 ]
 CATEGORY_LABELS: dict[str, str] = {
     "setup": "Setup",
     "security": "Security",
     "ui": "Appearance",
     "engines": "Engines",
+    "node": "Node",
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}
@@ -516,7 +538,7 @@ def _validate(field: ConfigField, value: Any) -> str | None:
         if value not in allowed:
             return f"must be one of {allowed}"
         return None
-    if vt == ConfigValueType.file_path or vt == ConfigValueType.string:
+    if vt in (ConfigValueType.file_path, ConfigValueType.string, ConfigValueType.url):
         # Existence is deliberately not checked here: the path is read
         # at spawn and at discovery, both of which report a missing file
         # with the path named. Rejecting it at PATCH time would stop an

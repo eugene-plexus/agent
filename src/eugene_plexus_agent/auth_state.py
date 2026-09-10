@@ -31,7 +31,12 @@ from dataclasses import dataclass, field
 class AuthState:
     """Per-process auth state. NOT persisted; rebuilt at every startup."""
 
-    # Per-restart HMAC signing key for all JWTs.
+    # HMAC signing key for all JWTs. Random per restart on an agent that
+    # has not enrolled; the INSTALL'S key, persisted in node.yaml and
+    # adopted at boot, on one that has (M7). Replaced in place by
+    # enrollment and by a signed re-key from the control root — the
+    # supervisor reads it at every spawn, so children restarted after
+    # either pick up the current one.
     signing_key: bytes
     # 32-byte master key derived from the operator's passphrase. None
     # until the passphrase has been verified (login) or recovered from
@@ -55,6 +60,16 @@ class AuthState:
             raise ValueError("master key must be 32 bytes")
         with self._lock:
             self.master_key = key
+
+    def set_signing_key(self, key: bytes) -> None:
+        """Adopt the install's signing key — at enrollment, or when the
+        control root rotates it. Every token this agent minted under the
+        previous key stops verifying here, which is the point of a
+        rotation and the price of enrollment."""
+        if len(key) != 32:
+            raise ValueError("signing key must be 32 bytes")
+        with self._lock:
+            self.signing_key = key
 
     def revoke(self, token: str) -> None:
         with self._lock:

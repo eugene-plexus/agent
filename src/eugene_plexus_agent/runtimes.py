@@ -203,6 +203,12 @@ class RuntimeSupervisor:
         # the moment the runtime is started.
         self._stop_reasons: dict[str, StopReason] = {}
         self._poll_task: asyncio.Task[None] | None = None
+        # This node's name once enrolled, read at compose time so it is
+        # filled from the agent's own identity and can never disagree
+        # with it — the contract's reason `Runtime.node` is reported
+        # rather than declared. None until enrollment, which is the only
+        # state in which "which node" has no answer.
+        self.node_name_provider: Callable[[], str | None] | None = None
 
     # --- collection management --------------------------------------------
 
@@ -352,6 +358,7 @@ class RuntimeSupervisor:
             # Derived from the declaration: `autoDriver` means the agent
             # keeps a companion under this name (reconciled at boot).
             driver=companion_name(spec.name) if spec.autoDriver is not False else None,
+            node=self.node_name_provider() if self.node_name_provider is not None else None,
             status=status,
             stopReason=stop_reason,
             url=url,  # type: ignore[arg-type]

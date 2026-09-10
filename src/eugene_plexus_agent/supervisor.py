@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -287,9 +288,16 @@ class _ComponentPlanner:
         entry: ComponentEntry,
         log: logging.Logger,
         auth_state: AuthState | None = None,
+        shared_child_env: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self.entry = entry
         self._log = log
+        # Suffix -> value for env vars every child gets, prefixed per
+        # kind at plan time: AGENT_URL (this agent's own local address,
+        # whatever port it is on) and BIND_HOST when this node
+        # advertises a non-loopback address. Read at every plan so a
+        # config change reaches the next spawn.
+        self._shared_child_env = shared_child_env
         # auth_state is the source of the per-restart JWT signing key +
         # (post-login) master key + service token issuance. Optional for
         # test ergonomics — tests that don't care about auth pass None
@@ -370,6 +378,14 @@ class _ComponentPlanner:
                 # Be explicit about absence so a child running stale env
                 # from a previous shell can't pick up an unrelated value.
                 env.pop(f"{prefix}_MASTER_KEY", None)
+
+        # Values this agent wants every child to have — the trust root
+        # included, since a bind host and an agent URL are bootstrap, not
+        # the auth trio. Applied before the operator's `spawn.env`, so an
+        # explicit per-component value still wins.
+        if self._shared_child_env is not None:
+            for suffix, value in self._shared_child_env().items():
+                env[f"{prefix}_{suffix}"] = str(value)
 
         if spawn.env:
             env.update({k: str(v) for k, v in spawn.env.items()})
@@ -462,9 +478,10 @@ class SupervisedProcess:
         entry: ComponentEntry,
         log: logging.Logger,
         auth_state: AuthState | None = None,
+        shared_child_env: Callable[[], dict[str, str]] | None = None,
     ) -> SupervisedProcess:
         """Supervise one Eugene Plexus component."""
-        return cls(_ComponentPlanner(entry, log, auth_state), log)
+        return cls(_ComponentPlanner(entry, log, auth_state, shared_child_env), log)
 
     @property
     def name(self) -> str:
@@ -740,8 +757,10 @@ class Supervisor:
         self,
         log: logging.Logger | None = None,
         auth_state: AuthState | None = None,
+        shared_child_env: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
+        self._shared_child_env = shared_child_env
         # v0.2: shared with every SupervisedProcess so each spawn can
         # issue a fresh service token, base64-encode the signing key,
         # and forward the (possibly-still-None) master key. Optional —
@@ -770,7 +789,12 @@ class Supervisor:
             # reachability, but no SupervisedProcess.
             self._reachable[entry.name] = False
             return
-        sp = SupervisedProcess.for_component(entry, self._log, auth_state=self._auth_state)
+        sp = SupervisedProcess.for_component(
+            entry,
+            self._log,
+            auth_state=self._auth_state,
+            shared_child_env=self._shared_child_env,
+        )
         self._processes[entry.name] = sp
         sp.start()
 

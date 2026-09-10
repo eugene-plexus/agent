@@ -46,6 +46,7 @@ from ..companions import (
     remove_companion,
 )
 from ..dependencies import (
+    require_operator_or_control,
     require_operator_or_gateway,
     require_operator_or_service,
     require_operator_session,
@@ -77,6 +78,10 @@ router = APIRouter()
 _read_auth = [Depends(require_operator_or_service)]
 _write_auth = [Depends(require_operator_session)]
 _lifecycle_auth = [Depends(require_operator_or_gateway)]
+# And declaring one, from M7: the operator OR the control root, because
+# the control root forwards declarations to the node that will run them
+# and the trust root's token is what every other credential reduces to.
+_declare_auth = [Depends(require_operator_or_control)]
 
 
 def _problem(*, code: int, slug: str, title: str, detail: str) -> HTTPException:
@@ -349,7 +354,7 @@ async def check_runtime_admission(request: Request, body: RuntimeSpec) -> Admiss
     response_model=Runtime,
     status_code=201,
     tags=["runtimes"],
-    dependencies=_write_auth,
+    dependencies=_declare_auth,
 )
 async def create_runtime(
     request: Request,

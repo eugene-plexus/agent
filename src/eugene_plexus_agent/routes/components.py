@@ -9,11 +9,14 @@ updating it triggers a restart so the change takes effect.
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import Component, ComponentEntry, ComponentList, ComponentStatus
 from ..dependencies import require_operator_or_service, require_operator_session
+from ..node_identity import advertise_host, effective_advertise_url, format_url
 from ..state import AgentState
 from ..supervisor import Supervisor
 
@@ -53,10 +56,30 @@ def _name_conflict(name: str) -> HTTPException:
     )
 
 
-def _compose(entry: ComponentEntry, supervisor: Supervisor | None) -> Component:
+def _advertise_host(request: Request) -> str | None:
+    """The host other nodes reach this agent at, if it has one — the
+    `advertiseUrl` config field, else what enrollment derived. None on a
+    single-host install, and then `Component.advertiseUrl` is absent."""
+    state: AgentState = request.app.state.agent_state
+    identity = getattr(request.app.state, "node_identity", None)
+    persisted = identity.record.advertise_url if identity is not None else None
+    return advertise_host(effective_advertise_url(state.get_config("advertiseUrl"), persisted))
+
+
+def _compose(
+    entry: ComponentEntry,
+    supervisor: Supervisor | None,
+    advertise: str | None = None,
+) -> Component:
     """Combine the declarative entry with whatever live state the
     Supervisor knows about it. When no Supervisor is wired (some tests),
-    falls back to `unreachable` so the wire shape is still spec-valid."""
+    falls back to `unreachable` so the wire shape is still spec-valid.
+
+    `advertise` is this node's advertise host. A spawned component gets
+    `advertiseUrl` = that host with its own port — where a peer on
+    another host reaches it — while `url` keeps its one meaning: what
+    this agent binds and probes. A remote entry is already an address
+    the operator chose, so it is left alone."""
     if supervisor is None:
         live_status = ComponentStatus.unreachable
         last_error = None
@@ -66,10 +89,16 @@ def _compose(entry: ComponentEntry, supervisor: Supervisor | None) -> Component:
         live_status, last_error, last_restart, pid = supervisor.status_for(
             entry.name, has_spawn=entry.spawn is not None
         )
+    advertise_url: str | None = None
+    if advertise is not None and entry.spawn is not None:
+        port = urlparse(str(entry.url)).port
+        if port is not None:
+            advertise_url = format_url(advertise, port)
     return Component(
         name=entry.name,
         kind=entry.kind,
         url=entry.url,
+        advertiseUrl=advertise_url,  # type: ignore[arg-type]
         spawn=entry.spawn,
         safeMode=entry.safeMode,
         status=live_status,
@@ -88,7 +117,9 @@ async def list_components(request: Request) -> ComponentList:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     return ComponentList(
-        components=[_compose(e, supervisor) for e in state.list_topology_entries()],
+        components=[
+            _compose(e, supervisor, _advertise_host(request)) for e in state.list_topology_entries()
+        ],
     )
 
 
@@ -102,7 +133,7 @@ async def create_component(request: Request, body: ComponentEntry) -> Component:
         raise _name_conflict(body.name) from e
     if supervisor is not None:
         supervisor.add_and_start(entry)
-    return _compose(entry, supervisor)
+    return _compose(entry, supervisor, _advertise_host(request))
 
 
 @router.get("/v1/components/{name}", response_model=Component, dependencies=_read_auth)
@@ -111,7 +142,7 @@ async def get_component(request: Request, name: str) -> Component:
     entry = state.get_topology_entry(name)
     if entry is None:
         raise _not_found(name)
-    return _compose(entry, _supervisor(request))
+    return _compose(entry, _supervisor(request), _advertise_host(request))
 
 
 @router.patch("/v1/components/{name}", response_model=Component, dependencies=_write_auth)
@@ -134,7 +165,7 @@ async def update_component(request: Request, name: str, body: ComponentEntry) ->
             supervisor.add_and_start(updated)
         else:
             await supervisor.restart(name)
-    return _compose(updated, supervisor)
+    return _compose(updated, supervisor, _advertise_host(request))
 
 
 @router.delete("/v1/components/{name}", status_code=204, dependencies=_write_auth)
