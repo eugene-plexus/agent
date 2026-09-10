@@ -8,6 +8,8 @@ test_supervisor.py.
 from __future__ import annotations
 
 import logging
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,9 +17,9 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_agent import security
 from eugene_plexus_agent._generated.models import RuntimeSpec, RuntimeStatus
-from eugene_plexus_agent.engines import LlamaCppAdapter
+from eugene_plexus_agent.engines import LlamaCppAdapter, VllmAdapter
 from eugene_plexus_agent.engines.base import Loading, Ready
-from eugene_plexus_agent.runtimes import RuntimeSupervisor, _RuntimePlanner
+from eugene_plexus_agent.runtimes import RuntimeSupervisor, _RuntimePlanner, describe_engines
 from eugene_plexus_agent.state import AgentState
 from eugene_plexus_agent.supervisor import ProcessState, SpawnPlanError
 
@@ -51,15 +53,15 @@ def test_engines_lists_every_adapter_with_its_flag_schema(authed_client: TestCli
     response = authed_client.get("/v1/engines")
     assert response.status_code == 200
     engines = response.json()["engines"]
-    assert [e["engine"] for e in engines] == ["llama_cpp"]
+    assert [e["engine"] for e in engines] == ["llama_cpp", "vllm"]
 
-    llama = engines[0]
-    assert llama["flagSchema"]["component"] == "engine:llama_cpp"
-    assert llama["flagSchema"]["fields"], "the form needs fields"
-    # available depends on the dev machine; the contract is that a false
-    # answer explains itself.
-    if not llama["available"]:
-        assert llama["error"]
+    for engine in engines:
+        assert engine["flagSchema"]["component"] == f"engine:{engine['engine']}"
+        assert engine["flagSchema"]["fields"], "the form needs fields"
+        # available depends on the dev machine; the contract is that a
+        # false answer explains itself.
+        if not engine["available"]:
+            assert engine["error"]
 
 
 def test_engines_declare_which_model_formats_they_load(authed_client: TestClient) -> None:
@@ -73,9 +75,12 @@ def test_engines_declare_which_model_formats_they_load(authed_client: TestClient
     library change.
     """
     engines = authed_client.get("/v1/engines").json()["engines"]
-    llama = next(e for e in engines if e["engine"] == "llama_cpp")
+    by_kind = {e["engine"]: e for e in engines}
 
-    assert llama["modelFormats"] == ["gguf"]
+    assert by_kind["llama_cpp"]["modelFormats"] == ["gguf"]
+    # And now the safetensors half of the join has an engine. GGUF stays
+    # off vLLM's list on purpose — see the adapter.
+    assert by_kind["vllm"]["modelFormats"] == ["safetensors"]
 
 
 def test_model_formats_do_not_depend_on_availability(authed_client: TestClient) -> None:
@@ -84,6 +89,120 @@ def test_model_formats_do_not_depend_on_availability(authed_client: TestClient) 
     load."""
     for engine in authed_client.get("/v1/engines").json()["engines"]:
         assert engine["modelFormats"], f"{engine['engine']} declared no formats"
+
+
+def test_vllm_is_a_manual_engine_whose_refusal_names_the_command(
+    authed_client: TestClient,
+) -> None:
+    """Three panels from one shape: install it, here is why we cannot,
+    and here is how you do it yourself. vLLM is the third, on every
+    host, by decision — `policy: manual` says so and `manualInstall`
+    carries upstream's command for the detected host (or, on this
+    Windows dev box, the honest note that the way in is WSL)."""
+    engines = authed_client.get("/v1/engines").json()["engines"]
+    vllm = next(e for e in engines if e["engine"] == "vllm")
+
+    acquisition = vllm["acquisition"]
+    assert acquisition["policy"] == "manual"
+    assert acquisition["installable"] is False
+    assert acquisition["manualInstall"]["docsUrl"].startswith("https://docs.vllm.ai/")
+    # `reason` restates the way forward in prose for a client that reads
+    # only that field.
+    assert "installed by the operator" in acquisition["reason"]
+
+    llama = next(e for e in engines if e["engine"] == "llama_cpp")
+    assert llama["acquisition"]["policy"] == "managed"
+    assert (
+        "manualInstall" not in llama["acquisition"] or llama["acquisition"]["manualInstall"] is None
+    )
+
+
+def test_installing_a_manual_engine_always_422s_with_the_command(
+    authed_client: TestClient,
+) -> None:
+    """Not 404 (the engine exists) and not 500 (nothing failed): we do
+    not install this engine, anywhere, and the detail says what to do
+    instead. A UI should read `policy` and never reach here."""
+    response = authed_client.post("/v1/engines/vllm/install")
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]["detail"]
+    assert "installed by the operator" in detail
+    assert "https://docs.vllm.ai/" in detail
+
+
+def test_unavailable_vllm_names_vllm_binary_as_the_fix(
+    authed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    vllm = next(
+        e for e in authed_client.get("/v1/engines").json()["engines"] if e["engine"] == "vllm"
+    )
+    assert vllm["available"] is False
+    assert "vllmBinary" in vllm["error"]
+    # Not the install endpoint, which 422s for this engine.
+    assert "/install" not in vllm["error"]
+
+
+def test_vllm_binary_config_makes_the_engine_discoverable(
+    authed_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The M4 discovery rung: an install-wide path in the agent's own
+    config, so an operator with a good venv is not `available: false`
+    unless they put it on PATH or repeat the path on every runtime.
+    Set through the standard config trio, no engine-specific endpoint."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    exe = tmp_path / "venv" / "bin" / "vllm"
+    exe.parent.mkdir(parents=True)
+    exe.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+
+    patched = authed_client.patch("/v1/config", json={"vllmBinary": str(exe)})
+    assert patched.status_code == 200
+    assert "vllmBinary" in patched.json()["applied"], patched.text
+
+    vllm = next(
+        e for e in authed_client.get("/v1/engines").json()["engines"] if e["engine"] == "vllm"
+    )
+    assert vllm["available"] is True
+    assert vllm["origin"] == "configured"
+    assert vllm["binaryPath"] == str(exe)
+    # The environment block rides along: interpreter from the shebang,
+    # versions from that interpreter's own metadata. This venv holds no
+    # vllm, and the descriptor says so rather than inventing one.
+    assert vllm["python"]["interpreter"]
+    assert vllm["python"]["pythonVersion"]
+    assert vllm["python"].get("packageVersion") is None
+
+
+def test_missing_vllm_binary_path_is_reported_not_replaced(
+    authed_client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/vllm")
+    authed_client.patch("/v1/config", json={"vllmBinary": str(tmp_path / "nope" / "vllm")})
+    vllm = next(
+        e for e in authed_client.get("/v1/engines").json()["engines"] if e["engine"] == "vllm"
+    )
+    assert vllm["available"] is False
+    assert "does not exist" in vllm["error"]
+    assert str(tmp_path / "nope" / "vllm") in vllm["error"]
+
+
+def test_describe_engines_reads_the_configured_path_through_the_getter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Config lives in AgentState and adapters are stateless singletons;
+    the getter is where they meet, and an empty value means unset."""
+    monkeypatch.setattr("shutil.which", lambda name: None)
+    exe = tmp_path / "vllm"
+    exe.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+
+    with_path = {e.engine.value: e for e in describe_engines(lambda k: str(exe))}
+    assert with_path["vllm"].available is True
+
+    blank = {e.engine.value: e for e in describe_engines(lambda k: "   ")}
+    assert blank["vllm"].available is False
+
+    none = {e.engine.value: e for e in describe_engines(None)}
+    assert none["vllm"].available is False
 
 
 # --------------------------------------------------------------------------- #
@@ -453,6 +572,56 @@ def test_status_mapping_covers_the_loading_distinction() -> None:
         proc: Any = _InState()
         proc.state = state
         assert supervisor._status_for(proc, None) == expected
+
+
+def test_a_silent_load_past_its_budget_is_loading_with_last_error() -> None:
+    """The contract names "a readiness probe that never passed" as one of
+    `lastError`'s sources. Past vLLM's startup budget the status is still
+    `loading` — a live, silent process cannot be anything else — but the
+    operator gets the elapsed time on `lastError` instead of a spinner."""
+    supervisor = RuntimeSupervisor(log=logging.getLogger("test"))
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B", "port": 8090}
+    )
+
+    class _Alive:
+        state = ProcessState.starting
+        pid = 4242
+        last_argv = None
+        last_error = None
+        last_restart = None
+
+    supervisor._processes["q"] = _Alive()  # type: ignore[assignment]
+
+    supervisor._readiness["q"] = Loading(detail="alive, silent (45s)", past_budget=False)
+    within = supervisor.compose(spec)
+    assert within.status == RuntimeStatus.loading
+    assert within.lastError is None
+
+    supervisor._readiness["q"] = Loading(detail="alive for 612s and still silent", past_budget=True)
+    past = supervisor.compose(spec)
+    assert past.status == RuntimeStatus.loading
+    assert past.lastError == "alive for 612s and still silent"
+
+    # The moment it answers, the flag is gone.
+    supervisor._readiness["q"] = Ready()
+    assert supervisor.compose(spec).lastError is None
+
+
+def test_planner_passes_the_configured_binary_to_the_adapter(tmp_path: Path) -> None:
+    """The install-wide `vllmBinary` reaches the spawn plan through the
+    supervisor's config getter, read at plan time."""
+    exe = tmp_path / "vllm"
+    exe.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B", "port": 8090}
+    )
+    planner = _RuntimePlanner(spec, VllmAdapter(), logging.getLogger("test"), lambda key: str(exe))
+    plan = planner.plan()
+    assert plan.argv[:3] == [str(exe), "serve", "/models/Qwen3-8B"]
+    # A console script inherits the agent's cwd; only prebuilt llama.cpp
+    # needs to run from its own directory.
+    assert plan.cwd is None
 
 
 def test_every_process_state_maps_onto_a_runtime_status() -> None:

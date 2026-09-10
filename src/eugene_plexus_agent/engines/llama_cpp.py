@@ -42,9 +42,14 @@ from .base import (
     NotAnswering,
     Readiness,
     Ready,
+    default_model_alias,
 )
 
 log = logging.getLogger(__name__)
+
+# The alias helper moved to `base` when a second engine needed it; kept
+# importable from here so existing callers and tests do not have to move.
+__all__ = ["LlamaCppAdapter", "default_model_alias"]
 
 # `llama-server --version` writes to stderr, and upstream changed the
 # format mid-2026:
@@ -96,11 +101,15 @@ class LlamaCppAdapter(EngineAdapter):
     kind = EngineKind.llama_cpp
     binary_name = "llama-server"
 
-    # GGUF only. A safetensors model in the library therefore has
-    # nowhere to run until the vLLM adapter lands at M4 — stated here
-    # rather than discovered by an operator whose launch button did
-    # nothing.
+    # GGUF only. A safetensors model in the library runs on vLLM
+    # instead; the UI joins the two lists to decide which engine a
+    # launch button offers.
     model_formats = (ModelFormat.gguf,)
+
+    # llama-server answers `/health` from the moment its socket is up
+    # (503 + "loading model" while the weights are read), so readiness
+    # for it is entirely a network observation. Contrast `VllmAdapter`.
+    answers_while_loading = True
 
     # --- discovery --------------------------------------------------------
 
@@ -238,12 +247,12 @@ class LlamaCppAdapter(EngineAdapter):
             async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as client:
                 response = await client.get(f"{url}/health")
         except httpx.HTTPError as e:
-            return NotAnswering(detail=str(e))
+            return NotAnswering(detail=str(e), reached=False)
 
         if response.status_code == 503:
             return Loading(detail=_status_text(response) or "loading model")
         if not response.is_success:
-            return NotAnswering(detail=f"/health returned {response.status_code}")
+            return NotAnswering(detail=f"/health returned {response.status_code}", reached=True)
 
         status = _status_text(response)
         if status and status != "ok":
@@ -302,21 +311,6 @@ class LlamaCppAdapter(EngineAdapter):
             categories=_CATEGORIES,
             fields=_FLAG_FIELDS,
         )
-
-
-def default_model_alias(model_path: str) -> str:
-    """Filename with its extension stripped.
-
-    Because models are stored as plainly-named files in directories the
-    user chose, the obvious name is already the right one — so this is
-    what `modelAlias` defaults to, and setting it is an override rather
-    than a requirement. Multi-file formats point at a directory, whose
-    name is the model name.
-    """
-    path = Path(model_path)
-    if path.suffix.lower() == ".gguf":
-        return path.stem
-    return path.name or path.stem
 
 
 def _status_text(response: httpx.Response) -> str | None:

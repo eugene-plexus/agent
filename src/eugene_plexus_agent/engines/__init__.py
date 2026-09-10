@@ -16,11 +16,15 @@ from .base import (
     NotAnswering,
     Readiness,
     Ready,
+    default_model_alias,
+    interpret_readiness,
 )
-from .llama_cpp import LlamaCppAdapter, default_model_alias
+from .llama_cpp import LlamaCppAdapter
+from .vllm import VllmAdapter
 
 ADAPTERS: dict[EngineKind, EngineAdapter] = {
     EngineKind.llama_cpp: LlamaCppAdapter(),
+    EngineKind.vllm: VllmAdapter(),
 }
 
 
@@ -44,6 +48,8 @@ __all__ = [
     "NotAnswering",
     "Readiness",
     "Ready",
+    "VllmAdapter",
     "adapter_for",
     "default_model_alias",
+    "interpret_readiness",
 ]

@@ -103,7 +103,9 @@ class _FakeEngineAdapter(LlamaCppAdapter):
     def working_directory(self, spec: RuntimeSpec, binary: DiscoveredBinary) -> str | None:
         return None
 
-    def resolve_binary(self, spec: RuntimeSpec) -> DiscoveredBinary:
+    def resolve_binary(
+        self, spec: RuntimeSpec, *, configured: str | None = None
+    ) -> DiscoveredBinary:
         return DiscoveredBinary(path=Path(sys.executable), origin=Origin.configured, version="test")
 
 

@@ -110,7 +110,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # that only engines have, and nothing about a component's health
     # story applies to a foreign binary.
     if not hasattr(app.state, "runtime_supervisor"):
-        runtime_supervisor = RuntimeSupervisor(log=log)
+        # The agent's config is where an install-wide engine path
+        # (`vllmBinary`) lives; the supervisor reads it at each spawn.
+        runtime_supervisor = RuntimeSupervisor(log=log, get_config=state.get_config)
         owns_runtimes = True
     else:
         runtime_supervisor = app.state.runtime_supervisor

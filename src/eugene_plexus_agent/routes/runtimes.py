@@ -82,8 +82,11 @@ def _compose(spec: RuntimeSpec, supervisor: RuntimeSupervisor | None) -> Runtime
 
 
 @router.get("/v1/engines", response_model=EngineList, tags=["engines"], dependencies=_read_auth)
-async def list_engines() -> EngineList:
-    return EngineList(engines=describe_engines())
+async def list_engines(request: Request) -> EngineList:
+    # The agent's own config is where an install-wide engine path
+    # (`vllmBinary`) lives, so discovery reads through it.
+    state: AgentState = request.app.state.agent_state
+    return EngineList(engines=describe_engines(get_config=state.get_config))
 
 
 def _engine_kind(engine: str) -> EngineKind:

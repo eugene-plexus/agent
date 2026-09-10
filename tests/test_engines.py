@@ -175,7 +175,7 @@ def test_explicit_binary_beats_discovery(
     custom = tmp_path / "my-llama-server"
     custom.write_text("#!/bin/sh\n", encoding="utf-8")
     on_path = DiscoveredBinary(Path("/usr/bin/llama-server"), Origin.path)
-    monkeypatch.setattr(adapter, "discover", lambda: on_path)
+    monkeypatch.setattr(adapter, "discover", lambda **_: on_path)
 
     resolved = adapter.resolve_binary(_spec(binary=str(custom)))
     assert resolved.path == custom
@@ -190,7 +190,7 @@ def test_missing_explicit_binary_is_an_error_not_a_fallback(adapter: LlamaCppAda
 def test_no_binary_anywhere_names_the_fix(
     adapter: LlamaCppAdapter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(adapter, "discover", lambda: None)
+    monkeypatch.setattr(adapter, "discover", lambda **_: None)
     with pytest.raises(EngineUnavailableError) as caught:
         adapter.resolve_binary(_spec())
     # The message has to name the fix, since until engine
@@ -347,11 +347,11 @@ def test_context_size_has_no_default(adapter: LlamaCppAdapter) -> None:
 # Engine kinds whose contract has landed but whose adapter has not. Empty is
 # the correct steady state; an entry here is a debt with a name.
 #
-# `vllm` arrived in EngineKind with specs 811112b (M4), whose implementation
-# was paused for M5's multi-host and trust work. Registering the vLLM adapter
-# is the first thing M4's implementation has to do, and deleting the entry
-# below is how that gets proved.
-CONTRACTED_WITHOUT_ADAPTER = {EngineKind.vllm}
+# `vllm` sat here from specs 811112b (M4's contracts, implementation paused
+# for M5) until its adapter landed, at which point the honesty test below
+# forced the entry out. That is the mechanism working as intended: the
+# allowlist cannot outlive the gap it excuses.
+CONTRACTED_WITHOUT_ADAPTER: set[EngineKind] = set()
 
 
 def test_registry_covers_every_engine_kind() -> None:

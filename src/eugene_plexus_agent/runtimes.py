@@ -1,7 +1,7 @@
 """Supervision of engine runtimes.
 
-A *runtime* is one third-party engine process — `llama-server` today —
-launched from an argv an `EngineAdapter` builds. It reuses the whole
+A *runtime* is one third-party engine process — `llama-server` or
+`vllm serve` — launched from an argv an `EngineAdapter` builds. It reuses the whole
 supervision loop in `supervisor.py` and adds the two things a foreign
 binary needs that a Eugene Plexus component does not: an engine-specific
 readiness probe, and a status that distinguishes "still loading the
@@ -17,7 +17,9 @@ import asyncio
 import contextlib
 import logging
 import os
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from ._generated.models import (
     EngineAcquisition,
@@ -25,6 +27,8 @@ from ._generated.models import (
     EngineInstall,
     EngineKind,
     ManagedEngine,
+    ManualInstall,
+    Policy,
     Runtime,
     RuntimeCapabilities,
     RuntimeSpec,
@@ -38,6 +42,7 @@ from .engines import (
     Ready,
     adapter_for,
     default_model_alias,
+    interpret_readiness,
 )
 from .engines.acquisition import (
     AcquisitionError,
@@ -64,6 +69,19 @@ log = logging.getLogger(__name__)
 # heavier answer than `/healthz`.
 _READINESS_POLL_SECONDS = 2.0
 
+# `key -> value` over the agent's own config. What an adapter's
+# `configured_binary_key` is read through: config lives in `AgentState`,
+# adapters are stateless singletons, and the two meet here.
+ConfigGetter = Callable[[str], Any]
+
+
+def _configured_binary(adapter: EngineAdapter, get_config: ConfigGetter | None) -> str | None:
+    """The install-wide binary path for this engine, if one is configured."""
+    if get_config is None or adapter.configured_binary_key is None:
+        return None
+    value = get_config(adapter.configured_binary_key)
+    return str(value) if isinstance(value, str) and value.strip() else None
+
 
 class _RuntimePlanner:
     """Launch plans for one engine runtime.
@@ -79,10 +97,12 @@ class _RuntimePlanner:
         spec: RuntimeSpec,
         adapter: EngineAdapter,
         log: logging.Logger,
+        get_config: ConfigGetter | None = None,
     ) -> None:
         self.spec = spec
         self._adapter = adapter
         self._log = log
+        self._get_config = get_config
         self.binary: DiscoveredBinary | None = None
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
         so the operator sees the build that is actually running rather than
@@ -98,7 +118,10 @@ class _RuntimePlanner:
 
     def plan(self) -> SpawnPlan:
         try:
-            binary = self._adapter.resolve_binary(self.spec)
+            binary = self._adapter.resolve_binary(
+                self.spec,
+                configured=_configured_binary(self._adapter, self._get_config),
+            )
         except EngineUnavailableError as e:
             # A declared runtime whose engine is missing is a crash, not a
             # skipped entry: the operator asked for something that cannot
@@ -157,8 +180,16 @@ class _RuntimePlanner:
 class RuntimeSupervisor:
     """Owns every engine process plus a background readiness-poll task."""
 
-    def __init__(self, log: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        log: logging.Logger | None = None,
+        get_config: ConfigGetter | None = None,
+    ) -> None:
         self._log = log or logging.getLogger(__name__)
+        # Read live at plan time, so an operator who sets `vllmBinary` in
+        # the UI gets the new path on the next spawn without restarting
+        # the agent.
+        self._get_config = get_config
         self._processes: dict[str, SupervisedProcess] = {}
         self._planners: dict[str, _RuntimePlanner] = {}
         # Latest readiness per runtime. Held here rather than on the
@@ -186,7 +217,7 @@ class RuntimeSupervisor:
                 spec.engine.value,
             )
             return
-        planner = _RuntimePlanner(spec, adapter, self._log)
+        planner = _RuntimePlanner(spec, adapter, self._log, self._get_config)
         sp = SupervisedProcess(planner, self._log)
         self._planners[spec.name] = planner
         self._processes[spec.name] = sp
@@ -270,6 +301,15 @@ class RuntimeSupervisor:
 
         last_restart: datetime | None = sp.last_restart if sp is not None else None
 
+        # A silent load that has outrun its adapter's startup budget is
+        # reported on `lastError` — the contract names "a readiness probe
+        # that never passed" as one of its three sources — while `status`
+        # stays `loading`, because that is still the only thing a live,
+        # silent process can be. Cleared the moment the engine answers.
+        last_error = sp.last_error if sp is not None else None
+        if last_error is None and isinstance(readiness, Loading) and readiness.past_budget:
+            last_error = readiness.detail
+
         return Runtime(
             name=spec.name,
             engine=spec.engine,
@@ -290,7 +330,7 @@ class RuntimeSupervisor:
             engineVersion=engine_version,
             capabilities=capabilities,
             lastRestart=last_restart,
-            lastError=sp.last_error if sp is not None else None,
+            lastError=last_error,
         )
 
     def _status_for(
@@ -340,13 +380,27 @@ class RuntimeSupervisor:
             return
 
     async def _probe_one(self, spec: RuntimeSpec) -> None:
-        if spec.name not in self._processes or spec.port is None:
+        sp = self._processes.get(spec.name)
+        if sp is None or spec.port is None:
             return
         adapter = adapter_for(spec.engine)
         if adapter is None:
             return
         base = f"http://{spec.host or '127.0.0.1'}:{spec.port}"
         outcome = await adapter.probe_readiness(base)
+        # The probe saw the network. This is where what the supervisor
+        # knows — the pid is alive, and for how long — is added: for an
+        # engine that answers nothing while it loads, alive-and-refusing
+        # IS loading, and only this side of the split can say so.
+        elapsed: float | None = None
+        if sp.last_restart is not None:
+            elapsed = (datetime.now(UTC) - sp.last_restart).total_seconds()
+        outcome = interpret_readiness(
+            adapter,
+            outcome,
+            process_alive=sp.pid is not None,
+            elapsed_seconds=elapsed,
+        )
         if isinstance(outcome, Ready | Loading):
             self._readiness[spec.name] = outcome
         else:
@@ -377,15 +431,37 @@ async def close_installers() -> None:
     _INSTALLERS.clear()
 
 
+def _manual_reason(adapter: EngineAdapter, manual: ManualInstall | None) -> str:
+    """Why we will not install a `manual` engine, written so the 422 from
+    the install endpoint still tells the operator what to do."""
+    parts = [
+        f"{adapter.kind.value} is installed by the operator, not by this agent: its unit "
+        f"of installation is a Python environment, which is not something we can fetch "
+        f"and verify."
+    ]
+    if manual is not None:
+        if manual.command:
+            parts.append(f"For this host: `{manual.command}`.")
+        if manual.notes:
+            parts.append(manual.notes)
+        parts.append(f"Upstream's install page: {manual.docsUrl}")
+    return " ".join(parts)
+
+
 def plan_for(kind: EngineKind, *, version: str | None = None) -> AcquisitionPlan | Unavailable:
     """What we would fetch for this host, or why we cannot.
 
-    Adapter-specific by necessity — asset naming is engine knowledge, the
-    same kind as argv construction — so this dispatches rather than
-    generalising over an interface that has exactly one implementation.
-    Widen it when a second engine ships prebuilt binaries; vLLM will not.
+    A `manual` engine is always `Unavailable`, on every host, and the
+    reason carries the install command — that is what makes the install
+    endpoint's 422 an answer rather than a refusal.
+
+    Otherwise adapter-specific by necessity — asset naming is engine
+    knowledge, the same kind as argv construction — so this dispatches
+    rather than generalising over an interface with one implementation.
     """
     adapter = adapter_for(kind)
+    if adapter is not None and adapter.install_policy is Policy.manual:
+        return Unavailable(reason=_manual_reason(adapter, adapter.manual_install(detect_host())))
     if not isinstance(adapter, LlamaCppAdapter):
         return Unavailable(
             reason=f"engine {kind.value!r} has no managed-install support in this build"
@@ -423,6 +499,22 @@ def _acquisition_for(kind: EngineKind) -> EngineAcquisition:
     check has to leave the panel stale rather than turn it into an error.
     """
     adapter = adapter_for(kind)
+    detected = detect_host()
+
+    if adapter is not None and adapter.install_policy is Policy.manual:
+        # Not by us, anywhere. `installable` is false by decision rather
+        # than by host, `manualInstall` carries the command for this host,
+        # and `reason` says the same thing in prose for a client that
+        # reads only that.
+        manual = adapter.manual_install(detected)
+        return EngineAcquisition(
+            policy=Policy.manual,
+            installable=False,
+            reason=_manual_reason(adapter, manual),
+            manualInstall=manual,
+            detected=detected,
+        )
+
     latest: Release | None = None
     checked_at: datetime | None = None
     # Inline isinstance rather than a hoisted flag: mypy narrows on the
@@ -433,9 +525,9 @@ def _acquisition_for(kind: EngineKind) -> EngineAcquisition:
         checked_at = adapter.releases.checked_at
     plan = plan_for(kind)
 
-    detected = detect_host()
     if isinstance(plan, Unavailable):
         return EngineAcquisition(
+            policy=Policy.managed,
             installable=False,
             reason=plan.reason,
             detected=detected,
@@ -444,6 +536,7 @@ def _acquisition_for(kind: EngineKind) -> EngineAcquisition:
             checkedAt=checked_at,
         )
     return EngineAcquisition(
+        policy=Policy.managed,
         installable=True,
         variant=plan.variant,
         detected=detected,
@@ -468,34 +561,53 @@ def _managed_for(adapter: EngineAdapter) -> ManagedEngine | None:
     )
 
 
-def describe_engines() -> list[EngineDescriptor]:
+def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescriptor]:
     """What this agent knows how to start, and what it found on disk.
 
     Backs `GET /v1/engines`. Note what `available` does and does not mean:
-    it answers "is a binary discoverable on this host", by managed install
-    or PATH. A runtime carrying an explicit `binary` bypasses discovery
-    entirely and runs happily against an engine reported here as
-    unavailable — which reads as a contradiction on a dashboard and is
-    worth saying out loud in the `error` text.
+    it answers "is a binary discoverable on this host" — by managed
+    install, by an install-wide configured path (`vllmBinary`, read
+    through `get_config`), or on PATH. A runtime carrying an explicit
+    `binary` bypasses discovery entirely and runs happily against an
+    engine reported here as unavailable — which reads as a contradiction
+    on a dashboard and is worth saying out loud in the `error` text.
     """
     out: list[EngineDescriptor] = []
     for kind, adapter in ADAPTERS.items():
-        found = adapter.discover()
         acquisition = _acquisition_for(kind)
         managed = _managed_for(adapter)
 
+        error: str | None = None
+        found: DiscoveredBinary | None
+        try:
+            found = adapter.discover(configured=_configured_binary(adapter, get_config))
+        except EngineUnavailableError as e:
+            # A configured path that does not exist. Reported as
+            # unavailable with the path named, never quietly replaced by
+            # whatever is on PATH.
+            found = None
+            error = str(e)
+
         if found is None:
-            hint = (
-                f"install one with POST /v1/engines/{kind.value}/install"
-                if acquisition.installable
-                else "set `binary` on a runtime to point at an existing build"
-            )
+            if error is None:
+                if adapter.configured_binary_key is not None:
+                    hint = (
+                        f"set `{adapter.configured_binary_key}` in the agent config to the "
+                        f"{adapter.binary_name!r} console script inside the environment where "
+                        f"you installed it, or put it on PATH; `acquisition.manualInstall` "
+                        f"has the install command for this host"
+                    )
+                elif acquisition.installable:
+                    hint = f"install one with POST /v1/engines/{kind.value}/install"
+                else:
+                    hint = "set `binary` on a runtime to point at an existing build"
+                error = f"no {adapter.binary_name!r} installed or on PATH — {hint}"
             out.append(
                 EngineDescriptor(
                     engine=kind,
                     available=False,
                     modelFormats=list(adapter.model_formats),
-                    error=f"no {adapter.binary_name!r} installed or on PATH — {hint}",
+                    error=error,
                     flagSchema=adapter.flag_schema(),
                     managed=managed,
                     acquisition=acquisition,
@@ -513,6 +625,7 @@ def describe_engines() -> list[EngineDescriptor]:
                 flagSchema=adapter.flag_schema(),
                 managed=managed,
                 acquisition=acquisition,
+                python=found.python,
             )
         )
     return out
@@ -546,6 +659,7 @@ def _default_alias(spec: RuntimeSpec) -> str:
 
 __all__ = [
     "AcquisitionError",
+    "ConfigGetter",
     "EngineInstall",
     "EngineKind",
     "RuntimeSupervisor",

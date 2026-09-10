@@ -117,11 +117,30 @@ CONFIG_FIELDS: list[ConfigField] = [
         enumValues=["small", "medium", "large"],
         enumLabels=["Small", "Medium", "Large"],
     ),
+    ConfigField(
+        key="vllmBinary",
+        label="vLLM binary",
+        description=(
+            "Install-wide path to the `vllm` console script inside the "
+            "virtual environment where you installed vLLM — for example "
+            "`/home/you/vllm/.venv/bin/vllm`. vLLM is an engine this agent "
+            "drives but does not install, so without this it is found only "
+            "if it is on PATH or a `binary` is set on every runtime. Point "
+            "at the console script, not at a Python interpreter or a venv "
+            "directory: the script's shebang binds its own interpreter, so "
+            "nothing needs activating. A `binary` set on an individual "
+            "runtime still wins over this. Read at the next spawn; no agent "
+            "restart needed."
+        ),
+        category="engines",
+        valueType=ConfigValueType.file_path,
+    ),
 ]
 CATEGORY_LABELS: dict[str, str] = {
     "setup": "Setup",
     "security": "Security",
     "ui": "Appearance",
+    "engines": "Engines",
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}
@@ -462,5 +481,14 @@ def _validate(field: ConfigField, value: Any) -> str | None:
         allowed = field.enumValues or []
         if value not in allowed:
             return f"must be one of {allowed}"
+        return None
+    if vt == ConfigValueType.file_path or vt == ConfigValueType.string:
+        # Existence is deliberately not checked here: the path is read
+        # at spawn and at discovery, both of which report a missing file
+        # with the path named. Rejecting it at PATCH time would stop an
+        # operator from pointing at an environment they are about to
+        # create.
+        if not isinstance(value, str):
+            return f"expected string, got {type(value).__name__}"
         return None
     return f"unsupported valueType for agent config: {vt}"
