@@ -825,7 +825,20 @@ class Supervisor:
         are logged but never raised; the operator's login flow
         shouldn't error out because one supervised child wedged.
         """
-        names = list(self._processes.keys())
+        # The trust root is skipped. It receives nothing from this agent's
+        # auth state — no master key, no signing key — so a restart hands it
+        # nothing new and costs it everything: a restarted control root holds
+        # its keys sealed and is locked until an operator logs in again. Found
+        # by the M7 run, where enrolling the control host's agent restarted
+        # the root it had just enrolled with.
+        names = [
+            name
+            for name, sp in self._processes.items()
+            if not (
+                isinstance(sp._planner, _ComponentPlanner)
+                and sp._planner.entry.kind in _TRUST_ROOT_KINDS
+            )
+        ]
         if not names:
             return []
         self._log.info(
