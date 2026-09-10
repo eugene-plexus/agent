@@ -157,6 +157,31 @@ def require_operator_or_service(
     return payload
 
 
+def require_operator_or_gateway(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> security.TokenPayload:
+    """Accept an operator session token OR the gateway's service token.
+
+    For the two lifecycle actions — stop and start a runtime — that M6
+    hands to the gateway, because the gateway is the one component that
+    sees demand. `service:gateway` exactly, not any service audience: a
+    leaked driver or library token still cannot stop a process holding a
+    GPU, which was the reason these were operator-only through M5.
+    """
+    payload = require_operator_or_service(request, creds)
+    if payload.aud == security.AUDIENCE_OPERATOR:
+        return payload
+    if payload.aud == f"{security.SERVICE_AUDIENCE_PREFIX}gateway":
+        return payload
+    raise _problem(
+        status.HTTP_401_UNAUTHORIZED,
+        "Wrong audience",
+        f"Token audience {payload.aud!r} may not start or stop a runtime; only the operator "
+        "or the gateway (service:gateway) may.",
+    )
+
+
 def require_service_token(
     request: Request,
     expected_kind: str,

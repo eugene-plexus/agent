@@ -37,6 +37,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -177,6 +178,12 @@ class AgentState:
         # masterSalt:     base64-encoded 16-byte salt used to derive the
         #                 master key from the passphrase via Argon2id raw.
         self._auth: dict[str, Any] = {}
+
+    @property
+    def path(self) -> Path:
+        """Where this state lives. Companion driver configs are written
+        beside it, under `drivers/`."""
+        return self._path
 
     # ----- lifecycle --------------------------------------------------
 
@@ -366,6 +373,32 @@ class AgentState:
             self._write_locked()
             return True
 
+    def _component_ports_locked(self) -> set[int]:
+        """Ports the components' URLs claim — companion drivers live in
+        the same range as runtimes, so both have to be checked."""
+        taken: set[int] = set()
+        for entry in self._components.values():
+            port = urlparse(str(entry.url)).port
+            if port is not None:
+                taken.add(port)
+        return taken
+
+    def allocate_component_port(self) -> int:
+        """A free port for a component the agent declares itself — the
+        companion driver. Same range as runtimes, checked against both,
+        so a companion never lands on a port a later runtime gets."""
+        with self._lock:
+            taken = self._component_ports_locked() | {
+                other.port for other in self._runtimes.values() if other.port is not None
+            }
+            for candidate in range(_RUNTIME_PORT_BASE, _RUNTIME_PORT_BASE + _RUNTIME_PORT_SPAN):
+                if candidate not in taken:
+                    return candidate
+        raise ValueError(
+            f"no free port in {_RUNTIME_PORT_BASE}-{_RUNTIME_PORT_BASE + _RUNTIME_PORT_SPAN - 1} "
+            f"for a companion driver"
+        )
+
     def _resolve_ports_locked(self, spec: RuntimeSpec) -> RuntimeSpec:
         """Assign a port when the operator did not pick one, and reject a
         collision when they did.
@@ -374,13 +407,14 @@ class AgentState:
         so the port is *persisted*: an engine's port ends up in a driver's
         config, and a value that changed on every restart would be
         useless there. With N runtimes nobody should be handing out port
-        numbers by hand.
+        numbers by hand. Component URL ports count as taken too, since
+        companion drivers are allocated from the same range.
         """
         taken = {
             other.port
             for name, other in self._runtimes.items()
             if name != spec.name and other.port is not None
-        }
+        } | self._component_ports_locked()
         if spec.port is not None:
             if spec.port in taken:
                 raise ValueError(f"port {spec.port} is already claimed by another runtime")

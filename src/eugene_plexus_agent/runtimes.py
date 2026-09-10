@@ -33,7 +33,9 @@ from ._generated.models import (
     RuntimeCapabilities,
     RuntimeSpec,
     RuntimeStatus,
+    StopReason,
 )
+from .companions import companion_name
 from .engines import (
     ADAPTERS,
     EngineAdapter,
@@ -196,6 +198,10 @@ class RuntimeSupervisor:
         # process because it is an *observation*, not loop state — the
         # same reason component safe-mode observations live on Supervisor.
         self._readiness: dict[str, Loading | Ready | None] = {}
+        # Why a stopped runtime is stopped — an observation, reported on
+        # `Runtime.stopReason` and never persisted or replicated. Cleared
+        # the moment the runtime is started.
+        self._stop_reasons: dict[str, StopReason] = {}
         self._poll_task: asyncio.Task[None] | None = None
 
     # --- collection management --------------------------------------------
@@ -208,6 +214,7 @@ class RuntimeSupervisor:
             return
         if spec.autoStart is False:
             self._planners.pop(spec.name, None)
+            self._stop_reasons.setdefault(spec.name, StopReason.autoStart)
             return
         adapter = adapter_for(spec.engine)
         if adapter is None:
@@ -221,12 +228,14 @@ class RuntimeSupervisor:
         sp = SupervisedProcess(planner, self._log)
         self._planners[spec.name] = planner
         self._processes[spec.name] = sp
+        self._stop_reasons.pop(spec.name, None)
         sp.start()
 
     async def remove_and_stop(self, name: str) -> None:
         sp = self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
+        self._stop_reasons.pop(name, None)
         if sp is not None:
             await sp.stop()
 
@@ -238,16 +247,18 @@ class RuntimeSupervisor:
         await sp.restart()
         return True
 
-    async def stop_one(self, name: str) -> None:
+    async def stop_one(self, name: str, *, reason: StopReason = StopReason.operator) -> None:
         """Stop the engine but keep the runtime declared.
 
         Distinct from `remove_and_stop` because an engine holds GPU
         memory: an operator who wants the VRAM back needs a stop that is
-        neither a delete nor a crash.
+        neither a delete nor a crash. `reason` is recorded so the
+        dashboard can say *why* — `idle` when the gateway unloaded it.
         """
         sp = self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
+        self._stop_reasons[name] = reason
         if sp is not None:
             await sp.stop()
 
@@ -265,6 +276,7 @@ class RuntimeSupervisor:
         self._processes.clear()
         self._planners.clear()
         self._readiness.clear()
+        self._stop_reasons.clear()
 
     async def start_readiness_loop(self, get_specs: object) -> None:
         """Start the background readiness poll. `get_specs` is a 0-arg
@@ -310,6 +322,17 @@ class RuntimeSupervisor:
         if last_error is None and isinstance(readiness, Loading) and readiness.past_budget:
             last_error = readiness.detail
 
+        # Why a stopped runtime is stopped. Recorded by `stop_one`; a
+        # runtime that was never started in this agent's lifetime was
+        # declared `autoStart: false`, which is the only other way to be
+        # `stopped` without a recorded reason.
+        stop_reason: StopReason | None = None
+        if status is RuntimeStatus.stopped:
+            stop_reason = self._stop_reasons.get(
+                name,
+                StopReason.autoStart if spec.autoStart is False else StopReason.operator,
+            )
+
         return Runtime(
             name=spec.name,
             engine=spec.engine,
@@ -318,12 +341,19 @@ class RuntimeSupervisor:
             host=spec.host,
             port=spec.port,
             autoStart=spec.autoStart,
+            autoDriver=spec.autoDriver,
+            idleUnloadSeconds=spec.idleUnloadSeconds,
+            startOnDemand=spec.startOnDemand,
             flags=spec.flags,
             extraArgs=spec.extraArgs,
             env=spec.env,
             workingDirectory=spec.workingDirectory,
             binary=spec.binary,
+            # Derived from the declaration: `autoDriver` means the agent
+            # keeps a companion under this name (reconciled at boot).
+            driver=companion_name(spec.name) if spec.autoDriver is not False else None,
             status=status,
+            stopReason=stop_reason,
             url=url,  # type: ignore[arg-type]
             argv=sp.last_argv if sp is not None else None,
             pid=sp.pid if sp is not None else None,

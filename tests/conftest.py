@@ -16,7 +16,7 @@ itself (login flow, rate limiting, token validation) use the bare
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,11 +27,14 @@ from fastapi.testclient import TestClient
 from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentStatus,
+    ComputeDevice,
+    ComputeDeviceKind,
     Runtime,
     RuntimeSpec,
     RuntimeStatus,
 )
 from eugene_plexus_agent.app import create_app
+from eugene_plexus_agent.engines.devices import DeviceSnapshot
 from eugene_plexus_agent.runtimes import RuntimeSupervisor
 from eugene_plexus_agent.settings import Settings
 
@@ -97,6 +100,8 @@ class StubRuntimeSupervisor(RuntimeSupervisor):
         self.calls.append(("add_and_start", spec.name))
         if spec.autoStart is not False:
             self.started.add(spec.name)
+            # Mirrors the real supervisor: a start clears why it was stopped.
+            self._stop_reasons.pop(spec.name, None)
 
     async def remove_and_stop(self, name: str) -> None:
         self.calls.append(("remove_and_stop", name))
@@ -106,9 +111,11 @@ class StubRuntimeSupervisor(RuntimeSupervisor):
         self.calls.append(("restart", name))
         return name in self.started
 
-    async def stop_one(self, name: str) -> None:
+    async def stop_one(self, name: str, *, reason: Any = None) -> None:
         self.calls.append(("stop_one", name))
         self.started.discard(name)
+        if reason is not None:
+            self._stop_reasons[name] = reason
 
     async def stop_all(self) -> None:
         self.calls.append(("stop_all", ""))
@@ -126,7 +133,7 @@ class StubRuntimeSupervisor(RuntimeSupervisor):
         # `starting` for anything this stub was asked to start, which is
         # what a just-created runtime actually looks like.
         if spec.name in self.started:
-            return runtime.model_copy(update={"status": RuntimeStatus.starting})
+            return runtime.model_copy(update={"status": RuntimeStatus.starting, "stopReason": None})
         return runtime
 
 
@@ -154,7 +161,46 @@ def app(
     app = create_app(settings=settings)
     app.state.supervisor = stub_supervisor
     app.state.runtime_supervisor = stub_runtime_supervisor
+    # Admission measures every launch against live devices. Unit tests
+    # get a fixed, generous card and no library, so a create is
+    # deterministic and never shells out to nvidia-smi — and CI on a
+    # GPU-less Linux runner behaves like this box.
+    app.state.device_detector = lambda: fake_devices()
+    app.state.library_fit_client = None
     return app
+
+
+def fake_devices(
+    *, free: int = 24 * 1024**3, total: int = 32 * 1024**3, count: int = 1
+) -> DeviceSnapshot:
+    """A device snapshot tests can shape: `count` CUDA cards of `total`
+    bytes with `free` available, plus a CPU carrying host memory."""
+    devices = [
+        ComputeDevice(
+            kind=ComputeDeviceKind.cuda,
+            index=i,
+            name=f"Fake GPU {i}",
+            memoryTotalBytes=total,
+            memoryFreeBytes=free,
+        )
+        for i in range(count)
+    ]
+    devices.append(
+        ComputeDevice(
+            kind=ComputeDeviceKind.cpu,
+            index=0,
+            name="Fake CPU",
+            memoryTotalBytes=64 * 1024**3,
+            memoryFreeBytes=40 * 1024**3,
+        )
+    )
+    return DeviceSnapshot(
+        devices=tuple(devices),
+        warnings=(),
+        ram_total_bytes=64 * 1024**3,
+        ram_available_bytes=40 * 1024**3,
+        detected_at=datetime.now(UTC),
+    )
 
 
 @pytest.fixture

@@ -402,7 +402,11 @@ def test_lifecycle_actions_404_on_unknown_names(authed_client: TestClient) -> No
 def test_service_token_can_read_but_not_mutate(client: TestClient) -> None:
     """Same split as components, for a sharper reason: the gateway needs
     to see what is running, but a leaked service token must not be able
-    to start or stop a process holding a GPU."""
+    to declare or delete a process holding a GPU.
+
+    M6 carved one exception: the *gateway's* token may stop and start,
+    because the gateway is the component that sees demand. Any other
+    service audience still may not — see test_lifecycle_routes.py."""
     client.post("/v1/auth/initialize", json={"passphrase": "correct horse battery staple"})
     headers = {"Authorization": f"Bearer {_service_token(client)}"}
 
@@ -412,7 +416,18 @@ def test_service_token_can_read_but_not_mutate(client: TestClient) -> None:
     # treats a service-audience token as no operator credential at all
     # rather than as an authenticated principal being denied.
     assert client.post("/v1/runtimes", json=_runtime(), headers=headers).status_code == 401
-    assert client.post("/v1/runtimes/x/stop", headers=headers).status_code == 401
+    assert client.delete("/v1/runtimes/x", headers=headers).status_code == 401
+    # The gateway's token is authorized for stop — so an unknown runtime
+    # is a 404, not a 401.
+    assert client.post("/v1/runtimes/x/stop", headers=headers).status_code == 404
+    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
+    driver = security.issue_service_token(signing_key=signing_key, kind="inference-driver")
+    assert (
+        client.post(
+            "/v1/runtimes/x/stop", headers={"Authorization": f"Bearer {driver}"}
+        ).status_code
+        == 401
+    )
 
 
 def test_runtimes_require_auth(client: TestClient) -> None:
@@ -464,7 +479,9 @@ def test_runtimes_and_components_are_separate_collections(
 
     components = authed_client.get("/v1/components").json()["components"]
     runtimes = authed_client.get("/v1/runtimes").json()["runtimes"]
-    assert [c["name"] for c in components] == ["gateway"]
+    # The runtime is not a component. Its companion *driver* is — a
+    # Eugene Plexus process the agent declared beside the engine (M6).
+    assert [c["name"] for c in components] == ["gateway", "qwen3-30b-driver"]
     assert [r["name"] for r in runtimes] == ["qwen3-30b"]
 
     raw = settings.config_file.read_text(encoding="utf-8")

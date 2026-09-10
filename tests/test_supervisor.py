@@ -825,3 +825,39 @@ async def test_nothing_to_launch_ends_the_loop_instead_of_spinning(
     assert sp._task is not None and sp._task.done(), "loop should have exited"
     assert sleeps == [], "should not have entered the back-off at all"
     await sp.stop()
+
+
+@pytest.mark.anyio
+async def test_a_planner_that_raises_anything_is_a_crash_not_a_dead_task() -> None:
+    """The M4 process note, fixed. A `TypeError` from a planner used to
+    escape `_spawn_once`, kill the supervision task, and leave the
+    runtime at `starting` forever with no error anywhere."""
+
+    class _BrokenPlanner:
+        name = "broken"
+        log_prefix = "[broken] "
+
+        def plan(self) -> SpawnPlan | None:
+            raise TypeError("resolve_binary() got an unexpected keyword argument 'configured'")
+
+        def on_crash_threshold(self) -> bool:
+            return False
+
+        def reset(self) -> None:
+            return None
+
+    sp = SupervisedProcess(_BrokenPlanner(), logging.getLogger("test"))
+    sp.start()
+    try:
+        for _ in range(200):
+            if sp.last_error is not None:
+                break
+            await asyncio.sleep(0.05)
+        assert sp.state == ProcessState.crashed
+        assert sp.last_error is not None
+        assert "TypeError" in sp.last_error
+        assert "configured" in sp.last_error
+    finally:
+        # The loop keeps backing off and retrying until the crash
+        # threshold; end it here rather than leave a pending task.
+        await sp.stop()

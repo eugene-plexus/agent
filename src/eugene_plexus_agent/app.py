@@ -24,13 +24,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__, keyring_store, security
+from . import __version__, companions, keyring_store, security
 from .auth_state import AuthState
 from .dependencies import require_operator_session
 from .routes import auth as auth_routes
 from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
+from .routes import node as node_routes
 from .routes import runtimes as runtimes_routes
 from .runtimes import RuntimeSupervisor, close_installers
 from .settings import Settings, load_settings
@@ -125,6 +126,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await supervisor.start_health_loop(state.list_topology_entries)
 
     if not settings.safe_mode and owns_runtimes:
+        # Companions first, so a runtime that has one gets it whether the
+        # install predates M6 or an operator deleted the driver by hand.
+        # `autoDriver: true` means the agent keeps one, and boot is where
+        # that promise is made good.
+        created = await companions.reconcile(state, supervisor)
+        if created:
+            log.info("declared %d companion driver(s) at boot: %s", len(created), created)
         for spec in state.list_runtime_specs():
             runtime_supervisor.add_and_start(spec)
         await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
@@ -172,7 +180,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(components_routes.router)
     # Same per-route auth split as components, for the same reason: the
     # gateway resolves what is running with a service token, while
-    # starting or stopping a process that holds a GPU stays operator-only.
+    # starting or stopping a process that holds a GPU is operator-only
+    # — or, from M6, the gateway's own token, because it is the one
+    # component that sees demand.
     app.include_router(runtimes_routes.router)
+    # This host's identity and devices; reads only, operator or service.
+    app.include_router(node_routes.router)
 
     return app

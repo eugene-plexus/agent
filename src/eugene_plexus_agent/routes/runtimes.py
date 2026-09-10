@@ -5,14 +5,28 @@ Mirrors the shape of the components routes — declaration from
 against a separate collection, because an engine binary shares none of a
 component's declarative shape. See the agent spec's
 components-vs-runtimes table.
+
+M6 adds three things here and they are the whole of lifecycle policy as
+the agent sees it: a declared runtime brings its **companion driver**
+with it (`companions.py`), a launch is **measured before it spawns**
+(`admission.py`), and the gateway — the one component that sees demand
+— may **stop and start** a runtime with its own service token, saying
+why, so the agent can report `stopReason`.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+import asyncio
+import logging
 
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+
+from .. import security
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import (
+    Admission,
+    AdmissionDecision,
+    ComponentKind,
     EngineInstall,
     EngineInstallRequest,
     EngineKind,
@@ -20,9 +34,24 @@ from .._generated.models import (
     Runtime,
     RuntimeList,
     RuntimeSpec,
+    StopReason,
+    StopRequest,
 )
-from ..dependencies import require_operator_or_service, require_operator_session
+from ..admission import LibraryFitClient, RunningRuntime, check_admission
+from ..companions import (
+    CompanionConflict,
+    companion_name,
+    ensure_companion,
+    is_companion,
+    remove_companion,
+)
+from ..dependencies import (
+    require_operator_or_gateway,
+    require_operator_or_service,
+    require_operator_session,
+)
 from ..engines.acquisition import AcquisitionError, Unavailable
+from ..engines.devices import detect_devices
 from ..runtimes import (
     RuntimeSupervisor,
     describe_engines,
@@ -32,14 +61,22 @@ from ..runtimes import (
 )
 from ..state import AgentState
 
+log = logging.getLogger(__name__)
+
 router = APIRouter()
 
 # Same split as components: reads accept operator OR service tokens so the
 # gateway can resolve what is running with its service token; mutations
 # stay operator-only, because a leaked service token must not be able to
 # start or stop a process holding a GPU.
+#
+# Except stop and start, from M6: those accept the operator OR the
+# gateway's own audience, checked exactly. The gateway is the component
+# that sees demand, so it is the one that unloads an idle runtime and
+# wakes one on request. A leaked driver or library token still cannot.
 _read_auth = [Depends(require_operator_or_service)]
 _write_auth = [Depends(require_operator_session)]
+_lifecycle_auth = [Depends(require_operator_or_gateway)]
 
 
 def _problem(*, code: int, slug: str, title: str, detail: str) -> HTTPException:
@@ -64,8 +101,21 @@ def _not_found(name: str) -> HTTPException:
     )
 
 
+def _refused(admission: Admission) -> HTTPException:
+    return _problem(
+        code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        slug="admission-refused",
+        title="Admission refused",
+        detail=admission.reason,
+    )
+
+
 def _supervisor(request: Request) -> RuntimeSupervisor | None:
     return getattr(request.app.state, "runtime_supervisor", None)
+
+
+def _component_supervisor(request: Request):  # type: ignore[no-untyped-def]
+    return getattr(request.app.state, "supervisor", None)
 
 
 def _compose(spec: RuntimeSpec, supervisor: RuntimeSupervisor | None) -> Runtime:
@@ -74,6 +124,53 @@ def _compose(spec: RuntimeSpec, supervisor: RuntimeSupervisor | None) -> Runtime
         # spec-valid `stopped`, which is honest — nothing is running it.
         return RuntimeSupervisor().compose(spec)
     return supervisor.compose(spec)
+
+
+# --------------------------------------------------------------------------- #
+# Admission
+# --------------------------------------------------------------------------- #
+
+
+def _library_client(request: Request) -> LibraryFitClient | None:
+    """The library, if this agent's topology has one.
+
+    Tests may inject `app.state.library_fit_client` (anything with an
+    async `fit`, or None to force the file-size path).
+    """
+    if hasattr(request.app.state, "library_fit_client"):
+        return request.app.state.library_fit_client  # type: ignore[no-any-return]
+    state: AgentState = request.app.state.agent_state
+    entry = next(
+        (e for e in state.list_topology_entries() if e.kind is ComponentKind.library), None
+    )
+    if entry is None:
+        return None
+    auth = getattr(request.app.state, "auth_state", None)
+    token = (
+        security.issue_service_token(signing_key=auth.signing_key, kind="agent")
+        if auth is not None and auth.signing_key is not None
+        else None
+    )
+    return LibraryFitClient(str(entry.url), token)
+
+
+async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
+    state: AgentState = request.app.state.agent_state
+    supervisor = _supervisor(request)
+    detector = getattr(request.app.state, "device_detector", None) or detect_devices
+    snapshot = await asyncio.to_thread(detector)
+    running = [
+        RunningRuntime(spec=other, status=_compose(other, supervisor).status)
+        for other in state.list_runtime_specs()
+        if other.name != spec.name
+    ]
+    return await check_admission(
+        spec,
+        snapshot=snapshot,
+        library=_library_client(request),
+        running=running,
+        size_of=getattr(request.app.state, "model_size_of", None),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -225,13 +322,40 @@ async def list_runtimes(request: Request) -> RuntimeList:
 
 
 @router.post(
+    "/v1/runtimes/admission",
+    response_model=Admission,
+    tags=["runtimes"],
+    dependencies=_read_auth,
+)
+async def check_runtime_admission(request: Request, body: RuntimeSpec) -> Admission:
+    """Would this runtime fit on the device it targets, right now?
+
+    The dry run behind create and start. Declares nothing, spawns
+    nothing; readable with a service token so the gateway can ask it
+    before waking a runtime.
+    """
+    if (reason := validate_spec(body)) is not None:
+        raise _problem(
+            code=status.HTTP_400_BAD_REQUEST,
+            slug="invalid-runtime-spec",
+            title="Invalid runtime spec",
+            detail=reason,
+        )
+    return await _admission_for(request, body)
+
+
+@router.post(
     "/v1/runtimes",
     response_model=Runtime,
     status_code=201,
     tags=["runtimes"],
     dependencies=_write_auth,
 )
-async def create_runtime(request: Request, body: RuntimeSpec) -> Runtime:
+async def create_runtime(
+    request: Request,
+    body: RuntimeSpec,
+    force: bool = Query(default=False),
+) -> Runtime:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
 
@@ -245,6 +369,33 @@ async def create_runtime(request: Request, body: RuntimeSpec) -> Runtime:
             title="Invalid runtime spec",
             detail=reason,
         )
+
+    # The companion's name has to be free before anything is written, or
+    # a refused companion would leave a runtime declared with no driver
+    # and the operator believing it has one.
+    if body.autoDriver is not False:
+        held = state.get_topology_entry(companion_name(body.name))
+        if held is not None and not is_companion(held, state):
+            raise _problem(
+                code=status.HTTP_409_CONFLICT,
+                slug="companion-name-conflict",
+                title="Companion driver name already in use",
+                detail=(
+                    f"Runtime {body.name!r} would declare a companion driver named "
+                    f"{companion_name(body.name)!r}, but a component of that name already "
+                    f"exists and is not a companion. Rename the runtime, or set "
+                    f"autoDriver: false and front it with that driver by hand."
+                ),
+            )
+
+    # A launch that will not fit is refused before it spawns. Measured
+    # only when it *is* a launch: `autoStart: false` is measured when it
+    # starts, and `force` is the operator saying they know better.
+    if body.autoStart is not False and not force:
+        admission = await _admission_for(request, body)
+        if admission.decision is AdmissionDecision.refuse:
+            raise _refused(admission)
+
     try:
         spec = state.add_runtime(body)
     except KeyError as e:
@@ -261,6 +412,15 @@ async def create_runtime(request: Request, body: RuntimeSpec) -> Runtime:
             title="Invalid runtime spec",
             detail=str(e),
         ) from e
+
+    # Runtime first, companion second: the runtime's port is assigned at
+    # write time, so when the driver resolves `runtimeName` the answer
+    # already exists whatever the engine's state.
+    if spec.autoDriver is not False:
+        try:
+            await ensure_companion(state, _component_supervisor(request), spec)
+        except CompanionConflict as e:  # pragma: no cover - checked above
+            log.error("companion for %s: %s", spec.name, e)
 
     if supervisor is not None:
         supervisor.add_and_start(spec)
@@ -284,6 +444,7 @@ async def get_runtime(request: Request, name: str) -> Runtime:
 async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runtime:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
+    components = _component_supervisor(request)
 
     if (reason := validate_spec(body)) is not None:
         raise _problem(
@@ -292,6 +453,9 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
             title="Invalid runtime spec",
             detail=reason,
         )
+    previous = state.get_runtime_spec(name)
+    if previous is None:
+        raise _not_found(name)
     try:
         updated = state.update_runtime(name, body)
     except KeyError as e:
@@ -311,6 +475,23 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     if updated is None:
         raise _not_found(name)
 
+    # The companion follows the declaration: gone with a rename or an
+    # opt-out, re-targeted when the alias moved, created when opted in.
+    if previous.autoDriver is not False and (
+        updated.name != previous.name or updated.autoDriver is False
+    ):
+        await remove_companion(state, components, previous.name)
+    if updated.autoDriver is not False:
+        try:
+            await ensure_companion(state, components, updated)
+        except CompanionConflict as e:
+            raise _problem(
+                code=status.HTTP_409_CONFLICT,
+                slug="companion-name-conflict",
+                title="Companion driver name already in use",
+                detail=str(e),
+            ) from e
+
     # Every field on a RuntimeSpec is baked into the argv at spawn time —
     # there is no way to re-flag a live llama-server — so any change
     # restarts the engine. The response reports the post-restart state,
@@ -325,12 +506,15 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
 async def delete_runtime(request: Request, name: str) -> Response:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
+    if state.get_runtime_spec(name) is None:
+        raise _not_found(name)
     if supervisor is not None:
         await supervisor.remove_and_stop(name)
-    # The model file is never touched. Removing a runtime un-declares a
-    # way of serving a model; it does not delete anything the user owns.
-    if not state.remove_runtime(name):
-        raise _not_found(name)
+    # The companion goes with its runtime; the model file is never
+    # touched. Removing a runtime un-declares a way of serving a model;
+    # it does not delete anything the user owns.
+    await remove_companion(state, _component_supervisor(request), name)
+    state.remove_runtime(name)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -367,21 +551,24 @@ async def restart_runtime(request: Request, name: str) -> RestartResult:
     response_model=RestartResult,
     status_code=202,
     tags=["runtimes"],
-    dependencies=_write_auth,
+    dependencies=_lifecycle_auth,
 )
-async def stop_runtime(request: Request, name: str) -> RestartResult:
+async def stop_runtime(
+    request: Request, name: str, body: StopRequest | None = None
+) -> RestartResult:
     state: AgentState = request.app.state.agent_state
     if state.get_runtime_spec(name) is None:
         raise _not_found(name)
+    reason = body.reason if body is not None and body.reason is not None else StopReason.operator
     supervisor = _supervisor(request)
     if supervisor is not None:
-        await supervisor.stop_one(name)
+        await supervisor.stop_one(name, reason=reason)
     return RestartResult(
         scheduled=True,
         delayMs=0,
         message=(
-            f"Engine runtime {name!r} stopped and left declared; its GPU memory "
-            f"is released. POST .../start to bring it back."
+            f"Engine runtime {name!r} stopped ({reason.value}) and left declared; its GPU "
+            f"memory is released. POST .../start to bring it back."
         ),
     )
 
@@ -391,15 +578,26 @@ async def stop_runtime(request: Request, name: str) -> RestartResult:
     response_model=RestartResult,
     status_code=202,
     tags=["runtimes"],
-    dependencies=_write_auth,
+    dependencies=_lifecycle_auth,
 )
-async def start_runtime(request: Request, name: str) -> RestartResult:
+async def start_runtime(
+    request: Request,
+    name: str,
+    force: bool = Query(default=False),
+) -> RestartResult:
     state: AgentState = request.app.state.agent_state
     spec = state.get_runtime_spec(name)
     if spec is None:
         raise _not_found(name)
     supervisor = _supervisor(request)
     already = supervisor is not None and supervisor.is_running(name)
+    if not already and not force:
+        # Where a runtime declared with `autoStart: false` meets
+        # admission — it was not measured at declaration because it was
+        # not being launched then.
+        admission = await _admission_for(request, spec)
+        if admission.decision is AdmissionDecision.refuse:
+            raise _refused(admission)
     if supervisor is not None and not already:
         # `autoStart: false` means "don't start at boot", not "never
         # start" — an explicit start overrides it for this session.

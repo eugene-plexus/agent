@@ -618,6 +618,17 @@ class SupervisedProcess:
             self.last_error = str(e)
             self._consecutive_crashes += 1
             return
+        except Exception as e:
+            # A planner bug — a TypeError from a changed adapter signature
+            # was the M4 case — used to escape here, kill the supervision
+            # task, and leave the runtime at `starting` forever with no
+            # error anywhere. It is a crash of the declaration, reported
+            # as one, and the loop keeps its footing.
+            self._log.exception("planner for %s raised; treating as a crash", self.name)
+            self.state = ProcessState.crashed
+            self.last_error = f"planner raised {type(e).__name__}: {e}"
+            self._consecutive_crashes += 1
+            return
 
         if plan is None:
             # Nothing to launch, and that is not an error.

@@ -288,9 +288,20 @@ class ConfigValueType(StrEnum):
     what is saved is the name rather than a URL because the address
     of a host is topology the control root owns.
 
-    `driver_list` stays reserved for the ordered model→driver
-    priority lists that arrive with lifecycle policy — **M6** since
-    multi-host and trust took M5.
+    `model_slots` is the gateway's priority-list surface, and the
+    one value here that holds objects. An ordered JSON array of
+    `{"model": <alias a client asks for>, "targets": [<model id>,
+    ...]}`: a request for `model` is served by the drivers serving
+    `model` itself, then by the drivers serving each target in
+    order, cascading on failure. Targets are **model ids, not driver
+    names**, because a model id names a replica set — every driver
+    currently serving it, load-balanced — and a driver name would
+    name one process. That is why the value reserved since M2 as
+    `driver_list` was renamed when M6 defined it: the old name said
+    the wrong thing about what goes in the list. A cloud
+    subscription is a target like any other, because a
+    `claude_code_cli` driver already serves a model id. UIs without
+    a structured renderer for it fall back to editing the JSON.
 
     """
 
@@ -307,7 +318,7 @@ class ConfigValueType(StrEnum):
     duration = 'duration'
     runtime_name = 'runtime_name'
     node_name = 'node_name'
-    driver_list = 'driver_list'
+    model_slots = 'model_slots'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -932,6 +943,19 @@ class RuntimeSpec(BaseModel):
         True,
         description='Whether the agent spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM.\n',
     )
+    autoDriver: bool | None = Field(
+        True,
+        description='Whether the agent declares and supervises a companion\n`inference-driver` that follows this runtime by name, so\nthe model is routable the moment the engine is ready. The\ncompanion is `<name>-driver`; `Runtime.driver` reports it.\nSet false to front the runtime by hand — one hand-tuned\ndriver pointed at an engine is still a supported shape, it\nis just no longer the only one. Decided 2026-09-10 over a\ndeclared pool: one driver per backend is the rule the\ncontract has stated since M0, a runtime is a backend, and a\npool would need allocation state and give drivers names\nthat mean a different model every hour.\n',
+    )
+    idleUnloadSeconds: int | None = Field(
+        None,
+        description="Stop the engine after this many seconds with no request for\nits model through the gateway, releasing its GPU memory.\nAbsent or 0 means never, which is every existing\ndeclaration's behaviour unchanged.\n\n**The gateway decides; this agent executes.** Only the\ngateway sees demand, so it tracks the last request per\nruntime and calls `POST .../stop` with `reason: idle` when\nthis expires. A runtime with a request in flight is never\nstopped. Setting this also **opts the runtime into\neviction**: when a `startOnDemand` model will not fit, the\ngateway may stop the most-idle runtimes that carry a timeout\nto make room. A model that must stay resident sets none.\n",
+        ge=0,
+    )
+    startOnDemand: bool | None = Field(
+        False,
+        description="Start this runtime when a request arrives for its model and\nit is `stopped`. The gateway calls `POST .../start`, waits\nfor `ready` (bounded by its `swapWaitSeconds`), and serves\nthe request; the response says it did (`swapped_in`). With\n`autoStart: false` and `idleUnloadSeconds` set, this is\nllama-swap's model: declare five, load none, serve whichever\nis asked for, unload it when it goes quiet — several at\nonce when they fit.\n\nFalse by default so that a hand-pressed Stop stays stopped.\n",
+    )
     flags: dict[str, Any] | None = Field(
         None,
         description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n',
@@ -1035,6 +1059,89 @@ class RuntimeCapabilities(BaseModel):
     )
     multimodal: bool | None = Field(
         None, description='Whether a projector was loaded alongside the model.'
+    )
+
+
+class StopReason(StrEnum):
+    """
+    * `operator` — an explicit stop, from the UI or the API.
+    * `idle` — the gateway unloaded it after `idleUnloadSeconds`
+      passed with no request for its model. It comes back on the
+      next request if `startOnDemand` is set.
+    * `autoStart` — declared with `autoStart: false` and never
+      started in this agent's lifetime.
+
+    A reason beside `status: stopped` rather than three new members
+    of `RuntimeStatus`, because the state is the same state — the
+    process is not running and the respawn loop is suppressed — and
+    only the cause differs.
+
+    """
+
+    operator = 'operator'
+    idle = 'idle'
+    autoStart = 'autoStart'
+
+
+class AdmissionDecision(StrEnum):
+    """
+    Refuse, never queue (decided 2026-09-10). A refusal carries its
+    numbers and is overridable with `force`; the on-demand path is
+    how a model that does not fit right now gets loaded when it is
+    actually asked for.
+
+    """
+
+    admit = 'admit'
+    refuse = 'refuse'
+
+
+class AdmissionFit(StrEnum):
+    """
+    The same four words the library's guidance uses, plus `unknown`,
+    mapped onto a decision by what the spec asked for. `fits` admits.
+    `tight` — inside total memory but not free memory — and `split`
+    — needs host memory too — refuse a full-offload launch and admit
+    one whose `gpuLayers` is set below full, because then the
+    operator chose partial offload. `no` refuses. `unknown` admits
+    with a warning: a verdict from a budget that could not be
+    measured is worse than none.
+
+    """
+
+    fits = 'fits'
+    tight = 'tight'
+    split = 'split'
+    no = 'no'
+    unknown = 'unknown'
+
+
+class AdmissionBasis(StrEnum):
+    """
+    * `metadata` — the library computed required bytes from the
+      model's real metadata at the requested context. Present when
+      a `library` component is in this agent's topology and
+      answered.
+    * `file_size` — the model file's size plus a fixed allowance.
+      What an agent with no library reachable can measure on its
+      own, said out loud rather than dressed up.
+
+    """
+
+    metadata = 'metadata'
+    file_size = 'file_size'
+
+
+class AdmissionBlocker(BaseModel):
+    name: str = Field(..., description='A runtime holding memory on the device.')
+    status: RuntimeStatus | None = None
+    idleUnloadSeconds: int | None = Field(
+        None,
+        description='Its declared idle timeout, when it has one. Only a runtime\nwith one is ever evicted by the gateway; the rest are here\nso the operator knows what is holding the memory.\n',
+    )
+    evictable: bool | None = Field(
+        None,
+        description='Whether the gateway may stop this runtime to make room —\ntrue exactly when it declared `idleUnloadSeconds`.\n',
     )
 
 
@@ -1345,12 +1452,23 @@ class Runtime(BaseModel):
         None, description='Resolved port, including one assigned by the agent.'
     )
     autoStart: bool | None = None
+    autoDriver: bool | None = None
+    idleUnloadSeconds: int | None = None
+    startOnDemand: bool | None = None
     flags: dict[str, Any] | None = None
     extraArgs: list[str] | None = None
     env: dict[str, str] | None = None
     workingDirectory: str | None = None
     binary: str | None = None
+    driver: str | None = Field(
+        None,
+        description="Name of the companion `inference-driver` component the agent\ndeclared for this runtime, when `autoDriver` is true. What\nthe gateway's routing table calls this backend, and the\nentry to read in `GET /v1/components` for its health. Absent\nwhen the operator fronts the runtime by hand.\n",
+    )
     status: RuntimeStatus
+    stopReason: StopReason | None = Field(
+        None,
+        description='Why a `stopped` runtime is stopped. Present only in that\nstate; cleared on start. An observation, not a declaration\n— it is never replicated, and after a control-root\npromotion the answer is re-read from this agent.\n',
+    )
     url: AnyUrl | None = Field(
         None,
         description="Where this engine is actually listening\n(`http://<host>:<port>`). This is the value an\ninference-driver's `baseUrl` points at, and the reason a\ndriver never needs to know about ports or argv.\n",
@@ -1374,6 +1492,69 @@ class Runtime(BaseModel):
     lastError: str | None = Field(
         None,
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
+    )
+
+
+class StopRequest(BaseModel):
+    """
+    Optional body for `POST /v1/runtimes/{name}/stop`, saying why.
+    Recorded as `Runtime.stopReason` so the dashboard can explain a
+    stopped model. Absent means `operator`.
+
+    """
+
+    reason: StopReason | None = None
+
+
+class Admission(BaseModel):
+    """
+    Whether a runtime would fit on the device it targets, right now,
+    and the arithmetic behind the answer. Returned by
+    `POST /v1/runtimes/admission`, and the reasoning behind a 422
+    from `POST /v1/runtimes` or `POST /v1/runtimes/{name}/start`.
+
+    Deliberately **not** the library's `Fit`. That schema describes
+    a model against a host for the discovery screen; this one
+    decides a launch of one spec on one device and names what to do
+    about a refusal. They overlap on the verdict words and diverge
+    on everything else, and sharing them would couple the discovery
+    screen to the supervisor.
+
+    """
+
+    decision: AdmissionDecision
+    fit: AdmissionFit
+    basis: AdmissionBasis
+    requiredBytes: int | None = Field(
+        None,
+        description='What the launch is estimated to need on the device — weights\nplus KV cache at the requested context plus an overhead\nallowance when the library computed it; file size plus a\nfixed allowance when it did not.\n',
+        ge=0,
+    )
+    freeBytes: int | None = Field(
+        None,
+        description='Free memory on the largest single target device at the\nmoment of measurement. Free, not total: M3 measured 2.9 GiB\nof a 32 GiB card held on an idle desktop.\n',
+        ge=0,
+    )
+    totalBytes: int | None = Field(None, ge=0)
+    device: ComputeDevice | None = Field(
+        None, description='The device the verdict is about.'
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context the KV cache was sized for — the spec's\n`contextSize`, or the model's own context when the spec\nleaves it to the engine.\n",
+        ge=0,
+    )
+    blockers: list[AdmissionBlocker] | None = Field(
+        None,
+        description="Runtimes currently holding memory on that device, most idle\nfirst. What an operator would stop to make room, and the\nlist the gateway's opt-in eviction walks — restricted there\nto runtimes that declared `idleUnloadSeconds`.\n",
+    )
+    reason: str = Field(
+        ...,
+        description='The decision in prose, naming the numbers. A refusal that\ndoes not say why is the complaint this endpoint exists to\nanswer.\n',
+    )
+    warning: str | None = Field(
+        None,
+        description='Present when the budget could not be fully measured — no\nvendor tool, an unreadable device, a detection path\nunverified on real hardware. An `admit` with a warning is\nan admit on faith, and says so.\n',
     )
 
 
