@@ -1,6 +1,10 @@
 # Contributing to Eugene Plexus `agent`
 
-Thanks for your interest. The agent is the outermost process of an Eugene Plexus install — it spawns and supervises the body components and serves the UI's static assets. It implements the `agent` OpenAPI contract from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs); please read that contract before opening a PR.
+The agent is Eugene Plexus's per-host supervisor: components, engine runtimes,
+admission, enrollment and local topology. It currently also serves UI assets.
+It implements the `agent` contract from
+[`eugene-plexus/specs`](https://github.com/eugene-plexus/specs); read that contract
+and the M6/M7 design records before changing lifecycle or enrollment behavior.
 
 ## Developer Certificate of Origin (DCO)
 
@@ -74,7 +78,7 @@ ruff format --check .              # formatting
 mypy src/                          # type-check
 pytest                             # tests
 python scripts/codegen.py          # regenerate models from pinned specs
-git diff --exit-code src/.../_generated/   # codegen freshness
+git diff --exit-code src/eugene_plexus_agent/_generated/   # codegen freshness
 ```
 
 ## Reporting issues
@@ -85,4 +89,5 @@ File issues at <https://github.com/eugene-plexus/agent/issues>. Useful issues in
 - Spec-vs-impl divergence (the impl drifted from `agent.yaml`).
 - Resource-leak / shutdown-cleanliness regressions.
 
-For broader architectural questions about Eugene Plexus, file the issue on the [orchestrator repo](https://github.com/eugene-plexus/orchestrator) instead.
+Cross-component architecture questions belong in
+[specs issues](https://github.com/eugene-plexus/specs/issues).

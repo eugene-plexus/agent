@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "eugene-plexus-agent"
 version = "0.1.0"
-description = "Process supervisor and UI host for Eugene Plexus. Outermost process of a personal install — spawns the body components, serves UI assets, owns topology config."
+description = "Per-host node agent for Eugene Plexus: component and engine supervision, runtime admission, engine acquisition, and node enrollment."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
