@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     path when agent.yaml itself is malformed. PATCH /v1/config still
     writes to the on-disk file normally."""
 
+    default_topology: bool = True
+    """On a first boot (no config file yet) and while unenrolled, declare the
+    control root, gateway and library this install must have — see
+    `default_topology.py` for why that is the agent's job and not a wizard's.
+
+    Set `EUGENE_PLEXUS_AGENT_DEFAULT_TOPOLOGY=0` for the one case the
+    conditions cannot detect: a fresh node that is about to *join* an existing
+    install, which needs an empty topology because its control root lives
+    elsewhere. Startup-only bootstrap, which is the sanctioned use of an env
+    var; everything a running install can change stays in the config UI."""
+
 
 def load_settings() -> Settings:
     return Settings()

@@ -139,7 +139,11 @@ class StubRuntimeSupervisor(RuntimeSupervisor):
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(config_file=tmp_path / "agent.yaml")
+    # `default_topology=False` for the same reason the supervisor is a stub:
+    # a unit test declares the topology it means to exercise, and every
+    # tmp_path install is technically a first boot. The seeding behaviour
+    # itself is opted into by tests/test_default_topology.py.
+    return Settings(config_file=tmp_path / "agent.yaml", default_topology=False)
 
 
 @pytest.fixture

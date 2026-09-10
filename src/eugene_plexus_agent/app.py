@@ -24,7 +24,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__, companions, keyring_store, node_identity, security
+from . import __version__, companions, default_topology, keyring_store, node_identity, security
 from .auth_state import AuthState
 from .dependencies import require_operator_session
 from .routes import auth as auth_routes
@@ -148,6 +148,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime_supervisor.node_name_provider = lambda: (
         identity.record.name if identity.record.enrolled else None
     )
+
+    # The topology every install has, on the one boot where there isn't
+    # one yet. Before supervision starts, so the components below are
+    # started by the same loop as any operator-declared entry rather
+    # than by a second path that could drift from it.
+    if (
+        not settings.safe_mode
+        and settings.default_topology
+        and default_topology.should_seed(state, enrolled=identity.record.enrolled)
+    ):
+        declared = default_topology.seed(state)
+        if declared:
+            log.info(
+                "first boot: declared the default topology (%s). "
+                "Edit or add to it from the UI, or set "
+                "EUGENE_PLEXUS_AGENT_DEFAULT_TOPOLOGY=0 on a node that will enroll.",
+                ", ".join(declared),
+            )
 
     if not settings.safe_mode and owns_supervisor:
         for entry in state.list_topology_entries():

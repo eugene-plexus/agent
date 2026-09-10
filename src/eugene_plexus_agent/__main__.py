@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import uvicorn
 
 from .app import create_app
@@ -22,6 +24,18 @@ def main() -> None:
     log_dir = settings.config_file.resolve().parent / "logs"
     log_path = install_console_capture(log_dir=log_dir)
     print(f"agent: console output is mirrored to {log_path}", flush=True)
+
+    # uvicorn configures only its own loggers, so without this the agent's
+    # own log calls never reach the console at all - every child component
+    # already does this and the supervisor was the one that didn't, which
+    # is why "declared the default topology" and "declared N companion
+    # driver(s) at boot" were both invisible. force=True overrides any
+    # basicConfig uvicorn already applied.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
     bootstrap_state = AgentState(settings.config_file)
     if not settings.safe_mode:
