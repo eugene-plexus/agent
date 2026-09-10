@@ -30,6 +30,24 @@ from eugene_plexus_agent.state import AgentState
 
 from .conftest import TEST_PASSPHRASE, StubSupervisor
 
+# Captured before any test patches the module attribute, so the one test that
+# checks the real implementation still gets it.
+_REAL_IS_INSTALLED = default_topology.is_installed
+
+
+@pytest.fixture(autouse=True)
+def assume_components_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend every component imports, for every test in this module.
+
+    Without this the suite is a test of the environment rather than of the
+    code. The agent's CI venv contains only the agent, so `is_installed` is
+    honestly False for control/gateway/library there and nothing is ever
+    declared - the seeding tests fail, and worse, the tests that assert
+    *nothing* was seeded pass for entirely the wrong reason. Tests that care
+    about the import gate patch over this themselves.
+    """
+    monkeypatch.setattr(default_topology, "is_installed", lambda module: True)
+
 
 def _seeding_settings(tmp_path: Path) -> Settings:
     return Settings(config_file=tmp_path / "agent.yaml", default_topology=True)
@@ -226,5 +244,8 @@ def test_should_seed_is_false_once_setup_has_been_completed(tmp_path: Path) -> N
 
 
 def test_is_installed_is_honest_about_this_interpreter() -> None:
-    assert default_topology.is_installed("eugene_plexus_agent") is True
-    assert default_topology.is_installed("eugene_plexus_not_a_real_component") is False
+    """The real implementation, not the autouse stand-in. The agent's own
+    package is the only one guaranteed present in every environment this
+    runs in, which is exactly why it is the one asserted on."""
+    assert _REAL_IS_INSTALLED("eugene_plexus_agent") is True
+    assert _REAL_IS_INSTALLED("eugene_plexus_not_a_real_component") is False
