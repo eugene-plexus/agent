@@ -9,10 +9,26 @@ setting that address is part of what joining does. So the machine has to
 ask, or be told on the command line.
 
     eugene-plexus-agent                 start (asks once, on a fresh boot with a TTY)
+    eugene-plexus-agent --unattended    start, never asking
     eugene-plexus-agent join --control <url> --token <jwt>
 
 See `onboarding.py` for why a missing TTY means "start a new install"
 rather than "wait".
+
+**`--unattended` exists because the TTY test is a proxy for "someone is
+watching", and install-paths §9 step 3 found a place the proxy is
+wrong.** A Windows scheduled task -- the non-elevated autostart, and so
+the common Windows install -- runs its process with a console attached:
+measured 2026-09-11, `sys.stdin.isatty()` and `sys.stdout.isatty()` are
+both True in one. So the agent printed the first-boot question into a
+console no one can see and blocked on `input()` forever, with no log,
+nothing listening, and a task reporting Running.
+
+The fix is not a better test. It is that **the unattended path should be
+declared rather than inferred**: every unit file this project writes --
+systemd, launchd, and the Windows task -- passes `--unattended`, and
+the installer, where a human actually is, owns the question instead.
+A bare terminal start keeps the prompt.
 """
 
 from __future__ import annotations
@@ -36,6 +52,14 @@ def _parser() -> argparse.ArgumentParser:
         description=(
             "Per-host node agent: supervises components and engine runtimes, and "
             "joins this machine to an Eugene Plexus install."
+        ),
+    )
+    parser.add_argument(
+        "--unattended",
+        action="store_true",
+        help=(
+            "Never ask the first-boot question; behave as though nobody is watching. "
+            "Every unit file the installers write passes this."
         ),
     )
     sub = parser.add_subparsers(dest="command")
@@ -98,10 +122,10 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
 
-    _serve(settings)
+    _serve(settings, unattended=args.unattended)
 
 
-def build_server(settings: Settings) -> uvicorn.Server:
+def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Server:
     """Everything `_serve` does except block on the socket.
 
     Split out at install-paths §9 step 3 so a Windows service can own the
@@ -117,7 +141,11 @@ def build_server(settings: Settings) -> uvicorn.Server:
     # with a TTY to ask into — a service unit or container has neither a
     # terminal nor anyone watching one, and an agent that blocks at boot
     # waiting for an answer is worse than one that picks the common case.
-    if is_fresh_boot(settings) and has_tty():
+    #
+    # `--unattended` comes first because a TTY is not the same thing as
+    # someone watching one: a Windows scheduled task has both handles as
+    # a console and nobody in front of it. See this module's docstring.
+    if not unattended and is_fresh_boot(settings) and has_tty():
         request = ask(settings)
         if request is not None:
             code = run_join(request, settings)
@@ -162,8 +190,8 @@ def build_server(settings: Settings) -> uvicorn.Server:
     return uvicorn.Server(config)
 
 
-def _serve(settings: Settings) -> None:
-    build_server(settings).run()
+def _serve(settings: Settings, *, unattended: bool = False) -> None:
+    build_server(settings, unattended=unattended).run()
 
 
 if __name__ == "__main__":

@@ -143,7 +143,11 @@ if PYWIN32_AVAILABLE:
             from .settings import load_settings
 
             settings = load_settings()
-            self._server = build_server(settings)
+            # A service has no console at all, so `has_tty()` would
+            # already be False -- but the unattended path is declared
+            # rather than inferred everywhere else this project starts
+            # the agent, and a service is the least-watched of the lot.
+            self._server = build_server(settings, unattended=True)
             # The run loop goes on a thread so SvcStop, which the SCM
             # calls on *its* thread, is not waiting behind it.
             thread = threading.Thread(target=self._server.run, name="agent", daemon=False)

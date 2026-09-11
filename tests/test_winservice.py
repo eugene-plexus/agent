@@ -121,3 +121,30 @@ def test_service_class_is_importable_by_name() -> None:
     resolved = getattr(importlib.import_module(module_name), cls.__name__)
     assert resolved is cls
     assert cls._svc_name_ == winservice.SERVICE_NAME
+
+
+def test_unattended_skips_the_first_boot_question(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The defect a Windows scheduled task found, asserted directly.
+
+    A task's process has BOTH stdin and stdout as a console -- measured
+    2026-09-11 -- so `has_tty()` is True and the agent printed the
+    first-boot question into a console nobody can see, then blocked on
+    `input()`. Nothing listened, nothing was logged, and the task
+    reported Running. The fix is that every unit file declares
+    `--unattended` rather than relying on the absence of a terminal, so
+    this asserts the flag beats a TTY rather than that a TTY is absent.
+    """
+    from eugene_plexus_agent import __main__ as entry
+
+    monkeypatch.setattr(entry, "has_tty", lambda: True)
+    monkeypatch.setattr(entry, "is_fresh_boot", lambda _settings: True)
+
+    asked = []
+    monkeypatch.setattr(entry, "ask", lambda _settings: asked.append(1) or None)
+
+    settings = Settings(config_file=tmp_path / "agent.yaml", bind_port=8180)
+    entry.build_server(settings, unattended=True)
+    assert asked == [], "the question was asked with --unattended and a TTY present"
+
+    entry.build_server(settings, unattended=False)
+    assert asked == [1], "without --unattended and with a TTY, the question must still be asked"
