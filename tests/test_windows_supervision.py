@@ -24,8 +24,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
-import subprocess
 from typing import Any
 
 import pytest
@@ -119,7 +117,7 @@ def test_windows_asks_with_a_console_event(monkeypatch: pytest.MonkeyPatch) -> N
     proc = _FakeProcess(pid=1234)
     result = process_signals.request_stop(proc, name="gateway")
     assert result == process_signals.StopSignal.ctrl_break
-    assert sent == [(1234, signal.CTRL_BREAK_EVENT)]
+    assert sent == [(1234, process_signals.CTRL_BREAK_EVENT)]
     assert not proc.terminated
 
 
@@ -172,7 +170,7 @@ def test_a_missing_pid_never_signals_the_agents_own_group(
 def test_windows_children_get_their_own_process_group(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(process_signals.sys, "platform", "win32")
     flags = process_signals.spawn_kwargs().get("creationflags", 0)
-    assert flags & subprocess.CREATE_NEW_PROCESS_GROUP
+    assert flags & process_signals.CREATE_NEW_PROCESS_GROUP
 
 
 def test_posix_spawn_kwargs_still_carry_orphan_prevention(

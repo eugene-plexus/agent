@@ -63,6 +63,19 @@ from . import orphan_kill
 log = logging.getLogger(__name__)
 
 
+# **Resolved by name with a literal fallback, so the Windows paths stay
+# testable on the only CI this project has — Linux.** `signal` has no
+# `CTRL_BREAK_EVENT` and `subprocess` no `CREATE_NEW_PROCESS_GROUP`
+# there, so a test that monkeypatches `sys.platform` to "win32" walks
+# straight into an AttributeError raised by production code, and the
+# behaviour that matters most on a first-class target ends up asserted
+# nowhere. These are fixed Win32 ABI constants, not Python details:
+# CTRL_BREAK_EVENT is 1 and CREATE_NEW_PROCESS_GROUP is 0x200, and they
+# cannot change without breaking every program on the platform.
+CTRL_BREAK_EVENT: int = getattr(signal, "CTRL_BREAK_EVENT", 1)
+CREATE_NEW_PROCESS_GROUP: int = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+
+
 class StopSignal(StrEnum):
     """What was actually sent, for logs and for tests that must be able
     to tell a graceful request from a hard kill."""
@@ -107,9 +120,7 @@ def spawn_kwargs() -> dict[str, Any]:
         # receives Ctrl+C from the agent's console, which is correct —
         # children are stopped by their supervisor, not by whoever is
         # looking at the terminal.
-        out["creationflags"] = (
-            out.get("creationflags", 0) | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined,unused-ignore]
-        )
+        out["creationflags"] = out.get("creationflags", 0) | CREATE_NEW_PROCESS_GROUP
     return out
 
 
@@ -145,7 +156,7 @@ def request_stop(proc: Any, *, name: str, logger: logging.Logger | None = None) 
         return StopSignal.terminate_process
 
     try:
-        os.kill(pid, signal.CTRL_BREAK_EVENT)
+        os.kill(pid, CTRL_BREAK_EVENT)
         return StopSignal.ctrl_break
     except OSError as exc:
         if not _console_warning_emitted:
