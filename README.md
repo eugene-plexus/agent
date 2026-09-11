@@ -75,11 +75,19 @@ for enrollment and rekey semantics.
 
 ## Verification Status
 
-As of **2026-09-10**, llama.cpp lifecycle and admission passed the M6 live run;
-enrollment, advertised addressing, and signed rekeying passed M7 with two agents
-on one Windows host. A real two-machine run, a vLLM launch, two-GPU placement,
-and AMD/Intel/Apple hardware detection remain unverified. M7 also exposed a short
-post-unload routing window in the gateway that remains open.
+As of **2026-09-11**: llama.cpp lifecycle and admission passed the M6 live run;
+**vLLM ran for real** in WSL2 on an RTX 5090 with no change to the adapter
+([record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m4-vllm-run.md)); and enrollment, advertised
+addressing and signed rekeying passed M7 **on two real machines** across NAT and
+a host firewall ([record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m7-two-host-run.md)). M9 added
+un-enrollment, address re-advertisement, and onboarding from a terminal
+(`eugene-plexus-agent join`), verified by
+[its own run](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m9-onboarding-run.md).
+
+Still unverified: a rotation with a genuinely offline node, clock skew between
+hosts, two-GPU placement, and AMD/Intel/Apple hardware detection. M7 also exposed
+a short post-unload routing window in the gateway that remains open and
+undiagnosed.
 
 The [project overview](https://github.com/eugene-plexus/specs#current-status) links
 the acceptance records and current limitations. The former consciousness and
