@@ -152,6 +152,25 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     remote = request.client.host if request.client else "unknown"
 
     if not state.has_passphrase():
+        # **An enrolled node is a different situation and needs different
+        # advice.** A worker onboarded with `eugene-plexus-agent join` has
+        # no passphrase of its own and never will: it verifies tokens with
+        # the install's signing key, so an operator session minted at the
+        # control root already works here. Telling it to run first-run
+        # setup would be telling an operator to raise a second install on
+        # a machine that is already part of one. Found by M9's acceptance
+        # run, which was the first thing to log in at a joined node.
+        identity = getattr(request.app.state, "node_identity", None)
+        record = identity.record if identity is not None else None
+        if record is not None and record.enrolled:
+            raise _problem(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "No local passphrase",
+                f"This node is enrolled in the install at {record.control_url} and has no "
+                f"passphrase of its own. Log in at the control root instead; the session "
+                f"token it issues is accepted here, because the whole install shares one "
+                f"signing key. Do not run first-run setup on a node that has joined.",
+            )
         raise _problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Setup required",

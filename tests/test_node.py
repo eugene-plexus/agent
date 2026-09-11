@@ -1006,3 +1006,29 @@ async def test_a_persisted_address_is_the_fallback_when_the_root_is_unreachable(
         persisted="http://192.0.2.99:8079",
     )
     assert resolved == "http://192.0.2.99:8079"
+
+
+def test_a_joined_node_is_told_to_log_in_at_the_control_root(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """A worker has no passphrase of its own and never will.
+
+    It verifies tokens with the install's signing key, so an operator
+    session minted at the control root already works there. The default
+    message told it to run `POST /v1/auth/initialize`, which on a machine
+    that has joined an install is advice to raise a second one. Found by
+    M9's acceptance run -- the first thing that ever tried to log in at a
+    joined node.
+    """
+    _enroll(authed_client, control)
+    # A node onboarded by `eugene-plexus-agent join` has an identity and
+    # no passphrase; simulate that half by clearing the passphrase the
+    # fixture set.
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    state._auth.pop("passphraseHash", None)
+
+    response = authed_client.post("/v1/auth/login", json={"passphrase": "anything"})
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]["detail"]
+    assert "control root" in detail
+    assert "first-run setup" in detail or "setup" in detail
