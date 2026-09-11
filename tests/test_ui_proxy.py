@@ -424,14 +424,43 @@ def test_healthz_still_answers_with_a_ui_mounted(tmp_path: Path) -> None:
         assert "status" in c.get("/healthz").json()
 
 
-def test_no_ui_is_a_degradation_not_a_failure(tmp_path: Path) -> None:
+def test_no_ui_is_a_degradation_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """`degraded-mode-required`: the API works, `/` explains itself, and
-    the explanation names the thing to install."""
+    the explanation names the thing to install.
+
+    **The import is refused explicitly rather than left to chance.** The
+    first version of this test passed with no override and no
+    monkeypatch, which was true only because `eugene-plexus-ui` was not
+    installed in the developer's venv — so installing the wheel, the
+    very thing this milestone ships, turned it red. A test whose subject
+    is "the distribution is absent" has to make it absent; reading that
+    off the ambient environment is the same mistake as an assertion that
+    matches the failure it was meant to catch.
+    """
+
+    def no_such_package(_name: str) -> object:
+        raise ImportError("no module named eugene_plexus_ui")
+
+    monkeypatch.setattr(ui_assets, "import_module", no_such_package)
     with ui_client(tmp_path, None) as c:
         root = c.get("/")
         assert root.status_code == 503
         assert "eugene-plexus-ui" in root.text
         assert c.get("/healthz").status_code in (200, 503)
+
+
+def test_the_installed_distribution_is_found_when_it_is_there(tmp_path: Path) -> None:
+    """The other half of the pair, and the one that needs the wheel: with
+    `eugene-plexus-ui` installed, `locate()` finds it with no override.
+    Skipped rather than failed where it is not installed, because a unit
+    suite must not require a Node build to run."""
+    pytest.importorskip("eugene_plexus_ui")
+    assets = ui_assets.locate(None)
+    assert assets, assets.reason
+    assert assets.source == ui_assets.UI_DISTRIBUTION
+    assert (assets.directory / "index.html").is_file()  # type: ignore[union-attr]
 
 
 def test_a_ui_directory_with_no_index_is_reported_as_such(tmp_path: Path) -> None:
