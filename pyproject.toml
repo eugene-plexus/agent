@@ -41,6 +41,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Windows autostart, installed by install.ps1 and by nothing else.
+# An extra rather than a marked dependency so a Windows *developer*
+# checkout — which starts the agent from a terminal and therefore keeps
+# the graceful stop path — does not carry a ~10 MB wheel it never
+# imports. See `winservice.py` for what it buys and what it costs.
+service = [
+    "pywin32>=306; sys_platform == 'win32'",
+]
 dev = [
     "pytest==8.4.2",
     "pytest-asyncio==0.26.0",
@@ -110,6 +118,14 @@ exclude = [
 [[tool.mypy.overrides]]
 module = "eugene_plexus_agent._generated.*"
 ignore_errors = true
+
+# pywin32 ships no stubs, and `types-pywin32` cannot be a dev dependency
+# because CI runs on Linux where the package it stubs does not exist.
+# Scoped to the four modules `winservice.py` imports so the rest of the
+# file keeps full checking.
+[[tool.mypy.overrides]]
+module = ["win32serviceutil", "win32service", "win32event", "servicemanager"]
+ignore_missing_imports = true
 
 # -----------------------------------------------------------------------------
 # Pytest

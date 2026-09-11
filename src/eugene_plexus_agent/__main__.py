@@ -101,7 +101,17 @@ def main(argv: list[str] | None = None) -> None:
     _serve(settings)
 
 
-def _serve(settings: Settings) -> None:
+def build_server(settings: Settings) -> uvicorn.Server:
+    """Everything `_serve` does except block on the socket.
+
+    Split out at install-paths §9 step 3 so a Windows service can own the
+    run loop. `uvicorn.run()` builds a `Server` and calls `.run()` on it,
+    which installs SIGINT/SIGTERM handlers — a service has neither, and
+    stops by having its control handler set `should_exit` on the server
+    object instead. That is the only reason this function exists, and it
+    is why the service still gets the *agent's* own lifespan shutdown
+    even where its children get a hard kill (see `process_signals`).
+    """
     # **The onboarding question, asked before anything is written.** Only
     # on a boot that would otherwise declare a control plane, and only
     # with a TTY to ask into — a service unit or container has neither a
@@ -148,7 +158,12 @@ def _serve(settings: Settings) -> None:
     log_level = "info"
 
     app = create_app(settings)
-    uvicorn.run(app, host=settings.bind_host, port=port, log_level=log_level)
+    config = uvicorn.Config(app, host=settings.bind_host, port=port, log_level=log_level)
+    return uvicorn.Server(config)
+
+
+def _serve(settings: Settings) -> None:
+    build_server(settings).run()
 
 
 if __name__ == "__main__":
