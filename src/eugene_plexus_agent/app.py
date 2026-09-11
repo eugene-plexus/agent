@@ -32,6 +32,7 @@ from . import (
     enrollment,
     keyring_store,
     node_identity,
+    process_signals,
     security,
     ui_assets,
 )
@@ -123,6 +124,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             "agent has no passphrase set; first-run wizard must call "
             "POST /v1/auth/initialize before other endpoints become available",
         )
+
+    # **How this host stops things, said at boot rather than discovered.**
+    # On Windows without a console — which is what a service is — the
+    # graceful path is unavailable and every child gets a hard kill. That
+    # limitation is accepted rather than worked around (see
+    # `process_signals.describe_stop_capability`), and an accepted
+    # limitation has to be visible or it is indistinguishable from a bug.
+    graceful, why = process_signals.describe_stop_capability()
+    app.state.graceful_stop = graceful
+    (log.info if graceful else log.warning)("child shutdown: %s", why)
 
     # Supervisor injection: tests can pre-populate `app.state.supervisor`
     # with a stub before the lifespan runs (mirroring the gateway's

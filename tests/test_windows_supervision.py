@@ -412,3 +412,55 @@ def test_describe_holder_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(ports, "_run", boom)
     assert ports.describe_holder(8080) is None
+
+
+# ---------------------------------------------------------------------------
+# the accepted degradation, said out loud at boot
+# ---------------------------------------------------------------------------
+
+
+def test_a_console_less_windows_agent_announces_the_hard_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Troy's call, 2026-09-11: Windows ships a real service, and a
+    service has no console, so children there are hard-killed. Accepted
+    — which is exactly why it has to be announced. Same shape as the
+    Vulkan decision: ship it, and badge it permanently."""
+    monkeypatch.setattr(process_signals.sys, "platform", "win32")
+    monkeypatch.setattr(process_signals, "console_attached", lambda: False)
+    graceful, why = process_signals.describe_stop_capability()
+    assert graceful is False
+    assert "TerminateProcess" in why
+    assert "accepted" in why, "a limitation that reads as a fault will be reported as one"
+
+
+def test_a_windows_agent_with_a_console_says_the_opposite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_signals.sys, "platform", "win32")
+    monkeypatch.setattr(process_signals, "console_attached", lambda: True)
+    graceful, why = process_signals.describe_stop_capability()
+    assert graceful is True
+    assert "CTRL_BREAK_EVENT" in why
+
+
+def test_posix_is_never_degraded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(process_signals.sys, "platform", "linux")
+    graceful, why = process_signals.describe_stop_capability()
+    assert graceful is True
+    assert "SIGTERM" in why
+
+
+def test_console_detection_uses_the_probe_that_does_not_lie() -> None:
+    """`GetConsoleWindow` returns a null HWND under any ConPTY terminal,
+    so it reports "no console" for a process that has one — it returned
+    False on this box in BOTH the has-console and no-console cases while
+    the work was being done, and sent one probe to a wrong conclusion.
+    This asserts the answer, not the mechanism: a test run has a console
+    on Windows and the function must say so. On POSIX it is True by
+    definition and the assertion is vacuous — stated rather than hidden,
+    because a check that passes for a different reason on the CI runner
+    than on the box it was written for is the thing this file keeps
+    finding elsewhere.
+    """
+    assert process_signals.console_attached() is True

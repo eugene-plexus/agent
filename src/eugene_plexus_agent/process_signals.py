@@ -129,6 +129,56 @@ def graceful_stop_kind() -> StopSignal:
     return StopSignal.ctrl_break if sys.platform == "win32" else StopSignal.sigterm
 
 
+def console_attached() -> bool:
+    """Is this process attached to a console? Windows only; True elsewhere.
+
+    **`GetConsoleProcessList`, not `GetConsoleWindow`.** The obvious
+    probe returns a null HWND for a process attached to a ConPTY — which
+    is every modern terminal — so it reports "no console" for a process
+    that has one and can send console events perfectly well. That lie
+    cost a probe run here: it claimed a console-less parent had a
+    console, and the conclusion had to be reached another way (calling
+    `FreeConsole()` and watching a working call start failing).
+    `GetConsoleProcessList` returns 4 and 0 for those two cases.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
+        buffer = (ctypes.c_uint32 * 1)()
+        return int(kernel32.GetConsoleProcessList(buffer, 1)) > 0
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def describe_stop_capability() -> tuple[bool, str]:
+    """`(graceful, why)` — for an announcement at startup, not at first stop.
+
+    **The degradation is accepted and therefore has to be visible.**
+    Troy's call, 2026-09-11: Windows ships a real service, and a service
+    has no console, so children there are hard-killed. That is the same
+    shape as the Vulkan decision (§7 of the install-paths design) —
+    ship it, and badge it permanently — and the badge is worth more at
+    boot than at the first stop, because at the first stop the operator
+    is already watching something else go wrong.
+    """
+    if sys.platform != "win32":
+        return True, "children are stopped with SIGTERM, then SIGKILL if they hang"
+    if console_attached():
+        return True, (
+            "children are stopped with CTRL_BREAK_EVENT, so they run their "
+            "shutdown hooks; a child that ignores it is killed"
+        )
+    return False, (
+        "this agent has no console, so children are hard-killed with "
+        "TerminateProcess: in-flight requests are dropped and shutdown hooks "
+        "do not run. That is what a Windows service looks like, and it is a "
+        "known, accepted limitation of running as one rather than a fault"
+    )
+
+
 def request_stop(proc: Any, *, name: str, logger: logging.Logger | None = None) -> StopSignal:
     """Ask a child to shut down, gracefully where the platform allows.
 
