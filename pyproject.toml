@@ -33,13 +33,17 @@ dependencies = [
     "pyjwt>=2.10,<3",             # session/service token sign + verify
     "pynacl>=1.5,<2",             # libsodium secretbox for at-rest envelopes
     "keyring>=25.5,<26",          # OS Credential Manager / Keychain / Secret Service
+    # The browser's pass-through to every component (routes/proxy.py).
+    # A runtime dependency since install-paths §9 step 1, not a test one:
+    # it was already here under [dev] because the test client needs it,
+    # and a proxy that streams needs `client.send(stream=True)`.
+    "httpx>=0.27,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest==8.4.2",
     "pytest-asyncio==0.26.0",
-    "httpx>=0.27,<1",
     "ruff==0.15.14",
     "mypy==1.20.2",
     "types-pyyaml>=6,<7",

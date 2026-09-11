@@ -33,6 +33,7 @@ from . import (
     keyring_store,
     node_identity,
     security,
+    ui_assets,
 )
 from .auth_state import AuthState
 from .dependencies import require_operator_session
@@ -41,6 +42,7 @@ from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
 from .routes import node as node_routes
+from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
 from .runtimes import RuntimeSupervisor, close_installers
 from .settings import Settings, load_settings
@@ -209,6 +211,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
+        # The browser's upstream connections. Closed first because it is
+        # the only thing here holding sockets to processes the next two
+        # steps are about to stop.
+        proxy_client = getattr(app.state, "ui_proxy_client", None)
+        if proxy_client is not None:
+            await proxy_client.aclose()
         # An in-flight engine download is the cheapest thing here to
         # abandon and the only one holding a half-written directory, so
         # it goes first.
@@ -319,5 +327,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(runtimes_routes.router)
     # This host's identity and devices; reads only, operator or service.
     app.include_router(node_routes.router)
+
+    # The browser surface, registered LAST and in this order. The proxy
+    # is deliberately unauthenticated — it is the path the login request
+    # itself travels — and the static mount answers everything not
+    # matched above, so anything registered after it is unreachable.
+    app.include_router(proxy_routes.router)
+    ui_assets.mount(app, settings.ui_dir)
 
     return app

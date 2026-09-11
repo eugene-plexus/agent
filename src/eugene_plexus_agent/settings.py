@@ -44,6 +44,21 @@ class Settings(BaseSettings):
     path when agent.yaml itself is malformed. PATCH /v1/config still
     writes to the on-disk file normally."""
 
+    ui_dir: Path | None = None
+    """Serve the web UI from this directory instead of the installed
+    `eugene-plexus-ui` distribution.
+
+    For development, where the assets are `ui/out` in a checkout being
+    rebuilt every few seconds. Startup-only bootstrap, which is the
+    sanctioned use of an env var — an install has nothing here it would
+    want to change while running, and the supported way to have no UI is
+    to not install the distribution.
+
+    **Acceptance runs must leave this unset.** A run that points at a
+    checkout tests the directory and never the wheel, which is this
+    project's recurring failure shape: a check whose subject is not
+    where it is looking."""
+
     default_topology: bool = True
     """On a first boot (no config file yet) and while unenrolled, declare the
     control root, gateway and library this install must have — see
