@@ -17,6 +17,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "uiTheme",
         "uiFontSize",
         "vllmBinary",
+        "mlxBinary",
         "advertiseUrl",
     }
     # `vllmBinary` is a plain config field on purpose — the generic editor

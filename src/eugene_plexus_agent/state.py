@@ -137,6 +137,27 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.file_path,
     ),
     ConfigField(
+        key="mlxBinary",
+        label="MLX binary",
+        description=(
+            "Install-wide path to the `mlx_lm.server` console script inside "
+            "the virtual environment where you installed mlx-lm — for example "
+            "`/Users/you/mlx/.venv/bin/mlx_lm.server`. The dot is part of the "
+            "script name, not a file extension. Like vLLM, mlx-lm is an engine "
+            "this agent drives but does not install, so without this it is "
+            "found only if it is on PATH or a `binary` is set on every "
+            "runtime. Point at the console script, not at a Python "
+            "interpreter or a venv directory. Apple silicon only: `pip install "
+            "mlx-lm` will succeed elsewhere and install nothing that can run a "
+            "model, because upstream marks its `mlx` dependency "
+            "`platform_system == 'Darwin'`. A `binary` set on an individual "
+            "runtime still wins over this. Read at the next spawn; no agent "
+            "restart needed."
+        ),
+        category="engines",
+        valueType=ConfigValueType.file_path,
+    ),
+    ConfigField(
         key="advertiseUrl",
         label="Advertise address",
         description=(

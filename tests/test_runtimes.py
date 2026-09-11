@@ -54,7 +54,7 @@ def test_engines_lists_every_adapter_with_its_flag_schema(authed_client: TestCli
     response = authed_client.get("/v1/engines")
     assert response.status_code == 200
     engines = response.json()["engines"]
-    assert [e["engine"] for e in engines] == ["llama_cpp", "vllm"]
+    assert [e["engine"] for e in engines] == ["llama_cpp", "vllm", "mlx"]
 
     for engine in engines:
         assert engine["flagSchema"]["component"] == f"engine:{engine['engine']}"
@@ -82,6 +82,12 @@ def test_engines_declare_which_model_formats_they_load(authed_client: TestClient
     # And now the safetensors half of the join has an engine. GGUF stays
     # off vLLM's list on purpose — see the adapter.
     assert by_kind["vllm"]["modelFormats"] == ["safetensors"]
+    # MLX claims the format, not the conversion: an MLX model is
+    # safetensors plus a config.json, which is exactly what upstream's
+    # own `probably_mlx_lm` check looks for. Whether a *vanilla* HF
+    # safetensors model loads unconverted is unverified — see
+    # docs/design/mlx-engine-unverified.md.
+    assert by_kind["mlx"]["modelFormats"] == ["safetensors"]
 
 
 def test_model_formats_do_not_depend_on_availability(authed_client: TestClient) -> None:
