@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -160,6 +161,58 @@ class VllmAdapter(EngineAdapter):
         """
         env = inspect_python_environment(binary)
         return env.packageVersion if env is not None else None
+
+    def default_env(self, spec: RuntimeSpec, binary: DiscoveredBinary) -> dict[str, str]:
+        """The two variables vLLM 0.29.0 cannot start without here.
+
+        Both were found by running the engine on a host nobody had
+        prepared, and both killed it 20-40s into a load from inside a
+        subprocess, with a traceback that named neither the cause nor the
+        cure. Neither is a preference: without them there is no engine.
+
+        `VLLM_WSL2_ENABLE_PIN_MEMORY` — on WSL2 vLLM disables pinned
+        memory by default (a small performance regression on that
+        kernel), and 0.29.0's model runner then hard-requires it anyway
+        via a UVA buffer, because `is_uva_available()` *is*
+        `is_pin_memory_available()`. The result is
+        `RuntimeError: UVA is not available`. Upstream owns the switch
+        and gates it on a kernel floor of 4.19.121, so setting it on an
+        older kernel changes nothing — upstream still refuses, and that
+        refusal is not ours to override.
+
+        `VLLM_USE_FLASHINFER_SAMPLER` — FlashInfer JIT-compiles its
+        *sampling* kernels and wants a full CUDA toolkit; with no `nvcc`
+        the engine dies with
+        `Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`.
+        Note it is the sampler and not attention: attention picked
+        prebuilt FlashAttention 2 and was never the problem. Turning it
+        off falls back to PyTorch-native sampling, which is *correct* and
+        slightly slower on large batches — so this one does trade a
+        little throughput, and it is still the right default, because the
+        thing it is traded against is not starting. An operator who
+        installs a toolkit gets the fast path back automatically, and one
+        who wants it without a toolkit can set the variable to `1` and
+        watch it fail on purpose.
+        """
+        env: dict[str, str] = {}
+        if _is_wsl():
+            env["VLLM_WSL2_ENABLE_PIN_MEMORY"] = "1"
+        if not _cuda_toolkit_present():
+            env["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+        return env
+
+    def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        """Name the host prerequisite behind a known startup death.
+
+        vLLM compiles at *first use* rather than at install, so a
+        perfectly good `pip install` leaves three ways for the engine to
+        die on a clean host. The traceback is forty frames of someone
+        else's code and mentions the fix in none of them.
+        """
+        for signature, explanation in _EXIT_EXPLANATIONS:
+            if signature in output_tail:
+                return explanation
+        return None
 
     def manual_install(self, host: HostAccelerator) -> ManualInstall:
         """The install command for this host, copied from upstream's
@@ -767,9 +820,87 @@ _FLAG_FIELDS: list[ConfigField] = [
 ]
 
 
+# Startup deaths worth explaining, newest-first in the order they were
+# met on the first Linux run. Matched against a tail of the engine's own
+# output, so each signature is a string upstream actually prints.
+_EXIT_EXPLANATIONS: tuple[tuple[str, str], ...] = (
+    (
+        "Failed to find C compiler",
+        "vLLM died because this host has no C compiler. Triton compiles a "
+        "small CPython extension the first time it runs, so vLLM needs a "
+        "toolchain at *run* time even though `pip install` did not: "
+        "`apt install build-essential` (or set CC). A host that has "
+        "already run this engine once has the compiled result cached and "
+        "does not need one.",
+    ),
+    (
+        "Python.h: No such file or directory",
+        "vLLM died because this host has no Python development headers. "
+        "Triton compiles a CPython extension at first use and needs "
+        "`Python.h` for the interpreter behind the engine: "
+        "`apt install python3-dev` (matching the engine's own Python "
+        "version).",
+    ),
+    (
+        "Could not find nvcc",
+        "vLLM died looking for a CUDA toolkit, which FlashInfer needs to "
+        "JIT-compile its sampling kernels. Either install a toolkit, or "
+        "set `VLLM_USE_FLASHINFER_SAMPLER=0` in the runtime's `env` for "
+        "native sampling — the agent sets that automatically when no "
+        "`nvcc` is visible, so seeing this means something overrode it.",
+    ),
+    (
+        "UVA is not available",
+        "vLLM died because pinned memory is unavailable. On WSL2 it is "
+        "disabled by default and this version requires it: set "
+        "`VLLM_WSL2_ENABLE_PIN_MEMORY=1` in the runtime's `env` — the "
+        "agent sets it automatically on WSL2, so seeing this means either "
+        "something overrode it or the WSL2 kernel is below upstream's "
+        "4.19.121 floor, which `wsl --update` fixes.",
+    ),
+)
+
+
+def _is_wsl() -> bool:
+    """True on a WSL kernel.
+
+    Read from `/proc/version` rather than inferred from the environment:
+    `WSL_DISTRO_NAME` is set for interactive shells and an agent started
+    by a service manager may not have it, while the kernel string is
+    always there. Absent or unreadable means not WSL, which is the safe
+    answer — the default this gates is inert off WSL anyway.
+    """
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower()
+    except OSError:
+        return False
+
+
+def _cuda_toolkit_present() -> bool:
+    """True when something in this host looks like a CUDA toolkit with
+    `nvcc` in it.
+
+    Mirrors FlashInfer's own `get_cuda_path`: the `CUDA_HOME` /
+    `CUDA_PATH` environment variables first, then `/usr/local/cuda`, and
+    additionally `nvcc` on PATH, which FlashInfer finds via `which` too.
+    Deliberately generous — a false *positive* here leaves FlashInfer
+    enabled and lets upstream produce its own error, while a false
+    negative silently downgrades sampling on a host that did not need it.
+    """
+    for var in ("CUDA_HOME", "CUDA_PATH"):
+        root = os.environ.get(var)
+        if root and (Path(root) / "bin" / "nvcc").exists():
+            return True
+    if (Path("/usr/local/cuda") / "bin" / "nvcc").exists():
+        return True
+    return shutil.which("nvcc") is not None
+
+
 __all__ = [
     "STARTUP_BUDGET_SECONDS",
     "VllmAdapter",
+    "_cuda_toolkit_present",
+    "_is_wsl",
     "accelerator_from_torch_version",
     "inspect_python_environment",
     "interpreter_from_shebang",

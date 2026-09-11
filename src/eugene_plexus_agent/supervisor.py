@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -79,6 +80,12 @@ _HEALTHZ_2XX_LINE = re.compile(r'"GET /healthz HTTP/[^"]+" 2\d\d')
 # terminal/output pane, Windows Terminal, modern cmd.exe with VTP. Older
 # environments may render the raw escape sequences — set NO_COLOR=1 in
 # the env to disable (https://no-color.org/).
+#: How many of a child's most recent output lines to keep for
+#: explaining a non-zero exit. Enough to hold a Python traceback plus
+#: the lines around it, small enough to be free. The log has everything;
+#: this is only what `explain_exit` gets to read.
+_OUTPUT_TAIL_LINES = 80
+
 _ALERT_WORD_RE = re.compile(r"\b(error|warning|warn)\b", re.IGNORECASE)
 _ANSI_RESET = "\x1b[0m"
 _ANSI_BY_WORD = {
@@ -274,6 +281,16 @@ class SpawnPlanner(Protocol):
         """Operator asked for a manual restart — drop any degraded state
         so the next plan is a normal one."""
 
+    def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        """A better `lastError` than "exited with code N", or None.
+
+        Offered a bounded tail of the child's own output on every
+        non-zero exit. Returning None keeps the generic message, which is
+        what a planner with nothing to add should do — guessing is worse
+        than "exited with code 1", because the operator will believe it.
+        """
+        return None
+
 
 class _ComponentPlanner:
     """Launch plans for one Eugene Plexus component.
@@ -403,6 +420,12 @@ class _ComponentPlanner:
             degraded=degraded,
         )
 
+    def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        """Components have nothing engine-specific to add: a component
+        that will not start is diagnosed from its own log and its own
+        `/v1/config`, both of which the operator already has."""
+        return None
+
     def on_crash_threshold(self) -> bool:
         """Two-stage: fall back to safe mode once, then give up.
 
@@ -470,6 +493,11 @@ class SupervisedProcess:
         asks is what command actually ran, and every tool that hides the
         answer makes that debugging worse."""
         self.last_error: str | None = None
+        # A bounded tail of the child's own output, kept so a non-zero
+        # exit can be explained by whoever understands the engine rather
+        # than reported as "exited with code 1". Bounded because this is
+        # a diagnostic aid, not a log: the log already has everything.
+        self._output_tail: deque[str] = deque(maxlen=_OUTPUT_TAIL_LINES)
         self.last_restart: datetime | None = None
 
     @classmethod
@@ -546,6 +574,19 @@ class SupervisedProcess:
 
     # --- internals ---------------------------------------------------------
 
+    def _explain_exit(self, return_code: int) -> str | None:
+        """Ask the planner to turn this exit into something actionable.
+
+        Best-effort by construction: a planner that raises while
+        explaining a crash must not turn one crash into two, so the
+        generic message stands and the exception is logged.
+        """
+        try:
+            return self._planner.explain_exit(return_code, "".join(self._output_tail))
+        except Exception:
+            self._log.exception("%s: explaining the exit failed", self.name)
+            return None
+
     async def _pipe_child_output(self, stream: asyncio.StreamReader | None) -> None:
         """Drain a child's stdout/stderr pipe and re-emit each line with
         the component name prefix. Runs as a background task per spawn;
@@ -571,6 +612,7 @@ class SupervisedProcess:
                 # newly-unhealthy component is visible.
                 if _HEALTHZ_2XX_LINE.search(text):
                     continue
+                self._output_tail.append(text)
                 # Colorize "error" / "warning" / "warn" inline so the
                 # important lines pop on a fast scroll. Word-level only —
                 # full-line color is unreadable on dark terminals.
@@ -720,7 +762,7 @@ class SupervisedProcess:
             self._consecutive_crashes = 0
         else:
             self._consecutive_crashes += 1
-            self.last_error = f"exited with code {return_code}"
+            self.last_error = self._explain_exit(return_code) or (f"exited with code {return_code}")
             self._log.warning(
                 "%s exited rc=%d (consecutive crashes: %d)",
                 self.name,

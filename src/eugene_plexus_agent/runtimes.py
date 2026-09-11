@@ -142,11 +142,34 @@ class _RuntimePlanner:
 
         argv = self._adapter.build_argv(self.spec, binary, port)
 
-        # Engines inherit the ambient environment plus the runtime's own
-        # additions. Accelerator selection (CUDA_VISIBLE_DEVICES and
-        # friends) rides here, which is how a runtime gets pinned to one
-        # card and how two replicas end up on two GPUs.
+        # Engines inherit the ambient environment, then the adapter's own
+        # defaults for values the engine cannot start without on this
+        # host, then the runtime's additions. Accelerator selection
+        # (CUDA_VISIBLE_DEVICES and friends) rides in the last of those,
+        # which is how a runtime gets pinned to one card and how two
+        # replicas end up on two GPUs.
+        #
+        # The precedence is the point: `setdefault` means an operator who
+        # exported the variable in the agent's own shell keeps their
+        # value, and `spec.env` last means the runtime's setting beats
+        # ours outright — including setting it to something that will
+        # fail, which is an expert's prerogative. Anything we actually
+        # injected is logged, because an environment variable nobody
+        # typed makes a later bug report unreadable.
         env = os.environ.copy()
+        injected = {}
+        for key, value in self._adapter.default_env(self.spec, binary).items():
+            if key not in env:
+                env[key] = value
+                injected[key] = value
+        if injected:
+            log.info(
+                "%s: %s set by the %s adapter as this host needs it; "
+                "override in the runtime's `env`",
+                self.spec.name,
+                ", ".join(f"{k}={v}" for k, v in sorted(injected.items())),
+                self.spec.engine.value,
+            )
         if self.spec.env:
             env.update({k: str(v) for k, v in self.spec.env.items()})
 
@@ -155,6 +178,15 @@ class _RuntimePlanner:
             env=env,
             cwd=self._adapter.working_directory(self.spec, binary),
         )
+
+    def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        """Let the engine's own adapter read the wreckage.
+
+        The adapter is the only thing here that knows what a given
+        engine's startup failures look like, so the planner does nothing
+        but hand the tail over.
+        """
+        return self._adapter.explain_exit(return_code, output_tail)
 
     def on_crash_threshold(self) -> bool:
         """Engines get no second chance, unlike components.

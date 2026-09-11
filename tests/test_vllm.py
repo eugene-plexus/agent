@@ -1,13 +1,21 @@
-"""The vLLM adapter: argv, discovery, environment readout, readiness.
+"""The vLLM adapter: argv, discovery, environment readout, readiness,
+host defaults.
 
 Everything here runs against fixtures — a fake console script, a fake
 interpreter probe, a fake HTTP transport, a fake process handle. That is
 real verification of the adapter's *logic* and the readiness state
-machine. What it cannot verify is vLLM itself: no vLLM process has ever
-run for this project (the dev box is Windows and vLLM has no Windows
-build), so the wall-clock startup budget and the "connections are
-refused, not accepted-and-hung" claim wait for the first Linux run.
-`scripts/m4-acceptance.sh` in the specs repo is that run, unexecuted.
+machine, and it is not verification of vLLM.
+
+**vLLM has now actually run** (2026-09-10, in WSL2; specs
+`scripts/m4-acceptance.sh`, 31 checks, zero failures) and the fixtures
+were vindicated: the adapter needed no change, and the "connections are
+refused, not accepted-and-hung" claim held on every probe across two
+startup paths. What the fixtures could not have told anyone is in
+`docs/acceptance/m4-vllm-run.md` in the specs repo — the wall-clock
+numbers, and the four host prerequisites vLLM needs at *run* time
+because it compiles at first use rather than at install. The
+`default_env` and `explain_exit` tests at the end of this file exist
+because of those.
 """
 
 from __future__ import annotations
@@ -49,11 +57,26 @@ from eugene_plexus_agent.engines.base import (
 from eugene_plexus_agent.engines.vllm import (
     _FLAG_CLI_NAMES,
     STARTUP_BUDGET_SECONDS,
+    _cuda_toolkit_present,
+    _is_wsl,
     accelerator_from_torch_version,
     inspect_python_environment,
     interpreter_from_shebang,
     manual_install_for,
 )
+
+
+def _fake_binary() -> DiscoveredBinary:
+    """A binary record for the hooks that never touch the filesystem.
+
+    `default_env` and `explain_exit` decide from the *host*, not from the
+    install, so they need a DiscoveredBinary only to satisfy the
+    signature — which is itself worth pinning: a default that varied by
+    binary path would be a default nobody could predict.
+    """
+    return DiscoveredBinary(
+        path=Path("/opt/vllm/bin/vllm"), origin=Origin.configured, version="0.29.0"
+    )
 
 
 @pytest.fixture
@@ -699,3 +722,154 @@ def test_trust_remote_code_says_what_it_is(adapter: VllmAdapter) -> None:
 def test_unknown_flags_are_reported_not_dropped(adapter: VllmAdapter) -> None:
     unknown = adapter.validate_flags({"maxModelLen": 8192, "ctxSize": 4096, "gpuLayers": 99})
     assert unknown == ["ctxSize", "gpuLayers"]
+
+
+# --- host defaults, and who beats them -----------------------------------
+#
+# The rule these encode (Troy, 2026-09-11): default to whatever makes the
+# thing work for someone with no technical knowledge, and always leave an
+# expert a way to take the wheel. So the adapter supplies a value only
+# when the engine cannot start without it here, and two separate
+# mechanisms override it.
+
+
+def test_wsl_gets_pin_memory_enabled(adapter: VllmAdapter, monkeypatch: Any) -> None:
+    """Without this, 0.29.0 dies with `RuntimeError: UVA is not available`
+    ~25s into a load, because WSL2 disables pinned memory by default and
+    the model runner requires it. Measured on the first Linux run."""
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._is_wsl", lambda: True)
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._cuda_toolkit_present", lambda: True)
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B"}
+    )
+    env = adapter.default_env(spec, _fake_binary())
+    assert env == {"VLLM_WSL2_ENABLE_PIN_MEMORY": "1"}
+
+
+def test_a_normal_linux_host_gets_no_pin_memory_default(
+    adapter: VllmAdapter, monkeypatch: Any
+) -> None:
+    """The default is inert off WSL2 — upstream's own default is already
+    right there, and overriding it would be us tuning rather than us
+    making the engine start."""
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._is_wsl", lambda: False)
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._cuda_toolkit_present", lambda: True)
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B"}
+    )
+    assert adapter.default_env(spec, _fake_binary()) == {}
+
+
+def test_no_cuda_toolkit_falls_back_to_native_sampling(
+    adapter: VllmAdapter, monkeypatch: Any
+) -> None:
+    """FlashInfer JIT-compiles its SAMPLING kernels and needs nvcc;
+    attention picked prebuilt FlashAttention 2 and was never involved.
+    This is the one default that trades a little throughput, and it is
+    traded against not starting at all."""
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._is_wsl", lambda: False)
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._cuda_toolkit_present", lambda: False)
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B"}
+    )
+    assert adapter.default_env(spec, _fake_binary()) == {"VLLM_USE_FLASHINFER_SAMPLER": "0"}
+
+
+def test_a_toolkit_keeps_the_fast_sampler(adapter: VllmAdapter, monkeypatch: Any) -> None:
+    """Install a toolkit and the fast path comes back with no
+    configuration — the default is computed per launch, not remembered."""
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._is_wsl", lambda: False)
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._cuda_toolkit_present", lambda: True)
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B"}
+    )
+    assert "VLLM_USE_FLASHINFER_SAMPLER" not in adapter.default_env(spec, _fake_binary())
+
+
+def test_cuda_toolkit_detection_mirrors_flashinfer(
+    adapter: VllmAdapter, tmp_path: Path, monkeypatch: Any
+) -> None:
+    """FlashInfer's own `get_cuda_path` reads CUDA_HOME/CUDA_PATH then
+    /usr/local/cuda, so we look where it looks — a disagreement here
+    would mean disabling a sampler that would have worked, or leaving one
+    enabled that cannot."""
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm.shutil.which", lambda _: None)
+    monkeypatch.delenv("CUDA_HOME", raising=False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    assert _cuda_toolkit_present() is False
+
+    nvcc = tmp_path / "bin" / "nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.write_text("", encoding="utf-8")
+    monkeypatch.setenv("CUDA_HOME", str(tmp_path))
+    assert _cuda_toolkit_present() is True
+
+    # A CUDA_HOME pointing somewhere without an nvcc in it is not a
+    # toolkit, however confidently it is set.
+    monkeypatch.setenv("CUDA_HOME", str(tmp_path / "nope"))
+    assert _cuda_toolkit_present() is False
+
+
+def test_wsl_is_read_from_proc_version_not_the_environment(monkeypatch: Any) -> None:
+    """`WSL_DISTRO_NAME` is set for interactive shells; an agent started
+    by a service manager may not have it. The kernel string always
+    exists, and an unreadable one means 'not WSL', which is safe because
+    the default it gates is inert elsewhere."""
+    monkeypatch.setattr(
+        "eugene_plexus_agent.engines.vllm.Path.read_text",
+        lambda self, **kw: "Linux version 6.18.33.2-microsoft-standard-WSL2",
+    )
+    assert _is_wsl() is True
+
+    monkeypatch.setattr(
+        "eugene_plexus_agent.engines.vllm.Path.read_text",
+        lambda self, **kw: "Linux version 6.8.0-generic",
+    )
+    assert _is_wsl() is False
+
+    def _boom(self: Any, **kw: Any) -> str:
+        raise OSError("no /proc here")
+
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm.Path.read_text", _boom)
+    assert _is_wsl() is False
+
+
+# --- explaining a death instead of refusing a launch ---------------------
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("RuntimeError: Failed to find C compiler. Please specify", "build-essential"),
+        ("fatal error: Python.h: No such file or directory", "python3-dev"),
+        ("RuntimeError: Could not find nvcc and default cuda_home=", "VLLM_USE_FLASHINFER_SAMPLER"),
+        ("RuntimeError: UVA is not available", "VLLM_WSL2_ENABLE_PIN_MEMORY"),
+    ],
+)
+def test_known_startup_deaths_name_their_fix(
+    adapter: VllmAdapter, tail: str, expected: str
+) -> None:
+    """All four were met on the first Linux run, each killing the engine
+    20-40s in from inside a subprocess with a traceback that named
+    neither cause nor cure. `exited with code 1` is what the operator
+    used to get."""
+    explanation = adapter.explain_exit(1, tail)
+    assert explanation is not None
+    assert expected in explanation
+
+
+def test_an_unrecognised_death_is_left_alone(adapter: VllmAdapter) -> None:
+    """Returning None keeps the generic message. Guessing would be worse
+    than the honest 'exited with code N'."""
+    assert adapter.explain_exit(1, "Killed\nsome other traceback") is None
+    assert adapter.explain_exit(1, "") is None
+
+
+def test_llama_cpp_explains_nothing_yet() -> None:
+    """The hook is generic and the base returns None, so an adapter that
+    has not opted in cannot accidentally claim a vLLM diagnosis."""
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "llama_cpp", "modelPath": "/models/x.gguf"}
+    )
+    assert LlamaCppAdapter().default_env(spec, _fake_binary()) == {}
+    assert LlamaCppAdapter().explain_exit(1, "RuntimeError: UVA is not available") is None

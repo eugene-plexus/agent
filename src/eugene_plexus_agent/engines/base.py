@@ -331,6 +331,48 @@ class EngineAdapter(abc.ABC):
             return spec.workingDirectory
         return str(binary.path.parent)
 
+    def default_env(self, spec: RuntimeSpec, binary: DiscoveredBinary) -> dict[str, str]:
+        """Environment this adapter supplies as a *default* for its engine.
+
+        Applied with `setdefault` semantics against the ambient
+        environment and then overridden by `RuntimeSpec.env`, so an
+        operator beats us at two levels: exporting the variable in the
+        shell that starts the agent, or setting it on the runtime through
+        the API or the UI. Whatever is injected is logged, because an
+        environment variable nobody typed is exactly the kind of thing
+        that makes a later bug report unreadable.
+
+        This is for values an engine **cannot start without on the
+        detected host**, not for tuning. A default that merely performs
+        better is a decision belonging to the operator or to
+        `ModelProfile`; a default that is the difference between running
+        and not running is ours to supply, because the alternative is a
+        working install that refuses to work for a reason only someone
+        who reads upstream's source would find. See vLLM's for the two
+        that qualify, and `docs/acceptance/m4-vllm-run.md` for the
+        tracebacks they replace.
+        """
+        return {}
+
+    def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        """A better `lastError` than "exited with code N", or None.
+
+        The supervisor keeps a bounded tail of the engine's own output
+        and offers it here on a non-zero exit. An adapter that recognises
+        a known failure signature returns a sentence naming the fix;
+        anything else returns None and the generic message stands.
+
+        Deliberately NOT a pre-launch refusal. The obvious design was to
+        check the host's toolchain before spawning and refuse early, and
+        it is wrong: a warm Triton cache runs vLLM with no C compiler on
+        the host at all — measured, `CC=/nonexistent` and it served in
+        19.9s — so refusing on a missing compiler would reject a launch
+        that works, on any host that has run the engine once. Explaining
+        a real failure cannot be a false refusal, which is the whole
+        reason it reads output after the fact instead of probing before.
+        """
+        return None
+
     # --- observing --------------------------------------------------------
 
     @abc.abstractmethod

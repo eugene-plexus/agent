@@ -7,6 +7,7 @@ test_supervisor.py.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -21,7 +22,7 @@ from eugene_plexus_agent.engines import LlamaCppAdapter, VllmAdapter
 from eugene_plexus_agent.engines.base import Loading, Ready
 from eugene_plexus_agent.runtimes import RuntimeSupervisor, _RuntimePlanner, describe_engines
 from eugene_plexus_agent.state import AgentState
-from eugene_plexus_agent.supervisor import ProcessState, SpawnPlanError
+from eugene_plexus_agent.supervisor import ProcessState, SpawnPlan, SpawnPlanError
 
 from .conftest import StubRuntimeSupervisor
 
@@ -671,3 +672,132 @@ def test_auto_start_false_is_declared_but_not_started() -> None:
     supervisor.add_and_start(spec)
     assert supervisor.is_running("big") is False
     assert supervisor.compose(spec).status == RuntimeStatus.stopped
+
+
+def test_adapter_env_defaults_lose_to_both_kinds_of_override(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The precedence that makes an injected default safe: ambient env
+    first (an operator who exported it in the agent's shell), then the
+    adapter's default for keys nobody set, then `RuntimeSpec.env`, which
+    wins outright — including winning with a value that will fail, which
+    is an expert's prerogative.
+    """
+    exe = tmp_path / "vllm"
+    exe.write_text(f"#!{sys.executable}\n", encoding="utf-8")
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._is_wsl", lambda: True)
+    monkeypatch.setattr("eugene_plexus_agent.engines.vllm._cuda_toolkit_present", lambda: False)
+
+    # 1. Nobody set anything: both defaults land.
+    monkeypatch.delenv("VLLM_WSL2_ENABLE_PIN_MEMORY", raising=False)
+    monkeypatch.delenv("VLLM_USE_FLASHINFER_SAMPLER", raising=False)
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B", "port": 8090}
+    )
+    plan = _RuntimePlanner(
+        spec, VllmAdapter(), logging.getLogger("test"), lambda key: str(exe)
+    ).plan()
+    assert plan is not None
+    assert plan.env["VLLM_WSL2_ENABLE_PIN_MEMORY"] == "1"
+    assert plan.env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
+
+    # 2. The runtime's own env wins, even when it is the losing choice.
+    spec_override = RuntimeSpec.model_validate(
+        {
+            "name": "q",
+            "engine": "vllm",
+            "modelPath": "/models/Qwen3-8B",
+            "port": 8090,
+            "env": {"VLLM_WSL2_ENABLE_PIN_MEMORY": "0"},
+        }
+    )
+    plan = _RuntimePlanner(
+        spec_override, VllmAdapter(), logging.getLogger("test"), lambda key: str(exe)
+    ).plan()
+    assert plan is not None
+    assert plan.env["VLLM_WSL2_ENABLE_PIN_MEMORY"] == "0"
+
+    # 3. An exported variable wins too, so an operator debugging from a
+    #    shell is not fighting an invisible default.
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_SAMPLER", "1")
+    plan = _RuntimePlanner(
+        spec, VllmAdapter(), logging.getLogger("test"), lambda key: str(exe)
+    ).plan()
+    assert plan is not None
+    assert plan.env["VLLM_USE_FLASHINFER_SAMPLER"] == "1"
+
+
+def test_the_runtime_planner_delegates_explaining_to_its_adapter() -> None:
+    """The planner knows nothing about any engine's failure modes, so it
+    forwards the tail and nothing else."""
+    spec = RuntimeSpec.model_validate(
+        {"name": "q", "engine": "vllm", "modelPath": "/models/Qwen3-8B", "port": 8090}
+    )
+    planner = _RuntimePlanner(spec, VllmAdapter(), logging.getLogger("test"))
+    explained = planner.explain_exit(1, "RuntimeError: UVA is not available")
+    assert explained is not None
+    assert "VLLM_WSL2_ENABLE_PIN_MEMORY" in explained
+    assert planner.explain_exit(1, "nothing recognisable") is None
+
+
+@pytest.mark.asyncio
+async def test_a_known_engine_death_reaches_last_error(tmp_path: Path) -> None:
+    """END TO END through the supervisor, because the first version of
+    this test did not.
+
+    It asserted the adapter's own method while being named as though it
+    proved the wiring, and the wiring was in fact broken: the supervisor
+    asked the *planner* for a hook that only the *adapter* had, so
+    nothing was ever explained and this test passed regardless. Drive
+    the real path or prove nothing.
+    """
+    from eugene_plexus_agent.supervisor import _OUTPUT_TAIL_LINES, SupervisedProcess
+
+    assert _OUTPUT_TAIL_LINES >= 40, "a tail too short to hold a traceback explains nothing"
+
+    # A child that prints a long traceback ending in a signature the vLLM
+    # adapter knows, then exits non-zero — which is exactly what a real
+    # toolchain-less vLLM does, minus forty seconds.
+    script = tmp_path / "dying_engine.py"
+    script.write_text(
+        "import sys\n"
+        "for i in range(200):\n"
+        "    print(f'  File \"frame{i}.py\", line {i}, in run')\n"
+        "print('RuntimeError: Failed to find C compiler. Please specify via CC')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+
+    class _DyingEnginePlanner:
+        name = "q"
+        log_prefix = "[engine: q] "
+
+        def plan(self) -> SpawnPlan:
+            return SpawnPlan(argv=[sys.executable, str(script)], env=None, cwd=None)
+
+        def on_crash_threshold(self) -> bool:
+            return False
+
+        def reset(self) -> None:
+            return None
+
+        def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+            return VllmAdapter().explain_exit(return_code, output_tail)
+
+    proc = SupervisedProcess(_DyingEnginePlanner(), logging.getLogger("test"))
+    proc.start()
+    try:
+        for _ in range(200):
+            if proc.state is ProcessState.crashed:
+                break
+            await asyncio.sleep(0.05)
+
+        assert proc.state is ProcessState.crashed
+        assert proc.last_error is not None
+        assert "build-essential" in proc.last_error, proc.last_error
+        # And the generic message is replaced, not appended to.
+        assert "exited with code" not in proc.last_error
+    finally:
+        # The loop respawns after a crash; without this the backoff task
+        # outlives the test.
+        await proc.stop()
