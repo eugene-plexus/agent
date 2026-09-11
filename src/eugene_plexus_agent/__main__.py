@@ -1,19 +1,118 @@
-"""Entrypoint: `python -m eugene_plexus_agent`."""
+"""Entrypoint: `python -m eugene_plexus_agent`, or `eugene-plexus-agent`.
+
+Two things happen here that are not "start a server", and both exist
+because **the same entry point runs on every machine in an install** —
+the control root's host and every worker. A worker cannot be onboarded
+from a browser: you cannot reach its web UI until it binds non-loopback,
+it binds non-loopback only when it advertises a non-loopback address, and
+setting that address is part of what joining does. So the machine has to
+ask, or be told on the command line.
+
+    eugene-plexus-agent                 start (asks once, on a fresh boot with a TTY)
+    eugene-plexus-agent join --control <url> --token <jwt>
+
+See `onboarding.py` for why a missing TTY means "start a new install"
+rather than "wait".
+"""
 
 from __future__ import annotations
 
+import argparse
 import logging
+import sys
 
 import uvicorn
 
 from .app import create_app
 from .console_logging import install_console_capture
-from .settings import load_settings
+from .onboarding import JoinRequest, ask, has_tty, is_fresh_boot, run_join
+from .settings import Settings, load_settings
 from .state import AgentState
 
 
-def main() -> None:
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="eugene-plexus-agent",
+        description=(
+            "Per-host node agent: supervises components and engine runtimes, and "
+            "joins this machine to an Eugene Plexus install."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    join = sub.add_parser(
+        "join",
+        help="Enroll this machine as a worker node in an existing install, then exit.",
+        description=(
+            "Enroll this machine with a control root and write node.yaml, without "
+            "starting the agent. The next normal start finds an enrolled node and "
+            "does not declare a control plane of its own. This is the scripted "
+            "answer to the same question the first-boot prompt asks."
+        ),
+    )
+    join.add_argument("--control", required=True, metavar="URL", help="Control root URL.")
+    join.add_argument(
+        "--token",
+        required=True,
+        metavar="JWT",
+        help="A join token minted at that control root (Nodes -> Add a node).",
+    )
+    join.add_argument(
+        "--name",
+        metavar="NAME",
+        help="Name for this node in the install. Defaults to the hostname.",
+    )
+    join.add_argument(
+        "--advertise",
+        metavar="URL",
+        help=(
+            "Address other hosts reach this machine at. Derived from the route to the "
+            "control root when omitted, which is right on a mesh VPN and worth setting "
+            "by hand when it is not."
+        ),
+    )
+    join.add_argument(
+        "--force",
+        action="store_true",
+        help="Join even though components are already declared here (see the refusal's text).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parser().parse_args(argv if argv is not None else sys.argv[1:])
     settings = load_settings()
+
+    if args.command == "join":
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
+        raise SystemExit(
+            run_join(
+                JoinRequest(
+                    control_url=args.control,
+                    token=args.token,
+                    name=args.name,
+                    advertise_url=args.advertise,
+                    force=args.force,
+                ),
+                settings,
+            )
+        )
+
+    _serve(settings)
+
+
+def _serve(settings: Settings) -> None:
+    # **The onboarding question, asked before anything is written.** Only
+    # on a boot that would otherwise declare a control plane, and only
+    # with a TTY to ask into — a service unit or container has neither a
+    # terminal nor anyone watching one, and an agent that blocks at boot
+    # waiting for an answer is worse than one that picks the common case.
+    if is_fresh_boot(settings) and has_tty():
+        request = ask(settings)
+        if request is not None:
+            code = run_join(request, settings)
+            if code != 0:
+                raise SystemExit(code)
 
     # Mirror stdout/stderr to a rotating log file FIRST — before anything
     # else writes a line. Captures the agent's own uvicorn output,

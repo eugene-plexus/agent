@@ -661,6 +661,20 @@ class RekeyRequest(BaseModel):
     )
 
 
+class UnenrollRequest(BaseModel):
+    """
+    Optional. The default does the right thing; the field exists for
+    the operator who already knows the root is gone and does not want
+    to wait for the attempt to time out.
+
+    """
+
+    notifyControl: bool | None = Field(
+        True,
+        description='Call `DELETE /v1/nodes/{name}` at the control root first, so\nthe install rotates its signing key and stops trusting this\nnode. Set false to skip the attempt entirely — it does not\nchange what happens *here*, only whether the root is told.\n',
+    )
+
+
 class AuthStatus(BaseModel):
     """
     Whether this install has been through first-run setup.
@@ -1390,6 +1404,15 @@ class NodeIdentity(BaseModel):
         None,
         description="The identity public key of the control root this agent\nenrolled with, recorded then and checked against every\n`POST /v1/node/rekey` since. A dashboard can compare it with\nthe root's own `Snapshot.controlPublicKey`.\n",
     )
+    signingPublicKey: str | None = Field(
+        None,
+        description="This node's **Ed25519** identity public key — the one it\nsigns `PATCH /v1/nodes/{name}` with, recorded at the control\nroot as `Node.signingPublicKey`.\n\nSeparate from `publicKey`, which is X25519 and exists to have\nsecrets sealed *to* it. One key cannot do both jobs: sealing\nis Diffie-Hellman and signing is Ed25519, and deriving one\nfrom the other only runs in the direction we do not have.\n\nAbsent on a node enrolled before this key existed, which is\nalso why its re-advertisements are refused — see\n`PATCH /v1/nodes/{name}` in `control.yaml`.\n",
+    )
+    advertiseSequence: int | None = Field(
+        None,
+        description='How many address announcements this node has made since it\nenrolled. Strictly increasing, persisted here and mirrored at\nthe control root, so a replayed announcement cannot move a\nnode back to an address it used to have.\n',
+        ge=0,
+    )
     os: Os | None = None
     arch: Arch | None = None
     devices: list[ComputeDevice] | None = Field(
@@ -1397,6 +1420,24 @@ class NodeIdentity(BaseModel):
         description='What this host can compute on, detected locally. The control\nroot aggregates these into the cross-host inventory M3\ndeferred; detection stays here because only the host can do\nit.\n',
     )
     agentVersion: str | None = None
+
+
+class UnenrollResult(BaseModel):
+    identity: NodeIdentity
+    controlNotified: bool = Field(
+        ...,
+        description='Whether the control root accepted the revocation. **False is\nnot a failure of this call** — the node has left either way.\nIt means the install still lists this node and still trusts\nthe key it just discarded, and an operator owes it a\n`DELETE /v1/nodes/{name}`.\n',
+    )
+    previousName: str | None = Field(
+        None, description='The name this node had in the install it just left.'
+    )
+    previousControlUrl: AnyUrl | None = Field(
+        None, description='The control root it answered to.'
+    )
+    detail: str | None = Field(
+        None,
+        description='Why the root was not told, when it was not. Present exactly\nwhen `controlNotified` is false and something was attempted.\n',
+    )
 
 
 class EngineAcquisition(BaseModel):

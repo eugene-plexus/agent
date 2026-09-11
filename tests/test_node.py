@@ -23,7 +23,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import node_identity, security
+from eugene_plexus_agent import enrollment, node_identity, security
 from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind, SpawnConfig
 from eugene_plexus_agent.app import create_app, shared_child_env
 from eugene_plexus_agent.node_identity import (
@@ -61,6 +61,13 @@ class FakeControl:
         self.signing_key_id = "1"
         self.refuse: tuple[int, dict[str, Any]] | None = None
         self.enroll_requests: list[dict[str, Any]] = []
+        # The node registry, as far as a fake needs one: the signing
+        # public key it was given, and the address/sequence high-water
+        # mark it enforces exactly as the real root does.
+        self.nodes: dict[str, dict[str, Any]] = {}
+        self.address_requests: list[dict[str, Any]] = []
+        self.revoked: list[str] = []
+        self.refuse_revoke: int | None = None
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
@@ -78,26 +85,99 @@ class FakeControl:
 
     def transport(self) -> httpx.MockTransport:
         def handle(request: httpx.Request) -> httpx.Response:
-            if request.url.path != "/v1/nodes/enroll":
-                return httpx.Response(404, json={"detail": "no such route on the fake control"})
-            body = json.loads(request.content)
-            self.enroll_requests.append(body)
-            if self.refuse is not None:
-                code, payload = self.refuse
-                return httpx.Response(code, json={"detail": payload})
-            return httpx.Response(
-                201,
-                json={
-                    "name": body["name"],
-                    "epoch": self.epoch,
-                    "signingKey": self.signing_key_b64,
-                    "signingKeyId": self.signing_key_id,
-                    "controlPublicKey": self.public,
-                    "recoveryPublicKey": self.recovery_public,
-                },
-            )
+            path = request.url.path
+            if path == "/v1/nodes/enroll":
+                return self._enroll(request)
+            if path.startswith("/v1/nodes/") and request.method == "PATCH":
+                return self._announce(path.rsplit("/", 1)[-1], request)
+            if path.startswith("/v1/nodes/") and request.method == "DELETE":
+                return self._revoke(path.rsplit("/", 1)[-1], request)
+            return httpx.Response(404, json={"detail": "no such route on the fake control"})
 
         return httpx.MockTransport(handle)
+
+    def _enroll(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.enroll_requests.append(body)
+        if self.refuse is not None:
+            code, payload = self.refuse
+            return httpx.Response(code, json={"detail": payload})
+        # Enrolling replaces the record, sequence included — the real
+        # root's `enrollNode` does, and a rebuilt host whose counter
+        # restarted could never re-advertise otherwise.
+        self.nodes[body["name"]] = {
+            "url": body.get("url"),
+            "signingPublicKey": body.get("signingPublicKey"),
+            "advertiseSequence": 0,
+        }
+        return httpx.Response(
+            201,
+            json={
+                "name": body["name"],
+                "epoch": self.epoch,
+                "signingKey": self.signing_key_b64,
+                "signingKeyId": self.signing_key_id,
+                "controlPublicKey": self.public,
+                "recoveryPublicKey": self.recovery_public,
+            },
+        )
+
+    def _announce(self, name: str, request: httpx.Request) -> httpx.Response:
+        """The real verification, not a rubber stamp.
+
+        Signature checked against the key enrollment recorded, over the
+        **raw body's** url — which is the whole trap: verify a parsed URL
+        and every announcement 401s on a trailing slash.
+        """
+        body = json.loads(request.content)
+        self.address_requests.append({"name": name, **body})
+        record = self.nodes.get(name)
+        if record is None:
+            return httpx.Response(404, json={"detail": "no such node"})
+        public = record.get("signingPublicKey")
+        if not public:
+            return httpx.Response(401, json={"detail": "no signing key; re-enroll"})
+        message = node_identity.address_message(
+            name=name, sequence=int(body["sequence"]), url=body["url"]
+        )
+        if not node_identity.verify_rekey_signature(
+            control_public_key=public, message=message, signature=body["signature"]
+        ):
+            return httpx.Response(401, json={"detail": "signature rejected"})
+        if body["url"] == record["url"]:
+            return httpx.Response(
+                200,
+                json={
+                    "name": name,
+                    "url": record["url"],
+                    "sequence": record["advertiseSequence"],
+                    "changed": False,
+                },
+            )
+        if int(body["sequence"]) <= int(record["advertiseSequence"]):
+            return httpx.Response(409, json={"detail": "stale announcement"})
+        record["url"] = body["url"]
+        record["advertiseSequence"] = int(body["sequence"])
+        return httpx.Response(
+            200,
+            json={
+                "name": name,
+                "url": record["url"],
+                "sequence": record["advertiseSequence"],
+                "changed": True,
+            },
+        )
+
+    def _revoke(self, name: str, request: httpx.Request) -> httpx.Response:
+        if self.refuse_revoke is not None:
+            return httpx.Response(self.refuse_revoke, json={"detail": "refused"})
+        if not request.headers.get("authorization"):
+            return httpx.Response(401, json={"detail": "operator token required"})
+        if name not in self.nodes:
+            return httpx.Response(404, json={"detail": "no such node"})
+        self.nodes.pop(name)
+        self.revoked.append(name)
+        return httpx.Response(202, json={"reason": "revocation", "signingKeyId": "2"})
 
     def rekey(
         self,
@@ -254,7 +334,9 @@ def test_enrolling_twice_is_a_409_that_names_the_way_out(
     assert authed_client.get("/v1/node", headers=stale).status_code == 401
     again = _enroll(authed_client, control)
     assert again.status_code == 409
-    assert "gpu-box" in again.text and "node.yaml" in again.text
+    # The way out is an operation now, not a filesystem instruction. Before
+    # M9 this message told the operator to delete node.yaml by hand.
+    assert "gpu-box" in again.text and "/v1/node/unenroll" in again.text
     assert len(control.enroll_requests) == 1, "a second enrollment must not reach the root"
 
 
@@ -677,3 +759,250 @@ def test_address_helpers() -> None:
     assert node_identity.effective_advertise_url("http://a:1/", "http://b:2") == "http://a:1"
     assert node_identity.effective_advertise_url("  ", "http://b:2/") == "http://b:2"
     assert node_identity.effective_advertise_url(None, None) is None
+
+
+# --------------------------------------------------------------------------- #
+# Leaving an install (M9)
+# --------------------------------------------------------------------------- #
+
+
+def test_unenroll_discards_the_installs_key_and_tells_the_root(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The inverse of enrolling, and the reason it is safe to run here.
+
+    Revocation exists because a node that still *holds* the signing key
+    can still authenticate. Un-enrolling discards it - the opposite
+    direction - so a node cannot escape revocation this way, only disarm
+    itself. The assertion that matters is the last one: the install's key
+    no longer verifies here.
+    """
+    assert _enroll(authed_client, control).status_code == 200
+    assert _auth(authed_client).signing_key == control.signing_key
+
+    response = authed_client.post("/v1/node/unenroll")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["controlNotified"] is True
+    assert body["previousName"] == "gpu-box"
+    assert body["identity"]["enrolled"] is False
+    assert control.revoked == ["gpu-box"]
+    assert _auth(authed_client).signing_key != control.signing_key
+
+
+def test_unenroll_keeps_this_nodes_own_keypairs(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """They are the *host's* identity, not the install's. The same node
+    re-joining anywhere is still the same node, and a departing install
+    holding only public halves can read nothing with them."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    before = (store.record.public_key, store.record.signing_public_key)
+    assert all(before)
+
+    authed_client.post("/v1/node/unenroll")
+    after = store.record
+    assert (after.public_key, after.signing_public_key) == before
+    # And everything that belonged to the install is gone.
+    assert after.signing_key is None
+    assert after.signing_key_id is None
+    assert after.epoch is None
+    assert after.control_url is None
+    assert after.control_public_key is None
+    assert after.advertise_sequence == 0
+
+
+def test_unenroll_proceeds_when_the_control_root_is_unreachable(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """`degraded-mode-required`, applied to a trust operation: an operator
+    detaching a node from a dead install is exactly the case where
+    refusing is useless. The node leaves and *says* the root was not
+    told, because the install still trusts a key nobody discarded."""
+    _enroll(authed_client, control)
+
+    def dead(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("control root is gone")
+
+    authed_client.app.state.control_transport = httpx.MockTransport(dead)  # type: ignore[attr-defined]
+    response = authed_client.post("/v1/node/unenroll")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["controlNotified"] is False
+    assert "DELETE /v1/nodes/gpu-box" in body["detail"]
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    assert store.record.enrolled is False
+
+
+def test_unenroll_can_skip_telling_the_root(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The expert override: an operator who already knows the root is gone
+    should not wait out a timeout to detach."""
+    _enroll(authed_client, control)
+    response = authed_client.post("/v1/node/unenroll", json={"notifyControl": False})
+    assert response.status_code == 200, response.text
+    assert response.json()["controlNotified"] is False
+    assert control.revoked == []
+
+
+def test_unenroll_restarts_children_and_is_409_when_not_enrolled(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Children hold the install's signing key in their environment, so a
+    key this agent just threw away reaches them only through a respawn -
+    the same reason enrollment restarts them."""
+    assert authed_client.post("/v1/node/unenroll").status_code == 409
+
+    _enroll(authed_client, control)
+    before = _restarts(authed_client)
+    assert authed_client.post("/v1/node/unenroll").status_code == 200
+    assert _restarts(authed_client) == before + 1
+
+
+# --------------------------------------------------------------------------- #
+# Saying where this host is (M9) - the defect that was live for four
+# milestones: announced once at enrollment, never again.
+# --------------------------------------------------------------------------- #
+
+
+def test_enrollment_sends_the_nodes_signing_public_key(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Without it the root has nothing to verify a re-advertisement
+    against, and this node can never tell it that it moved."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    assert control.enroll_requests[-1]["signingPublicKey"]
+    assert control.enroll_requests[-1]["signingPublicKey"] == store.record.signing_public_key
+    # The two keys are different keys. One seals, one signs; neither can
+    # do the other's job.
+    assert store.record.signing_public_key != store.record.public_key
+
+
+@pytest.mark.asyncio
+async def test_a_node_that_moved_announces_its_new_address(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The whole point. `announce_address` is what the lifespan runs on
+    every boot; here it runs directly so the assertion is about the
+    exchange rather than about task scheduling."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    # Whatever enrollment derived — the point is that it is not the
+    # address this host is about to be found at.
+    assert control.nodes["gpu-box"]["url"] != "http://10.0.0.9:8079"
+
+    outcome = await enrollment.announce_address(
+        store=store, url="http://10.0.0.9:8079", transport=control.transport()
+    )
+    assert outcome.announced and outcome.changed
+    assert control.nodes["gpu-box"]["url"] == "http://10.0.0.9:8079"
+    assert store.record.advertise_sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_address_is_announced_and_changes_nothing(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The common case is a restart. It must be free at the root - every
+    reboot of every node appending a log entry would be a log that grows
+    with uptime rather than with events."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    recorded = control.nodes["gpu-box"]["url"]
+
+    outcome = await enrollment.announce_address(
+        store=store, url=recorded, transport=control.transport()
+    )
+    assert outcome.announced and outcome.changed is False
+
+
+@pytest.mark.asyncio
+async def test_the_sequence_advances_even_when_an_announcement_fails(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Claimed before the call and never rolled back. A gap costs nothing
+    - the root only needs the next number to be higher - while re-using
+    one after a timeout that actually succeeded would look exactly like a
+    replay and be refused forever."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+
+    def dead(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("root is gone")
+
+    outcome = await enrollment.announce_address(
+        store=store, url="http://10.0.0.9:8079", transport=httpx.MockTransport(dead)
+    )
+    assert outcome.announced is False
+    assert store.record.advertise_sequence == 1
+
+    outcome = await enrollment.announce_address(
+        store=store, url="http://10.0.0.9:8079", transport=control.transport()
+    )
+    assert outcome.announced and outcome.changed
+    assert store.record.advertise_sequence == 2
+
+
+@pytest.mark.asyncio
+async def test_announcing_never_raises_when_the_root_refuses(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """This runs at boot. Throwing here would take supervision down over
+    a management-plane problem, which is the inversion
+    `degraded-mode-required` exists to prevent."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    control.nodes["gpu-box"]["signingPublicKey"] = None
+
+    outcome = await enrollment.announce_address(
+        store=store, url="http://10.0.0.9:8079", transport=control.transport()
+    )
+    assert outcome.announced is False
+    assert outcome.detail
+
+
+@pytest.mark.asyncio
+async def test_a_configured_advertise_url_beats_a_derived_one(control: FakeControl) -> None:
+    """The expert override, and it wins even when it is wrong - an
+    override that cannot be wrong is not one."""
+    resolved = await enrollment.resolve_advertise_url(
+        configured="http://tailnet-name:8079",
+        control_url=control.url,
+        bind_port=8079,
+        persisted="http://stale:8079",
+    )
+    assert resolved == "http://tailnet-name:8079"
+
+
+@pytest.mark.asyncio
+async def test_an_unconfigured_advertise_url_is_re_derived_not_read_back(
+    control: FakeControl,
+) -> None:
+    """The line that actually fixes the defect. A host that rebooted onto
+    a new address has a *stale* persisted value, so resolving from it
+    first would announce the old one - confidently, and forever."""
+    resolved = await enrollment.resolve_advertise_url(
+        configured=None,
+        control_url=control.url,
+        bind_port=8079,
+        persisted="http://192.0.2.99:8079",
+    )
+    assert resolved is not None
+    assert urlparse(resolved).hostname == "127.0.0.1"
+    assert resolved != "http://192.0.2.99:8079"
+
+
+@pytest.mark.asyncio
+async def test_a_persisted_address_is_the_fallback_when_the_root_is_unreachable() -> None:
+    """Better than nothing on a boot where the route cannot be measured:
+    the last known address is more likely right than no address at all."""
+    resolved = await enrollment.resolve_advertise_url(
+        configured=None,
+        control_url="http://127.0.0.1:1",
+        bind_port=8079,
+        persisted="http://192.0.2.99:8079",
+    )
+    assert resolved == "http://192.0.2.99:8079"

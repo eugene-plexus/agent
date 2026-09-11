@@ -33,25 +33,35 @@ import base64
 import binascii
 import logging
 import platform
-import socket
 import sys
-from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from .. import __version__
+from .. import __version__, security
 from .._generated.common_models import Problem
-from .._generated.models import Arch, EnrollRequest, NodeIdentity, Os, RekeyRequest
+from .._generated.models import (
+    Arch,
+    EnrollRequest,
+    NodeIdentity,
+    Os,
+    RekeyRequest,
+    UnenrollRequest,
+    UnenrollResult,
+)
 from ..auth_state import AuthState
 from ..dependencies import require_operator_or_service, require_operator_session
 from ..engines.devices import DeviceSnapshot, detect_devices
+from ..enrollment import (
+    EnrollmentError,
+    perform_enrollment,
+    problem_detail,
+    resolve_advertise_url,
+)
 from ..node_identity import (
     FencedError,
     NodeIdentityStore,
-    derive_advertise_host,
     effective_advertise_url,
-    format_url,
     rekey_message,
     verify_rekey_signature,
 )
@@ -64,9 +74,11 @@ router = APIRouter(tags=["node"])
 _read_auth = [Depends(require_operator_or_service)]
 _write_auth = [Depends(require_operator_session)]
 
-# The control root answers enrollment from memory plus one log append;
-# anything slower is the root being down, which is a 502 here either way.
-_ENROLL_TIMEOUT_SECONDS = 15.0
+# Revoking at the root rotates the install's signing key across every
+# remaining node, so it is slower than a read and worth waiting for —
+# but not worth blocking a detach on, which is why exceeding it still
+# leaves this node un-enrolled with `controlNotified: false`.
+_REVOKE_TIMEOUT_SECONDS = 20.0
 
 
 def _problem(code: int, slug: str, title: str, detail: str) -> HTTPException:
@@ -126,6 +138,8 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         advertiseUrl=advertise,  # type: ignore[arg-type]
         signingKeyId=record.signing_key_id if record.enrolled else None,
         controlPublicKey=record.control_public_key if record.enrolled else None,
+        signingPublicKey=record.signing_public_key,
+        advertiseSequence=record.advertise_sequence,
         os=_os(),
         arch=_arch(),
         devices=list(snapshot.devices),
@@ -188,7 +202,7 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
 
     **The operator's own session on this agent stops verifying the moment
     this succeeds**, because the key it was signed with has been replaced
-    by the install's. Log in again — here or at the control root; both
+    by the install's. Log in again - here or at the control root; both
     now mint tokens this agent accepts. The same price a rotation charges
     at the control root, for the same reason.
 
@@ -200,118 +214,172 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
     loopback address recorded at the control root for a remote node
     would make the root probe itself, which is worse than a node it
     knows it cannot reach.
+
+    The protocol itself lives in `enrollment.py`, because
+    `eugene-plexus-agent join` runs it with no app around it.
     """
     store = _store(request)
     state: AgentState = request.app.state.agent_state
     auth: AuthState = request.app.state.auth_state
     settings = request.app.state.settings
 
-    if store.record.enrolled:
-        held = store.record
-        raise _problem(
-            status.HTTP_409_CONFLICT,
-            "already-enrolled",
-            "Already enrolled",
-            f"This agent is enrolled as {held.name!r} with the control root at "
-            f"{held.control_url}. Re-enrolling elsewhere is a deliberate act: revoke it there "
-            f"first (DELETE /v1/nodes/{held.name}), which rotates the install's signing key, "
-            f"then remove node.yaml beside agent.yaml and restart this agent.",
-        )
-
-    record = store.ensure_keypair()
     control_url = str(body.controlUrl).rstrip("/")
-
-    advertise = effective_advertise_url(state.get_config("advertiseUrl"), None)
+    advertise = await resolve_advertise_url(
+        configured=state.get_config("advertiseUrl"),
+        control_url=control_url,
+        bind_port=int(settings.bind_port),
+    )
     if advertise is None:
-        host = await asyncio.to_thread(derive_advertise_host, control_url)
-        if host is not None:
-            advertise = format_url(host, int(settings.bind_port))
-            log.info("derived advertise address %s from the route to %s", advertise, control_url)
-        else:
-            log.warning(
-                "enrolling with no advertise address: the control root will record this node "
-                "without a URL and report it unreachable. Set `advertiseUrl` in the agent "
-                "config and re-enroll."
-            )
+        log.warning(
+            "enrolling with no advertise address: the control root will record this node "
+            "without a URL and report it unreachable. Set `advertiseUrl` in the agent "
+            "config and re-enroll."
+        )
 
     snapshot = await _devices(request)
-    name = (body.name or "").strip() or socket.gethostname()
-    host_os = _os()
-    host_arch = _arch()
-    payload: dict[str, Any] = {
-        "token": body.token,
-        "name": name,
-        "publicKey": record.public_key,
-        "agentVersion": __version__,
-        "os": host_os.value if host_os is not None else None,
-        "arch": host_arch.value if host_arch is not None else None,
-        "devices": [d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
-    }
-    if advertise is not None:
-        payload["url"] = advertise
-
-    transport = getattr(request.app.state, "control_transport", None)
     try:
-        async with httpx.AsyncClient(
-            timeout=_ENROLL_TIMEOUT_SECONDS, transport=transport
-        ) as client:
-            response = await client.post(f"{control_url}/v1/nodes/enroll", json=payload)
-    except httpx.HTTPError as exc:
-        raise _problem(
-            status.HTTP_502_BAD_GATEWAY,
-            "control-root-unreachable",
-            "Control root unreachable",
-            f"Could not reach the control root at {control_url}: {exc}. Nothing was recorded; "
-            f"this agent is still unenrolled.",
-        ) from exc
-
-    if response.status_code != 201:
-        raise _problem(
-            status.HTTP_502_BAD_GATEWAY,
-            "control-root-refused",
-            "Control root refused the enrollment",
-            f"The control root at {control_url} answered {response.status_code}: "
-            f"{_detail(response)}. Nothing was recorded; this agent is still unenrolled.",
+        outcome = await perform_enrollment(
+            store=store,
+            control_url=control_url,
+            token=body.token,
+            name=body.name,
+            advertise_url=advertise,
+            devices=[d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
+            transport=getattr(request.app.state, "control_transport", None),
         )
+    except EnrollmentError as exc:
+        raise _from_enrollment_error(exc) from exc
 
-    try:
-        enrollment = response.json()
-    except ValueError:
-        enrollment = None
-    if not isinstance(enrollment, dict):
-        raise _malformed(control_url, "the body was not a JSON object")
-    granted_name = enrollment.get("name")
-    epoch = enrollment.get("epoch")
-    signing_key_b64 = enrollment.get("signingKey")
-    if not isinstance(granted_name, str) or not granted_name:
-        raise _malformed(control_url, "`name` is missing")
-    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
-        raise _malformed(control_url, f"`epoch` is {epoch!r}")
-    signing_key = _decode_signing_key(signing_key_b64) if isinstance(signing_key_b64, str) else None
-    if signing_key is None:
-        raise _malformed(control_url, "`signingKey` is not 32 base64 bytes")
-
-    store.record_enrollment(
-        name=granted_name,
-        control_url=control_url,
-        epoch=epoch,
-        signing_key=str(signing_key_b64),
-        signing_key_id=_str_or_none(enrollment.get("signingKeyId")),
-        control_public_key=_str_or_none(enrollment.get("controlPublicKey")),
-        recovery_public_key=_str_or_none(enrollment.get("recoveryPublicKey")),
-        advertise_url=advertise,
-    )
-    auth.set_signing_key(signing_key)
+    auth.set_signing_key(outcome.signing_key)
     log.info(
         "enrolled as %r with the control root at %s at epoch %d; adopted the install's signing "
         "key (generation %s)",
-        granted_name,
+        outcome.name,
         control_url,
-        epoch,
-        enrollment.get("signingKeyId"),
+        outcome.epoch,
+        outcome.signing_key_id,
     )
     await _restart_children(request, why="enrolled and adopted the install's signing key")
     return _identity(request, snapshot)
+
+
+@router.post(
+    "/v1/node/unenroll",
+    response_model=UnenrollResult,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -> UnenrollResult:
+    """Leave an install - the exact inverse of enrolling.
+
+    **Why this is safe to allow from the node**, which is the only part
+    that needs an argument: revocation exists because a node that still
+    *holds* the signing key can still authenticate, so removing a registry
+    entry alone does nothing. Un-enrolling **discards** that key. A node
+    cannot escape revocation this way; it can only disarm itself.
+
+    **It proceeds when the root is unreachable.** An operator detaching a
+    node from a dead install is precisely the case where refusing is
+    useless - `degraded-mode-required`, applied to a trust operation.
+    `controlNotified` is how the caller learns the install still lists
+    this node and still trusts the key it just threw away.
+
+    The root is told first, forwarding the caller's own bearer: one
+    install, one signing key, so the operator session that authorized
+    this call is an operator session at the root too. Revoking there
+    rotates the key for every remaining node, which is the entire point
+    of revoking rather than deleting.
+
+    Like enrollment, this logs out every session on this node, because
+    the key they were signed with is gone.
+    """
+    store = _store(request)
+    auth: AuthState = request.app.state.auth_state
+    record = store.record
+
+    if not record.enrolled:
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "not-enrolled",
+            "Not enrolled",
+            "This agent is not enrolled with any control root, so there is nothing to leave.",
+        )
+
+    previous_name = str(record.name)
+    previous_control_url = str(record.control_url)
+    notify = True if body is None or body.notifyControl is None else bool(body.notifyControl)
+
+    notified = False
+    detail: str | None = None
+    if not notify:
+        detail = (
+            "notifyControl was false, so the control root was not told. It still lists this "
+            f"node as {previous_name!r} and still trusts the signing key this node just "
+            f"discarded; revoke it there (DELETE /v1/nodes/{previous_name}) when you can."
+        )
+    else:
+        notified, detail = await _revoke_at_root(
+            request, control_url=previous_control_url, name=previous_name
+        )
+
+    store.unenroll()
+    auth.set_signing_key(security.generate_signing_key())
+    log.warning(
+        "left the install at %s (was %r); discarded its signing key and minted a local one%s",
+        previous_control_url,
+        previous_name,
+        "" if notified else "; THE CONTROL ROOT WAS NOT TOLD",
+    )
+    await _restart_children(request, why="left the install and returned to a local signing key")
+
+    return UnenrollResult(
+        identity=_identity(request, await _devices(request)),
+        controlNotified=notified,
+        previousName=previous_name,
+        previousControlUrl=previous_control_url,  # type: ignore[arg-type]
+        detail=detail,
+    )
+
+
+async def _revoke_at_root(
+    request: Request, *, control_url: str, name: str
+) -> tuple[bool, str | None]:
+    """Ask the root to revoke this node, with the caller's own credential.
+
+    Returns `(notified, detail)` and never raises: every failure here is
+    survivable, and the one thing that must not happen is a node that
+    stays attached because its dead root could not be reached.
+    """
+    credentials = request.headers.get("authorization")
+    if not credentials:
+        return False, (
+            "No Authorization header to forward, so the control root was not told. "
+            f"Revoke this node there: DELETE /v1/nodes/{name}."
+        )
+    transport = getattr(request.app.state, "control_transport", None)
+    target = f"{control_url.rstrip('/')}/v1/nodes/{name}"
+    try:
+        async with httpx.AsyncClient(
+            timeout=_REVOKE_TIMEOUT_SECONDS, transport=transport
+        ) as client:
+            response = await client.delete(target, headers={"Authorization": credentials})
+    except httpx.HTTPError as exc:
+        return False, (
+            f"Could not reach the control root at {control_url}: {exc}. This node has left "
+            f"anyway; revoke it there (DELETE /v1/nodes/{name}) so the install rotates its "
+            f"signing key."
+        )
+    if response.status_code == 404:
+        # Already gone from the registry. Nothing is owed, and reporting
+        # this as "not notified" would send an operator chasing a node
+        # the root has never heard of.
+        return True, None
+    if response.status_code not in (200, 202, 204):
+        return False, (
+            f"The control root answered {response.status_code}: {problem_detail(response)}. "
+            f"This node has left anyway; revoke it there (DELETE /v1/nodes/{name})."
+        )
+    return True, None
 
 
 @router.post(
@@ -389,28 +457,15 @@ async def rekey_node(request: Request, body: RekeyRequest) -> NodeIdentity:
 # --------------------------------------------------------------------------- #
 
 
-def _detail(response: httpx.Response) -> str:
-    try:
-        payload = response.json()
-    except ValueError:
-        return response.text[:300]
-    if isinstance(payload, dict):
-        detail = payload.get("detail")
-        if isinstance(detail, dict):
-            return str(detail.get("detail") or detail.get("title") or detail)
-        if detail:
-            return str(detail)
-    return response.text[:300]
+def _from_enrollment_error(exc: EnrollmentError) -> HTTPException:
+    """One mapping from the protocol module's failures to HTTP.
 
-
-def _malformed(control_url: str, what: str) -> HTTPException:
-    return _problem(
-        status.HTTP_502_BAD_GATEWAY,
-        "control-root-malformed",
-        "Control root answered with a malformed enrollment",
-        f"The control root at {control_url} answered 201 but {what}. Nothing was recorded.",
+    `already-enrolled` is the only 409; everything else is the control
+    root being unreachable, refusing, or answering something we cannot
+    read, which are all 502 - the failure is upstream of this agent, and
+    this agent recorded nothing either way.
+    """
+    code = (
+        status.HTTP_409_CONFLICT if exc.slug == "already-enrolled" else status.HTTP_502_BAD_GATEWAY
     )
-
-
-def _str_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
+    return _problem(code, exc.slug, exc.title, exc.detail)

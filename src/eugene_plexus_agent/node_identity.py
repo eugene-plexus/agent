@@ -7,6 +7,9 @@ never had a half. This is it. One file, `node.yaml`, beside `agent.yaml`:
     name: gpu-box
     privateKey: <base64 X25519>        never leaves this host
     publicKey: <base64 X25519>
+    signingPrivateKey: <base64 Ed25519 seed>   signs address announcements
+    signingPublicKey: <base64 Ed25519>
+    advertiseSequence: 3               strictly increasing, mirrored at the root
     controlUrl: http://100.64.0.1:8083
     controlPublicKey: <base64 Ed25519>  the root's identity, checked on every re-key
     recoveryPublicKey: <base64 X25519>  the second recipient of anything sealed here
@@ -34,6 +37,17 @@ highest recorded, and an equal epoch with a lower key generation — a
 superseded control root, or a replayed rotation, is refused on this host
 alone, with no election and no agreement with any other agent. That is
 the whole of M5 §6's mechanism, on the side that does the fencing.
+
+**The node signs too, and for the mirror-image reason.** An address
+announcement (`PATCH /v1/nodes/{name}` at the root) is signed with this
+node's Ed25519 key, because a service token names a *kind* and not a
+host, and because the case that matters is an unattended reboot with no
+operator to authenticate. So: the root proves itself to a node with its
+identity key, a node proves itself to the root with its own, and neither
+uses a bearer. That needs a **second** keypair — the one above is X25519,
+minted so secrets can be sealed *to* this node, and X25519 does not sign;
+the derivation between them only runs Ed25519 to X25519, which is the
+direction we do not have.
 
 **The re-key's credential is a signature, not a bearer.** A rotation
 invalidates every service token in the install, and a re-run of an
@@ -101,6 +115,29 @@ def rekey_message(*, signing_key: str, signing_key_id: str, epoch: int) -> bytes
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def address_message(*, name: str, sequence: int, url: str) -> bytes:
+    """The canonical bytes an address announcement is signed over —
+    `NodeAddressAnnouncement.signature` in `control.yaml`, byte for byte.
+
+    The mirror of `rekey_message`: three fields, keys sorted, no
+    whitespace. `url` goes in **exactly as it will be sent**, before any
+    normalization, because the root verifies against the raw request body
+    for precisely this reason. Sign a parsed URL and every announcement
+    fails with what looks like a crypto error.
+    """
+    return json.dumps(
+        {"name": name, "sequence": sequence, "url": url},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def sign_address(*, signing_private_key: str, message: bytes) -> str:
+    """Detached Ed25519 signature by this node's identity signing key."""
+    seed = base64.b64decode(signing_private_key, validate=True)
+    return base64.b64encode(nacl.signing.SigningKey(seed).sign(message).signature).decode("ascii")
 
 
 def verify_rekey_signature(*, control_public_key: str, message: bytes, signature: str) -> bool:
@@ -232,6 +269,9 @@ class IdentityRecord:
     name: str | None = None
     private_key: str | None = None
     public_key: str | None = None
+    signing_private_key: str | None = None
+    signing_public_key: str | None = None
+    advertise_sequence: int = 0
     control_url: str | None = None
     control_public_key: str | None = None
     recovery_public_key: str | None = None
@@ -260,6 +300,9 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("name", "name"),
     ("privateKey", "private_key"),
     ("publicKey", "public_key"),
+    ("signingPrivateKey", "signing_private_key"),
+    ("signingPublicKey", "signing_public_key"),
+    ("advertiseSequence", "advertise_sequence"),
     ("controlUrl", "control_url"),
     ("controlPublicKey", "control_public_key"),
     ("recoveryPublicKey", "recovery_public_key"),
@@ -312,6 +355,8 @@ class NodeIdentityStore:
                 value = raw.get(wire)
                 if attr == "epoch":
                     values[attr] = int(value) if isinstance(value, int) else None
+                elif attr == "advertise_sequence":
+                    values[attr] = int(value) if isinstance(value, int) else 0
                 else:
                     values[attr] = (
                         str(value) if isinstance(value, str | int) and value != "" else None
@@ -330,19 +375,44 @@ class NodeIdentityStore:
     # ----- mutations --------------------------------------------------
 
     def ensure_keypair(self) -> IdentityRecord:
-        """Generate the node's X25519 keypair if none exists. The private
-        half is written here and read by nothing but this process."""
+        """Generate this node's two keypairs if they are missing. Both
+        private halves are written here and read by nothing but this
+        process.
+
+        **Two, not one, and they are not interchangeable.** The X25519
+        pair exists so the control root can seal secrets *to* this node;
+        the Ed25519 pair exists so this node can sign an address
+        announcement. One key cannot do both jobs — sealing is
+        Diffie-Hellman, signing is Ed25519 — and a key that did both
+        would be a key whose compromise costs twice.
+
+        Each is filled in independently, so a node that enrolled before
+        the signing key existed grows one on its next start. That alone
+        does not let it re-advertise: the control root has to hold the
+        public half, which only enrollment gives it.
+        """
         with self._lock:
-            if self._record.private_key and self._record.public_key:
-                return self._record
-            private = nacl.public.PrivateKey.generate()
-            self._record = replace(
-                self._record,
-                private_key=base64.b64encode(bytes(private)).decode("ascii"),
-                public_key=base64.b64encode(bytes(private.public_key)).decode("ascii"),
-            )
-            self._write_locked()
-            log.info("generated this node's identity keypair")
+            changed = False
+            if not (self._record.private_key and self._record.public_key):
+                private = nacl.public.PrivateKey.generate()
+                self._record = replace(
+                    self._record,
+                    private_key=base64.b64encode(bytes(private)).decode("ascii"),
+                    public_key=base64.b64encode(bytes(private.public_key)).decode("ascii"),
+                )
+                changed = True
+                log.info("generated this node's sealing keypair")
+            if not (self._record.signing_private_key and self._record.signing_public_key):
+                signing = nacl.signing.SigningKey.generate()
+                self._record = replace(
+                    self._record,
+                    signing_private_key=base64.b64encode(bytes(signing)).decode("ascii"),
+                    signing_public_key=base64.b64encode(bytes(signing.verify_key)).decode("ascii"),
+                )
+                changed = True
+                log.info("generated this node's signing keypair")
+            if changed:
+                self._write_locked()
             return self._record
 
     def record_enrollment(
@@ -368,7 +438,72 @@ class NodeIdentityStore:
                 control_public_key=control_public_key,
                 recovery_public_key=recovery_public_key,
                 advertise_url=advertise_url,
+                # The root's `enrollNode` replaces the node record
+                # wholesale, so its high-water mark goes to zero here
+                # too. Keeping a stale counter on either side is how a
+                # rebuilt host ends up unable to re-advertise.
+                advertise_sequence=0,
                 enrolled_at=datetime.now(UTC).isoformat(),
+            )
+            self._write_locked()
+            return self._record
+
+    def record_advertise_url(self, url: str | None) -> IdentityRecord:
+        """Persist what this node currently believes its address to be.
+
+        Written whether or not the root has been told, because it is what
+        `GET /v1/node` reports and what decides whether children bind
+        wide. Announcing is a separate step that can fail.
+        """
+        with self._lock:
+            if url == self._record.advertise_url:
+                return self._record
+            self._record = replace(self._record, advertise_url=url)
+            self._write_locked()
+            return self._record
+
+    def next_advertise_sequence(self) -> int:
+        """Claim the next announcement number, persisting it first.
+
+        Incremented **before** the call goes out and never rolled back on
+        failure. A gap in the sequence costs nothing — the root only
+        requires the next one to be higher — while re-using a number
+        after a timeout that actually succeeded would look exactly like
+        a replay and be refused forever.
+        """
+        with self._lock:
+            claimed = int(self._record.advertise_sequence or 0) + 1
+            self._record = replace(self._record, advertise_sequence=claimed)
+            self._write_locked()
+            return claimed
+
+    def unenroll(self) -> IdentityRecord:
+        """Leave the install: discard its signing key, epoch, root URL and
+        root identity, and return this node to its own.
+
+        **The node's own keypairs are kept.** They are this host's
+        identity, not the install's — the same node re-joining anywhere
+        is still the same node, and nothing the departing install holds
+        can be read with a public half alone.
+
+        **The derived advertise URL is discarded**, because it was
+        derived from the route to a control root this node no longer
+        answers to. An operator-configured `advertiseUrl` lives in
+        `agent.yaml` and is untouched, so it keeps winning.
+        """
+        with self._lock:
+            self._record = replace(
+                self._record,
+                name=None,
+                control_url=None,
+                control_public_key=None,
+                recovery_public_key=None,
+                signing_key=None,
+                signing_key_id=None,
+                epoch=None,
+                advertise_url=None,
+                advertise_sequence=0,
+                enrolled_at=None,
             )
             self._write_locked()
             return self._record
@@ -435,6 +570,7 @@ __all__ = [
     "FencedError",
     "IdentityRecord",
     "NodeIdentityStore",
+    "address_message",
     "advertise_host",
     "derive_advertise_host",
     "effective_advertise_url",
@@ -443,6 +579,7 @@ __all__ = [
     "is_loopback_host",
     "local_agent_url",
     "rekey_message",
+    "sign_address",
     "sign_rekey_message",
     "verify_rekey_signature",
 ]

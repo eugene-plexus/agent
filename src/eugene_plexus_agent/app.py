@@ -18,13 +18,22 @@ spawned in this same lifespan get MASTER_KEY in their env immediately
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__, companions, default_topology, keyring_store, node_identity, security
+from . import (
+    __version__,
+    companions,
+    default_topology,
+    enrollment,
+    keyring_store,
+    node_identity,
+    security,
+)
 from .auth_state import AuthState
 from .dependencies import require_operator_session
 from .routes import auth as auth_routes
@@ -184,9 +193,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             runtime_supervisor.add_and_start(spec)
         await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
 
+    # **Where this host is, said out loud on every boot.** Before M9 the
+    # address was announced once, at enrollment, so a host that rebooted
+    # onto a new tailnet IP left the control root holding an address
+    # nobody was listening on — and the root could not poll its way out,
+    # because the only address it had was the stale one. A background
+    # task, not an await: a management-plane call must not hold up
+    # supervision, and an unreachable root is a normal state here.
+    announce_task: asyncio.Task[None] | None = None
+    if not settings.safe_mode and identity.record.enrolled:
+        announce_task = asyncio.create_task(_announce_address(app, settings, state, identity))
+
     try:
         yield
     finally:
+        if announce_task is not None and not announce_task.done():
+            announce_task.cancel()
         # An in-flight engine download is the cheapest thing here to
         # abandon and the only one holding a half-written directory, so
         # it goes first.
@@ -198,6 +220,46 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await runtime_supervisor.stop_all()
         if owns_supervisor:
             await supervisor.stop_all()
+
+
+async def _announce_address(
+    app: FastAPI,
+    settings: Settings,
+    state: AgentState,
+    identity: node_identity.NodeIdentityStore,
+) -> None:
+    """Re-derive this node's address and tell the control root.
+
+    **Re-derived rather than read back**, which is the whole point: a
+    host that rebooted onto a new address has a *stale* persisted value,
+    so trusting it would announce the old one. An operator-configured
+    `advertiseUrl` still wins, and a root that cannot be reached leaves
+    the persisted value alone.
+    """
+    try:
+        url = await enrollment.resolve_advertise_url(
+            configured=state.get_config("advertiseUrl"),
+            control_url=identity.record.control_url,
+            bind_port=int(settings.bind_port),
+            persisted=identity.record.advertise_url,
+        )
+        if url is None:
+            log.warning(
+                "enrolled with %s but this node has no address to advertise; other hosts "
+                "cannot reach it. Set `advertiseUrl` in the agent config.",
+                identity.record.control_url,
+            )
+            return
+        identity.record_advertise_url(url)
+        await enrollment.announce_address(
+            store=identity,
+            url=url,
+            transport=getattr(app.state, "control_transport", None),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - defensive
+        log.warning("could not announce this node's address: %s", exc)
 
 
 def shared_child_env(

@@ -13,7 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from .. import keyring_store
+from .. import enrollment, keyring_store
 from .._generated.common_models import (
     ConfigDocument,
     ConfigSchema,
@@ -129,8 +129,16 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     # flip away) belong at this layer — `state` is a YAML serializer
     # and shouldn't know about OS secret stores.
     prior_mode = state.get_config("securityMode")
+    prior_advertise = state.get_config("advertiseUrl")
     result = state.apply_config_patch(body)
     new_mode = state.get_config("securityMode")
+
+    # An operator who changes where this host is reachable has to reach
+    # the control root with it, or the root keeps routing to the old
+    # address. The other half of the same fix announces on every boot;
+    # this is the half that does not wait for one.
+    if state.get_config("advertiseUrl") != prior_advertise:
+        await _announce_advertise_url(request)
 
     if prior_mode == "os_keyring" and new_mode != "os_keyring":
         # Operator moved to the stronger boundary. The stored auto-
@@ -153,3 +161,31 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
             log.info("securityMode changed to os_keyring; persisted master key for auto-unlock")
 
     return result
+
+
+async def _announce_advertise_url(request: Request) -> None:
+    """Tell the control root this node moved, after a config edit.
+
+    Never raises and never fails the edit: the config change is already
+    persisted and correct locally, and a management-plane call that
+    could undo an operator's save would be worse than one that logs.
+    """
+    identity = getattr(request.app.state, "node_identity", None)
+    if identity is None or not identity.record.enrolled:
+        return
+    state: AgentState = request.app.state.agent_state
+    settings = request.app.state.settings
+    url = await enrollment.resolve_advertise_url(
+        configured=state.get_config("advertiseUrl"),
+        control_url=identity.record.control_url,
+        bind_port=int(settings.bind_port),
+        persisted=identity.record.advertise_url,
+    )
+    if url is None:
+        return
+    identity.record_advertise_url(url)
+    await enrollment.announce_address(
+        store=identity,
+        url=url,
+        transport=getattr(request.app.state, "control_transport", None),
+    )
