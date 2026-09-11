@@ -15,14 +15,16 @@ which is why they are separate surfaces on the API.
 
 ## Cross-platform notes
 
-`asyncio.subprocess.Process.terminate()` is the graceful-shutdown signal
-we use on every supervised exit. On POSIX that maps to SIGTERM (children
-get a chance to flush logs and answer their last in-flight request). On
-Windows it's `TerminateProcess`, which is a hard kill — no graceful
-window. Living with that for now; Windows is primarily a dev surface,
-real installs are Linux/Mac/Docker. This matters more for engines than
-for components: a hard-killed `llama-server` can leave a GPU context to
-be reclaimed by the driver.
+Stopping a child is `process_signals.request_stop` on every platform:
+SIGTERM on POSIX, `CTRL_BREAK_EVENT` into the child's own process group
+on Windows. **The old note here said Windows was "primarily a dev
+surface, real installs are Linux/Mac/Docker" and that its hard kill was
+being lived with.** Neither survives: Windows is a first-class target by
+decision (install-paths §11.1), and the hard kill was measured to be the
+only stop that skips a component's ASGI lifespan shutdown. See
+`process_signals` for the measurements and the three constraints they
+imposed — chief among them that **a graceful request can be ignored**,
+so every stop here carries an escalation deadline.
 """
 
 from __future__ import annotations
@@ -45,7 +47,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import orphan_kill, security
+from . import orphan_kill, ports, process_signals, security
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 from .auth_state import AuthState
 
@@ -246,6 +248,13 @@ class SpawnPlan:
     component's safe mode). Surfaced back out so the mapping layer can
     report it; the loop itself only records it."""
 
+    port: int | None = None
+    """The TCP port this child will try to bind, when the planner knows
+    it. Used only to say something useful when the bind fails: a child
+    whose port is taken exits instantly with an OS error, and the loop's
+    answer to that is a crash-backoff cycle that names neither the port
+    nor what is holding it. Optional because not every plan has one."""
+
 
 class SpawnPlanner(Protocol):
     """Knows what to launch, and what to do when launching keeps failing.
@@ -418,6 +427,7 @@ class _ComponentPlanner:
             argv=[sys.executable, "-m", spec.module],
             env=env,
             degraded=degraded,
+            port=port,
         )
 
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
@@ -481,6 +491,14 @@ class SupervisedProcess:
         self._task: asyncio.Task[None] | None = None
         self._stop_requested = False
         self._consecutive_crashes = 0
+        self._last_port: int | None = None
+        """The port the current plan asked for, if the planner knew it.
+        Read only when explaining a crash."""
+        self._expected_exit = False
+        """Set when WE asked the child to go. Cleared by the loop when it
+        reaps one. Without it a stop request and a crash are the same
+        event to the loop, which on Windows they always were — a console
+        event produces a non-zero exit code."""
 
         self.state: ProcessState = ProcessState.starting
         self.degraded = False
@@ -525,34 +543,44 @@ class SupervisedProcess:
         self._task = asyncio.create_task(self._run(), name=f"supervise:{self.name}")
 
     async def restart(self) -> None:
-        """SIGTERM the child; the supervision loop respawns it. Clears the
-        crash counter and asks the planner to drop any degraded state, so
-        a manual restart returns the child to normal operation."""
+        """Ask the child to stop; the supervision loop respawns it.
+
+        Clears the crash counter and asks the planner to drop any
+        degraded state, so a manual restart returns the child to normal
+        operation.
+
+        **Two things this used to get wrong on Windows.** It sent
+        `TerminateProcess`, so the child never ran its shutdown hooks and
+        dropped whatever it was answering. And the child then exited
+        non-zero, which the loop counted as a *crash* — so every
+        operator-requested restart incremented the crash counter and
+        bought a back-off sleep, and enough of them in a row would trip
+        the threshold and drop a component into safe mode. POSIX never
+        showed it, because SIGTERM gets uvicorn to exit 0.
+        """
         self._consecutive_crashes = 0
         self._planner.reset()
         proc = self._proc
         if proc is not None and proc.returncode is None:
-            self._log.info(
-                "restart requested for %s; terminating pid %d",
-                self.name,
-                proc.pid,
-            )
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
+            self._expected_exit = True
+            sent = process_signals.request_stop(proc, name=self.name, logger=self._log)
+            self._log.info("restart requested for %s; sent %s to pid %d", self.name, sent, proc.pid)
+            await self._escalate_if_still_alive(proc)
 
     async def stop(self) -> None:
         """Stop the supervision loop and ensure the child is dead.
-        Terminates with a timeout, escalates to kill if the child hangs."""
+        Asks gracefully first, escalates to a hard kill if it hangs."""
         self._stop_requested = True
+        self._expected_exit = True
         proc = self._proc
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
+                process_signals.request_stop(proc, name=self.name, logger=self._log)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=_TERM_TIMEOUT_SECONDS)
             except TimeoutError:
                 self._log.warning(
-                    "%s did not exit within %.1fs of terminate; killing",
+                    "%s did not exit within %.1fs of the stop request; killing",
                     self.name,
                     _TERM_TIMEOUT_SECONDS,
                 )
@@ -565,6 +593,33 @@ class SupervisedProcess:
             with contextlib.suppress(asyncio.CancelledError, BaseException):
                 await self._task
 
+    async def _escalate_if_still_alive(self, proc: Any) -> None:
+        """Hard-kill a child that ignored the stop request.
+
+        **A graceful request introduces a hang that `TerminateProcess`
+        could not have.** Measured: a Windows child that installs a
+        console handler and returns TRUE from it survives
+        `CTRL_BREAK_EVENT` indefinitely. Without this the supervision
+        loop would sit on `proc.wait()` for a restart that never
+        completes, and the component would read as `starting` forever.
+
+        A second waiter on the same process, alongside the supervision
+        loop's own — verified safe: `asyncio` keeps a list of exit
+        waiters, and `wait_for` cancelling this one on timeout leaves the
+        loop's untouched.
+        """
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=_TERM_TIMEOUT_SECONDS)
+        if proc.returncode is None:
+            self._log.warning(
+                "%s ignored the stop request for %.1fs; killing pid %s",
+                self.name,
+                _TERM_TIMEOUT_SECONDS,
+                proc.pid,
+            )
+            with contextlib.suppress(ProcessLookupError, BaseException):
+                proc.kill()
+
     # --- introspection (read-only properties for the routes layer) ---------
 
     @property
@@ -575,14 +630,26 @@ class SupervisedProcess:
     # --- internals ---------------------------------------------------------
 
     def _explain_exit(self, return_code: int) -> str | None:
-        """Ask the planner to turn this exit into something actionable.
+        """Turn this exit into something actionable.
+
+        A bind collision is checked first and by the loop rather than by
+        a planner, because it is the one failure both kinds of child
+        share: a component and an engine that cannot have their port die
+        the same way and for the same reason. Leaving it to the planners
+        would mean writing it twice and, as it happened, having written
+        it in neither — the component planner's `explain_exit` returns
+        None on principle.
 
         Best-effort by construction: a planner that raises while
         explaining a crash must not turn one crash into two, so the
         generic message stands and the exception is logged.
         """
+        tail = "".join(self._output_tail)
+        collision = ports.explain_collision(self._last_port, tail)
+        if collision is not None:
+            return collision
         try:
-            return self._planner.explain_exit(return_code, "".join(self._output_tail))
+            return self._planner.explain_exit(return_code, tail)
         except Exception:
             self._log.exception("%s: explaining the exit failed", self.name)
             return None
@@ -708,7 +775,7 @@ class SupervisedProcess:
                 cwd=plan.cwd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                **orphan_kill.kwargs_for_platform(),
+                **process_signals.spawn_kwargs(),
             )
         except OSError as e:
             self._log.error("failed to spawn %s: %s", self.name, e)
@@ -726,6 +793,7 @@ class SupervisedProcess:
 
         self.state = ProcessState.starting
         self.degraded = plan.degraded
+        self._last_port = plan.port
         self.last_argv = list(plan.argv)
         self.last_restart = datetime.now(UTC)
         self.last_error = None
@@ -756,18 +824,42 @@ class SupervisedProcess:
             self.state = ProcessState.exited
             return
 
-        if return_code == 0:
-            self._log.info("%s exited cleanly (rc=0); respawning", self.name)
+        expected = self._expected_exit
+        self._expected_exit = False
+
+        if return_code == 0 or expected:
+            # **`or expected` is the Windows half.** A child asked to stop
+            # via a console event exits with the code for an interrupted
+            # program, not 0 — rc=3 for CPython's KeyboardInterrupt path.
+            # Counting that as a crash is how an operator's restart used
+            # to buy itself a back-off sleep, and enough restarts in a row
+            # would trip the threshold and drop the component into safe
+            # mode for doing exactly what it was asked.
+            self._log.info(
+                "%s exited %s (rc=%d); respawning",
+                self.name,
+                "on request" if expected and return_code != 0 else "cleanly",
+                return_code,
+            )
             self.state = ProcessState.exited
             self._consecutive_crashes = 0
         else:
             self._consecutive_crashes += 1
             self.last_error = self._explain_exit(return_code) or (f"exited with code {return_code}")
+            # **The explanation goes to the log, not only to the API.**
+            # `_explain_exit` has existed since M0 and its answer has only
+            # ever reached `Component.lastError` — so an engine adapter's
+            # diagnosis, and now a port collision naming the process
+            # holding it, were invisible to the operator watching the
+            # console, which is where they are at boot. Found by an
+            # acceptance check that read the log for a message the API
+            # was already carrying.
             self._log.warning(
-                "%s exited rc=%d (consecutive crashes: %d)",
+                "%s exited rc=%d (consecutive crashes: %d): %s",
                 self.name,
                 return_code,
                 self._consecutive_crashes,
+                self.last_error,
             )
             self.state = ProcessState.crashed
 
