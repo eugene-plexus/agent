@@ -150,9 +150,14 @@ CONFIG_FIELDS: list[ConfigField] = [
             "shows what it derived. Setting a host that is not loopback also makes "
             "spawned components bind 0.0.0.0 instead of loopback, because a "
             "component that must be reached from another host cannot bind only "
-            "to this one; engines are never widened. Read at the next spawn and "
-            "at the next enrollment; the control root keeps the URL it was told "
-            "at enrollment until this node re-enrolls."
+            "to this one; engines are never widened. Announced to the control "
+            "root the moment you change it — no restart and no re-enrollment — "
+            "and read again at the next spawn. Set it on the node that runs the "
+            "gateway if other nodes' browsers cannot open it: a node whose "
+            "registry entry is a loopback address can be reached by nothing. "
+            "Give the full address including the port the OUTSIDE uses, which "
+            "is not necessarily the port this agent binds — a container "
+            "published on a different port is the common case."
         ),
         category="node",
         valueType=ConfigValueType.url,

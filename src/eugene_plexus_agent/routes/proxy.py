@@ -50,17 +50,26 @@ written down and disagree with what the agent actually spawned — the
 OpenClaw trap the driver path had already avoided. The expert override
 is not gone, it moved: edit the topology entry's URL, which is the
 place that was always authoritative.
+
+**And a target that is not on this node is forwarded to the node that
+has it**, so a worker's browser is a console for the install rather
+than for one host. That resolution lives in `install_proxy.py`, which
+carries the argument for hopping node-to-node instead of
+component-to-component; here it is only ever the second thing tried,
+after the local topology and never instead of it.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
+from .. import install_proxy
 from .._generated.common_models import Problem
 from ..node_identity import local_agent_url
 from ..settings import Settings
@@ -93,6 +102,9 @@ _STRIPPED_REQUEST_HEADERS = frozenset(
         "content-length",
         "transfer-encoding",
         "accept-encoding",
+        # Ours, read below and re-set deliberately when we forward. A
+        # component has no use for it and should never see it.
+        install_proxy.HOP_HEADER,
     }
 )
 
@@ -139,13 +151,24 @@ def is_valid_target_name(value: str) -> bool:
     return bool(value) and "/" not in value and ".." not in value
 
 
-def resolve_target(request: Request, target: str) -> str:
-    """The base URL for a proxy target, or a 503 naming what was sought.
+@dataclass(frozen=True)
+class Route:
+    """Where a target's request goes.
 
-    A 503 rather than a fallback address, which is the lesson the Next
-    version had already learned: a default that also fails tells the
-    operator nothing about which of the two things is missing.
+    `prefix` is empty for a component on this host and
+    `/api/proxy/<target>` for one reached through another node's agent —
+    the hop described in `install_proxy`. Same shape either way, so the
+    forwarding code below has one path and cannot treat the remote case
+    as an afterthought.
     """
+
+    base: str
+    prefix: str = ""
+    node: str | None = None
+
+
+def resolve_local(request: Request, target: str) -> str | None:
+    """The base URL for a target declared on this host, or None."""
     settings: Settings = request.app.state.settings
     if target == "agent":
         return local_agent_url(settings.bind_host, int(settings.bind_port))
@@ -158,22 +181,95 @@ def resolve_target(request: Request, target: str) -> str:
         for entry in entries:
             if str(entry.kind) == kind and str(entry.url):
                 return str(entry.url)
-        raise _problem(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Target not in topology",
-            f"No component of kind {kind!r} is declared on this node. "
-            f"Add one on the Config page — or, if this is a worker node, the "
-            f"install's {kind} lives on the control host and not here.",
-        )
+        return None
 
     for entry in entries:
         if str(entry.kind) == "inference-driver" and entry.name == target and str(entry.url):
             return str(entry.url)
-    raise _problem(
-        status.HTTP_503_SERVICE_UNAVAILABLE,
-        "Target not in topology",
-        f"No inference-driver named {target!r} is declared on this node.",
+    return None
+
+
+def install_topology(request: Request) -> install_proxy.InstallTopology:
+    """The shared install-wide lookup cache, created on first use.
+
+    Injectable the same way the upstream client is, so a test can seed a
+    resolution without a control root.
+    """
+    cache: install_proxy.InstallTopology | None = getattr(
+        request.app.state, "install_topology", None
     )
+    if cache is None:
+        cache = install_proxy.InstallTopology()
+        request.app.state.install_topology = cache
+    return cache
+
+
+async def resolve_target(request: Request, target: str) -> Route:
+    """Where this target lives: on this host, on another node, or nowhere.
+
+    A 503 rather than a fallback address, which is the lesson the Next
+    version had already learned: a default that also fails tells the
+    operator nothing about which of the two things is missing. The same
+    reasoning is why each failure below says a different sentence — the
+    operator's next action is different in each, and one generic "not in
+    topology" was the report that started this work.
+    """
+    local = resolve_local(request, target)
+    if local is not None:
+        return Route(base=local)
+
+    kind = _SINGLETON_KINDS.get(target)
+    article = f"component of kind {kind!r}" if kind else f"inference-driver named {target!r}"
+
+    # Already forwarded once. A second hop can only be a resolution
+    # loop, so this ends here rather than going back out.
+    hop = request.headers.get(install_proxy.HOP_HEADER)
+    if hop:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Target not on this node",
+            f"Node {hop!r} forwarded this request here because the install's registry says "
+            f"the {article} runs on this node, but nothing of that description is declared "
+            "here. The registry and this node's topology disagree.",
+        )
+
+    identity = getattr(request.app.state, "node_identity", None)
+    record = identity.record if identity is not None else None
+    if record is None or not record.enrolled or not record.control_url:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Target not in topology",
+            f"No {article} is declared on this node, and this node is not enrolled with a "
+            "control root, so there is nowhere else to look. Declare one on the Config "
+            "page, or join this machine to an existing install.",
+        )
+
+    try:
+        remote = await install_topology(request).owner_of(
+            target,
+            control_url=str(record.control_url),
+            authorization=request.headers.get("authorization"),
+            transport=getattr(request.app.state, "control_transport", None),
+        )
+    except install_proxy.InstallLookupError as exc:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Target not on this node",
+            f"No {article} runs on this node, so it was looked for in the rest of the "
+            f"install. {exc}",
+        ) from exc
+
+    if record.name and remote.name == record.name:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Target not on this node",
+            f"The install's registry says the {article} runs on this node "
+            f"({remote.name!r}), but nothing of that description is declared here. Check "
+            "the Config page: the registry is reporting a component this agent is not "
+            "running.",
+        )
+
+    return Route(base=remote.agent_url, prefix=f"{PROXY_PREFIX}/{target}", node=remote.name)
 
 
 def get_client(request: Request) -> httpx.AsyncClient:
@@ -203,13 +299,19 @@ def _upstream_url(base: str, path: str, query: str) -> httpx.URL:
     return url
 
 
-def _request_headers(request: Request) -> dict[str, str]:
+def _request_headers(request: Request, route: Route) -> dict[str, str]:
     headers = {
         key: value
         for key, value in request.headers.items()
         if key.lower() not in _STRIPPED_REQUEST_HEADERS
     }
     headers["accept-encoding"] = "identity"
+    if route.node is not None:
+        # Set only on the hop to another node's agent, and it carries
+        # this node's name so the receiver's refusal can say who sent it.
+        identity = getattr(request.app.state, "node_identity", None)
+        record = identity.record if identity is not None else None
+        headers[install_proxy.HOP_HEADER] = (record.name if record else None) or "an enrolled node"
     return headers
 
 
@@ -230,8 +332,8 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
             f"{target!r} is not a usable proxy target name.",
         )
 
-    base = resolve_target(request, target)
-    url = _upstream_url(base, path, request.url.query)
+    route = await resolve_target(request, target)
+    url = _upstream_url(route.base, route.prefix + "/" + path.lstrip("/"), request.url.query)
 
     # The request body is buffered and the response is not, which is the
     # asymmetry that matters: uploads here are small JSON documents,
@@ -240,12 +342,23 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
 
     client = get_client(request)
     upstream_request = client.build_request(
-        request.method, url, headers=_request_headers(request), content=body
+        request.method, url, headers=_request_headers(request, route), content=body
     )
     try:
         upstream = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
         log.debug("proxy to %s failed: %s", url, exc)
+        if route.node is not None:
+            # The lookup said this node is reachable and it was not, so
+            # the cached answer is stale; the next request re-reads
+            # rather than repeating a known-bad address for 30 seconds.
+            install_topology(request).invalidate()
+            raise _problem(
+                status.HTTP_502_BAD_GATEWAY,
+                "Upstream unreachable",
+                f"The install's {target} runs on node {route.node!r}, whose agent at "
+                f"{route.base} did not answer: {exc}",
+            ) from exc
         raise _problem(
             status.HTTP_502_BAD_GATEWAY,
             "Upstream unreachable",
