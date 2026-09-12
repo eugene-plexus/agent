@@ -256,6 +256,44 @@ def advertise_host(url: str | None) -> str | None:
     return urlparse(url).hostname
 
 
+def bind_host_for_advertised_node(
+    *,
+    configured: str,
+    configured_explicitly: bool,
+    advertise_url: str | None,
+) -> str:
+    """Which interface *this agent* binds, given what its node advertises.
+
+    The same rule `shared_child_env` applies to every component this
+    agent spawns, applied to the agent itself: **a node that advertises
+    a non-loopback address binds one.** Advertising an address is what
+    enrolling does, so a node cannot end up telling the control root to
+    call back on an address nothing is listening on.
+
+    It could, until 2026-09-11. Enrollment is outbound, so `201 Created`
+    proves the node reached the root and nothing at all about the return
+    path; a node that joined without `EUGENE_PLEXUS_AGENT_BIND_HOST` set
+    came up on loopback, advertised its LAN address, and looked healthy
+    from every direction except the one that mattered. Union topology,
+    idle unload and start-on-demand would all have failed silently. The
+    installers learned to widen the bind themselves; this is the half
+    that covers `eugene-plexus-agent join` run by hand, which is the path
+    `docs/deployment/tailnet.md` documents.
+
+    **The env var still wins, including with a value that will fail** —
+    `easy-default-expert-override`. An operator who sets
+    `EUGENE_PLEXUS_AGENT_BIND_HOST=127.0.0.1` on an enrolled node gets
+    loopback and the unreachable install they asked for; pydantic tracks
+    that in `model_fields_set` even though the value equals the default,
+    so "explicitly loopback" and "never mentioned it" are distinguishable.
+    """
+    if configured_explicitly:
+        return configured
+    if is_loopback_host(advertise_host(advertise_url)):
+        return configured
+    return "0.0.0.0"
+
+
 # --------------------------------------------------------------------------- #
 # The record and its store
 # --------------------------------------------------------------------------- #

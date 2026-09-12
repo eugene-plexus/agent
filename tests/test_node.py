@@ -1032,3 +1032,84 @@ def test_a_joined_node_is_told_to_log_in_at_the_control_root(
     detail = response.json()["detail"]["detail"]
     assert "control root" in detail
     assert "first-run setup" in detail or "setup" in detail
+
+
+# --------------------------------------------------------------------------- #
+# What the agent itself binds
+# --------------------------------------------------------------------------- #
+
+
+def _bind_host_of(tmp_path: Any, **settings_kwargs: Any) -> str:
+    """The interface `build_server` actually hands uvicorn.
+
+    Asserted off `server.config.host` rather than off the resolver,
+    because the resolver was never the part that was wrong: the rule
+    existed in `shared_child_env` and this module's docstring, and the
+    socket was opened somewhere that had not heard about it.
+    """
+    from eugene_plexus_agent.__main__ import build_server
+
+    settings = Settings(
+        config_file=tmp_path / "agent.yaml",
+        bind_port=8179,
+        default_topology=False,
+        **settings_kwargs,
+    )
+    return str(build_server(settings, unattended=True).config.host)
+
+
+def test_agent_binds_loopback_when_it_advertises_nothing(tmp_path: Any) -> None:
+    """The single-machine default, which is nearly every install.
+
+    This is the test that makes the next one mean something: a fix that
+    widened unconditionally would put four services plus the agent on
+    every interface of every laptop that ever ran this.
+    """
+    assert _bind_host_of(tmp_path) == "127.0.0.1"
+
+
+def test_agent_binds_wide_when_its_node_advertises_a_lan_address(tmp_path: Any) -> None:
+    """The bug, from 2026-09-11: a joined node advertised an address it
+    did not bind.
+
+    Enrollment is outbound, so `201 Created` says the node reached the
+    root and nothing about the return path. The node came up on
+    loopback, told the root to call back on its LAN address, and looked
+    healthy from every direction except that one -- union topology, idle
+    unload and start-on-demand would all have failed silently. The
+    installers widen the bind themselves now; this covers
+    `eugene-plexus-agent join` run by hand, which is the path
+    `docs/deployment/tailnet.md` documents.
+    """
+    NodeIdentityStore(tmp_path / "node.yaml").record_advertise_url("http://192.168.16.75:8079")
+    assert _bind_host_of(tmp_path) == "0.0.0.0"
+
+
+def test_agent_binds_wide_from_the_config_field_too(tmp_path: Any) -> None:
+    """`advertiseUrl` in agent.yaml, not node.yaml -- machine A's case.
+
+    The control host sets the address before its first start and is not
+    enrolled at that moment, so a rule keyed on enrollment would miss
+    exactly the machine `tailnet.md` calls its most important
+    instruction. Keyed on the advertised address instead, which is the
+    same thing `shared_child_env` keys on and the same precedence
+    `GET /v1/node` reports: the config field wins over node.yaml.
+    """
+    (tmp_path / "agent.yaml").write_text("advertiseUrl: http://100.64.0.1:8079\n", encoding="utf-8")
+    assert _bind_host_of(tmp_path) == "0.0.0.0"
+
+
+def test_an_explicit_bind_host_wins_even_when_it_will_not_work(tmp_path: Any) -> None:
+    """`easy-default-expert-override`, and the half of it that has teeth.
+
+    An operator who names the interface gets the interface -- including
+    `127.0.0.1` on a node that advertises a LAN address, which is the
+    broken install this whole change exists to prevent. The rule is that
+    the topmost override wins even with a value that will fail, so the
+    default must be distinguishable from someone typing the default:
+    pydantic's `model_fields_set` carries that, and `bind_host` is
+    absent from it when nothing supplied one.
+    """
+    NodeIdentityStore(tmp_path / "node.yaml").record_advertise_url("http://192.168.16.75:8079")
+    assert _bind_host_of(tmp_path, bind_host="127.0.0.1") == "127.0.0.1"
+    assert _bind_host_of(tmp_path, bind_host="192.168.16.75") == "192.168.16.75"

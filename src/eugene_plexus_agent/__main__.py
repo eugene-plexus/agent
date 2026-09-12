@@ -34,11 +34,13 @@ A bare terminal start keeps the prompt.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import sys
 
 import uvicorn
 
+from . import node_identity
 from .app import create_app
 from .console_logging import install_console_capture
 from .onboarding import JoinRequest, ask, has_tty, is_fresh_boot, run_join
@@ -185,8 +187,41 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     port = settings.bind_port
     log_level = "info"
 
+    # **A node that advertises a non-loopback address binds one.** The
+    # rule `shared_child_env` has always applied to this agent's
+    # children, applied to the agent itself -- see
+    # `node_identity.bind_host_for_advertised_node` for the bug that
+    # bought it. This module's own docstring has asserted the rule since
+    # step 3 ("it binds non-loopback only when it advertises a
+    # non-loopback address"); until now only the children obeyed it.
+    #
+    # Read from the same two places `/v1/node` reports from, so what is
+    # bound and what is advertised cannot disagree: the config field
+    # wins over what enrollment derived.
+    identity = node_identity.NodeIdentityStore(
+        settings.config_file.resolve().parent / node_identity.NODE_FILE
+    )
+    # Degraded, not dead -- `create_app` logs this properly and comes up
+    # unenrolled. An unreadable identity advertises nothing, so the
+    # configured bind is the right answer anyway.
+    with contextlib.suppress(ValueError):
+        identity.load()
+    advertise = node_identity.effective_advertise_url(
+        bootstrap_state.get_config("advertiseUrl"), identity.record.advertise_url
+    )
+    bind_host = node_identity.bind_host_for_advertised_node(
+        configured=settings.bind_host,
+        configured_explicitly="bind_host" in settings.model_fields_set,
+        advertise_url=advertise,
+    )
+    if bind_host != settings.bind_host:
+        print(
+            f"agent: binding {bind_host} because this node advertises {advertise}",
+            flush=True,
+        )
+
     app = create_app(settings)
-    config = uvicorn.Config(app, host=settings.bind_host, port=port, log_level=log_level)
+    config = uvicorn.Config(app, host=bind_host, port=port, log_level=log_level)
     return uvicorn.Server(config)
 
 
