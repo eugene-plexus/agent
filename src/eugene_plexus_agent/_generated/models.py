@@ -59,6 +59,7 @@ class Role(StrEnum):
     system = 'system'
     user = 'user'
     assistant = 'assistant'
+    tool = 'tool'
 
 
 class Message(BaseModel):
@@ -70,9 +71,17 @@ class Message(BaseModel):
     """
 
     role: Role
-    content: str = Field(
-        ...,
-        description='Message text. Text-only for now; multimodal extensions deferred.',
+    content: str | None = Field(
+        None,
+        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
     )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'
