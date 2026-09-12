@@ -30,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import os
 import re
 import sys
 import threading
@@ -102,16 +103,31 @@ def install_console_capture(
     log_dir: Path,
     max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 5,
-) -> Path:
+) -> Path | None:
     """Replace sys.stdout/sys.stderr with tees that mirror to a rotating
-    log file under `log_dir`. Returns the resolved log file path.
+    log file under `log_dir`. Returns the log file path, or **None** when
+    the file copy could not be opened.
 
     Idempotent: a second call within the same process is a no-op so
     test fixtures that import the agent module repeatedly don't
     stack handlers. Call as early as possible in main() — anything
     that writes to stdout before this runs is missed in the file copy.
+
+    **A log file this cannot open is not a reason to refuse to run.**
+    It used to be: `mkdir` and the handler were both unguarded, so an
+    unwritable `logs/` killed the agent at startup with a `PermissionError`
+    raised inside `logging.handlers`, five frames from anything that names
+    the actual problem. That contradicts `degraded-mode-required`, which
+    this project applies to bad *config* and had never applied to the
+    supervisor's own conveniences — and this is a convenience. The
+    combined stream still goes to stdout, which is the only copy a
+    container or a systemd unit ever reads anyway.
+
+    Found on an Unraid install on 2026-09-12: a data directory created by
+    an earlier container under one uid, mounted into a new one running as
+    `--user 99:100`. `logs/` already existed, so `mkdir(exist_ok=True)`
+    succeeded and opening the file inside it did not.
     """
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "agent.log"
 
     # Dedicated logger — not propagated to root, so unrelated library
@@ -122,12 +138,27 @@ def install_console_capture(
     if any(isinstance(h, RotatingFileHandler) for h in capture.handlers):
         return log_path
     capture.setLevel(logging.INFO)
-    handler = RotatingFileHandler(
-        filename=log_path,
-        maxBytes=max_bytes,
-        backupCount=backup_count,
-        encoding="utf-8",
-    )
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            filename=log_path,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+    except OSError as e:
+        # Said on the console, which is the copy that still works, and
+        # said in terms of the directory rather than of `logging` — the
+        # traceback this replaces named neither.
+        who = f" as uid {os.getuid()}" if hasattr(os, "getuid") else ""
+        print(
+            f"agent: cannot write {log_path} ({e.strerror or e}); continuing with console "
+            f"output only. Make {log_dir} writable{who} to get the file copy back. "
+            f"In a container this usually means the mounted directory is owned by a "
+            f"different user than the one the container runs as.",
+            flush=True,
+        )
+        return None
     # Raw passthrough — incoming lines are already formatted by uvicorn
     # / the supervisor reader / each component's own logger. Adding a
     # timestamp prefix here would double-stamp lines that have one.

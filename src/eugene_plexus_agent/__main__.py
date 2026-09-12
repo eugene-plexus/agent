@@ -162,7 +162,10 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # operator having to fish through env vars or task command flags.
     log_dir = settings.config_file.resolve().parent / "logs"
     log_path = install_console_capture(log_dir=log_dir)
-    print(f"agent: console output is mirrored to {log_path}", flush=True)
+    if log_path is not None:
+        print(f"agent: console output is mirrored to {log_path}", flush=True)
+    # None means the file copy could not be opened; the call already said
+    # why, on the console. Not fatal -- see that module's docstring.
 
     # uvicorn configures only its own loggers, so without this the agent's
     # own log calls never reach the console at all - every child component

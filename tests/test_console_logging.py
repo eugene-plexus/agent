@@ -12,14 +12,40 @@ from __future__ import annotations
 
 import io
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+import pytest
 
 from eugene_plexus_agent.console_logging import (
     _ANSI_SGR_RE,
     _TeeStream,
     install_console_capture,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_capture_state() -> object:
+    """`install_console_capture` mutates process-global state -- a handler
+    on a named logger, and `sys.stdout`/`sys.stderr`.
+
+    Without this the tests are order-dependent, and silently so: the
+    function returns early when a handler is already attached, so a test
+    that ran after the idempotency one got a path where it expected the
+    degraded `None` and failed for a reason having nothing to do with its
+    subject. Found exactly that way.
+    """
+    capture = logging.getLogger("eugene_plexus_agent._console_capture")
+    saved_out, saved_err = sys.stdout, sys.stderr
+    for h in list(capture.handlers):
+        capture.removeHandler(h)
+        h.close()
+    yield
+    for h in list(capture.handlers):
+        capture.removeHandler(h)
+        h.close()
+    sys.stdout, sys.stderr = saved_out, saved_err
 
 
 def test_tee_writes_console_verbatim_and_file_stripped(tmp_path: Path) -> None:
@@ -100,3 +126,42 @@ def test_ansi_regex_only_matches_sgr_sequences() -> None:
     assert _ANSI_SGR_RE.sub("", "\x1b[1;33;42mfancy\x1b[0m") == "fancy"
     # Bracketed text that isn't an SGR escape is left alone.
     assert _ANSI_SGR_RE.sub("", "[orchestrator] msg") == "[orchestrator] msg"
+
+
+def test_an_unwritable_log_directory_does_not_stop_the_agent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**A log file is a convenience, and the supervisor used to die for it.**
+
+    `mkdir` and the handler were both unguarded, so an unwritable `logs/`
+    raised `PermissionError` five frames deep inside `logging.handlers`
+    and the agent never started. The traceback named neither the
+    directory nor the reason, and `degraded-mode-required` -- which this
+    project applies to bad config -- had never been applied to the
+    agent's own conveniences.
+
+    Found on a real Unraid install: a data directory created by an
+    earlier container under one uid, mounted into a new one running as
+    `--user 99:100`. `logs/` already existed, so `mkdir(exist_ok=True)`
+    succeeded and opening the file inside it did not -- which is why this
+    simulates the failure at the handler rather than by chmod-ing a
+    directory, a thing Windows would not honour anyway.
+    """
+    import eugene_plexus_agent.console_logging as cl
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(cl, "RotatingFileHandler", refuse)
+
+    log_dir = tmp_path / "logs"
+    result = cl.install_console_capture(log_dir=log_dir)
+
+    assert result is None, "an unopenable log file must report itself, not raise"
+    said = capsys.readouterr().out
+    assert "console output only" in said
+    assert str(log_dir) in said, "the message has to name the directory to be actionable"
+
+    # And the console still works, which is the whole point of degrading.
+    print("still alive")
+    assert "still alive" in capsys.readouterr().out
