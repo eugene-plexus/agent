@@ -58,6 +58,7 @@ import importlib.util
 import logging
 from dataclasses import dataclass
 
+from ._generated.common_models import ConfigUpdateRequest
 from ._generated.models import ComponentEntry, ComponentKind, SpawnConfig
 from .state import AgentState
 
@@ -123,6 +124,38 @@ def should_seed(state: AgentState, *, enrolled: bool) -> bool:
     if state.get_config("firstRunComplete"):
         return False
     return not state.list_topology_entries()
+
+
+def mark_onboarded(state: AgentState) -> bool:
+    """Record that this install is set up. Returns True if it changed.
+
+    **Enrolling IS onboarding**, which is the whole framing of
+    `onboarding.py`: one question -- am I the root of a new install or
+    joining an existing one? -- answered three ways. A node that
+    answered "joining" has answered it, and there is nothing left for a
+    first-run wizard to do. Running one would raise a SECOND install on
+    a machine that already belongs to one.
+
+    This exists because two notions of "set up" had drifted apart.
+    `should_seed` above already treats `enrolled` as decisive and
+    refuses to seed a control plane onto a node -- correct, and
+    invisible. But `firstRunComplete` was written by exactly one thing,
+    the web wizard, so an enrolled node still carried `false`, and the
+    UI reads that flag alone: sign in on a worker and it bounces you
+    into the wizard. Reported from a real two-machine install.
+
+    Fixing the flag rather than teaching the UI about enrollment is
+    deliberate: the flag is what every reader consults, so making it
+    true of the actual state fixes readers that do not exist yet.
+    """
+    if state.get_config("firstRunComplete"):
+        return False
+    # Through the ordinary patch path rather than poking `_config`, so
+    # this write is validated and persisted exactly like the wizard's.
+    # `ConfigUpdateRequest` declares no fields and allows extras, so a
+    # one-key patch really is a one-key patch.
+    state.apply_config_patch(ConfigUpdateRequest(firstRunComplete=True))
+    return True
 
 
 def seed(state: AgentState) -> list[str]:

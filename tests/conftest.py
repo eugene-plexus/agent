@@ -15,6 +15,7 @@ itself (login flow, rate limiting, token validation) use the bare
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -226,3 +227,24 @@ def authed_client(app: FastAPI) -> Iterator[TestClient]:
         token = resp.json()["sessionToken"]
         c.headers["Authorization"] = f"Bearer {token}"
         yield c
+
+
+# Every test runs with the ambient EUGENE_PLEXUS_* environment cleared.
+#
+# **Not hygiene -- two tests really do fail without it**, and they fail
+# on a developer machine while CI stays green, because CI has no install
+# and a developer's machine does. `install.ps1` sets
+# `EUGENE_PLEXUS_AGENT_CONFIG_FILE` in the USER environment on purpose
+# (a logon task inherits it), so every shell on that account carries it,
+# and `Settings` reads the same prefix the installer writes. The
+# symptoms were a bind-host assertion reading 0.0.0.0 and a planner
+# assertion finding EUGENE_PLEXUS_* in a child's env -- both of them
+# asserting about the developer's install rather than about the code.
+#
+# Same root cause as the acceptance scripts, which clear this explicitly
+# for the same reason; see `scripts/context-honesty-acceptance.sh` in
+# the specs repo for what it costs when it is missed.
+@pytest.fixture(autouse=True)
+def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:
+        monkeypatch.delenv(key, raising=False)

@@ -38,7 +38,7 @@ import sys
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from .. import __version__, security
+from .. import __version__, default_topology, security
 from .._generated.common_models import Problem
 from .._generated.models import (
     Arch,
@@ -251,6 +251,11 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
         raise _from_enrollment_error(exc) from exc
 
     auth.set_signing_key(outcome.signing_key)
+    # Joining answers the one onboarding question, so nothing is left
+    # for the wizard to do. Set here rather than only at the next boot
+    # because enrolling does not restart this process -- without it the
+    # operator who just enrolled gets sent to first-run setup.
+    default_topology.mark_onboarded(state)
     log.info(
         "enrolled as %r with the control root at %s at epoch %d; adopted the install's signing "
         "key (generation %s)",

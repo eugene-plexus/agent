@@ -175,6 +175,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # one yet. Before supervision starts, so the components below are
     # started by the same loop as any operator-declared entry rather
     # than by a second path that could drift from it.
+    # An enrolled node is onboarded by definition. Done here as well as
+    # at the moment of enrolling, because an install that joined before
+    # this existed is still carrying `firstRunComplete: false` and would
+    # otherwise keep offering its operator a wizard that would raise a
+    # second install. Costs one config write, once.
+    if (
+        not settings.safe_mode
+        and identity.record.enrolled
+        and default_topology.mark_onboarded(state)
+    ):
+        log.info(
+            "this node is enrolled with %s, so first-run setup is complete; recorded it "
+            "(the web UI reads that flag and was offering the first-run wizard)",
+            identity.record.control_url or "a control root",
+        )
+
     if (
         not settings.safe_mode
         and settings.default_topology
