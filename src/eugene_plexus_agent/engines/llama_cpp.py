@@ -146,16 +146,26 @@ class LlamaCppAdapter(EngineAdapter):
     releases = GitHubReleases(LLAMA_CPP_REPO)
 
     def latest_release(self, *, force: bool = False) -> Release | None:
-        """Newest published build.
+        """Newest published build **that has assets**.
 
         Sorted by build number rather than by publish order: the tag IS a
         monotonic counter, and trusting it beats trusting a timestamp on a
         repository that publishes several releases an hour.
+
+        A release with no assets is skipped. Found live 2026-09-12: upstream
+        published `b10931` at 14:48Z as a release object with **zero**
+        assets — its CI had not uploaded yet, or never did — while `b10930`
+        an hour earlier carried the usual 27. Taking the newest tag made
+        every host in the install "not installable" (*"release b10931 has no
+        asset for 'win-cuda-13.3-x64'. Published variants: (none)"*) for as
+        long as that object stayed newest, and the answer was one build
+        behind it the whole time. Every `b` build is marked prerelease, so
+        that flag cannot be the filter; the presence of assets can.
         """
         builds = [
             (int(m.group(1)), release)
             for release in self.releases.list_releases(force=force)
-            if (m := _BUILD_TAG_RE.match(release.version))
+            if (m := _BUILD_TAG_RE.match(release.version)) and release.assets
         ]
         if not builds:
             return None

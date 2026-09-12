@@ -233,6 +233,37 @@ def test_latest_release_sorts_numerically_not_lexically(
     assert latest.version == "b10867"
 
 
+def test_latest_release_skips_a_build_with_no_assets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Found live 2026-09-12: upstream published `b10931` as a release
+    object with zero assets -- CI had not uploaded yet -- while `b10930`
+    an hour earlier carried the usual 27. Taking the newest tag told
+    every host in the install that nothing was installable ("Published
+    variants: (none)"), with the answer one build behind it. Every `b`
+    build is a prerelease, so that flag cannot be the filter; assets can."""
+    adapter = LlamaCppAdapter()
+    monkeypatch.setattr(
+        adapter.releases,
+        "list_releases",
+        lambda force=False: [_release("b10931", names=[]), _release("b10930")],
+    )
+    latest = adapter.latest_release()
+    assert latest is not None
+    assert latest.version == "b10930"
+
+
+def test_latest_release_is_none_when_no_build_has_assets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing to offer is `None`, which the descriptor already renders as
+    "not installable" with a reason -- not a plan for a build that
+    cannot be fetched."""
+    adapter = LlamaCppAdapter()
+    monkeypatch.setattr(
+        adapter.releases, "list_releases", lambda force=False: [_release("b10931", names=[])]
+    )
+    assert adapter.latest_release() is None
+
+
 # --------------------------------------------------------------------------- #
 # Install
 # --------------------------------------------------------------------------- #
