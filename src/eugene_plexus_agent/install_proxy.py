@@ -163,21 +163,34 @@ class InstallTopology:
                 "control root knows of none, so this is not a question of which node you "
                 "are browsing from."
             )
+        return RemoteNode(name=node, agent_url=_reachable_url(snapshot, node, f"{target!r} runs"))
 
-        url = snapshot.node_urls.get(node)
-        if not url:
+    async def agent_url_of(
+        self,
+        node: str,
+        *,
+        control_url: str,
+        authorization: str | None,
+        transport: Any = None,
+    ) -> str:
+        """The agent URL of a named node -- the `node:<name>` proxy target.
+
+        The hop above addresses a *component* and finds its node; this
+        addresses the node itself, for the surfaces that are per-agent by
+        nature: a runtime's start/stop/restart, which engines a host has,
+        an engine install. Same registry, same reachability rules.
+        """
+        snapshot = await self._load(
+            control_url=control_url, authorization=authorization, transport=transport
+        )
+        if snapshot.error is not None:
+            raise InstallLookupError(snapshot.error)
+        if node not in snapshot.node_urls:
             raise InstallLookupError(
-                f"{target!r} runs on node {node!r}, but that node has no address in the "
-                "install's registry, so nothing here can reach it."
+                f"No node named {node!r} is enrolled in this install. The control root's "
+                "GET /v1/nodes lists the ones that are."
             )
-        if is_loopback_host(advertise_host(url)):
-            raise InstallLookupError(
-                f"{target!r} runs on node {node!r}, which advertises {url} -- a loopback "
-                "address, reachable only from that host. Set `advertiseUrl` in that "
-                "node's agent config to the address other hosts use for it (the same one "
-                "you type in the browser); it re-announces itself immediately."
-            )
-        return RemoteNode(name=node, agent_url=url)
+        return _reachable_url(snapshot, node, f"Node {node!r} is")
 
     # -- internals ---------------------------------------------------
 
@@ -244,6 +257,30 @@ class InstallTopology:
             owners=_owners(components),
             node_urls=_node_urls(nodes),
         )
+
+
+def _reachable_url(snapshot: _Snapshot, node: str, subject: str) -> str:
+    """A node's agent URL, or the reason nothing here can reach it.
+
+    Each failure is a different action for the operator, and the loopback
+    one is the failure the live install actually had: without it the
+    proxy would connect to that port on the *asking* machine and report
+    the component as not answering -- on the wrong host entirely.
+    """
+    url = snapshot.node_urls.get(node)
+    if not url:
+        raise InstallLookupError(
+            f"{subject} on node {node!r}, but that node has no address in the install's "
+            "registry, so nothing here can reach it."
+        )
+    if is_loopback_host(advertise_host(url)):
+        raise InstallLookupError(
+            f"{subject} on node {node!r}, which advertises {url} -- a loopback address, "
+            "reachable only from that host. Set `advertiseUrl` in that node's agent config "
+            "to the address other hosts use for it (the same one you type in the browser); "
+            "it re-announces itself immediately."
+        )
+    return url
 
 
 def _owners(response: httpx.Response) -> dict[str, str]:

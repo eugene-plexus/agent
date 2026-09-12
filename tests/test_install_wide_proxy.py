@@ -501,3 +501,72 @@ def test_the_body_of_a_post_survives_the_hop(
 ) -> None:
     client.post("/api/proxy/gateway/v1/chat/completions", json={"model": "m", "messages": []})
     assert json.loads(upstream.last.content)["model"] == "m"
+
+
+# --------------------------------------------------------------------------
+# node:<name> -- another node's agent, not a component on it
+# --------------------------------------------------------------------------
+
+
+def test_a_node_target_reaches_that_nodes_agent_api_directly(
+    client: TestClient, upstream: Upstream, asked: list[httpx.Request]
+) -> None:
+    """No /api/proxy prefix on the far side: this is the agent's own API,
+    for the surfaces that are per-agent by nature (a runtime's stop, an
+    engine install). The install-wide inference screen acts on a runtime
+    that lives elsewhere through exactly this."""
+    assert client.post("/api/proxy/node:root/v1/runtimes/llama-1/stop").status_code == 200
+    assert str(upstream.last.url) == "http://root.invalid:8279/v1/runtimes/llama-1/stop"
+
+
+def test_our_own_name_is_the_local_agent_without_a_lookup(
+    client: TestClient, upstream: Upstream, asked: list[httpx.Request]
+) -> None:
+    """The screen names every node the same way; the local one must not
+    cost a round trip to the control root and back to ourselves."""
+    assert client.get("/api/proxy/node:worker-1/v1/engines").status_code == 200
+    assert str(upstream.last.url) == "http://127.0.0.1:8079/v1/engines"
+    assert asked == []
+
+
+def test_an_unknown_node_is_named_in_the_refusal(
+    client: TestClient, upstream: Upstream, asked: list[httpx.Request]
+) -> None:
+    response = client.get("/api/proxy/node:ghost/v1/engines")
+    assert response.status_code == 503
+    assert "No node named 'ghost'" in detail(response)
+    assert upstream.requests == []
+
+
+def test_a_loopback_node_is_explained_rather_than_dialled_here_too(
+    app: FastAPI, client: TestClient, upstream: Upstream
+) -> None:
+    app.state.control_transport = control_transport(
+        [], nodes=[{"name": "root", "url": "http://127.0.0.1:8079/"}]
+    )
+    enroll(app)
+
+    response = client.get("/api/proxy/node:root/v1/engines")
+    assert response.status_code == 503
+    assert "`advertiseUrl`" in detail(response)
+    assert upstream.requests == []
+
+
+def test_a_forwarded_node_request_is_not_forwarded_again(
+    client: TestClient, upstream: Upstream, asked: list[httpx.Request]
+) -> None:
+    response = client.get(
+        "/api/proxy/node:root/v1/engines", headers={install_proxy.HOP_HEADER: "root"}
+    )
+    assert response.status_code == 503
+    assert upstream.requests == []
+    assert asked == []
+
+
+def test_an_unenrolled_node_knows_no_other_nodes(
+    app: FastAPI, client: TestClient, upstream: Upstream
+) -> None:
+    enroll(app, enrolled=False, control_url=None, name=None)
+    response = client.get("/api/proxy/node:anything/v1/engines")
+    assert response.status_code == 503
+    assert "not enrolled" in detail(response)

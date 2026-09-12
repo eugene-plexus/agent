@@ -86,6 +86,13 @@ PROXY_PREFIX = "/api/proxy"
 # place it can be wrong.
 _SINGLETON_KINDS = {"gateway": "gateway", "library": "library", "control": "control"}
 
+# `node:<name>` addresses another node's AGENT rather than a component
+# on it -- for the surfaces that are per-agent by nature (a runtime's
+# start/stop, which engines a host has, an engine install). `agent` is
+# still the local one; this is how the install-wide inference screen
+# acts on a runtime that lives somewhere else.
+NODE_PREFIX = "node:"
+
 # Hop-by-hop headers, plus the two that describe a body we re-frame
 # ourselves. `accept-encoding` is dropped and replaced rather than
 # forwarded: see the module docstring on why no decoder may sit in this
@@ -214,6 +221,9 @@ async def resolve_target(request: Request, target: str) -> Route:
     operator's next action is different in each, and one generic "not in
     topology" was the report that started this work.
     """
+    if target.startswith(NODE_PREFIX):
+        return await _resolve_node(request, target[len(NODE_PREFIX) :])
+
     local = resolve_local(request, target)
     if local is not None:
         return Route(base=local)
@@ -270,6 +280,51 @@ async def resolve_target(request: Request, target: str) -> Route:
         )
 
     return Route(base=remote.agent_url, prefix=f"{PROXY_PREFIX}/{target}", node=remote.name)
+
+
+async def _resolve_node(request: Request, name: str) -> Route:
+    """`node:<name>`: that node's agent, or this one when the name is ours.
+
+    No `/api/proxy` prefix on the far side -- this reaches the agent's
+    own API, so there is no second resolution and no way to loop. The
+    hop marker is still set by `_request_headers` and still refused here
+    on arrival, which costs nothing and keeps one rule.
+    """
+    settings: Settings = request.app.state.settings
+    identity = getattr(request.app.state, "node_identity", None)
+    record = identity.record if identity is not None else None
+
+    if record is not None and record.name and record.name == name:
+        return Route(base=local_agent_url(settings.bind_host, int(settings.bind_port)))
+
+    hop = request.headers.get(install_proxy.HOP_HEADER)
+    if hop:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Target not on this node",
+            f"Node {hop!r} forwarded a request for node {name!r} here, but this node is "
+            f"{record.name if record and record.name else 'not enrolled'!r}. The registry "
+            "and this node's identity disagree.",
+        )
+
+    if record is None or not record.enrolled or not record.control_url:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Target not in topology",
+            f"This node is not enrolled with a control root, so it knows of no node named "
+            f"{name!r} -- or any other. Use the `agent` target for this host.",
+        )
+
+    try:
+        url = await install_topology(request).agent_url_of(
+            name,
+            control_url=str(record.control_url),
+            authorization=request.headers.get("authorization"),
+            transport=getattr(request.app.state, "control_transport", None),
+        )
+    except install_proxy.InstallLookupError as exc:
+        raise _problem(status.HTTP_503_SERVICE_UNAVAILABLE, "Node unreachable", str(exc)) from exc
+    return Route(base=url, node=name)
 
 
 def get_client(request: Request) -> httpx.AsyncClient:
