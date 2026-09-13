@@ -29,10 +29,14 @@ Three rules, each with its reason:
 * **By components, not by string prefix.** `/models2/x` is not under
   `/models`. The longest `from` wins; ties go to the first rule listed.
 
-The resolver takes the local separator as a parameter so one test suite
-exercises both directions on either platform: CI is Linux, this desk is
-Windows, and the real install is a Linux library describing files for a
-Windows engine.
+The `to` side's shape decides the separator the remainder is re-joined
+with -- `Z:\\models` gets `\\`, `/mnt/models` gets `/` -- rather than
+this host's `os.sep`. A `to` is a path on the host that wrote it, and
+its shape says how that host spells paths, exactly as the `from`'s
+shape decides how it matches. It also means one test suite exercises
+both directions on either platform: CI is Linux, this desk is Windows,
+and the real install is a Linux library describing files for a Windows
+engine.
 """
 
 from __future__ import annotations
@@ -123,13 +127,18 @@ def match(rule: PathRule, declared: str) -> tuple[str, ...] | None:
     return raw[len(source) :]
 
 
-def join_local(base: str, remainder: Sequence[str], *, sep: str) -> str:
-    """`base` with `remainder` appended using this host's separator.
+def join_local(base: str, remainder: Sequence[str], *, sep: str | None = None) -> str:
+    """`base` with `remainder` appended in the base's own convention.
 
-    The base is used as the operator spelled it, minus a trailing
-    separator that is not a drive root's (`Z:\\` keeps it; `Z:\\models\\`
-    loses it), so `Z:\\models` and `Z:\\models\\` produce one answer.
+    The separator follows the base's shape -- a drive letter or UNC
+    prefix means `\\`, anything else `/` -- unless the caller says
+    otherwise. The base is used as the operator spelled it, minus a
+    trailing separator that is not a drive root's (`Z:\\` keeps it;
+    `Z:\\models\\` loses it), so `Z:\\models` and `Z:\\models\\` produce
+    one answer.
     """
+    if sep is None:
+        sep = "\\" if is_windows_shaped(base) else "/"
     trimmed = base
     while len(trimmed) > 1 and trimmed[-1] in "\\/" and trimmed[-2] != ":":
         trimmed = trimmed[:-1]
@@ -144,7 +153,6 @@ def resolve_model_path(
     declared: str,
     rules: Sequence[PathRule],
     *,
-    sep: str = os.sep,
     expand: Callable[[str], str] = os.path.expanduser,
 ) -> Resolution:
     """Where `declared` is on this host: through the longest matching
@@ -163,7 +171,7 @@ def resolve_model_path(
     _, _, rule, remainder = best
     return Resolution(
         declared=declared,
-        local_path=join_local(expand(rule.target), remainder, sep=sep),
+        local_path=join_local(expand(rule.target), remainder),
         rule=rule,
     )
 
@@ -274,7 +282,6 @@ def check_rules(
     exists: Callable[[str], bool] = os.path.exists,
     isdir: Callable[[str], bool] = os.path.isdir,
     size_of: Callable[[str], int | None] | None = None,
-    sep: str = os.sep,
     expand: Callable[[str], str] = os.path.expanduser,
 ) -> list[RuleCheck]:
     """Stat each rule's target, and -- when the library's models are in
@@ -297,7 +304,7 @@ def check_rules(
             path = model.get("path")
             if not isinstance(path, str):
                 continue
-            resolution = resolve_model_path(path, [rule], sep=sep, expand=expand)
+            resolution = resolve_model_path(path, [rule], expand=expand)
             if resolution.rule is None:
                 continue
             under += 1

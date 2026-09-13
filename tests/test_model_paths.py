@@ -1,9 +1,10 @@
 """Where another host's model directories are on this one (M11).
 
 Pure tests over the resolver, in both directions on whichever platform
-runs them: the separator is a parameter, so CI's Linux and the Windows
-desk both exercise a POSIX library describing files for a Windows
-engine and the reverse.
+runs them: the `to` side's shape decides the separator, so CI's Linux
+and the Windows desk both exercise a POSIX library describing files for
+a Windows engine and the reverse -- which is how CI caught the first
+version joining `Z:\\models` with `/`.
 """
 
 from __future__ import annotations
@@ -46,38 +47,36 @@ def test_the_from_side_says_which_convention_it_came_from() -> None:
 
 
 def test_a_posix_library_path_opens_as_a_windows_path() -> None:
-    result = resolve_model_path(
-        "/models/lmstudio-community/Qwen3-GGUF/Qwen3-Q4_K_M.gguf", [NAS], sep="\\"
-    )
+    result = resolve_model_path("/models/lmstudio-community/Qwen3-GGUF/Qwen3-Q4_K_M.gguf", [NAS])
     assert result.local_path == "Z:\\models\\lmstudio-community\\Qwen3-GGUF\\Qwen3-Q4_K_M.gguf"
     assert result.rule is NAS
     assert result.declared == "/models/lmstudio-community/Qwen3-GGUF/Qwen3-Q4_K_M.gguf"
 
 
 def test_a_windows_library_path_opens_as_a_posix_path() -> None:
-    result = resolve_model_path("D:\\models\\qwen\\q.gguf", [WIN], sep="/")
+    result = resolve_model_path("D:\\models\\qwen\\q.gguf", [WIN])
     assert result.local_path == "/mnt/d-models/qwen/q.gguf"
 
 
 def test_windows_rules_read_either_separator_and_any_case() -> None:
-    assert resolve_model_path("d:/Models/Qwen/q.gguf", [WIN], sep="/").local_path == (
+    assert resolve_model_path("d:/Models/Qwen/q.gguf", [WIN]).local_path == (
         "/mnt/d-models/Qwen/q.gguf"
     )
-    assert resolve_model_path("D:\\MODELS\\q.gguf", [WIN], sep="/").rule is WIN
+    assert resolve_model_path("D:\\MODELS\\q.gguf", [WIN]).rule is WIN
 
 
 def test_a_unc_share_is_one_anchor() -> None:
-    result = resolve_model_path("\\\\nas\\models\\a\\b.gguf", [UNC], sep="/")
+    result = resolve_model_path("\\\\nas\\models\\a\\b.gguf", [UNC])
     assert result.local_path == "/mnt/nas/a/b.gguf"
     # A different share on the same server is not under it.
-    assert resolve_model_path("\\\\nas\\other\\b.gguf", [UNC], sep="/").rule is None
+    assert resolve_model_path("\\\\nas\\other\\b.gguf", [UNC]).rule is None
 
 
 def test_posix_rules_are_case_sensitive_and_slash_only() -> None:
-    assert resolve_model_path("/Models/x.gguf", [NAS], sep="\\").rule is None
+    assert resolve_model_path("/Models/x.gguf", [NAS]).rule is None
     # A backslash is a legal filename character on POSIX, so this is one
     # component and stays one.
-    result = resolve_model_path("/models/a\\b.gguf", [NAS], sep="\\")
+    result = resolve_model_path("/models/a\\b.gguf", [NAS])
     assert result.local_path == "Z:\\models\\a\\b.gguf"
 
 
@@ -94,30 +93,30 @@ def test_the_longest_match_wins_whatever_the_order() -> None:
     broad = PathRule(source="/models", target="Z:\\models")
     narrow = PathRule(source="/models/big", target="Y:\\big")
     for rules in ([broad, narrow], [narrow, broad]):
-        result = resolve_model_path("/models/big/x.gguf", rules, sep="\\")
+        result = resolve_model_path("/models/big/x.gguf", rules)
         assert result.rule is narrow
         assert result.local_path == "Y:\\big\\x.gguf"
-    assert resolve_model_path("/models/small/x.gguf", [narrow, broad], sep="\\").rule is broad
+    assert resolve_model_path("/models/small/x.gguf", [narrow, broad]).rule is broad
 
 
 def test_a_tie_goes_to_the_first_rule_listed() -> None:
     first = PathRule(source="/models", target="Z:\\models")
     second = PathRule(source="/models", target="Y:\\models")
-    assert resolve_model_path("/models/x", [first, second], sep="\\").rule is first
+    assert resolve_model_path("/models/x", [first, second]).rule is first
 
 
 def test_no_match_leaves_the_path_exactly_as_given() -> None:
-    result = resolve_model_path("C:\\Users\\troyc\\models\\q.gguf", [NAS, WIN], sep="\\")
+    result = resolve_model_path("C:\\Users\\troyc\\models\\q.gguf", [NAS, WIN])
     assert result.rule is None
     assert result.local_path == "C:\\Users\\troyc\\models\\q.gguf"
     assert not result.mapped
-    assert resolve_model_path("/x", [], sep="/").local_path == "/x"
+    assert resolve_model_path("/x", []).local_path == "/x"
 
 
 def test_the_declared_path_is_never_normalized_before_matching() -> None:
     """`abspath` on Windows would turn `/models/x` into `C:\\models\\x`
     and then nothing could match it. The rule matches the string."""
-    assert resolve_model_path("/models/x.gguf", [NAS], sep="\\").rule is NAS
+    assert resolve_model_path("/models/x.gguf", [NAS]).rule is NAS
 
 
 # --- joining ----------------------------------------------------------------
@@ -125,26 +124,34 @@ def test_the_declared_path_is_never_normalized_before_matching() -> None:
 
 def test_trailing_separators_on_either_side_change_nothing() -> None:
     rule = PathRule(source="/models/", target="Z:\\models\\")
-    assert resolve_model_path("/models/x.gguf", [rule], sep="\\").local_path == (
-        "Z:\\models\\x.gguf"
-    )
-    assert join_local("Z:\\models\\", ["a"], sep="\\") == "Z:\\models\\a"
-    assert join_local("/mnt/models/", ["a"], sep="/") == "/mnt/models/a"
+    assert resolve_model_path("/models/x.gguf", [rule]).local_path == ("Z:\\models\\x.gguf")
+    assert join_local("Z:\\models\\", ["a"]) == "Z:\\models\\a"
+    assert join_local("/mnt/models/", ["a"]) == "/mnt/models/a"
 
 
 def test_a_drive_root_keeps_its_separator() -> None:
-    assert join_local("Z:\\", ["a", "b"], sep="\\") == "Z:\\a\\b"
-    assert join_local("/", ["a", "b"], sep="/") == "/a/b"
-    assert join_local("Z:\\", [], sep="\\") == "Z:\\"
+    assert join_local("Z:\\", ["a", "b"]) == "Z:\\a\\b"
+    assert join_local("/", ["a", "b"]) == "/a/b"
+    assert join_local("Z:\\", []) == "Z:\\"
+
+
+def test_the_separator_follows_the_target_not_the_host() -> None:
+    """A `to` is a path on the host that wrote it. CI's Linux joined
+    `Z:\\models` with `/` in the first version; the shape decides now."""
+    assert join_local("Z:\\models", ["a", "b.gguf"]) == "Z:\\models\\a\\b.gguf"
+    assert join_local("\\\\nas\\models", ["b.gguf"]) == "\\\\nas\\models\\b.gguf"
+    assert join_local("/mnt/models", ["a", "b.gguf"]) == "/mnt/models/a/b.gguf"
+    # An explicit override still wins, for a caller that knows better.
+    assert join_local("/mnt/models", ["a"], sep="\\") == "/mnt/models\\a"
 
 
 def test_the_to_side_is_used_as_spelled_and_tilde_expands() -> None:
     rule = PathRule(source="/models", target="~/models")
-    result = resolve_model_path("/models/x.gguf", [rule], sep="/", expand=_expand)
+    result = resolve_model_path("/models/x.gguf", [rule], expand=_expand)
     assert result.local_path == "/home/troy/models/x.gguf"
     # Forward slashes in a Windows target are the operator's choice.
     win = PathRule(source="/models", target="Z:/models")
-    assert resolve_model_path("/models/x.gguf", [win], sep="\\").local_path == "Z:/models\\x.gguf"
+    assert resolve_model_path("/models/x.gguf", [win]).local_path == "Z:/models\\x.gguf"
 
 
 def test_the_mapping_reports_itself_on_the_wire() -> None:
@@ -220,7 +227,6 @@ def test_the_check_stats_targets_and_walks_the_librarys_models() -> None:
         exists=lambda p: p in present,
         isdir=lambda p: p in {"Z:\\models", "Z:\\models\\sub"},
         size_of=lambda p: sizes.get(p),
-        sep="\\",
     )
     assert check.target_exists and check.target_is_dir
     assert check.models_under == 2
@@ -242,7 +248,6 @@ def test_a_size_that_disagrees_with_the_library_is_named() -> None:
         exists=lambda p: True,
         isdir=lambda p: not p.endswith(".gguf"),
         size_of=lambda p: 99,
-        sep="\\",
     )
     assert check.mismatched == ["Z:\\models\\a.gguf (99 bytes here, 100 in the library)"]
     ok, _, error = describe_checks([check], library_consulted=True)
