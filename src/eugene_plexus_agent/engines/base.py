@@ -480,8 +480,16 @@ def default_model_alias(model_path: str) -> str:
 
     Engine-agnostic on purpose: every adapter passes the resolved alias
     to its engine explicitly, so they had better agree on the default.
+
+    Separator-agnostic too (M11): the declared path is the library's
+    spelling, which on a Linux node may be `D:\\models\\x.gguf`. The alias
+    is a routing key that must agree across every replica of a model on
+    every node, so it is taken from the last component under either
+    convention rather than from what this host's `Path` makes of it.
     """
-    path = Path(model_path)
+    trimmed = model_path.rstrip("\\/")
+    last = trimmed.replace("\\", "/").rsplit("/", 1)[-1] or trimmed
+    path = Path(last)
     if path.suffix.lower() == ".gguf":
         return path.stem
     return path.name or path.stem

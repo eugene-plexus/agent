@@ -56,6 +56,7 @@ from .engines.acquisition import (
 from .engines.base import DiscoveredBinary
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
+from .model_paths import resolve_model_path, rules_from_config
 from .supervisor import (
     ProcessState,
     SpawnPlan,
@@ -140,7 +141,12 @@ class _RuntimePlanner:
                 f"re-save it so the agent can allocate one"
             )
 
-        argv = self._adapter.build_argv(self.spec, binary, port)
+        # The engine opens the model where THIS host has it (M11). The
+        # declaration keeps the library's spelling; the copy handed to
+        # the adapter carries the resolved local path, and that is the
+        # only place the two differ.
+        launch_spec = self._launch_spec()
+        argv = self._adapter.build_argv(launch_spec, binary, port)
 
         # Engines inherit the ambient environment, then the adapter's own
         # defaults for values the engine cannot start without on this
@@ -158,7 +164,7 @@ class _RuntimePlanner:
         # typed makes a later bug report unreadable.
         env = os.environ.copy()
         injected = {}
-        for key, value in self._adapter.default_env(self.spec, binary).items():
+        for key, value in self._adapter.default_env(launch_spec, binary).items():
             if key not in env:
                 env[key] = value
                 injected[key] = value
@@ -176,8 +182,30 @@ class _RuntimePlanner:
         return SpawnPlan(
             argv=argv,
             env=env,
-            cwd=self._adapter.working_directory(self.spec, binary),
+            cwd=self._adapter.working_directory(launch_spec, binary),
         )
+
+    def _launch_spec(self) -> RuntimeSpec:
+        """The declaration as the engine should see it.
+
+        `modelPath` resolved through this node's `pathMappings`, read
+        live so a mapping added after the declaration applies at the
+        next start with nothing re-declared. Everything else is the
+        declaration verbatim. Logged when a rule applied, because an
+        argv naming a path nobody typed makes a later bug report
+        unreadable.
+        """
+        resolution = resolve_model_path(self.spec.modelPath, rules_from_config(self._get_config))
+        if resolution.rule is None:
+            return self.spec
+        self._log.info(
+            "%s: opening %s as %s (mapping %s)",
+            self.spec.name,
+            self.spec.modelPath,
+            resolution.local_path,
+            resolution.rule,
+        )
+        return self.spec.model_copy(update={"modelPath": resolution.local_path})
 
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
         """Let the engine's own adapter read the wreckage.
@@ -375,6 +403,11 @@ class RuntimeSupervisor:
             name=spec.name,
             engine=spec.engine,
             modelPath=spec.modelPath,
+            # Observed, from the current mapping, every time it is read:
+            # a stopped runtime shows what its next start would open.
+            localPath=resolve_model_path(
+                spec.modelPath, rules_from_config(self._get_config)
+            ).local_path,
             modelAlias=spec.modelAlias or _default_alias(spec),
             host=spec.host,
             port=spec.port,

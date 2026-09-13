@@ -27,12 +27,24 @@ Two inputs, both measured on the host that will spawn:
 `unknown` never refuses. A verdict computed from a budget that could
 not be measured is worse than no verdict, and three of the detection
 paths are unverified on real hardware.
+
+Since M11 the question before memory is answered here too: **is the
+model on this host at all?** `modelPath` is the library's spelling and
+the library may be on another machine, so it is resolved through this
+node's `pathMappings` (`model_paths.py`) and the result is reported as
+`location`. A path that names nothing here is a `refuse` with `fit:
+unknown` -- the rule above is about a budget that could not be measured,
+and a file that is not there is a measurement. Until this existed a
+launch of such a path was admitted on faith, given a companion driver,
+and crashed at spawn.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -49,10 +61,12 @@ from ._generated.models import (
     ComputeDevice,
     ComputeDeviceKind,
     EngineKind,
+    ModelLocation,
     RuntimeSpec,
     RuntimeStatus,
 )
 from .engines.devices import DeviceSnapshot
+from .model_paths import PathRule, resolve_model_path
 
 log = logging.getLogger(__name__)
 
@@ -77,14 +91,24 @@ _PIN_ENV_VARS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DE
 
 _RUNNING = frozenset({RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.ready})
 
+# The existence check, as a module attribute so a test can describe a
+# file that is not there the same way `model_size_bytes` lets it
+# describe one that is 200 GiB.
+path_exists: Callable[[str], bool] = os.path.exists
+
 
 @dataclass(frozen=True)
 class LibraryFit:
-    """What the library said a model needs."""
+    """What the library said a model needs -- and weighs."""
 
     required_bytes: int
     verdict: str
     context_length: int | None
+    # What the library's scan recorded for the model: the whole model,
+    # and the one file a launch line names. What `location` compares a
+    # mapped file against (M11).
+    size_bytes: int | None = None
+    weights_size_bytes: int | None = None
 
 
 class FitSource(Protocol):
@@ -111,9 +135,33 @@ class LibraryFitClient:
     about *this* device rather than whatever the library detected.
     """
 
-    def __init__(self, base_url: str, service_token: str | None) -> None:
+    def __init__(self, base_url: str, service_token: str | None, *, transport: Any = None) -> None:
         self._base = base_url.rstrip("/")
         self._headers = {"Authorization": f"Bearer {service_token}"} if service_token else {}
+        # Injectable so a test can stand in for the library without a
+        # socket; production leaves it None.
+        self._transport = transport
+
+    @property
+    def base_url(self) -> str:
+        return self._base
+
+    async def list_models(self) -> list[dict[str, Any]] | None:
+        """Every model the library knows, raw -- for the mapping check
+        behind `POST /v1/config/test`. None when it could not answer."""
+        try:
+            async with httpx.AsyncClient(
+                timeout=_LIBRARY_TIMEOUT_SECONDS, transport=self._transport
+            ) as client:
+                response = await client.get(f"{self._base}/v1/models", headers=self._headers)
+                if response.status_code >= 400:
+                    log.info("library model list returned %d", response.status_code)
+                    return None
+                models = response.json().get("models")
+                return models if isinstance(models, list) else None
+        except (httpx.HTTPError, ValueError) as e:
+            log.info("library unreachable for its model list (%s)", e)
+            return None
 
     async def fit(
         self,
@@ -124,7 +172,9 @@ class LibraryFitClient:
         ram_bytes: int | None,
     ) -> LibraryFit | None:
         try:
-            async with httpx.AsyncClient(timeout=_LIBRARY_TIMEOUT_SECONDS) as client:
+            async with httpx.AsyncClient(
+                timeout=_LIBRARY_TIMEOUT_SECONDS, transport=self._transport
+            ) as client:
                 lookup = await client.get(
                     f"{self._base}/v1/models",
                     params={"path": model_path},
@@ -164,10 +214,21 @@ class LibraryFitClient:
                 if not isinstance(required, int) or not isinstance(verdict, str):
                     return None
                 context = fit.get("contextLength")
+                size = model.get("sizeBytes")
+                weights = next(
+                    (
+                        f.get("sizeBytes")
+                        for f in model.get("files") or []
+                        if isinstance(f, dict) and f.get("role") == "weights"
+                    ),
+                    size if model.get("fileCount") == 1 else None,
+                )
                 return LibraryFit(
                     required_bytes=required,
                     verdict=verdict,
                     context_length=context if isinstance(context, int) else None,
+                    size_bytes=size if isinstance(size, int) else None,
+                    weights_size_bytes=weights if isinstance(weights, int) else None,
                 )
         except (httpx.HTTPError, ValueError) as e:
             log.info("library unreachable for fit (%s); falling back to file size", e)
@@ -351,13 +412,21 @@ async def check_admission(
     library: FitSource | None,
     running: list[RunningRuntime],
     size_of: Callable[[str], int | None] | None = None,
+    mappings: Sequence[PathRule] = (),
+    node_name: str | None = None,
+    exists: Callable[[str], bool] | None = None,
 ) -> Admission:
     """Measure `spec` against the device it targets, right now.
 
     `size_of` is the on-disk sizer, injectable so tests need not create
     a 200 GiB file to describe one — which Windows would zero-fill.
+    `exists` is its sibling for the file being there at all. `mappings`
+    are this node's `pathMappings`, applied to `modelPath` before
+    anything on disk is asked about it (M11); `node_name` is for the
+    refusal's prose.
     """
     sizer = size_of or model_size_bytes
+    is_there = exists or path_exists
     targets = target_devices(spec, snapshot)
     warnings = list(snapshot.warnings)
     flags = spec.flags or {}
@@ -365,6 +434,15 @@ async def check_admission(
     context_length = (
         int(context) if isinstance(context, int | float | str) and str(context).isdigit() else None
     )
+
+    # Where the model is on this host, before any question about memory.
+    # The stat runs off the event loop: a dead network share blocks for
+    # as long as the OS takes to give up.
+    location = await asyncio.to_thread(_locate, spec, mappings, is_there, sizer)
+    if not location.exists:
+        return _refuse_missing(
+            spec, location, node_name=node_name, context_length=context_length, warnings=warnings
+        )
 
     if not targets:
         return Admission(
@@ -406,8 +484,13 @@ async def check_admission(
             fit = _library_verdict(answer.verdict) if free is not None else AdmissionFit.unknown
             if answer.context_length is not None:
                 context_length = answer.context_length
+            location, mismatch = _compare_sizes(location, answer)
+            if mismatch is not None:
+                warnings.append(mismatch)
     if required is None:
-        size = sizer(spec.modelPath)
+        # Already measured once, at the local path, when the location
+        # was resolved.
+        size = location.sizeBytes
         if size is not None:
             required = int(size * (1 + FILE_SIZE_ALLOWANCE))
             fit = local_verdict(required, free=free, total=total, ram_available=ram_available)
@@ -474,8 +557,91 @@ async def check_admission(
         device=device,
         contextLength=context_length,
         blockers=blockers,
+        location=location,
         reason=reason,
         warning=warning,
+    )
+
+
+def _locate(
+    spec: RuntimeSpec,
+    mappings: Sequence[PathRule],
+    is_there: Callable[[str], bool],
+    sizer: Callable[[str], int | None],
+) -> ModelLocation:
+    """Resolve `modelPath` through this node's mappings and stat it."""
+    resolution = resolve_model_path(spec.modelPath, mappings)
+    local = resolution.local_path
+    present = bool(is_there(local))
+    return ModelLocation(
+        path=spec.modelPath,
+        localPath=local,
+        exists=present,
+        mapping=resolution.rule.as_mapping() if resolution.rule is not None else None,
+        sizeBytes=sizer(local) if present else None,
+    )
+
+
+def _compare_sizes(location: ModelLocation, answer: LibraryFit) -> tuple[ModelLocation, str | None]:
+    """Attach what the library says the file weighs, and whether the
+    file here agrees. A disagreement is a warning, not a refusal: a
+    stale library scan is likelier than a mapping that points at a
+    look-alike, and the engine will say if the file is broken."""
+    if location.sizeBytes is None:
+        return location, None
+    expected = (
+        answer.weights_size_bytes if os.path.isfile(location.localPath) else answer.size_bytes
+    )
+    if expected is None:
+        return location, None
+    matches = expected == location.sizeBytes
+    located = location.model_copy(
+        update={"librarySizeBytes": expected, "sizeMatchesLibrary": matches}
+    )
+    if matches:
+        return located, None
+    return located, (
+        f"{location.localPath} is {location.sizeBytes} bytes here but the library lists "
+        f"{expected} for {location.path}; the mapping may point at a different file, or the "
+        f"library's scan is stale"
+    )
+
+
+def _refuse_missing(
+    spec: RuntimeSpec,
+    location: ModelLocation,
+    *,
+    node_name: str | None,
+    context_length: int | None,
+    warnings: list[str],
+) -> Admission:
+    """The one launch failure the dry run can predict with certainty."""
+    where = f"on {node_name}" if node_name else "on this host"
+    tab = f"Config -> Agent{f' @ {node_name}' if node_name else ''} -> Model directory mappings"
+    if location.mapping is None:
+        fix = (
+            f"Nothing exists at {location.localPath}. If these files live on another machine "
+            f"-- the library's own model directory, say -- mount that share here and add a "
+            f"mapping from the directory as the library spells it to where it is mounted "
+            f"here: {tab}."
+        )
+    else:
+        fix = (
+            f"The mapping {location.mapping.from_} -> {location.mapping.to} applied and "
+            f"nothing exists at {location.localPath}. Check that the share is mounted at "
+            f"{location.mapping.to}, or fix the mapping: {tab}."
+        )
+    return Admission(
+        decision=AdmissionDecision.refuse,
+        fit=AdmissionFit.unknown,
+        basis=AdmissionBasis.file_size,
+        contextLength=context_length,
+        blockers=[],
+        location=location,
+        reason=(
+            f"refuse: {spec.modelPath} is not {where}. {fix} Or pass ?force=true to launch anyway."
+        ),
+        warning="; ".join(warnings) or None,
     )
 
 
@@ -490,6 +656,7 @@ __all__ = [
     "decide",
     "local_verdict",
     "model_size_bytes",
+    "path_exists",
     "pinned_indices",
     "target_devices",
     "wants_full_offload",

@@ -41,6 +41,7 @@ from .dependencies import require_operator_session
 from .routes import auth as auth_routes
 from .routes import components as components_routes
 from .routes import config as config_routes
+from .routes import directories as directories_routes
 from .routes import health as health_routes
 from .routes import node as node_routes
 from .routes import proxy as proxy_routes
@@ -340,6 +341,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # v0.2 protected routes — bearer session token required.
     protected_dependencies = [Depends(require_operator_session)]
     app.include_router(config_routes.router, dependencies=protected_dependencies)
+    # The picker behind every path field (M11). Declares operator-only on
+    # its one route; it lists what the operator could already type.
+    app.include_router(directories_routes.router)
     # The components router declares auth per-route, NOT at the router
     # level: the read endpoints accept operator OR service tokens (so
     # peers can auto-resolve topology), while mutations stay operator-

@@ -50,6 +50,8 @@ def _fake_sizes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Describe a 200 GiB file without creating one — Windows zero-fills
     a truncate, and the first run of this suite took four minutes."""
     monkeypatch.setattr(admission_module, "model_size_bytes", lambda p: _SIZES.get(p))
+    # And that it is there at all (M11): a described file exists.
+    monkeypatch.setattr(admission_module, "path_exists", lambda p: True)
 
 
 def _model(tmp_path: Path, size: int) -> str:

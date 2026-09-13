@@ -21,7 +21,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import security
+from .. import install_proxy, security
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import (
     Admission,
@@ -53,6 +53,7 @@ from ..dependencies import (
 )
 from ..engines.acquisition import AcquisitionError, Unavailable
 from ..engines.devices import detect_devices
+from ..model_paths import rules_from_config
 from ..runtimes import (
     RuntimeSupervisor,
     describe_engines,
@@ -61,6 +62,7 @@ from ..runtimes import (
     validate_spec,
 )
 from ..state import AgentState
+from .proxy import install_topology
 
 log = logging.getLogger(__name__)
 
@@ -136,27 +138,70 @@ def _compose(spec: RuntimeSpec, supervisor: RuntimeSupervisor | None) -> Runtime
 # --------------------------------------------------------------------------- #
 
 
-def _library_client(request: Request) -> LibraryFitClient | None:
-    """The library, if this agent's topology has one.
+async def library_client_for(request: Request) -> LibraryFitClient | None:
+    """The library this agent can ask, if any.
+
+    The one in this agent's own topology when there is one. Otherwise --
+    an enrolled worker declares none, by M9's rule -- the install's,
+    found through the control root the way the console hop finds a
+    component (`install_proxy`: address nodes, not components) and
+    reached through the owning node's agent proxy, with a
+    `service:agent` token this node mints. That is what makes admission
+    on a worker `metadata`-based at all (M11); before it, every launch
+    on the GPU node of the first two-machine install was measured by
+    file size and nothing said so.
+
+    Nothing here is fatal. With no library reachable, admission falls
+    back to file size exactly as it did before, and logs why.
 
     Tests may inject `app.state.library_fit_client` (anything with an
-    async `fit`, or None to force the file-size path).
+    async `fit`, or None to force the file-size path), a
+    `library_transport` for the client to speak through, and a
+    `control_transport` for the lookup.
     """
     if hasattr(request.app.state, "library_fit_client"):
         return request.app.state.library_fit_client  # type: ignore[no-any-return]
     state: AgentState = request.app.state.agent_state
-    entry = next(
-        (e for e in state.list_topology_entries() if e.kind is ComponentKind.library), None
-    )
-    if entry is None:
-        return None
     auth = getattr(request.app.state, "auth_state", None)
     token = (
         security.issue_service_token(signing_key=auth.signing_key, kind="agent")
         if auth is not None and auth.signing_key is not None
         else None
     )
-    return LibraryFitClient(str(entry.url), token)
+    transport = getattr(request.app.state, "library_transport", None)
+
+    entry = next(
+        (e for e in state.list_topology_entries() if e.kind is ComponentKind.library), None
+    )
+    if entry is not None:
+        return LibraryFitClient(str(entry.url), token, transport=transport)
+
+    identity = getattr(request.app.state, "node_identity", None)
+    record = identity.record if identity is not None else None
+    if record is None or not record.enrolled or not record.control_url:
+        return None
+    try:
+        remote = await install_topology(request).owner_of(
+            "library",
+            control_url=str(record.control_url),
+            authorization=request.headers.get("authorization"),
+            transport=getattr(request.app.state, "control_transport", None),
+        )
+    except install_proxy.InstallLookupError as exc:
+        log.info(
+            "no library on this node, and the install's could not be found (%s); "
+            "admission measures by file size",
+            exc,
+        )
+        return None
+    if record.name and remote.name == record.name:
+        # The registry says the library is here and this topology has
+        # none. A disagreement the console hop reports; here it means
+        # there is nothing to ask.
+        return None
+    return LibraryFitClient(
+        f"{remote.agent_url.rstrip('/')}/api/proxy/library", token, transport=transport
+    )
 
 
 async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
@@ -169,12 +214,17 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
         for other in state.list_runtime_specs()
         if other.name != spec.name
     ]
+    identity = getattr(request.app.state, "node_identity", None)
+    node_name = identity.record.name if identity is not None and identity.record.enrolled else None
     return await check_admission(
         spec,
         snapshot=snapshot,
-        library=_library_client(request),
+        library=await library_client_for(request),
         running=running,
         size_of=getattr(request.app.state, "model_size_of", None),
+        mappings=rules_from_config(state.get_config),
+        node_name=node_name,
+        exists=getattr(request.app.state, "model_exists", None),
     )
 
 

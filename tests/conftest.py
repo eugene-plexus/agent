@@ -172,6 +172,11 @@ def app(
     # GPU-less Linux runner behaves like this box.
     app.state.device_detector = lambda: fake_devices()
     app.state.library_fit_client = None
+    # M11: admission refuses a model that is not on this host. Route
+    # tests declare paths like `/models/q.gguf` that exist nowhere, so
+    # the existence check is a seam here too -- everything is present
+    # unless a test says otherwise.
+    app.state.model_exists = lambda path: True
     return app
 
 

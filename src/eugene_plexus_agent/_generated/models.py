@@ -312,6 +312,18 @@ class ConfigValueType(StrEnum):
     `claude_code_cli` driver already serves a model id. UIs without
     a structured renderer for it fall back to editing the JSON.
 
+    `path_mappings` (M11) is an ordered JSON array of `PathMapping`
+    — `{"from": <a directory as another machine states it>, "to":
+    <the same directory on this host>}`. Its one user is the agent's
+    `pathMappings`, which is how a node opens model files a library
+    on another host described by *its* path: `/models` on the NAS
+    is `Z:\\models` here. UIs render it as rows of two directory
+    fields, the right-hand one browsable on the component's own
+    host, and offer the library's configured roots as suggestions
+    for the left. Matching, precedence and translation rules are on
+    the agent's field description, not here — the type promises a
+    list of pairs and nothing about what they mean.
+
     """
 
     string = 'string'
@@ -328,6 +340,7 @@ class ConfigValueType(StrEnum):
     runtime_name = 'runtime_name'
     node_name = 'node_name'
     model_slots = 'model_slots'
+    path_mappings = 'path_mappings'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -580,6 +593,49 @@ class RestartResult(BaseModel):
         None,
         description='Optional human-readable note (e.g. "logs flushed, exiting\nnow"). UI may display this in the restart-progress dialog.\n',
     )
+
+
+class PathMapping(BaseModel):
+    """
+    One rule for reading a path that another machine wrote.
+
+    The library describes each model by its path **on the library's
+    own host**, and a runtime declaration copies that string
+    verbatim — so when the engine runs elsewhere, the agent there is
+    handed a path from a filesystem it does not have. A mapping says
+    where the same directory is on this host: the NAS's `/models`
+    is `Z:\\models` on the Windows box that mounts it. Nothing is
+    copied or cached; the operator mounts the share, and this tells
+    the agent where they mounted it.
+
+    Shared here because it appears in two places on the agent: as
+    the entries of the `pathMappings` config field, and as
+    `ModelLocation.mapping` on an admission answer, which reports
+    the rule that applied. Two definitions of one pair would drift.
+
+    """
+
+    from_: str = Field(
+        ...,
+        alias='from',
+        description="A directory as the other machine states it — in practice a\nlibrary root, spelled exactly as the library's own\n`GET /v1/config` lists it. Its shape decides how it matches:\na drive letter or UNC prefix means Windows rules (case-\ninsensitive, `/` and `\\` interchangeable); a leading `/`\nmeans POSIX rules. The agent cannot know the library's\noperating system, and the string came from it, so the\nstring stands in.\n",
+    )
+    to: str = Field(
+        ...,
+        description="The same directory on the host holding this config. Used\nverbatim, `~` expanded; the remainder of a matched path is\nre-joined onto it with this host's own separator.\n",
+    )
+
+
+class DirectoryEntryKind(StrEnum):
+    """
+    Files appear only when a listing asked for `includeFiles`. A
+    directory picker never does; a `file_path` field's picker would,
+    which is why the flag exists on the endpoint without a UI yet.
+
+    """
+
+    directory = 'directory'
+    file = 'file'
 
 
 class SpawnConfig(BaseModel):
@@ -971,7 +1027,7 @@ class RuntimeSpec(BaseModel):
     engine: EngineKind
     modelPath: str = Field(
         ...,
-        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n",
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through its `pathMappings`, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
     )
     modelAlias: str | None = Field(
         None,
@@ -1193,6 +1249,48 @@ class AdmissionBlocker(BaseModel):
     )
 
 
+class ModelLocation(BaseModel):
+    """
+    Where a declared model path lands on this host (M11).
+
+    The library describes a model by its path on the library's own
+    host; a node that runs the engine elsewhere reaches the same
+    file through a `pathMappings` rule, or not at all. This is the
+    resolution, reported with the declaration so an operator sees
+    both spellings — and reported on the admission dry run so the
+    launch screen can say what will happen before the button is
+    pressed.
+
+    """
+
+    path: str = Field(..., description="The path as declared — the library's spelling.")
+    localPath: str = Field(
+        ...,
+        description='The path this host would open: `path` through the rule in\n`mapping`, or `path` itself when none applied.\n',
+    )
+    exists: bool = Field(
+        ...,
+        description='Whether `localPath` names a file or directory on this host,\nat the moment of measurement. False is what turns the\ndecision to `refuse`.\n',
+    )
+    mapping: PathMapping | None = Field(
+        None, description='The rule that applied, when one did.'
+    )
+    sizeBytes: int | None = Field(
+        None,
+        description='Bytes at `localPath` on this host — one file, or every file\nunder a directory. Absent when it does not exist or could\nnot be measured.\n',
+        ge=0,
+    )
+    librarySizeBytes: int | None = Field(
+        None,
+        description='What the library says the same thing is: its weights file\nfor a file path, its whole `sizeBytes` for a directory.\nAbsent when no library answered.\n',
+        ge=0,
+    )
+    sizeMatchesLibrary: bool | None = Field(
+        None,
+        description='Whether the two sizes agree. Absent when either is absent.\nFalse is a warning and not a refusal: a stale library scan\nafter an upstream replacement is likelier than a mapping\nthat points at a look-alike, and the engine will say if the\nfile is broken. What this cannot catch, and does not\npretend to, is a different file of the same size.\n',
+    )
+
+
 class Component(BaseModel):
     """
     Combined declarative + operational view of one supervised
@@ -1357,6 +1455,18 @@ class ConfigSchema(BaseModel):
     categories: dict[str, str] | None = Field(
         None,
         description='Map from category key (used in `ConfigField.category`) to\na human-readable section label. Optional; UIs may fall back\nto the raw key.\n',
+    )
+
+
+class DirectoryEntry(BaseModel):
+    name: str
+    path: str = Field(
+        ..., description='Absolute path, ready to be used as a config value.'
+    )
+    kind: DirectoryEntryKind
+    hidden: bool | None = Field(
+        False,
+        description='A dot-prefixed name, or the hidden attribute on Windows.\nOnly present in a listing that asked for `showHidden`.\n',
     )
 
 
@@ -1534,6 +1644,10 @@ class Runtime(BaseModel):
     name: str
     engine: EngineKind
     modelPath: str
+    localPath: str | None = Field(
+        None,
+        description="Where **this host** opens the model: `modelPath` resolved\nthrough this node's `pathMappings`, or `modelPath` itself\nwhen no mapping applies (M11). Observed, never declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n",
+    )
     modelAlias: str | None = Field(
         None,
         description='Resolved alias — the declared value, or the derived filename.',
@@ -1611,6 +1725,12 @@ class Admission(BaseModel):
     on everything else, and sharing them would couple the discovery
     screen to the supervisor.
 
+    Since M11 it also answers the question that comes before memory:
+    is the model on this host at all. `location` is where the
+    declared path resolves on this node and whether anything is
+    there, and a `refuse` with `fit: unknown` is that answer being
+    no.
+
     """
 
     decision: AdmissionDecision
@@ -1639,6 +1759,10 @@ class Admission(BaseModel):
         None,
         description="Runtimes currently holding memory on that device, most idle\nfirst. What an operator would stop to make room, and the\nlist the gateway's opt-in eviction walks — restricted there\nto runtimes that declared `idleUnloadSeconds`.\n",
     )
+    location: ModelLocation | None = Field(
+        None,
+        description='Where the declared model is on this host, and whether it is\n(M11). Present on every answer from an agent that computes\nit; absent from an older agent.\n',
+    )
     reason: str = Field(
         ...,
         description='The decision in prose, naming the numbers. A refusal that\ndoes not say why is the complaint this endpoint exists to\nanswer.\n',
@@ -1653,6 +1777,43 @@ class ComponentList(BaseModel):
     components: list[Component] = Field(
         ...,
         description='Components in the order they were configured. The first-run\nwizard fills this in; later editing happens via the\nComponents tab.\n',
+    )
+
+
+class DirectoryListing(BaseModel):
+    """
+    One directory on the component's own host, listed for a picker.
+
+    Returned by `GET /v1/directories` on the library (whose host
+    holds the model roots) and on the agent (whose host holds a
+    path mapping's `to`, and any engine binary an operator points
+    at). The same shape on both, because the UI has one picker and
+    the only thing that differs is which machine's disk it is
+    looking at — which is why `host` is on the response.
+
+    This is the endpoint behind the promise `path_list` has carried
+    since M2: *"an add/remove list of directory pickers"*. It lists
+    what an operator could already type into a path field, on
+    request, to the strongest credential there is; it is not a new
+    capability and it is not a file browser.
+
+    """
+
+    host: str = Field(
+        ...,
+        description='The machine whose disk this is. On a multi-host install the\nanswer to "browse" is frequently a machine other than the\none the browser is on.\n',
+    )
+    path: str | None = Field(
+        None,
+        description='The directory listed, absolute and as this host spells it.\nAbsent when no `path` was asked for, in which case `entries`\nare the places to start from — every drive on Windows, `/`\non POSIX, and the home directory.\n',
+    )
+    parent: str | None = Field(
+        None,
+        description='The directory above `path`, so a picker can go up without\ndoing path arithmetic in a browser. Absent at a filesystem\nroot and when `path` is absent.\n',
+    )
+    entries: list[DirectoryEntry] = Field(
+        ...,
+        description='Sorted by name, directories first. Entries this component\nmay not read are omitted rather than failing the listing.\n',
     )
 
 

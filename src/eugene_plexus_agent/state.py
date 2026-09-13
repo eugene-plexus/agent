@@ -41,6 +41,7 @@ from urllib.parse import urlparse
 
 import yaml
 
+from . import model_paths
 from ._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -162,6 +163,30 @@ CONFIG_FIELDS: list[ConfigField] = [
         category="node",
         valueType=ConfigValueType.url,
     ),
+    ConfigField(
+        key="pathMappings",
+        label="Model directory mappings",
+        description=(
+            "Where another machine's model directories are on THIS host. The "
+            "library describes each model by its path on the machine the library "
+            "runs on, and a launch here is handed that path as-is -- so when the "
+            "library is elsewhere (a NAS, a container), say where the same "
+            "directory is mounted here: from `/models` (the library's directory, "
+            "spelled exactly as its Model directories setting lists it) to "
+            "`Z:\\models` (where you mounted that share on this machine). The "
+            "rest of the path is carried over. Leave this empty when the library "
+            "runs on this machine, or when the share is mounted at the same path "
+            "on both. Nothing is copied or cached: you mount the share, this says "
+            "where. When several entries match, the most specific wins. Applied "
+            "at every launch, so a change takes effect at the next start without "
+            "re-declaring anything; `Runtime.localPath` shows what was opened. "
+            "Test checks each mapping against the library's real files before you "
+            "save it."
+        ),
+        category="storage",
+        valueType=ConfigValueType.path_mappings,
+        default=[],
+    ),
 ]
 CATEGORY_LABELS: dict[str, str] = {
     "setup": "Setup",
@@ -169,6 +194,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "ui": "Appearance",
     "engines": "Engines",
     "node": "Node",
+    "storage": "Model storage",
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}
@@ -552,4 +578,9 @@ def _validate(field: ConfigField, value: Any) -> str | None:
         if not isinstance(value, str):
             return f"expected string, got {type(value).__name__}"
         return None
+    if vt == ConfigValueType.path_mappings:
+        # Shape only. Existence is checked by `POST /v1/config/test`, for
+        # the reason `file_path` gives above: a share about to be mounted
+        # is an environment the operator is about to create.
+        return model_paths.validate_rules(value)
     return f"unsupported valueType for agent config: {vt}"

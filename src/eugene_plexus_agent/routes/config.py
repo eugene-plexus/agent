@@ -7,13 +7,14 @@ the install. See `state.py` for the rationale.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
 
 from fastapi import APIRouter, Request
 
-from .. import enrollment, keyring_store
+from .. import enrollment, keyring_store, model_paths
 from .._generated.common_models import (
     ConfigDocument,
     ConfigSchema,
@@ -22,7 +23,9 @@ from .._generated.common_models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
 )
+from ..admission import model_size_bytes
 from ..state import AgentState
+from .runtimes import library_client_for
 
 log = logging.getLogger(__name__)
 
@@ -58,8 +61,12 @@ async def test_config(
     attempt.
 
     Body's `overrides` are honored so the operator can test a
-    pending switch BEFORE saving it. v0.2 only consumes the
-    `securityMode` override; other fields are no-ops.
+    pending switch BEFORE saving it. Two fields are consumed:
+    `securityMode`, and (M11) `pathMappings` -- each mapping's target is
+    stat'd, and when the library can be reached every model it lists
+    under a mapping's `from` is resolved and checked for being here and
+    being the size the library says. That is the verification that
+    launches nothing, and the Test button beside the mapping editor.
     """
     start = time.perf_counter()
     state: AgentState = request.app.state.agent_state
@@ -72,6 +79,9 @@ async def test_config(
         else state.get_config("securityMode")
     )
 
+    problems: list[str] = []
+    notes: list[str] = []
+
     if effective_mode == "os_keyring":
         # Read whatever's there. Returning None is fine — it means
         # the operator hasn't logged in yet, so nothing's stored.
@@ -80,43 +90,56 @@ async def test_config(
         try:
             keyring_store.get_master_key()
         except Exception as e:
-            elapsed_ms = int((time.perf_counter() - start) * 1000)
-            return ConfigTestResult(
-                ok=False,
-                component="agent",
-                latencyMs=elapsed_ms,
-                error=(
-                    f"OS keyring probe raised {type(e).__name__}: {e}. "
-                    f"securityMode=os_keyring will fail to auto-unlock on "
-                    f"next boot. Switch to prompt_on_startup, or install / "
-                    f"start the platform's keyring backend (Credential "
-                    f"Manager on Windows, Secret Service on Linux, "
-                    f"Keychain on macOS)."
-                ),
+            problems.append(
+                f"OS keyring probe raised {type(e).__name__}: {e}. "
+                f"securityMode=os_keyring will fail to auto-unlock on "
+                f"next boot. Switch to prompt_on_startup, or install / "
+                f"start the platform's keyring backend (Credential "
+                f"Manager on Windows, Secret Service on Linux, "
+                f"Keychain on macOS)."
             )
-        elapsed_ms = int((time.perf_counter() - start) * 1000)
-        return ConfigTestResult(
-            ok=True,
-            component="agent",
-            latencyMs=elapsed_ms,
-            summary=(
+        else:
+            notes.append(
                 "OS keyring backend is reachable. Auto-unlock will work "
                 "on next boot once the operator has logged in (the "
                 "master key is persisted on login or on securityMode "
                 "transition to os_keyring)."
-            ),
-        )
-
-    elapsed_ms = int((time.perf_counter() - start) * 1000)
-    return ConfigTestResult(
-        ok=True,
-        component="agent",
-        latencyMs=elapsed_ms,
-        summary=(
+            )
+    else:
+        notes.append(
             f"securityMode={effective_mode}; no external dependency to "
             f"verify. (Switch to os_keyring to probe the OS secret "
             f"store round-trip.)"
-        ),
+        )
+
+    raw_rules = (
+        overrides[model_paths.CONFIG_KEY]
+        if model_paths.CONFIG_KEY in overrides
+        else state.get_config(model_paths.CONFIG_KEY)
+    )
+    rules = model_paths.parse_rules(raw_rules)
+    if rules:
+        library = await library_client_for(request)
+        models = await library.list_models() if library is not None else None
+        # Real filesystem calls, off the event loop: a mapping whose
+        # target is a dead share blocks for as long as the OS allows.
+        checks = await asyncio.to_thread(
+            model_paths.check_rules, rules, models, size_of=model_size_bytes
+        )
+        _ok, summary, error = model_paths.describe_checks(
+            checks, library_consulted=models is not None
+        )
+        notes.append(summary)
+        if error is not None:
+            problems.append(error)
+
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    return ConfigTestResult(
+        ok=not problems,
+        component="agent",
+        latencyMs=elapsed_ms,
+        summary=" ".join(notes) or None,
+        error="; ".join(problems) or None,
     )
 
 

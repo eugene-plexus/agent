@@ -18,6 +18,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "uiFontSize",
         "vllmBinary",
         "advertiseUrl",
+        "pathMappings",
     }
     # `vllmBinary` is a plain config field on purpose — the generic editor
     # renders a `file_path` with no engine-specific UI code.
