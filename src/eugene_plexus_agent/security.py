@@ -303,6 +303,51 @@ def issue_service_token(
     return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
 
 
+CLOCK_SKEW_LEEWAY_SECONDS = 300
+"""How far apart two hosts' clocks may drift before a token is refused.
+
+Five minutes: Kerberos's `MaxClockSkew`, and the window Entra and most
+OAuth validators apply to `iat`, `nbf` and `exp`. **It was zero until
+2026-09-15.** On the live two-machine install the control root's clock
+ran half a second ahead of a worker whose Windows Time service had
+stopped, and every token the root minted in the first half of each
+second was refused by that worker as "not yet valid (iat)" a few
+milliseconds later. Long-lived tokens (the gateway's, the operator's
+session) passed, every health check said ok, and the root listed the
+node `down` with no reason -- so it read as a key or enrollment fault
+and was neither. A skew large enough to matter for security is a
+broken clock; a broken clock is *reported* (`_note_clock_skew`), not
+enforced by refusing traffic between two healthy hosts.
+"""
+
+_SKEW_WARN_AFTER_SECONDS = 2.0
+_SKEW_WARN_INTERVAL_SECONDS = 60.0
+_last_skew_warning = 0.0
+
+
+def _note_clock_skew(iat: int, *, now: float | None = None) -> None:
+    """Warn, at most once a minute, when a token was issued in this host's future.
+
+    Accepted within `CLOCK_SKEW_LEEWAY_SECONDS`, so nothing breaks. Logged
+    so a wrong clock on either host is visible long before the skew grows
+    past the leeway and starts refusing traffic.
+    """
+    global _last_skew_warning
+    current = time.time() if now is None else now
+    ahead = iat - current
+    if ahead <= _SKEW_WARN_AFTER_SECONDS:
+        return
+    if current - _last_skew_warning < _SKEW_WARN_INTERVAL_SECONDS:
+        return
+    _last_skew_warning = current
+    log.warning(
+        "accepted a token issued %.1f s in this host's future: the issuer's clock or "
+        "this host's is wrong (tolerated up to %d s, then tokens are refused)",
+        ahead,
+        CLOCK_SKEW_LEEWAY_SECONDS,
+    )
+
+
 def decode_token(
     *,
     token: str,
@@ -337,7 +382,9 @@ def decode_token(
         # PyJWT validates against time.time() internally. Tests using
         # the `now` parameter validate by setting the iat/exp explicitly.
         pass
+    decode_kwargs["leeway"] = CLOCK_SKEW_LEEWAY_SECONDS
     claims = jwt.decode(token, **decode_kwargs)
+    _note_clock_skew(int(claims["iat"]))
     return TokenPayload(
         sub=str(claims["sub"]),
         aud=str(claims["aud"]),
