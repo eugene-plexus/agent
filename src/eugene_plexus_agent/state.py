@@ -165,23 +165,21 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="pathMappings",
-        label="Model directory mappings",
+        label="Library folder overrides",
         description=(
-            "Where another machine's model directories are on THIS host. The "
-            "library describes each model by its path on the machine the library "
-            "runs on, and a launch here is handed that path as-is -- so when the "
-            "library is elsewhere (a NAS, a container), say where the same "
-            "directory is mounted here: from `/models` (the library's directory, "
-            "spelled exactly as its Model directories setting lists it) to "
-            "`Z:\\models` (where you mounted that share on this machine). The "
-            "rest of the path is carried over. Leave this empty when the library "
-            "runs on this machine, or when the share is mounted at the same path "
-            "on both. Nothing is copied or cached: you mount the share, this says "
-            "where. When several entries match, the most specific wins. Applied "
-            "at every launch, so a change takes effect at the next start without "
-            "re-declaring anything; `Runtime.localPath` shows what was opened. "
-            "Test checks each mapping against the library's real files before you "
-            "save it."
+            "Only where THIS machine mounts a Library folder somewhere other than "
+            "the folder's own mounts say. Leave this empty: a Library folder "
+            "carries the mounts its nodes reach it by (Library -> Folders), one "
+            "for Linux/macOS nodes and one for Windows nodes, and this machine "
+            "inherits the one of its kind. Add a row here only for the odd box "
+            "-- from `/models` (the folder, spelled exactly as the Library lists "
+            "it) to `Z:\\models` (where this machine mounted that share). The "
+            "rest of the path is carried over; the most specific rule wins; an "
+            "override beats the folder's mount. Applied at every launch, so a "
+            "change takes effect at the next start without re-declaring "
+            "anything; `Runtime.localPath` shows what was opened. Nothing is "
+            "copied or cached: you mount the share, this says where. Test checks "
+            "the rule against the Library's real files before you save it."
         ),
         category="storage",
         valueType=ConfigValueType.path_mappings,
@@ -194,7 +192,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "ui": "Appearance",
     "engines": "Engines",
     "node": "Node",
-    "storage": "Model storage",
+    "storage": "Library",
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}

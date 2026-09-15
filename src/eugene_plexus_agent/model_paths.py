@@ -370,7 +370,11 @@ def describe_checks(
                 + ", ".join(check.mismatched[:5])
             )
     if not checks:
-        return True, "No model directory mappings configured.", None
+        return (
+            True,
+            "No Library folder rule applies on this host: every folder opens at its own path.",
+            None,
+        )
     summary = "; ".join(lines) if lines else f"{len(checks)} mapping(s) checked."
     if not library_consulted and lines:
         summary += ". The library could not be consulted, so only the directories were checked."

@@ -14,18 +14,20 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from .. import enrollment, keyring_store, model_paths
+from .. import enrollment, keyring_store, library_folders, model_paths
 from .._generated.common_models import (
     ConfigDocument,
+    ConfigFieldError,
     ConfigSchema,
     ConfigTestRequest,
     ConfigTestResult,
     ConfigUpdateRequest,
     ConfigUpdateResult,
 )
+from .._generated.models import LibraryFolderCheckRequest, LibraryFolderReach
 from ..admission import model_size_bytes
 from ..state import AgentState
-from .runtimes import library_client_for
+from .runtimes import folder_cache_for, library_client_for, refresh_library_folders
 
 log = logging.getLogger(__name__)
 
@@ -117,7 +119,16 @@ async def test_config(
         if model_paths.CONFIG_KEY in overrides
         else state.get_config(model_paths.CONFIG_KEY)
     )
-    rules = model_paths.parse_rules(raw_rules)
+    # The EFFECTIVE rules (2026-09-14): the overrides under test, then
+    # the Library folders' mounts they do not shadow -- so the Test
+    # button on the agent's own field stays honest about what a spawn
+    # would open.
+    await refresh_library_folders(request)
+    cache = folder_cache_for(request)
+    rules = library_folders.effective_rules(
+        model_paths.parse_rules(raw_rules),
+        cache.inherited_rules() if cache is not None else (),
+    )
     if rules:
         library = await library_client_for(request)
         models = await library.list_models() if library is not None else None
@@ -153,7 +164,10 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     # and shouldn't know about OS secret stores.
     prior_mode = state.get_config("securityMode")
     prior_advertise = state.get_config("advertiseUrl")
+    body, folder_rejection = await _check_overrides_name_folders(request, body)
     result = state.apply_config_patch(body)
+    if folder_rejection is not None:
+        result.rejected.append(folder_rejection)
     new_mode = state.get_config("securityMode")
 
     # An operator who changes where this host is reachable has to reach
@@ -184,6 +198,78 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
             log.info("securityMode changed to os_keyring; persisted master key for auto-unlock")
 
     return result
+
+
+async def _check_overrides_name_folders(
+    request: Request, body: ConfigUpdateRequest
+) -> tuple[ConfigUpdateRequest, ConfigFieldError | None]:
+    """`pathMappings` is this node's overrides of Library folders, so a
+    `from` that is no Library folder is rejected -- when the folder list
+    is known. Never fetched means accepted with a warning: refusing an
+    edit because the library is down would be the wrong kind of strict.
+    The rest of the patch still applies."""
+    patch = body.model_dump(exclude_unset=True)
+    raw = patch.get(model_paths.CONFIG_KEY)
+    if raw is None:
+        return body, None
+    await refresh_library_folders(request)
+    cache = folder_cache_for(request)
+    if cache is None or not cache.known:
+        log.warning(
+            "pathMappings saved without checking against the Library's folders: this node "
+            "has never read them"
+        )
+        return body, None
+    known = {library_folders.identity(f.path) for f in cache.folders or []}
+    for index, rule in enumerate(model_paths.parse_rules(raw)):
+        if library_folders.identity(rule.source) not in known:
+            del patch[model_paths.CONFIG_KEY]
+            return ConfigUpdateRequest.model_validate(patch), ConfigFieldError(
+                key=model_paths.CONFIG_KEY,
+                message=(
+                    f"entry {index}: {rule.source!r} is not a Library folder. An override says "
+                    f"where THIS machine mounts a Library folder; add the directory to the "
+                    f"Library first (Library -> Folders), then say where it is here."
+                ),
+            )
+    return body, None
+
+
+@router.post("/v1/library/folders/check", response_model=LibraryFolderReach)
+async def check_library_folders(
+    request: Request, body: LibraryFolderCheckRequest | None = None
+) -> LibraryFolderReach:
+    """Where each Library folder is on this host, and whether it is there.
+
+    One row per folder: the path this node would open, which rule said
+    so (the folder's own mount, this node's override, or none), whether
+    it exists here, and how many of the library's models under it are
+    reachable. `pathMappings` in the body stands in for the saved
+    overrides -- the Test beside an unsaved edit. Refreshes this node's
+    copy of the folder list on the way when the library can be reached.
+    """
+    state: AgentState = request.app.state.agent_state
+    cache = folder_cache_for(request)
+    if cache is None:
+        return LibraryFolderReach(libraryConsulted=False, folders=[])
+    consulted = await refresh_library_folders(request)
+    if body is not None and body.pathMappings is not None:
+        overrides = model_paths.parse_rules(
+            [m.model_dump(by_alias=True) for m in body.pathMappings]
+        )
+    else:
+        overrides = model_paths.parse_rules(state.get_config(model_paths.CONFIG_KEY))
+    library = await library_client_for(request)
+    models = await library.list_models() if library is not None else None
+    # Real filesystem calls, off the event loop: a dead share blocks for
+    # as long as the OS allows.
+    return await asyncio.to_thread(
+        library_folders.check_reach,
+        cache,
+        overrides,
+        models,
+        library_consulted=consulted,
+    )
 
 
 async def _announce_advertise_url(request: Request) -> None:

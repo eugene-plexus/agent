@@ -163,6 +163,24 @@ class LibraryFitClient:
             log.info("library unreachable for its model list (%s)", e)
             return None
 
+    async def folders(self) -> list[dict[str, Any]] | None:
+        """The library's folders with their mounts, raw -- what this node
+        inherits its path rules from (2026-09-14). None when it could not
+        answer, and the node keeps its last copy."""
+        try:
+            async with httpx.AsyncClient(
+                timeout=_LIBRARY_TIMEOUT_SECONDS, transport=self._transport
+            ) as client:
+                response = await client.get(f"{self._base}/v1/folders", headers=self._headers)
+                if response.status_code >= 400:
+                    log.info("library folder list returned %d", response.status_code)
+                    return None
+                folders = response.json().get("folders")
+                return folders if isinstance(folders, list) else None
+        except (httpx.HTTPError, ValueError) as e:
+            log.info("library unreachable for its folder list (%s)", e)
+            return None
+
     async def fit(
         self,
         model_path: str,
@@ -617,19 +635,19 @@ def _refuse_missing(
 ) -> Admission:
     """The one launch failure the dry run can predict with certainty."""
     where = f"on {node_name}" if node_name else "on this host"
-    tab = f"Config -> Agent{f' @ {node_name}' if node_name else ''} -> Model directory mappings"
+    tab = f"Library -> {node_name or 'this machine'} -> Folders"
     if location.mapping is None:
         fix = (
             f"Nothing exists at {location.localPath}. If these files live on another machine "
-            f"-- the library's own model directory, say -- mount that share here and add a "
-            f"mapping from the directory as the library spells it to where it is mounted "
-            f"here: {tab}."
+            f"-- the Library's own folder, say -- mount that share here and say where: on the "
+            f"Library folder's mounts, so every node of this kind inherits it, or as this "
+            f"node's own override: {tab}."
         )
     else:
         fix = (
-            f"The mapping {location.mapping.from_} -> {location.mapping.to} applied and "
+            f"The rule {location.mapping.from_} -> {location.mapping.to} applied and "
             f"nothing exists at {location.localPath}. Check that the share is mounted at "
-            f"{location.mapping.to}, or fix the mapping: {tab}."
+            f"{location.mapping.to}, or fix the folder's mount or this node's override: {tab}."
         )
     return Admission(
         decision=AdmissionDecision.refuse,

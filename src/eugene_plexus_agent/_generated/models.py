@@ -324,6 +324,22 @@ class ConfigValueType(StrEnum):
     the agent's field description, not here — the type promises a
     list of pairs and nothing about what they mean.
 
+    `library_folders` (2026-09-14) is an ordered JSON array of
+    `LibraryFolder` — `{"path": <a directory on the library's
+    host>, "mounts": [<where other machines find the same
+    directory>, ...]}`. Its one user is the library's `modelRoots`,
+    which was a `path_list` until the reach of a folder moved onto
+    the folder: a folder is one exported share, mounted the same
+    way on every node of one OS, so the library says where once and
+    every node inherits it rather than each node carrying a row per
+    folder. A bare string is accepted wherever a `LibraryFolder` is
+    expected and means a folder with no mounts — so a config file,
+    a PATCH body or a default written for `path_list` still works,
+    and `GET /v1/config` always answers in the object form. UIs
+    render it as rows of one browsable directory (the library's
+    host) plus its mounts; the per-node grid over it is the
+    Library's Folders page, not this field.
+
     """
 
     string = 'string'
@@ -341,6 +357,7 @@ class ConfigValueType(StrEnum):
     node_name = 'node_name'
     model_slots = 'model_slots'
     path_mappings = 'path_mappings'
+    library_folders = 'library_folders'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -623,6 +640,41 @@ class PathMapping(BaseModel):
     to: str = Field(
         ...,
         description="The same directory on the host holding this config. Used\nverbatim, `~` expanded; the remainder of a matched path is\nre-joined onto it with this host's own separator.\n",
+    )
+
+
+class LibraryFolder(BaseModel):
+    """
+    One directory the library catalogues, and where other machines
+    find it (2026-09-14).
+
+    `path` is the directory as the library's own host spells it —
+    what the scanner walks, what a `ModelSummary.path` starts with,
+    the left-hand side of every rule that reaches it. `mounts` is
+    the same directory as **other** machines see it: a POSIX-shaped
+    entry is for Linux and macOS nodes, a Windows-shaped one (drive
+    letter or UNC) for Windows nodes, and a node takes the first
+    entry of its own shape. That is the whole of "how does node X
+    reach folder Y" for every node that mounts the share where the
+    folder says; a node that mounts it elsewhere carries one
+    override in its agent's `pathMappings`, and a node with no
+    mount of its shape opens `path` as written — the identical-mount
+    convention, and every single-host install.
+
+    The rule this replaces was per node per folder, on each node's
+    agent, and grew as nodes × folders with every row typed by hand.
+    This is per folder, stated once. Nothing is copied or cached:
+    the operator mounts the share, this says where.
+
+    """
+
+    path: str = Field(
+        ...,
+        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
+    )
+    mounts: list[str] | None = Field(
+        [],
+        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
     )
 
 
@@ -1027,7 +1079,7 @@ class RuntimeSpec(BaseModel):
     engine: EngineKind
     modelPath: str = Field(
         ...,
-        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through its `pathMappings`, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
     )
     modelAlias: str | None = Field(
         None,
@@ -1289,6 +1341,40 @@ class ModelLocation(BaseModel):
         None,
         description='Whether the two sizes agree. Absent when either is absent.\nFalse is a warning and not a refusal: a stale library scan\nafter an upstream replacement is likelier than a mapping\nthat points at a look-alike, and the engine will say if the\nfile is broken. What this cannot catch, and does not\npretend to, is a different file of the same size.\n',
     )
+
+
+class LibraryFolderCheckRequest(BaseModel):
+    """
+    Optional overrides for `POST /v1/library/folders/check`. Same
+    idea as `ConfigTestRequest`: what is sent stands in for the
+    saved value for this answer only.
+
+    """
+
+    pathMappings: list[PathMapping] | None = Field(
+        None,
+        description="This node's overrides as they would be after an unsaved\nedit. Absent means the saved ones.\n",
+    )
+
+
+class FolderReachSource(StrEnum):
+    """
+    Which rule decided a folder's `localPath` on this host.
+
+    * `same_path` — no rule applied; the folder's own path is
+      opened as written. Every single-host install, and any node
+      that mounts the share at the same path the library uses.
+    * `inherited` — the folder's `mounts` carried an entry of this
+      host's OS shape. Stated once on the Library, nothing on this
+      node.
+    * `override` — this node's `pathMappings` named the folder, and
+      won.
+
+    """
+
+    same_path = 'same_path'
+    inherited = 'inherited'
+    override = 'override'
 
 
 class Component(BaseModel):
@@ -1646,7 +1732,7 @@ class Runtime(BaseModel):
     modelPath: str
     localPath: str | None = Field(
         None,
-        description="Where **this host** opens the model: `modelPath` resolved\nthrough this node's `pathMappings`, or `modelPath` itself\nwhen no mapping applies (M11). Observed, never declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n",
+        description="Where **this host** opens the model: `modelPath` resolved\nthrough the Library folder's `mounts` for this OS and this\nnode's `pathMappings` overrides, or `modelPath` itself when\nno rule applies (M11; the folder half 2026-09-14). Observed,\nnever declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n",
     )
     modelAlias: str | None = Field(
         None,
@@ -1773,6 +1859,43 @@ class Admission(BaseModel):
     )
 
 
+class LibraryFolderStatus(BaseModel):
+    """
+    One Library folder as this host reaches it.
+    """
+
+    path: str = Field(..., description='The folder as the library spells it.')
+    localPath: str = Field(..., description='The path this host would open for it.')
+    source: FolderReachSource
+    mount: str | None = Field(
+        None,
+        description="The folder's mount this host's OS shape selected, when the\nsource is `inherited`. Absent otherwise.\n",
+    )
+    override: PathMapping | None = Field(
+        None, description='The `pathMappings` rule that applied, when one did.'
+    )
+    exists: bool = Field(
+        ..., description='Whether `localPath` exists on this host, now.'
+    )
+    isDirectory: bool | None = Field(
+        None, description='Whether it is a directory. Absent when it does not exist.'
+    )
+    modelsUnder: int | None = Field(
+        None,
+        description='How many models the library lists under this folder. Absent\nwhen the library was not consulted.\n',
+        ge=0,
+    )
+    modelsReachable: int | None = Field(
+        None,
+        description='How many of those exist at their resolved path here. Absent\nwith `modelsUnder`.\n',
+        ge=0,
+    )
+    problem: str | None = Field(
+        None,
+        description='What is wrong, in a sentence, when something is: the path\nis missing, not a directory, or models the library lists\nare not where the rule says. Absent when nothing is.\n',
+    )
+
+
 class ComponentList(BaseModel):
     components: list[Component] = Field(
         ...,
@@ -1858,6 +1981,28 @@ class EngineDescriptor(BaseModel):
 
 class RuntimeList(BaseModel):
     runtimes: list[Runtime]
+
+
+class LibraryFolderReach(BaseModel):
+    """
+    The answer to "how does this node reach each Library folder",
+    one row per folder (2026-09-14).
+
+    """
+
+    libraryConsulted: bool = Field(
+        ...,
+        description="Whether the library answered during this call. False means\nthe rows come from this node's last copy of its folder\nlist, or there are none because it has never been read —\n`folders` is then empty and `folderListAgeSeconds` absent,\nand the declaration check on `POST /v1/runtimes` is being\nskipped with a warning.\n",
+    )
+    folderListAgeSeconds: int | None = Field(
+        None,
+        description='How long ago the folder list was last read from the library.\nZero when `libraryConsulted`. Absent when never.\n',
+        ge=0,
+    )
+    libraryUrl: str | None = Field(
+        None, description='Where the library was, or was looked for.'
+    )
+    folders: list[LibraryFolderStatus]
 
 
 class EngineList(BaseModel):

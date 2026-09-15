@@ -79,8 +79,8 @@ async def test_a_model_that_is_not_here_is_refused_with_the_fix() -> None:
     assert result.location.localPath == "/models/q.gguf"
     assert result.location.mapping is None
     assert result.reason.startswith("refuse: /models/q.gguf is not on Amish_Station.")
-    assert "mount that share here and add a mapping" in result.reason
-    assert "Config -> Agent @ Amish_Station -> Model directory mappings" in result.reason
+    assert "mount that share here and say where" in result.reason
+    assert "Library -> Amish_Station -> Folders" in result.reason
     assert "?force=true" in result.reason
 
 
@@ -102,7 +102,7 @@ async def test_a_mapping_whose_target_is_missing_names_the_mount() -> None:
         "from": "/models",
         "to": "Z:\\models",
     }
-    assert "The mapping /models -> Z:\\models applied" in result.reason
+    assert "The rule /models -> Z:\\models applied" in result.reason
     assert "Check that the share is mounted at Z:\\models" in result.reason
     assert "is not on this host" in result.reason
 
@@ -253,7 +253,7 @@ def test_a_create_of_a_model_that_is_not_here_is_a_422_naming_the_fix(
     assert response.status_code == 422
     detail = response.json()["detail"]["detail"]
     assert detail.startswith("refuse: /models/q.gguf is not on this host.")
-    assert "Model directory mappings" in detail
+    assert "Library -> this machine -> Folders" in detail
     assert authed_client.get("/v1/runtimes").json()["runtimes"] == []
     # And no companion driver was declared for it.
     names = [c["name"] for c in authed_client.get("/v1/components").json()["components"]]
@@ -418,11 +418,14 @@ def test_a_worker_reaches_the_installs_library_through_its_node(
     assert body["location"]["localPath"] == str(here)
     assert body["location"]["librarySizeBytes"] == 10
     assert body["location"]["sizeMatchesLibrary"] is True
-    # Through the OWNING NODE's agent proxy, never a component URL.
+    # Through the OWNING NODE's agent proxy, never a component URL. The
+    # folder list rides the same hop (2026-09-14): a worker inherits its
+    # path rules from the Library it reaches this way.
     assert all(
-        str(r.url).startswith("http://root.invalid:8279/api/proxy/library/v1/models")
+        str(r.url).startswith("http://root.invalid:8279/api/proxy/library/v1/")
         for r in upstream.requests
     ), [str(r.url) for r in upstream.requests]
+    assert any(str(r.url).endswith("/v1/folders") for r in upstream.requests)
     # With a token this node minted for itself.
     assert all(r.headers.get("authorization", "").startswith("Bearer ") for r in upstream.requests)
 

@@ -56,7 +56,8 @@ from .engines.acquisition import (
 from .engines.base import DiscoveredBinary
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
-from .model_paths import resolve_model_path, rules_from_config
+from .library_folders import RulesProvider, effective_rules
+from .model_paths import PathRule, resolve_model_path, rules_from_config
 from .supervisor import (
     ProcessState,
     SpawnPlan,
@@ -101,11 +102,16 @@ class _RuntimePlanner:
         adapter: EngineAdapter,
         log: logging.Logger,
         get_config: ConfigGetter | None = None,
+        inherited_rules: RulesProvider | None = None,
     ) -> None:
         self.spec = spec
         self._adapter = adapter
         self._log = log
         self._get_config = get_config
+        # The Library folders' mounts for this host, read live like the
+        # config (2026-09-14). This node's `pathMappings` are the
+        # overrides and come first.
+        self._inherited_rules = inherited_rules
         self.binary: DiscoveredBinary | None = None
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
         so the operator sees the build that is actually running rather than
@@ -185,21 +191,27 @@ class _RuntimePlanner:
             cwd=self._adapter.working_directory(launch_spec, binary),
         )
 
+    def _rules(self) -> list[PathRule]:
+        return effective_rules(
+            rules_from_config(self._get_config),
+            self._inherited_rules() if self._inherited_rules is not None else (),
+        )
+
     def _launch_spec(self) -> RuntimeSpec:
         """The declaration as the engine should see it.
 
-        `modelPath` resolved through this node's `pathMappings`, read
-        live so a mapping added after the declaration applies at the
-        next start with nothing re-declared. Everything else is the
-        declaration verbatim. Logged when a rule applied, because an
-        argv naming a path nobody typed makes a later bug report
-        unreadable.
+        `modelPath` resolved through the Library folder's mount for this
+        host and this node's `pathMappings` overrides, read live so a
+        rule added after the declaration applies at the next start with
+        nothing re-declared. Everything else is the declaration
+        verbatim. Logged when a rule applied, because an argv naming a
+        path nobody typed makes a later bug report unreadable.
         """
-        resolution = resolve_model_path(self.spec.modelPath, rules_from_config(self._get_config))
+        resolution = resolve_model_path(self.spec.modelPath, self._rules())
         if resolution.rule is None:
             return self.spec
         self._log.info(
-            "%s: opening %s as %s (mapping %s)",
+            "%s: opening %s as %s (rule %s)",
             self.spec.name,
             self.spec.modelPath,
             resolution.local_path,
@@ -246,12 +258,17 @@ class RuntimeSupervisor:
         self,
         log: logging.Logger | None = None,
         get_config: ConfigGetter | None = None,
+        inherited_rules: RulesProvider | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
         # Read live at plan time, so an operator who sets `vllmBinary` in
         # the UI gets the new path on the next spawn without restarting
         # the agent.
         self._get_config = get_config
+        # The Library folders' mounts for this host (2026-09-14), also
+        # read live -- this node's copy of the library's folder list,
+        # refreshed by every request that talks to the library.
+        self._inherited_rules = inherited_rules
         self._processes: dict[str, SupervisedProcess] = {}
         self._planners: dict[str, _RuntimePlanner] = {}
         # Latest readiness per runtime. Held here rather than on the
@@ -290,7 +307,9 @@ class RuntimeSupervisor:
                 spec.engine.value,
             )
             return
-        planner = _RuntimePlanner(spec, adapter, self._log, self._get_config)
+        planner = _RuntimePlanner(
+            spec, adapter, self._log, self._get_config, inherited_rules=self._inherited_rules
+        )
         sp = SupervisedProcess(planner, self._log)
         self._planners[spec.name] = planner
         self._processes[spec.name] = sp
@@ -359,6 +378,12 @@ class RuntimeSupervisor:
 
     # --- read model -------------------------------------------------------
 
+    def _rules(self) -> list[PathRule]:
+        return effective_rules(
+            rules_from_config(self._get_config),
+            self._inherited_rules() if self._inherited_rules is not None else (),
+        )
+
     def compose(self, spec: RuntimeSpec) -> Runtime:
         """Pair a declaration with what is observed of it."""
         sp = self._processes.get(name := spec.name)
@@ -403,11 +428,9 @@ class RuntimeSupervisor:
             name=spec.name,
             engine=spec.engine,
             modelPath=spec.modelPath,
-            # Observed, from the current mapping, every time it is read:
+            # Observed, from the current rules, every time it is read:
             # a stopped runtime shows what its next start would open.
-            localPath=resolve_model_path(
-                spec.modelPath, rules_from_config(self._get_config)
-            ).local_path,
+            localPath=resolve_model_path(spec.modelPath, self._rules()).local_path,
             modelAlias=spec.modelAlias or _default_alias(spec),
             host=spec.host,
             port=spec.port,

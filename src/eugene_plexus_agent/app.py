@@ -38,6 +38,7 @@ from . import (
 )
 from .auth_state import AuthState
 from .dependencies import require_operator_session
+from .library_folders import FOLDERS_FILE, LibraryFolderCache
 from .routes import auth as auth_routes
 from .routes import components as components_routes
 from .routes import config as config_routes
@@ -158,10 +159,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # and deliberately a separate object: it owns the readiness polling
     # that only engines have, and nothing about a component's health
     # story applies to a foreign binary.
+    # This node's copy of the Library's folder list (2026-09-14), beside
+    # agent.yaml. Every request that talks to the library refreshes it;
+    # a spawn reads it, so an agent that restarts with the library down
+    # still resolves a folder's mount. Tests may inject their own.
+    if not hasattr(app.state, "library_folders"):
+        folders_cache = LibraryFolderCache(settings.config_file.resolve().parent / FOLDERS_FILE)
+        if not settings.safe_mode:
+            folders_cache.load()
+        app.state.library_folders = folders_cache
+    else:
+        folders_cache = app.state.library_folders
+
     if not hasattr(app.state, "runtime_supervisor"):
         # The agent's config is where an install-wide engine path
         # (`vllmBinary`) lives; the supervisor reads it at each spawn.
-        runtime_supervisor = RuntimeSupervisor(log=log, get_config=state.get_config)
+        runtime_supervisor = RuntimeSupervisor(
+            log=log,
+            get_config=state.get_config,
+            inherited_rules=folders_cache.inherited_rules,
+        )
         owns_runtimes = True
     else:
         runtime_supervisor = app.state.runtime_supervisor

@@ -21,7 +21,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import install_proxy, security
+from .. import install_proxy, library_folders, security
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import (
     Admission,
@@ -53,7 +53,7 @@ from ..dependencies import (
 )
 from ..engines.acquisition import AcquisitionError, Unavailable
 from ..engines.devices import detect_devices
-from ..model_paths import rules_from_config
+from ..model_paths import PathRule, rules_from_config
 from ..runtimes import (
     RuntimeSupervisor,
     describe_engines,
@@ -204,9 +204,72 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
     )
 
 
+def folder_cache_for(request: Request) -> library_folders.LibraryFolderCache | None:
+    """This node's copy of the Library's folders, when the app has one."""
+    cache = getattr(request.app.state, "library_folders", None)
+    return cache if isinstance(cache, library_folders.LibraryFolderCache) else None
+
+
+def effective_rules_for(request: Request) -> list[PathRule]:
+    """This node's `pathMappings` overrides, then the Library folders'
+    mounts for this host -- the rules a spawn uses (2026-09-14)."""
+    state: AgentState = request.app.state.agent_state
+    cache = folder_cache_for(request)
+    return library_folders.effective_rules(
+        rules_from_config(state.get_config),
+        cache.inherited_rules() if cache is not None else (),
+    )
+
+
+async def refresh_library_folders(request: Request) -> bool:
+    """Read the library's folders into this node's copy, once per request.
+
+    Spends the request's own credential through `library_client_for`,
+    which is why there is no background loop: the install-wide lookup
+    carries the caller's token and nothing else. True when the library
+    answered on this request.
+    """
+    done = getattr(request.state, "library_folders_refreshed", None)
+    if done is not None:
+        return bool(done)
+    cache = folder_cache_for(request)
+    answered = False
+    if cache is not None:
+        answered = await library_folders.refresh(cache, await library_client_for(request))
+    request.state.library_folders_refreshed = answered
+    return answered
+
+
+def require_library_folder(request: Request, model_path: str) -> None:
+    """A node runs only what the Library catalogues (2026-09-14).
+
+    400 when `model_path` lies under none of the Library's folders. When
+    the folder list has never been read from this node, the check is
+    skipped with a warning rather than refusing every launch -- a worker
+    in its first minute, a single box whose library has not started.
+    """
+    cache = folder_cache_for(request)
+    if cache is None or not cache.known:
+        log.warning(
+            "%s was not checked against the Library's folders: this node has never read "
+            "them (no library reachable). It launches on M11's terms; "
+            "POST /v1/library/folders/check says when the list arrives.",
+            model_path,
+        )
+        return
+    if cache.folder_for(model_path) is None:
+        raise _problem(
+            code=status.HTTP_400_BAD_REQUEST,
+            slug="model-not-in-library",
+            title="Not a Library model",
+            detail=library_folders.not_in_library_detail(model_path),
+        )
+
+
 async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
+    await refresh_library_folders(request)
     detector = getattr(request.app.state, "device_detector", None) or detect_devices
     snapshot = await asyncio.to_thread(detector)
     running = [
@@ -222,7 +285,7 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
         library=await library_client_for(request),
         running=running,
         size_of=getattr(request.app.state, "model_size_of", None),
-        mappings=rules_from_config(state.get_config),
+        mappings=effective_rules_for(request),
         node_name=node_name,
         exists=getattr(request.app.state, "model_exists", None),
     )
@@ -425,6 +488,12 @@ async def create_runtime(
             detail=reason,
         )
 
+    # A node runs only what the Library catalogues. Checked before the
+    # companion is declared, or a refused runtime would leave a driver
+    # behind -- the same ordering the companion-name check keeps.
+    await refresh_library_folders(request)
+    require_library_folder(request, body.modelPath)
+
     # The companion's name has to be free before anything is written, or
     # a refused companion would leave a runtime declared with no driver
     # and the operator believing it has one.
@@ -508,6 +577,8 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
             title="Invalid runtime spec",
             detail=reason,
         )
+    await refresh_library_folders(request)
+    require_library_folder(request, body.modelPath)
     previous = state.get_runtime_spec(name)
     if previous is None:
         raise _not_found(name)

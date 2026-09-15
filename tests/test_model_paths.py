@@ -273,6 +273,6 @@ def test_without_the_library_only_the_directories_are_checked() -> None:
 def test_no_rules_is_not_a_failure() -> None:
     assert describe_checks([], library_consulted=True) == (
         True,
-        "No model directory mappings configured.",
+        "No Library folder rule applies on this host: every folder opens at its own path.",
         None,
     )
