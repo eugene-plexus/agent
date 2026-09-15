@@ -125,9 +125,19 @@ class Unavailable:
     CUDA build for Linux, so a Linux box with an NVIDIA GPU legitimately has
     nothing installable and the operator needs to be told that in those
     words — not handed a slower build nobody offered them.
+
+    `release_bound` separates two kinds of "no": a reason derived from
+    **this release's assets** (the variant is not among them, the cudart
+    companion is missing, no CUDA build for this architecture is in it)
+    from one about **the host** (Linux with NVIDIA, a driver that reports
+    no CUDA version). The first may be answered by an older release —
+    upstream's CI uploads a build's assets over the better part of an
+    hour, and b10991 sat at five of thirty-three for the run that found
+    this — and the second cannot, so the selection stops on it.
     """
 
     reason: str
+    release_bound: bool = False
 
 
 # --------------------------------------------------------------------------- #

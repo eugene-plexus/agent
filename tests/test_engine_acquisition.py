@@ -156,8 +156,8 @@ def test_windows_cuda_without_its_cudart_is_refused() -> None:
 
 
 def test_cuda_picks_the_highest_build_the_driver_can_load() -> None:
-    """Minor-version compatibility within a major: a 12.4 build runs on a
-    12.8 driver. A 13.x build does not."""
+    """A 12.4 build on a 12.8 driver: the ordinary case. The 13.x build
+    is a different major and is not considered."""
     plan = LlamaCppAdapter().plan_acquisition(
         _host(Os.windows, Arch.x64, Accelerator.cuda, "12.8"), _release()
     )
@@ -165,14 +165,98 @@ def test_cuda_picks_the_highest_build_the_driver_can_load() -> None:
     assert plan.variant == "win-cuda-12.4-x64"
 
 
-def test_cuda_never_crosses_a_major_upward() -> None:
-    """A driver capped at 12.2 cannot load a 12.4 build either, and must
-    not be handed the 13.x one as 'closest'."""
+def test_cuda_takes_the_newer_minor_when_nothing_older_is_published() -> None:
+    """CUDA minor-version compatibility: a build from a newer minor runs
+    on any driver of the same major. Verified live 2026-09-15 -- b10990's
+    13.4 build loaded and served on a 5090 whose driver reports 13.3, the
+    day upstream stopped publishing 13.3 at all. A driver capped at 12.2
+    therefore gets the 12.4 build, not a refusal."""
     plan = LlamaCppAdapter().plan_acquisition(
         _host(Os.windows, Arch.x64, Accelerator.cuda, "12.2"), _release()
     )
+    assert not isinstance(plan, Unavailable), getattr(plan, "reason", "")
+    assert plan.variant == "win-cuda-12.4-x64"
+
+
+def test_cuda_never_crosses_a_major() -> None:
+    """An 11.8 driver cannot load a 12.x or 13.x build, and must be told
+    to update rather than handed a binary that fails at load. The reason
+    names what the release does publish."""
+    plan = LlamaCppAdapter().plan_acquisition(
+        _host(Os.windows, Arch.x64, Accelerator.cuda, "11.8"), _release()
+    )
     assert isinstance(plan, Unavailable)
     assert "Update the NVIDIA driver" in plan.reason
+    assert "same major" in plan.reason
+    assert "12.4" in plan.reason and "13.3" in plan.reason
+
+
+# The release that broke the table: every build from b10983 (2026-09-15)
+# ships `win-cuda-13.4-x64` and no 13.3. Names verbatim from b10990.
+_B10990_NAMES = [
+    "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "cudart-llama-bin-win-cuda-13.4-arm64.zip",
+    "cudart-llama-bin-win-cuda-13.4-x64.zip",
+    "llama-b10990-bin-macos-arm64.tar.gz",
+    "llama-b10990-bin-ubuntu-cuda-13.3-x64.tar.gz",
+    "llama-b10990-bin-ubuntu-x64.tar.gz",
+    "llama-b10990-bin-win-cpu-x64.zip",
+    "llama-b10990-bin-win-cuda-12.4-x64.zip",
+    "llama-b10990-bin-win-cuda-13.4-arm64.zip",
+    "llama-b10990-bin-win-cuda-13.4-x64.zip",
+    "llama-b10990-bin-win-vulkan-x64.zip",
+]
+
+
+@pytest.mark.parametrize(
+    ("driver", "expected"),
+    [
+        # The live case: a 13.3 driver, and upstream publishes 13.4 only.
+        ("13.3", "win-cuda-13.4-x64"),
+        # A newer driver takes the same build the ordinary way.
+        ("13.5", "win-cuda-13.4-x64"),
+        # A 12.x driver never sees 13.x.
+        ("12.8", "win-cuda-12.4-x64"),
+    ],
+)
+def test_cuda_minors_come_from_the_release_not_a_table(driver: str, expected: str) -> None:
+    """The candidate list is read off the release's own asset names. The
+    hardcoded table this replaced was written from b10867 and went stale
+    the day upstream moved to 13.4: a 13.3 driver read *"release b10990
+    has no asset for 'win-cuda-13.3-x64'"* -- a reason about upstream's
+    publishing presented as one about the host. Found by the one-click
+    run acceptance run, whose fresh box could not install anything."""
+    plan = LlamaCppAdapter().plan_acquisition(
+        _host(Os.windows, Arch.x64, Accelerator.cuda, driver),
+        _release("b10990", names=_B10990_NAMES),
+    )
+    assert not isinstance(plan, Unavailable), getattr(plan, "reason", "")
+    assert plan.variant == expected
+    # And the two-asset shape still holds for whichever variant was chosen.
+    assert [a.name for a in plan.assets] == [
+        f"llama-b10990-bin-{expected}.zip",
+        f"cudart-llama-bin-{expected}.zip",
+    ]
+
+
+def test_cuda_arm64_reads_its_own_column() -> None:
+    plan = LlamaCppAdapter().plan_acquisition(
+        _host(Os.windows, Arch.arm64, Accelerator.cuda, "13.4"),
+        _release("b10990", names=_B10990_NAMES),
+    )
+    assert not isinstance(plan, Unavailable), getattr(plan, "reason", "")
+    assert plan.variant == "win-cuda-13.4-arm64"
+
+
+def test_a_release_with_no_windows_cuda_build_says_so() -> None:
+    names = [n for n in _B10990_NAMES if "win-cuda" not in n]
+    plan = LlamaCppAdapter().plan_acquisition(
+        _host(Os.windows, Arch.x64, Accelerator.cuda, "13.3"),
+        _release("b10990", names=names),
+    )
+    assert isinstance(plan, Unavailable)
+    assert "publishes no Windows CUDA build for x64" in plan.reason
+    assert "b10990" in plan.reason
 
 
 def test_nvidia_without_a_reported_cuda_version_is_refused() -> None:
@@ -249,6 +333,106 @@ def test_latest_release_skips_a_build_with_no_assets(monkeypatch: pytest.MonkeyP
     latest = adapter.latest_release()
     assert latest is not None
     assert latest.version == "b10930"
+
+
+# b10991 as the run found it at 23:42Z: five assets uploaded, no server build.
+_B10991_PARTIAL = [
+    "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "llama-b10991-bin-macos-arm64.tar.gz",
+    "llama-b10991-bin-ubuntu-x64.tar.gz",
+    "llama-b10991-bin-win-cpu-x64.zip",
+    "llama-b10991-bin-ubuntu-vulkan-x64.tar.gz",
+]
+
+
+def test_plan_latest_steps_back_to_the_newest_build_that_has_this_hosts_asset(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A release mid-upload has assets and not ours. `latest_release` still
+    names it (it IS the newest build we know of); the install plans against
+    the build before it, and says so in the log."""
+    adapter = LlamaCppAdapter()
+    monkeypatch.setattr(
+        adapter.releases,
+        "list_releases",
+        lambda force=False: [
+            _release("b10990", names=_B10990_NAMES),
+            _release("b10991", names=_B10991_PARTIAL),
+        ],
+    )
+    host = _host(Os.windows, Arch.x64, Accelerator.cuda, "13.3")
+    assert adapter.latest_release() is not None
+    assert adapter.latest_release().version == "b10991"  # type: ignore[union-attr]
+    with caplog.at_level("INFO"):
+        plan = adapter.plan_latest(host)
+    assert not isinstance(plan, Unavailable), getattr(plan, "reason", "")
+    assert plan.version == "b10990"
+    assert plan.variant == "win-cuda-13.4-x64"
+    assert "b10991 has no 'win-cuda-13.4-x64' asset yet" in caplog.text
+    assert "using b10990" in caplog.text
+
+
+def test_plan_latest_takes_the_newest_build_when_it_is_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = LlamaCppAdapter()
+    monkeypatch.setattr(
+        adapter.releases,
+        "list_releases",
+        lambda force=False: [
+            _release("b10989", names=_B10990_NAMES),
+            _release("b10990", names=_B10990_NAMES),
+        ],
+    )
+    plan = adapter.plan_latest(_host(Os.windows, Arch.x64, Accelerator.cuda, "13.3"))
+    assert not isinstance(plan, Unavailable)
+    assert plan.version == "b10990"
+
+
+def test_plan_latest_stops_at_once_on_a_reason_about_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Linux with NVIDIA is refused by every release; looking further back
+    would only delay the same answer."""
+    adapter = LlamaCppAdapter()
+    calls: list[str] = []
+    real = adapter.plan_acquisition
+
+    def spy(host: HostAccelerator, release: Release):  # type: ignore[no-untyped-def]
+        calls.append(release.version)
+        return real(host, release)
+
+    monkeypatch.setattr(adapter, "plan_acquisition", spy)
+    monkeypatch.setattr(
+        adapter.releases,
+        "list_releases",
+        lambda force=False: [
+            _release("b10990", names=_B10990_NAMES),
+            _release("b10991", names=_B10991_PARTIAL),
+        ],
+    )
+    plan = adapter.plan_latest(_host(Os.linux, Arch.x64, Accelerator.cuda, "13.3"))
+    assert isinstance(plan, Unavailable)
+    assert "no prebuilt CUDA build for Linux" in plan.reason
+    assert calls == ["b10991"]
+
+
+def test_plan_latest_reports_the_newest_builds_reason_when_none_in_reach_has_the_asset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = LlamaCppAdapter()
+    monkeypatch.setattr(
+        adapter.releases,
+        "list_releases",
+        lambda force=False: [
+            _release("b10990", names=_B10991_PARTIAL),
+            _release("b10991", names=_B10991_PARTIAL),
+        ],
+    )
+    plan = adapter.plan_latest(_host(Os.windows, Arch.x64, Accelerator.cuda, "13.3"))
+    assert isinstance(plan, Unavailable)
+    assert plan.reason.startswith("release b10991 publishes no Windows CUDA build for x64.")
+    assert "None of the 1 build(s) before it has one either." in plan.reason
 
 
 def test_latest_release_is_none_when_no_build_has_assets(

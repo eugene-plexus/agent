@@ -593,24 +593,19 @@ def plan_for(kind: EngineKind, *, version: str | None = None) -> AcquisitionPlan
         )
 
     if version is None:
-        release = adapter.latest_release()
-    else:
-        release = next(
-            (r for r in adapter.releases.list_releases() if r.version == version),
-            None,
-        )
-        if release is None:
-            return Unavailable(
-                reason=(
-                    f"build {version!r} is not among the recent releases of "
-                    f"{adapter.binary_name}; only recent builds can be installed"
-                )
-            )
+        # The newest build that carries THIS host's assets, which since
+        # 2026-09-15 is not always the newest build with assets: a release
+        # mid-upload has some and not ours.
+        return adapter.plan_latest(detect_host())
+    release = next(
+        (r for r in adapter.releases.list_releases() if r.version == version),
+        None,
+    )
     if release is None:
         return Unavailable(
             reason=(
-                "could not reach the upstream release list. Check network access, or "
-                "set `binary` on the runtime to a build you already have."
+                f"build {version!r} is not among the recent releases of "
+                f"{adapter.binary_name}; only recent builds can be installed"
             )
         )
     return adapter.plan_acquisition(detect_host(), release)

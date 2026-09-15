@@ -949,7 +949,7 @@ class HostAccelerator(BaseModel):
     )
     acceleratorVersion: str | None = Field(
         None,
-        description='For CUDA, the highest version the installed driver supports.\nSelection takes the highest published build whose major\nmatches and whose minor is no greater than this; a higher\nmajor is never chosen.\n',
+        description="For CUDA, the highest version the installed driver supports.\nSelection takes the highest published build whose major\nmatches and whose minor is no greater than this. When the\nrelease publishes no such build — upstream moved from 13.3\nto 13.4 on 2026-09-15 and stopped shipping 13.3 — the lowest\npublished minor **above** it within the same major is taken\ninstead, under CUDA's minor-version compatibility (an\napplication built with any 13.x toolkit runs on any 13.x\ndriver, minus PTX JIT for newer PTX and APIs the driver\nlacks; verified live with b10990's 13.4 build on a 13.3\ndriver), and the agent logs the choice. A different major\nis never chosen, and the refusal says so. The candidate\nminors are read from the release's own asset names, not a\ntable: the table this replaced went stale in a day.\n",
     )
 
 
