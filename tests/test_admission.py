@@ -317,3 +317,90 @@ async def test_vllm_is_always_full_offload(tmp_path: Path) -> None:
         running=[],
     )
     assert result.decision is AdmissionDecision.refuse
+
+
+@pytest.mark.anyio
+async def test_a_refusal_hands_back_the_context_that_would_fit(tmp_path: Path) -> None:
+    """Found 2026-09-15 on the live install: Discover said `fits` at its
+    8,192 guidance context, a default profile left contextSize to the
+    engine, and admission refused the same file at the model's 262,144
+    with "lower contextSize" and no number. The library computes the
+    largest context that fits; the answer carries it and the reason
+    names it."""
+    library = _FakeLibrary(
+        LibraryFit(
+            required_bytes=41 * GIB,
+            verdict="split",
+            context_length=262144,
+            max_context_length=90112,
+        )
+    )
+    result = await check_admission(
+        _spec(_model(tmp_path, 24 * GIB)),
+        snapshot=fake_devices(free=30 * GIB, total=32 * GIB),
+        library=library,
+        running=[],
+    )
+    assert result.decision is AdmissionDecision.refuse
+    assert result.maxContextLength == 90112
+    assert "fits up to 90112 context on this device" in result.reason
+    assert "contextSize to 90112 or below" in result.reason
+    assert "lower contextSize" not in result.reason
+
+
+@pytest.mark.anyio
+async def test_a_refusal_without_the_number_still_says_lower(tmp_path: Path) -> None:
+    library = _FakeLibrary(LibraryFit(required_bytes=41 * GIB, verdict="no", context_length=262144))
+    result = await check_admission(
+        _spec(_model(tmp_path, 24 * GIB)),
+        snapshot=fake_devices(free=30 * GIB, total=32 * GIB),
+        library=library,
+        running=[],
+    )
+    assert result.maxContextLength is None
+    assert "fits up to" not in result.reason
+    assert "Lower contextSize" in result.reason
+
+
+@pytest.mark.anyio
+async def test_the_library_client_reads_max_context_off_the_fit_response() -> None:
+    """`maxContextLength` sits beside `fit` on the library's answer, not
+    inside it; a client reading only `fit` would report None forever."""
+    import httpx
+
+    from eugene_plexus_agent.admission import LibraryFitClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "id": "m1",
+                            "path": "/models/q.gguf",
+                            "sizeBytes": 24 * GIB,
+                            "contextLength": 262144,
+                            "fileCount": 1,
+                        }
+                    ]
+                },
+            )
+        assert request.url.path == "/v1/models/m1/fit"
+        assert request.url.params["contextLength"] == "262144"
+        return httpx.Response(
+            200,
+            json={
+                "fit": {"verdict": "split", "requiredBytes": 41 * GIB, "contextLength": 262144},
+                "maxContextLength": 90112,
+                "modelContextLength": 262144,
+            },
+        )
+
+    client = LibraryFitClient("http://library", None, transport=httpx.MockTransport(handler))
+    answer = await client.fit(
+        "/models/q.gguf", context_length=None, vram_bytes=30 * GIB, ram_bytes=None
+    )
+    assert answer is not None
+    assert answer.max_context_length == 90112
+    assert answer.context_length == 262144

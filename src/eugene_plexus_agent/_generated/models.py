@@ -1841,6 +1841,11 @@ class Admission(BaseModel):
         description="The context the KV cache was sized for — the spec's\n`contextSize`, or the model's own context when the spec\nleaves it to the engine.\n",
         ge=0,
     )
+    maxContextLength: int | None = Field(
+        None,
+        description='The largest `contextSize` at which this file fits entirely in\nthe target device\'s free memory, from the library\'s fit model\nscored against the budget this agent measured. Rounded down\nto a multiple of 256. `null` when the library was not\nconsulted (`basis: file_size`), and `0` when the weights\nalone do not fit, so no context makes it true.\n\n**This is the number a refusal should hand back.** Added\n2026-09-15 after Discover scored a 27B Q6 as `fits` at its\n8,192-token guidance context, the operator made a default\nprofile that left `contextSize` to the engine, and admission\nrefused it at the model\'s own 262,144 — 41 GiB against 30 —\nwith advice to "lower contextSize" and no number. The two\nscreens had never disagreed about the model, only about the\ncontext, and neither said so. A profile form prefills from\nthis; a refusal offers it as a one-click fix.\n',
+        ge=0,
+    )
     blockers: list[AdmissionBlocker] | None = Field(
         None,
         description="Runtimes currently holding memory on that device, most idle\nfirst. What an operator would stop to make room, and the\nlist the gateway's opt-in eviction walks — restricted there\nto runtimes that declared `idleUnloadSeconds`.\n",

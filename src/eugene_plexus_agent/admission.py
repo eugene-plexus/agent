@@ -104,6 +104,10 @@ class LibraryFit:
     required_bytes: int
     verdict: str
     context_length: int | None
+    max_context_length: int | None = None
+    """The largest contextSize at which the weights and KV fit the budget
+    the agent handed the library; 0 when the weights alone do not fit;
+    None when the library did not say."""
     # What the library's scan recorded for the model: the whole model,
     # and the one file a launch line names. What `location` compares a
     # mapped file against (M11).
@@ -232,6 +236,7 @@ class LibraryFitClient:
                 if not isinstance(required, int) or not isinstance(verdict, str):
                     return None
                 context = fit.get("contextLength")
+                max_context = response.json().get("maxContextLength")
                 size = model.get("sizeBytes")
                 weights = next(
                     (
@@ -245,6 +250,7 @@ class LibraryFitClient:
                     required_bytes=required,
                     verdict=verdict,
                     context_length=context if isinstance(context, int) else None,
+                    max_context_length=max_context if isinstance(max_context, int) else None,
                     size_bytes=size if isinstance(size, int) else None,
                     weights_size_bytes=weights if isinstance(weights, int) else None,
                 )
@@ -452,6 +458,7 @@ async def check_admission(
     context_length = (
         int(context) if isinstance(context, int | float | str) and str(context).isdigit() else None
     )
+    max_context_length: int | None = None
 
     # Where the model is on this host, before any question about memory.
     # The stat runs off the event loop: a dead network share blocks for
@@ -502,6 +509,7 @@ async def check_admission(
             fit = _library_verdict(answer.verdict) if free is not None else AdmissionFit.unknown
             if answer.context_length is not None:
                 context_length = answer.context_length
+            max_context_length = answer.max_context_length
             location, mismatch = _compare_sizes(location, answer)
             if mismatch is not None:
                 warnings.append(mismatch)
@@ -530,6 +538,14 @@ async def check_admission(
         else "Nothing else of ours holds memory on it."
     )
     ctx_text = f" at {context_length} context" if context_length else ""
+    # The number a refusal hands back. Discover scores at the library's
+    # guidance context and a profile that leaves contextSize to the engine
+    # is scored at the model's own, so the two screens disagreed about
+    # context, never about the model -- and the refusal said "lower
+    # contextSize" with no number to lower it to.
+    fits_up_to = (
+        f" It fits up to {max_context_length} context on this device." if max_context_length else ""
+    )
     basis_text = "library metadata" if basis is AdmissionBasis.metadata else "file size plus 10%"
 
     if fit is AdmissionFit.unknown:
@@ -552,16 +568,22 @@ async def check_admission(
         )
         warning = "; ".join(warnings) or None
     else:
+        lower = (
+            f"set contextSize to {max_context_length} or below"
+            if max_context_length
+            else "lower contextSize"
+        )
         fix = (
-            "Stop one of them, lower contextSize, set gpuLayers below full for partial offload, "
+            f"Stop one of them, {lower}, set gpuLayers below full for partial offload, "
             "or pass ?force=true to launch anyway."
             if blockers
-            else "Lower contextSize, set gpuLayers below full for partial offload, pick a smaller "
-            "quant, or pass ?force=true to launch anyway."
+            else f"{lower[0].upper()}{lower[1:]}, set gpuLayers below full for partial offload, "
+            "pick a smaller quant, or pass ?force=true to launch anyway."
         )
         reason = (
             f"refuse: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) but "
-            f"{where} has {_gib(free)} free of {_gib(total)}; verdict {fit.value}. {held} {fix}"
+            f"{where} has {_gib(free)} free of {_gib(total)}; verdict {fit.value}.{fits_up_to} "
+            f"{held} {fix}"
         )
         warning = "; ".join(warnings) or None
 
@@ -574,6 +596,7 @@ async def check_admission(
         totalBytes=total,
         device=device,
         contextLength=context_length,
+        maxContextLength=max_context_length,
         blockers=blockers,
         location=location,
         reason=reason,
