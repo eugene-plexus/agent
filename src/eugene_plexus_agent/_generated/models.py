@@ -794,13 +794,29 @@ class UnenrollRequest(BaseModel):
 
 class AuthStatus(BaseModel):
     """
-    Whether this install has been through first-run setup.
+    Whether this install has been through first-run setup, whether
+    its secrets are open right now, and whether this host can keep
+    them open across a restart on its own.
+
+    Unauthenticated by necessity: it is what the UI asks before it
+    has a token. Nothing here is a secret. The two optional fields
+    arrived with the hobbyist UX work (2026-09-15) so the first-run
+    wizard can default `securityMode` to `os_keyring` where a
+    keyring exists and say plainly where one does not.
 
     """
 
     initialized: bool = Field(
         ...,
         description='True once a passphrase has been set. False means every\nendpoint except this one, `/healthz` and\n`POST /v1/auth/initialize` will refuse.\n',
+    )
+    unlocked: bool | None = Field(
+        None,
+        description="True while the master key is in this process's memory, so\nsealed values (provider API keys, the install signing key on\nan enrolled node) can be opened. False after a restart under\n`securityMode: prompt_on_startup` until someone signs in, or\nwhen an `os_keyring` recovery found nothing usable. Absent\nfrom an agent that predates the field.\n",
+    )
+    keyringAvailable: bool | None = Field(
+        None,
+        description="Whether this host's OS keyring (Windows Credential Manager,\nmacOS Keychain, a Linux Secret Service) accepted a write,\nread and delete of a probe entry from this process — measured\nonce per process run, not assumed from the platform. False on\na headless Linux box with no unlocked secret service, in a\ncontainer, or under a service account with no credential\nstore; true on the ordinary desktop. The wizard defaults\n`securityMode` to `os_keyring` on true and explains the\npassphrase prompt on false. Absent when the probe was not run\nor did not finish within its budget.\n",
     )
 
 

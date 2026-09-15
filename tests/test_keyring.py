@@ -72,6 +72,11 @@ class _FakeKeyring:
             raise keyring.errors.PasswordDeleteError(f"no value at {service!r}:{username!r}") from e
 
 
+# The scope the primitive tests store under. Any install id works for
+# them; what matters is that it is the SAME one on both sides of a call.
+INSTALL = "0123456789ab"
+
+
 @pytest.fixture
 def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> _FakeKeyring:
     """Patch the keyring module with the fake. The wrapper imports
@@ -90,31 +95,31 @@ def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> _FakeKeyring:
 
 def test_keyring_store_round_trip(fake_keyring: _FakeKeyring) -> None:
     key = secrets.token_bytes(32)
-    assert keyring_store.set_master_key(key) is True
-    assert keyring_store.get_master_key() == key
-    assert keyring_store.delete_master_key() is True
-    assert keyring_store.get_master_key() is None
+    assert keyring_store.set_master_key(key, INSTALL) is True
+    assert keyring_store.get_master_key(INSTALL) == key
+    assert keyring_store.delete_master_key(INSTALL) is True
+    assert keyring_store.get_master_key(INSTALL) is None
 
 
 def test_keyring_store_returns_none_when_empty(fake_keyring: _FakeKeyring) -> None:
-    assert keyring_store.get_master_key() is None
+    assert keyring_store.get_master_key(INSTALL) is None
 
 
 def test_keyring_store_set_rejects_wrong_length() -> None:
     with pytest.raises(ValueError, match="32 bytes"):
-        keyring_store.set_master_key(b"\x00" * 16)
+        keyring_store.set_master_key(b"\x00" * 16, INSTALL)
 
 
 def test_keyring_store_get_handles_backend_failure(fake_keyring: _FakeKeyring) -> None:
     fake_keyring.raise_on.add("get")
     # Must not raise; must return None.
-    assert keyring_store.get_master_key() is None
+    assert keyring_store.get_master_key(INSTALL) is None
 
 
 def test_keyring_store_set_handles_backend_failure(fake_keyring: _FakeKeyring) -> None:
     fake_keyring.raise_on.add("set")
     # Must not raise; must return False so callers can react.
-    assert keyring_store.set_master_key(secrets.token_bytes(32)) is False
+    assert keyring_store.set_master_key(secrets.token_bytes(32), INSTALL) is False
 
 
 def test_keyring_store_delete_returns_false_when_empty(
@@ -123,7 +128,7 @@ def test_keyring_store_delete_returns_false_when_empty(
     """Deleting a non-existent entry is a no-op from our perspective —
     not an error. (The wizard's "switching modes" flow calls delete
     blind without checking presence first.)"""
-    assert keyring_store.delete_master_key() is False
+    assert keyring_store.delete_master_key(INSTALL) is False
 
 
 def test_keyring_store_get_handles_garbage_b64(fake_keyring: _FakeKeyring) -> None:
@@ -133,7 +138,7 @@ def test_keyring_store_get_handles_garbage_b64(fake_keyring: _FakeKeyring) -> No
     fake_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = (
         "this-is-not-base64-padding-or-anything"
     )
-    assert keyring_store.get_master_key() is None
+    assert keyring_store.get_master_key(INSTALL) is None
 
 
 def test_keyring_store_get_handles_wrong_length(fake_keyring: _FakeKeyring) -> None:
@@ -141,7 +146,7 @@ def test_keyring_store_get_handles_wrong_length(fake_keyring: _FakeKeyring) -> N
     fake_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
         b"\x00" * 16
     ).decode("ascii")
-    assert keyring_store.get_master_key() is None
+    assert keyring_store.get_master_key(INSTALL) is None
 
 
 # --------------------------------------------------------------------------- #

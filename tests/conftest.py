@@ -253,3 +253,18 @@ def authed_client(app: FastAPI) -> Iterator[TestClient]:
 def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:
         monkeypatch.delenv(key, raising=False)
+
+
+# `GET /v1/auth/status` probes the OS keyring once per process. In a test
+# that is the developer's real Credential Manager or a CI runner's absent
+# Secret Service - neither is the subject. Every test starts with the
+# probe memoised to False; a test about the probe itself calls
+# `keyring_store.reset_probe_cache()` after installing its fake.
+@pytest.fixture(autouse=True)
+def _memoise_keyring_probe() -> Iterator[None]:
+    from eugene_plexus_agent import keyring_store
+
+    keyring_store._probe_result = False
+    keyring_store._probe_done = True
+    yield
+    keyring_store.reset_probe_cache()

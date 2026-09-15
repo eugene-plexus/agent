@@ -20,6 +20,7 @@ locks the source out for 60 seconds. Cleared on success.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from datetime import UTC, datetime
@@ -34,11 +35,18 @@ from .._generated.common_models import (
     AuthLoginResponse,
     Problem,
 )
+from .._generated.models import AuthStatus
 from ..auth_state import AuthState
 from ..dependencies import require_operator_session
 from ..state import AgentState
 
 log = logging.getLogger(__name__)
+
+# How long `GET /v1/auth/status` waits for the keyring probe before
+# answering without it. Generous for a desktop keyring's first-contact
+# dialog to be dismissed; short enough that a locked headless Secret
+# Service does not hang the wizard's first page load.
+KEYRING_PROBE_BUDGET_SECONDS = 3.0
 
 router = APIRouter(tags=["auth"])
 
@@ -65,17 +73,43 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     )
 
 
-@router.get("/v1/auth/status")
-async def auth_status(request: Request) -> dict[str, bool]:
-    """Public probe — has a passphrase been set on this install?
+@router.get("/v1/auth/status", response_model=AuthStatus)
+async def auth_status(request: Request) -> AuthStatus:
+    """Public probe — has a passphrase been set, is the process unlocked,
+    and can this host's keyring keep it that way?
 
-    The UI uses this to disambiguate "fresh install, route to /setup"
-    from "logged-out, route to /login" without consuming a rate-limited
-    login attempt. Returns one boolean only; no secrets, no per-IP
-    behavior, no rate limit — safe to call on every page load.
+    The UI uses `initialized` to disambiguate "fresh install, route to
+    /setup" from "logged-out, route to /login" without consuming a
+    rate-limited login attempt. The first-run wizard reads
+    `keyringAvailable` to default `securityMode` to `os_keyring` where a
+    keyring exists and to say plainly where one does not (S0 of the
+    hobbyist UX plan). No secrets, no per-IP behavior, no rate limit —
+    safe to call on every page load.
+
+    The probe runs once per process, in a thread, with a deadline: a
+    Secret Service that is present but locked can block on a prompt
+    nobody will answer, and a status endpoint must not hang with it.
+    Past the deadline the field is absent, not False — "we could not
+    tell" is a different answer from "no".
     """
     state: AgentState = request.app.state.agent_state
-    return {"initialized": state.has_passphrase()}
+    auth: AuthState = request.app.state.auth_state
+    try:
+        available: bool | None = await asyncio.wait_for(
+            asyncio.to_thread(keyring_store.probe_sync), timeout=KEYRING_PROBE_BUDGET_SECONDS
+        )
+    except TimeoutError:
+        log.warning(
+            "the OS keyring probe did not finish within %.0fs; reporting keyringAvailable "
+            "as unknown",
+            KEYRING_PROBE_BUDGET_SECONDS,
+        )
+        available = None
+    return AuthStatus(
+        initialized=state.has_passphrase(),
+        unlocked=auth.has_master_key(),
+        keyringAvailable=available,
+    )
 
 
 class _InitializeRequest(BaseModel):
@@ -258,7 +292,10 @@ def _persist_master_key_if_keyring_mode(state: AgentState, master_key: bytes) ->
     """
     if state.get_config("securityMode") != "os_keyring":
         return
-    if keyring_store.set_master_key(master_key):
+    salt_b64 = state.get_master_salt_b64()
+    if salt_b64 is None:
+        return
+    if keyring_store.set_master_key(master_key, keyring_store.install_id_for(salt_b64)):
         log.info("master key persisted to OS keyring for auto-unlock")
     else:
         log.warning(

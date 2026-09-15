@@ -109,7 +109,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         and state.get_config("securityMode") == "os_keyring"
         and not app.state.auth_state.has_master_key()
     ):
-        stored = keyring_store.get_master_key()
+        salt_b64 = state.get_master_salt_b64()
+        stored = (
+            keyring_store.get_master_key(keyring_store.install_id_for(salt_b64))
+            if salt_b64
+            else None
+        )
         if stored is not None:
             app.state.auth_state.set_master_key(stored)
             log.info("master key recovered from OS keyring; children will auto-unlock")

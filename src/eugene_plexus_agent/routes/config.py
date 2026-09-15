@@ -85,27 +85,25 @@ async def test_config(
     notes: list[str] = []
 
     if effective_mode == "os_keyring":
-        # Read whatever's there. Returning None is fine — it means
-        # the operator hasn't logged in yet, so nothing's stored.
-        # A KeyringError raised internally would log + return None
-        # too. Either result tells us the backend is functional.
-        try:
-            keyring_store.get_master_key()
-        except Exception as e:
-            problems.append(
-                f"OS keyring probe raised {type(e).__name__}: {e}. "
-                f"securityMode=os_keyring will fail to auto-unlock on "
-                f"next boot. Switch to prompt_on_startup, or install / "
-                f"start the platform's keyring backend (Credential "
-                f"Manager on Windows, Secret Service on Linux, "
-                f"Keychain on macOS)."
-            )
-        else:
+        # A real round trip — write, read back, delete a throwaway
+        # entry — rather than a read of whatever is there. A read
+        # returning None cannot tell a working keyring with nothing
+        # stored from a `fail` backend, and the old version of this
+        # check could not either.
+        if await asyncio.to_thread(keyring_store.probe_sync):
             notes.append(
-                "OS keyring backend is reachable. Auto-unlock will work "
+                "OS keyring accepted a probe entry. Auto-unlock will work "
                 "on next boot once the operator has logged in (the "
                 "master key is persisted on login or on securityMode "
                 "transition to os_keyring)."
+            )
+        else:
+            problems.append(
+                "This host's OS keyring did not accept a probe entry, so "
+                "securityMode=os_keyring will not auto-unlock on the next "
+                "boot. Switch to prompt_on_startup, or install / start the "
+                "platform's keyring backend (Credential Manager on Windows, "
+                "Secret Service on Linux, Keychain on macOS)."
             )
     else:
         notes.append(
@@ -181,7 +179,7 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
         # Operator moved to the stronger boundary. The stored auto-
         # unlock secret must go — otherwise the install would still
         # auto-recover, contradicting the promise of the new mode.
-        if keyring_store.delete_master_key():
+        if keyring_store.delete_master_key(_install_id(state)):
             log.info(
                 "securityMode changed from os_keyring to %s; deleted stored "
                 "master key from OS keyring",
@@ -194,10 +192,23 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
         # in memory, the next /v1/auth/login will save it instead —
         # both paths converge to "next restart works".
         auth = request.app.state.auth_state
-        if auth.has_master_key() and keyring_store.set_master_key(auth.master_key):
+        if auth.has_master_key() and keyring_store.set_master_key(
+            auth.master_key, _install_id(state)
+        ):
             log.info("securityMode changed to os_keyring; persisted master key for auto-unlock")
 
     return result
+
+
+def _install_id(state: AgentState) -> str:
+    """The keyring scope for this install — see `keyring_store.install_id_for`.
+
+    Every caller here runs behind auth, so a passphrase and therefore a
+    salt exist; the empty fallback only keeps a corrupt state file from
+    raising inside a config write.
+    """
+    salt_b64 = state.get_master_salt_b64()
+    return keyring_store.install_id_for(salt_b64) if salt_b64 else ""
 
 
 async def _check_overrides_name_folders(
