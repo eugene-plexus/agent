@@ -15,7 +15,9 @@ import base64
 import json
 import logging
 import socket
+import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -255,6 +257,37 @@ def test_node_reports_devices_and_unenrolled(authed_client: TestClient) -> None:
     assert kinds == ["cuda", "cpu"]
     assert body["devices"][0]["memoryFreeBytes"] == 24 * 1024**3
     assert body["agentVersion"]
+
+
+def test_node_carries_this_hosts_own_clock(authed_client: TestClient) -> None:
+    """The one fact a console cannot get any other way.
+
+    Bracketed the way a caller is told to bracket it: the answer must
+    sit inside the window the request occupied, or it is not this
+    host's clock at the moment it answered.
+    """
+    before = datetime.now(UTC)
+    response = authed_client.get("/v1/node")
+    after = datetime.now(UTC)
+    assert response.status_code == 200, response.text
+
+    reported = response.json()["time"]
+    # Offset-aware on the wire, or a consumer in another zone reads it
+    # as local time and computes a skew of whole hours.
+    assert reported.endswith("Z") or "+" in reported[10:] or reported[10:].count("-") > 0
+    parsed = datetime.fromisoformat(reported)
+    assert parsed.tzinfo is not None
+    assert before <= parsed <= after
+
+
+def test_the_clock_is_read_per_request_not_at_startup(authed_client: TestClient) -> None:
+    """A cached value would report a fixed lie rather than a live clock,
+    and a drift that grew after boot would be invisible -- which is the
+    failure the field exists to make visible."""
+    first = datetime.fromisoformat(authed_client.get("/v1/node").json()["time"])
+    time.sleep(0.01)
+    second = datetime.fromisoformat(authed_client.get("/v1/node").json()["time"])
+    assert second > first
 
 
 def test_node_is_readable_with_a_service_token(client: TestClient) -> None:

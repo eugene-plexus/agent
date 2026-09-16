@@ -2361,6 +2361,11 @@ class NodeIdentity(BaseModel):
         description='What this host can compute on, detected locally. The control\nroot aggregates these into the cross-host inventory M3\ndeferred; detection stays here because only the host can do\nit.\n',
     )
     agentVersion: str | None = None
+    time: AwareDatetime | None = Field(
+        None,
+        description='This host\'s wall clock at the moment it answered.\n\nOne field, and it exists because **no component put its own\ncurrent time on any response body**, so nothing outside a\nhost could tell that its clock was wrong. On 2026-09-15 a\ncontrol root running 0.50 s ahead of a worker whose Windows\nTime service had stopped refused that worker\'s traffic as\n"not yet valid (iat)" on every token minted in the first\nhalf of a second; every health check said `ok`, the node was\nlisted `down` with no reason, and the cause took a morning\nto find. Components tolerate 300 s of skew now — which buys\ntime, and makes the drift *silent* until it crosses the\nthreshold and the install stops working.\n\nA console reads this from two hosts a few milliseconds\napart and knows what they disagree by. Bound the round trip\naround the read (`t0` before, `t1` after) and the true\noffset is inside `[time - t1, time - t0]`; report a skew\nonly where that interval clears zero by a margin, because a\nslow proxy hop must not read as a broken clock.\n\n**Not** a remembered observation of skew. A remembered one\nsays a peer was wrong at some past minute; this says what\nthis host thinks the time is now, which is the quantity,\nand it needs no state. It is also why the field is on the\nhost\'s own identity rather than under `reach`: a clock is a\nproperty of a machine, not of who can get to it.\n',
+        examples=['2026-09-16T14:03:21.482Z'],
+    )
     reach: NodeReach | None = None
 
 

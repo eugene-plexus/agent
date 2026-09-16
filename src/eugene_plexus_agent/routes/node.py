@@ -34,6 +34,7 @@ import binascii
 import logging
 import platform
 import sys
+from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
@@ -154,6 +155,12 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         arch=_arch(),
         devices=list(snapshot.devices),
         agentVersion=__version__,
+        # Read at the moment of answering, not cached and not derived
+        # from anything: the point of the field is that a console can
+        # compare two hosts and see a drift neither host can see about
+        # itself. `_note_clock_skew` in security.py observes the same
+        # quantity precisely and can only write it to a log.
+        time=datetime.now(UTC),
     )
 
 
