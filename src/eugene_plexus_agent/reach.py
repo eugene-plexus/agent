@@ -277,6 +277,13 @@ def _running_as_windows_service() -> bool:
     on a box whose agent is a logon task. A property every service has
     is not a property only services have.
     """
+    if sys.platform != "win32":
+        # For mypy on Linux, which knows `ctypes.windll` is not there --
+        # the same narrowing `firewall.windows.elevated` uses, and the
+        # same here-versus-CI mismatch `ci-hygiene-and-devenv-mismatch`
+        # is about. The caller already branches on the platform; the
+        # checker cannot see through the call.
+        return False
     try:
         import ctypes
         from ctypes import wintypes
