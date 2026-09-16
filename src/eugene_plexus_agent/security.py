@@ -72,6 +72,20 @@ _DEFAULT_SESSION_TTL_SECONDS = 14 * 24 * 3600  # 14 days
 AUDIENCE_OPERATOR = "operator"
 SERVICE_AUDIENCE_PREFIX = "service:"
 
+AUDIENCE_CLIENT = "client"
+"""A long-lived key an app outside the install holds (S4, 2026-09-15).
+
+Deliberately neither `operator` nor a `service:` audience, because every
+check in every component tests for one of those two. So a client key is
+refused by this agent, by the control root, by the library and by the
+gateway's own config, admin and metrics paths **without any of them
+being taught about it** -- the narrowing comes from the shape of the
+claim, not from a list someone has to remember to update. Exactly one
+place opts in: the gateway's three OpenAI-compatible paths.
+"""
+
+_DEFAULT_CLIENT_TTL_SECONDS = 365 * 24 * 3600
+
 
 # --------------------------------------------------------------------------- #
 # Passphrase
@@ -234,6 +248,14 @@ class TokenPayload:
     aud: str
     iat: int
     exp: int
+    jti: str | None = None
+    """The key's id, on a client key. Absent on every other token.
+
+    Not in the `require` list: operator sessions and service tokens have
+    never carried one, and demanding it would refuse every token minted
+    before 2026-09-15 -- including the one the caller is holding while
+    they read this.
+    """
 
 
 def generate_signing_key() -> bytes:
@@ -301,6 +323,43 @@ def issue_service_token(
         "exp": expires_at,
     }
     return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
+
+
+def issue_client_token(
+    *,
+    signing_key: bytes,
+    key_id: str,
+    name: str,
+    ttl_seconds: int = _DEFAULT_CLIENT_TTL_SECONDS,
+    now: int | None = None,
+) -> tuple[str, int]:
+    """Mint the bearer an OpenAI-compatible client outside the install holds.
+
+    Returns `(token, exp_unix_seconds)`. Signed with the same install
+    key as everything else, so no component needs a second key to verify
+    it; what makes it safe to hand out is the `aud`, which only the
+    gateway's front door accepts.
+
+    `sub` is the operator's name for the key, so a token decoded by hand
+    during a support conversation says what it is for. `jti` is the
+    record's id: the only claim the gateway needs in order to refuse a
+    revoked one.
+    """
+    if not key_id:
+        raise ValueError("key_id must not be empty")
+    if ttl_seconds <= 0:
+        raise ValueError("ttl_seconds must be positive")
+    issued_at = now if now is not None else int(time.time())
+    expires_at = issued_at + ttl_seconds
+    claims = {
+        "sub": name or "client",
+        "aud": AUDIENCE_CLIENT,
+        "iat": issued_at,
+        "exp": expires_at,
+        "jti": key_id,
+    }
+    token = jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
+    return token, expires_at
 
 
 CLOCK_SKEW_LEEWAY_SECONDS = 300
@@ -385,9 +444,11 @@ def decode_token(
     decode_kwargs["leeway"] = CLOCK_SKEW_LEEWAY_SECONDS
     claims = jwt.decode(token, **decode_kwargs)
     _note_clock_skew(int(claims["iat"]))
+    raw_jti = claims.get("jti")
     return TokenPayload(
         sub=str(claims["sub"]),
         aud=str(claims["aud"]),
         iat=int(claims["iat"]),
         exp=int(claims["exp"]),
+        jti=str(raw_jti) if raw_jti is not None else None,
     )

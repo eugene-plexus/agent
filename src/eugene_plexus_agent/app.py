@@ -37,6 +37,7 @@ from . import (
     ui_assets,
 )
 from .auth_state import AuthState
+from .client_keys import KEYS_FILE, ClientKeyStore
 from .dependencies import require_operator_session
 from .library_folders import FOLDERS_FILE, LibraryFolderCache
 from .routes import auth as auth_routes
@@ -175,6 +176,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.library_folders = folders_cache
     else:
         folders_cache = app.state.library_folders
+
+    # The long-lived keys this node has minted for apps outside the
+    # install (S4). Beside agent.yaml, its own file: `AgentState` writes
+    # its `auth` block whole, and a growing list does not belong in a
+    # document the config trio serves.
+    if not hasattr(app.state, "client_keys"):
+        key_store = ClientKeyStore(settings.config_file.resolve().parent / KEYS_FILE)
+        if not settings.safe_mode:
+            key_store.load()
+        app.state.client_keys = key_store
 
     if not hasattr(app.state, "runtime_supervisor"):
         # The agent's config is where an install-wide engine path

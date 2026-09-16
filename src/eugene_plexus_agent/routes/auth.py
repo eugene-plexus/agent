@@ -16,6 +16,13 @@ to spawned children that need to decrypt at-rest secrets.
 
 Rate-limiting: bucket per source IP, 5 failures within 60 seconds
 locks the source out for 60 seconds. Cleared on success.
+
+**Client keys (S4, 2026-09-15)** live at the bottom of this file. A
+different kind of credential: not a session, not a component's service
+token, but a long-lived named bearer an operator hands to an app
+outside the install. Everything about how they are stored, why the
+record keeps a tail rather than a prefix, and why revocation is bounded
+rather than instant is in `client_keys.py`.
 """
 
 from __future__ import annotations
@@ -23,21 +30,31 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from datetime import UTC, datetime
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from .. import keyring_store, security
+from .. import client_keys, keyring_store, security
 from .._generated.common_models import (
     AuthLoginRequest,
     AuthLoginResponse,
     Problem,
 )
-from .._generated.models import AuthStatus
+from .._generated.models import (
+    AuthStatus,
+    ClientKey,
+    ClientKeyCreated,
+    ClientKeyCreateRequest,
+    ClientKeyList,
+    ClientKeyRevocations,
+)
 from ..auth_state import AuthState
-from ..dependencies import require_operator_session
+from ..client_keys import ClientKeyStore
+from ..dependencies import require_operator_or_gateway, require_operator_session
 from ..state import AgentState
 
 log = logging.getLogger(__name__)
@@ -358,3 +375,149 @@ def _dt_from_unix(unix_seconds: int) -> datetime:
     generated AuthLoginResponse model (which types expiresAt as
     datetime) accepts it."""
     return datetime.fromtimestamp(unix_seconds, tz=UTC)
+
+
+# --------------------------------------------------------------------- #
+# Client keys (hobbyist UX S4, 2026-09-15)
+# --------------------------------------------------------------------- #
+
+
+def _keys(request: Request) -> ClientKeyStore:
+    """The record store, or a transient one.
+
+    `app.state.client_keys` is wired in the lifespan. A test app that
+    skips it gets an in-memory store rather than a 500, which is the
+    same tolerance `library_folders` and `supervisor` already get.
+    """
+    store: ClientKeyStore | None = getattr(request.app.state, "client_keys", None)
+    if store is None:
+        store = ClientKeyStore(Path(".") / client_keys.KEYS_FILE)
+        request.app.state.client_keys = store
+    return store
+
+
+def _to_model(record: client_keys.ClientKeyRecord) -> ClientKey:
+    return ClientKey(
+        id=record.id,
+        name=record.name,
+        tail=record.tail,
+        createdAt=client_keys.as_datetime(record.created_at),
+        expiresAt=client_keys.as_datetime(record.expires_at),
+        revokedAt=(
+            client_keys.as_datetime(record.revoked_at) if record.revoked_at is not None else None
+        ),
+    )
+
+
+@router.get(
+    "/v1/auth/client-keys",
+    response_model=ClientKeyList,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator_session)],
+)
+async def list_client_keys(request: Request) -> ClientKeyList:
+    """The records, newest first. Never the tokens -- see `client_keys`."""
+    return ClientKeyList(keys=[_to_model(r) for r in _keys(request).records()])
+
+
+@router.post(
+    "/v1/auth/client-keys",
+    response_model=ClientKeyCreated,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_operator_session)],
+)
+async def create_client_key(request: Request, body: ClientKeyCreateRequest) -> ClientKeyCreated:
+    """Mint a long-lived key for an app outside the install.
+
+    The token comes back here and nowhere else, ever. What is persisted
+    is the record beside it; the agent forgets the token as soon as this
+    response is serialized.
+
+    Signed with `auth.signing_key`, which on an enrolled node is **the
+    install's** -- so the key verifies at a gateway on any machine in
+    the install, which is what makes one key work for one person's
+    whole setup. On an unenrolled single box it is that box's
+    per-restart key, and the token dies with the process; that is the
+    same bargain every operator session already makes there, and the
+    reason first-boot enrollment exists.
+    """
+    name = body.name.strip()
+    if not name:
+        raise _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Name required",
+            "Give the key a name so it can be told apart from the others later -- "
+            "what app or machine it is for.",
+        )
+    ttl_days = body.ttlDays if body.ttlDays is not None else client_keys.DEFAULT_TTL_DAYS
+    auth: AuthState = request.app.state.auth_state
+    key_id = client_keys.new_key_id()
+    # One instant for both, so the record's `createdAt` IS the token's
+    # `iat`. Two clock reads would put the record a fraction of a second
+    # before the token and make "valid a year" read as 364 days in any
+    # arithmetic a client does on the two fields.
+    issued_at = int(time.time())
+    token, expires_at = security.issue_client_token(
+        signing_key=auth.signing_key,
+        key_id=key_id,
+        name=name,
+        ttl_seconds=int(ttl_days) * 24 * 3600,
+        now=issued_at,
+    )
+    record = _keys(request).add(
+        client_keys.ClientKeyRecord(
+            id=key_id,
+            name=name,
+            tail=client_keys.tail_of(token),
+            created_at=float(issued_at),
+            expires_at=float(expires_at),
+        )
+    )
+    log.info("minted client key %r (id %s), valid %d day(s)", name, key_id, ttl_days)
+    return ClientKeyCreated(key=_to_model(record), token=token)
+
+
+@router.get(
+    "/v1/auth/client-keys/revoked",
+    response_model=ClientKeyRevocations,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator_or_gateway)],
+)
+async def list_revoked_client_keys(request: Request) -> ClientKeyRevocations:
+    """What the gateway polls. Ids only, and the revision they are at.
+
+    `require_operator_or_gateway` and not "any service token": a leaked
+    driver or library token learns nothing from here. The same narrowing
+    M6 applied to starting and stopping a runtime, for the same reason
+    -- the set of components that legitimately need a surface is
+    usually one, and "any service" is what makes a leak useful.
+    """
+    ids, revision = _keys(request).revoked()
+    return ClientKeyRevocations(ids=ids, revision=revision)
+
+
+@router.delete(
+    "/v1/auth/client-keys/{key_id}",
+    status_code=204,
+    dependencies=[Depends(require_operator_session)],
+)
+async def revoke_client_key(request: Request, key_id: str) -> None:
+    """Turn one key off. Repeating it is a 204, not an error.
+
+    The record stays, stamped, until the key's own expiry passes; a list
+    that forgets what was revoked cannot tell "never minted here" from
+    "turned off". The gateway learns within one of its routing refresh
+    intervals, which the contract says plainly rather than promising
+    instant.
+    """
+    record = _keys(request).revoke(key_id)
+    if record is None:
+        raise _problem(
+            status.HTTP_404_NOT_FOUND,
+            "No such key",
+            f"This agent has no client key with id {key_id!r}. Client-key records live on the "
+            "agent that minted them -- the one on the gateway's node -- so check you are asking "
+            "that machine.",
+        )
+    log.info("revoked client key %r (id %s)", record.name, key_id)
