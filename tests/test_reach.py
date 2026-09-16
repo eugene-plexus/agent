@@ -14,6 +14,8 @@ field.
 
 from __future__ import annotations
 
+import os
+import sys
 from datetime import UTC, datetime
 
 import pytest
@@ -29,6 +31,12 @@ from eugene_plexus_agent._generated.models import (
     Verdict,
 )
 from eugene_plexus_agent.firewall import FirewallQuery, unsupported
+
+NL = chr(10)
+
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="the Windows detector only runs on Windows"
+)
 
 # --------------------------------------------------------------------- #
 # Where this host is on its own network
@@ -177,6 +185,117 @@ def test_a_known_mechanism_that_cannot_self_restart_still_refuses() -> None:
         assert ok is False, mechanism
 
 
+@windows_only
+def test_another_installs_logon_task_is_not_this_process_supervisor() -> None:
+    """The defect the acceptance run found, and it was dangerous.
+
+    A throwaway agent started from a shell, in a checkout's own
+    virtualenv, on ports +100, reported `logon_task` /
+    `canSelfRestart: true` -- because the LIVE install on the same box
+    owns a scheduled task by that name. The switch's restart would have
+    run `schtasks /End` against the operator's real agent: stopping the
+    live install, and starting it again while the throwaway kept
+    running. Nothing in the run was harmed only because the run never
+    asked for a restart.
+
+    The discriminator is the task's program against this process's
+    `sys.prefix`. Not `sys.executable`: in a uv-made virtualenv that is
+    the base interpreter under `pythons/cpython-...`, outside the prefix
+    and shared between installs -- so comparing it would call the real
+    install's own task somebody else's.
+    """
+    import sys
+
+    from eugene_plexus_agent.reach import task_runs_from_prefix
+
+    exe = os.path.join(sys.prefix, "Scripts", "eugene-plexus-agent.exe")
+    mine = "TaskName:      \\EugenePlexusAgent\nTask To Run:   " + exe + " --unattended\n"
+    other = os.path.join(
+        "C:\\",
+        "Users",
+        "someone",
+        "AppData",
+        "Local",
+        "EugenePlexus",
+        "venv",
+        "Scripts",
+        "eugene-plexus-agent.exe",
+    )
+    theirs = "TaskName:      \\EugenePlexusAgent\nTask To Run:   " + other + " --unattended\n"
+
+    assert task_runs_from_prefix(mine, sys.prefix) is True
+    assert task_runs_from_prefix(theirs, sys.prefix) is False
+    # The base interpreter of a uv virtualenv sits OUTSIDE the prefix,
+    # which is why `sys.executable` is the wrong thing to compare -- and
+    # on this box it is exactly that, so the assertion below is the
+    # measurement rather than a restatement of the rule.
+    inside_prefix = os.path.normcase(os.path.normpath(sys.executable)).startswith(
+        os.path.normcase(os.path.normpath(sys.prefix)) + os.sep
+    )
+    assert task_runs_from_prefix("Task To Run:   " + sys.executable + "\n", sys.prefix) is (
+        inside_prefix
+    )
+
+
+@windows_only
+def test_a_sibling_installs_task_does_not_count_either() -> None:
+    """A second sabotage escaped too, and this is what it was.
+
+    Loosening the comparison from the prefix to its PARENT directory
+    passed every test, because the only negative case was a task under
+    another user's home -- nowhere near this checkout. Two installs side
+    by side is the realistic shape: this checkout's own virtualenv and a
+    second one beside it, or `EugenePlexus/venv` next to
+    `EugenePlexus-dev/venv`. A negative case has to be near the positive
+    one to be worth anything.
+    """
+    from eugene_plexus_agent.reach import task_runs_from_prefix
+
+    sibling = os.path.join(
+        os.path.dirname(sys.prefix), ".venv-other", "Scripts", "eugene-plexus-agent.exe"
+    )
+    assert task_runs_from_prefix("Task To Run:   " + sibling + NL, sys.prefix) is False
+    # And the prefix itself, spelled as a prefix of a LONGER name, is not
+    # a match either: `.venv2` must not be read as inside `.venv`.
+    lookalike = sys.prefix + "2" + os.sep + "Scripts" + os.sep + "eugene-plexus-agent.exe"
+    assert task_runs_from_prefix("Task To Run:   " + lookalike + NL, sys.prefix) is False
+
+
+@windows_only
+def test_the_task_detector_actually_consults_the_query(monkeypatch) -> None:
+    """The first sabotage escaped because nothing tested the caller.
+
+    Replacing `_windows_task_runs_this_install`'s body with `return True`
+    passed all thirty-six tests: every assertion was about the pure
+    helper, and the function that decides whether this agent may stop
+    itself was untested. That is the same shape as the `canSelfRestart`
+    sabotage earlier in this file -- a property held for the wrong
+    reason -- and it is the second time in one slice.
+    """
+    import subprocess as sp
+
+    from eugene_plexus_agent import reach as reach_module
+
+    class _Result:
+        def __init__(self, code: int, out: str) -> None:
+            self.returncode = code
+            self.stdout = out
+
+    other = os.path.join(
+        "C:" + os.sep, "OtherInstall", "venv", "Scripts", "eugene-plexus-agent.exe"
+    )
+    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result(0, "Task To Run:   " + other + NL))
+    assert reach_module._windows_task_runs_this_install() is False
+
+    mine = os.path.join(sys.prefix, "Scripts", "eugene-plexus-agent.exe")
+    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result(0, "Task To Run:   " + mine + NL))
+    assert reach_module._windows_task_runs_this_install() is True
+
+    # No such task at all.
+    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result(1, ""))
+    assert reach_module._windows_task_runs_this_install() is False
+
+
 def test_describe_restart_answers_something_on_this_platform() -> None:
     described = reach.describe_restart()
     assert described.mechanism in set(Mechanism)
@@ -220,10 +339,6 @@ def test_read_firewall_never_raises_and_never_invents_allowed(monkeypatch) -> No
 # --------------------------------------------------------------------- #
 # The Windows detector's two measured shapes
 # --------------------------------------------------------------------- #
-
-windows_only = pytest.mark.skipif(
-    __import__("sys").platform != "win32", reason="the Windows detector only runs on Windows"
-)
 
 
 @windows_only

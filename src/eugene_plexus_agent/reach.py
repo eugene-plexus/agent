@@ -240,7 +240,7 @@ def _windows_restart() -> AgentRestart:
             canSelfRestart=True,
             command=f"Restart-Service {WINDOWS_SERVICE_NAME}",
         )
-    if _windows_task_exists():
+    if _windows_task_runs_this_install():
         return AgentRestart(
             mechanism=Mechanism.logon_task,
             canSelfRestart=True,
@@ -290,10 +290,34 @@ def _running_as_windows_service() -> bool:
         return False
 
 
-def _windows_task_exists() -> bool:
+def _windows_task_runs_this_install() -> bool:
+    r"""Is the logon task the thing that started *this* process?
+
+    **The task existing is not the answer**, and the first version of
+    this said it was. The acceptance run found it: a throwaway agent
+    started from a shell, in a checkout's own virtualenv, on ports +100,
+    reported `logon_task` / `canSelfRestart: true` -- because the live
+    install on the same box owns a task by that name. Pressing the
+    switch's restart there would have run `schtasks /End` against **the
+    operator's real agent**, stopping the live install and starting it
+    again while the throwaway kept running. A machine can hold two
+    installs; every other part of this codebase already knows that
+    (`keyring_store` scopes its entry by install, the acceptance scripts
+    clear the ambient environment for the same reason).
+
+    The discriminator is the task's program against this process's
+    `sys.prefix`: the installer registers
+    `<prefix>\Scripts\eugene-plexus-agent.exe`, so a task whose action
+    lives inside the virtualenv this interpreter is running from is this
+    install's task, and one that does not is somebody else's.
+
+    Deliberately not `sys.executable`: in a uv-made virtualenv that is
+    the *base* interpreter under `pythons\cpython-...`, which is outside
+    the prefix and shared between installs.
+    """
     try:
         proc = subprocess.run(
-            ["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME],
+            ["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST", "/V"],
             capture_output=True,
             text=True,
             timeout=10.0,
@@ -303,7 +327,35 @@ def _windows_task_exists() -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        return False
+    return task_runs_from_prefix(proc.stdout or "", sys.prefix)
+
+
+def task_runs_from_prefix(query_output: str, prefix: str) -> bool:
+    """Does `schtasks /V /FO LIST` output name a program inside `prefix`?
+
+    Split out so it can be tested against real output without a task
+    existing, and without this test being the one that has to be right
+    about `schtasks`' localised field names -- it looks for the path, not
+    for the label in front of it.
+    """
+    wanted = os.path.normcase(os.path.normpath(prefix))
+    for line in query_output.splitlines():
+        _, _, value = line.partition(":")
+        candidate = (value or line).strip().strip('"')
+        if not candidate:
+            continue
+        # A "Task To Run" line is `<exe> <args>`; the exe is what matters
+        # and an installed console script has no spaces in its path.
+        head = candidate.split(" --")[0].strip().strip('"')
+        try:
+            normalised = os.path.normcase(os.path.normpath(head))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            continue
+        if normalised.startswith(wanted + os.sep):
+            return True
+    return False
 
 
 def _systemd_restart() -> AgentRestart:
@@ -333,13 +385,20 @@ def _systemd_restart() -> AgentRestart:
 
 
 def _launchd_restart() -> AgentRestart:
+    # The plist existing is not proof this process is the thing it
+    # starts -- the same mistake the Windows task test made, and the
+    # acceptance run caught. A launchd-started process is reparented to
+    # launchd itself, so its parent is pid 1.
     plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
-    if not plist.exists():
+    if not plist.exists() or os.getppid() != 1:
         return AgentRestart(
             mechanism=Mechanism.none,
             canSelfRestart=False,
             command="eugene-plexus-agent",
-            detail="No launchd agent is installed for Eugene on this Mac.",
+            detail=(
+                "Nothing starts this agent automatically on this Mac -- there is no launchd "
+                "agent for Eugene, or this process was not started by one."
+            ),
         )
     uid = _uid()
     return AgentRestart(
