@@ -34,18 +34,24 @@ import binascii
 import logging
 import platform
 import sys
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from .. import __version__, default_topology, security
-from .._generated.common_models import Problem
+from .. import __version__, default_topology, reach, security
+from .._generated.common_models import ConfigUpdateRequest, Problem
 from .._generated.models import (
     Arch,
     EnrollRequest,
     NodeIdentity,
+    NodeReach,
+    NodeReachRequest,
+    NodeReachResult,
     Os,
+    ReachStep,
     RekeyRequest,
+    Step,
     UnenrollRequest,
     UnenrollResult,
 )
@@ -54,14 +60,18 @@ from ..dependencies import require_operator_or_service, require_operator_session
 from ..engines.devices import DeviceSnapshot, detect_devices
 from ..enrollment import (
     EnrollmentError,
+    announce_address,
     perform_enrollment,
     problem_detail,
     resolve_advertise_url,
 )
+from ..firewall import FirewallQuery, read_firewall
 from ..node_identity import (
     FencedError,
     NodeIdentityStore,
+    advertise_host,
     effective_advertise_url,
+    is_loopback_host,
     rekey_message,
     verify_rekey_signature,
 )
@@ -188,7 +198,22 @@ def _decode_signing_key(value: str) -> bytes | None:
     dependencies=_read_auth,
 )
 async def get_node(request: Request) -> NodeIdentity:
-    return _identity(request, await _devices(request))
+    """This host, its devices, and whether anything else can get to it.
+
+    `reach` is assembled here rather than on the identity helper because
+    the other three callers of `_identity` -- enroll, unenroll, rekey --
+    are each in the middle of a trust operation and none of them wants a
+    firewall read on the way out. It goes in a thread: the firewall read
+    is a COM enumeration on Windows and two subprocesses on POSIX, and
+    neither belongs on the event loop.
+    """
+    identity = _identity(request, await _devices(request))
+    identity.reach = await asyncio.to_thread(
+        _reach_view,
+        request,
+        advertise=str(identity.advertiseUrl) if identity.advertiseUrl else None,
+    )
+    return identity
 
 
 @router.post(
@@ -455,6 +480,277 @@ async def rekey_node(request: Request, body: RekeyRequest) -> NodeIdentity:
         log.info("epoch %d acknowledged; signing key unchanged", body.epoch)
 
     return _identity(request, await _devices(request))
+
+
+# --------------------------------------------------------------------------- #
+# reach: can anything else on the network get here
+# --------------------------------------------------------------------------- #
+
+
+def _listeners(request: Request) -> list[reach.Listener]:
+    """This install's processes on this host, and the interface each one
+    was actually started on.
+
+    The agent's own bind is the value `build_server` handed uvicorn; a
+    component's is what the supervisor spawned it with. A component this
+    agent declares but is not currently running contributes nothing —
+    "what it would bind if it started" is a guess, and this object
+    exists to hold facts.
+    """
+    settings = request.app.state.settings
+    out = [
+        reach.Listener(
+            process="agent",
+            port=int(settings.bind_port),
+            bind_host=getattr(request.app.state, "bind_host", None) or settings.bind_host,
+        )
+    ]
+    state: AgentState = request.app.state.agent_state
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is None:
+        return out
+    for entry in state.list_topology_entries():
+        if entry.spawn is None or not supervisor.is_supervised(entry.name):
+            continue
+        port = urlparse(str(entry.url)).port
+        if port is None:
+            continue
+        out.append(
+            reach.Listener(
+                process=str(entry.kind.value if hasattr(entry.kind, "value") else entry.kind),
+                port=port,
+                bind_host=supervisor.bind_host_for(entry.name),
+            )
+        )
+    return out
+
+
+def _firewall_program() -> str | None:
+    """The executable the firewall would have a rule about.
+
+    `sys.executable`, because that is what listens: every component here
+    is `python -m <module>` under this agent's own interpreter, and it is
+    that path Windows' *Windows Security Alert* dialog names when
+    somebody clicks Allow.
+    """
+    return sys.executable or None
+
+
+def _reach_view(request: Request, *, advertise: str | None) -> NodeReach:
+    """`NodeReach` as it stands right now.
+
+    Assembled rather than cached. The firewall read is 78 ms on the
+    machine it was measured on, the bind values are in memory, and the
+    proposed address is half a millisecond of routing-table lookup — so
+    there is nothing here worth serving stale, and a stale reach answer
+    is worse than a slow one by the same argument that makes the object
+    evidence rather than configuration.
+    """
+    settings = request.app.state.settings
+    listeners = _listeners(request)
+    bound = reach.bound_addresses(listeners)
+    agent_bound = next((b for b in bound if b.process == "agent"), None)
+    restart = (getattr(request.app.state, "restart_describer", None) or reach.describe_restart)()
+    # A seam, for the reason the library learned the hard way at
+    # `test_detail_groups_candidates_and_attaches_the_fit`: a test that
+    # reads live hardware asserts about the developer's machine. This
+    # one would read the developer's own firewall rules and answer
+    # differently on every box and in CI. `conftest` pins it.
+    reader = getattr(request.app.state, "firewall_reader", None) or read_firewall
+    fw = reader(
+        FirewallQuery(
+            ports=tuple(b.port for b in bound) or (int(settings.bind_port),),
+            program=_firewall_program(),
+        )
+    )
+    witness = getattr(request.app.state, "off_host", None)
+    return NodeReach(
+        enabled=not is_loopback_host(advertise_host(advertise)),
+        advertiseUrl=advertise,  # type: ignore[arg-type]
+        proposedUrl=reach.proposed_url(int(settings.bind_port)),  # type: ignore[arg-type]
+        boundAddresses=bound,
+        restartRequired=reach.restart_required(advertise_url=advertise, agent_bound=agent_bound),
+        restart=restart,
+        firewall=fw,
+        lastReachedFrom=witness.address if witness is not None else None,
+        lastReachedAt=witness.at if witness is not None else None,
+    )
+
+
+@router.post(
+    "/v1/node/reach",
+    response_model=NodeReachResult,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def set_node_reach(request: Request, body: NodeReachRequest) -> NodeReachResult:
+    """Turn "reach it from other devices" on or off. See `agent.yaml`.
+
+    Four steps, in this order, each recorded whether or not it worked:
+    write the address, tell the control root, restart the components,
+    change the firewall. **A step that fails does not roll back the ones
+    before it** — a firewall rule that could not be added is not a
+    reason to stop advertising, and an operator who is told "nothing
+    happened" about a change that half happened is worse off than one
+    who is told which half.
+
+    The agent's own restart is a fifth step and is opt-in, because the
+    browser making this call is talking to the process that would go
+    away.
+    """
+    state: AgentState = request.app.state.agent_state
+    settings = request.app.state.settings
+    steps: list[ReachStep] = []
+
+    url: str | None = None
+    if body.enabled:
+        url = str(body.url).rstrip("/") if body.url else reach.proposed_url(int(settings.bind_port))
+        if url is None:
+            raise _problem(
+                status.HTTP_400_BAD_REQUEST,
+                "no-network-address",
+                "No address to offer",
+                "This machine has no address on a network other than its own loopback, so "
+                "there is nothing for another device to connect to. Connect it to a network, "
+                "or set the address yourself in the agent's config.",
+            )
+        if is_loopback_host(advertise_host(url)):
+            raise _problem(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "loopback-address",
+                "That address is this machine only",
+                f"{url} is a loopback address, which is what turning this off means. Give an "
+                "address other devices can reach, or turn it off instead.",
+            )
+
+    # 1. the setting.
+    result = state.apply_config_patch(
+        ConfigUpdateRequest(advertiseUrl=url if body.enabled else None)
+    )
+    if result.rejected:
+        steps.append(
+            ReachStep(step=Step.advertise, ok=False, detail="; ".join(map(str, result.rejected)))
+        )
+    else:
+        steps.append(
+            ReachStep(
+                step=Step.advertise,
+                ok=True,
+                detail=(
+                    f"This machine now tells the rest of the install it is at {url}."
+                    if body.enabled
+                    else "This machine is back to answering only itself."
+                ),
+            )
+        )
+
+    # 2. the control root, if there is one. Same call the config route
+    #    makes when the field is edited by hand: an install whose root
+    #    holds the old address routes to the old address.
+    identity = getattr(request.app.state, "node_identity", None)
+    if identity is not None and identity.record.enrolled:
+        try:
+            await _announce_reach(request)
+            steps.append(ReachStep(step=Step.announce, ok=True))
+        except Exception as exc:  # pragma: no cover - the announce path logs its own failures
+            steps.append(ReachStep(step=Step.announce, ok=False, detail=str(exc)))
+
+    # 3. the components. They take the bind host from their environment
+    #    at spawn, so this is the whole of their half.
+    supervisor = getattr(request.app.state, "supervisor", None)
+    if supervisor is not None:
+        try:
+            restarted = await supervisor.restart_all()
+            steps.append(
+                ReachStep(
+                    step=Step.restart_components,
+                    ok=True,
+                    detail=(
+                        f"Restarted {', '.join(restarted)}." if restarted else "Nothing to restart."
+                    ),
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            steps.append(ReachStep(step=Step.restart_components, ok=False, detail=str(exc)))
+
+    # 4. the firewall.
+    if body.allowFirewall:
+        ports = tuple(sorted({listener.port for listener in _listeners(request)}))
+        ok, detail = await asyncio.to_thread(_change_firewall, body.enabled, ports)
+        steps.append(ReachStep(step=Step.firewall, ok=ok, detail=detail))
+
+    advertise = effective_advertise_url(
+        state.get_config("advertiseUrl"),
+        identity.record.advertise_url if identity is not None else None,
+    )
+    view = await asyncio.to_thread(_reach_view, request, advertise=advertise)
+
+    # 5. this agent, last and only when asked.
+    restarted_self = False
+    if body.restartAgent:
+        restarted_self, detail = reach.spawn_restart(view.restart or reach.describe_restart())
+        steps.append(ReachStep(step=Step.restart_agent, ok=restarted_self, detail=detail))
+
+    log.info(
+        "reach turned %s: %s",
+        "on" if body.enabled else "off",
+        "; ".join(f"{s.step.value}={'ok' if s.ok else 'failed'}" for s in steps),
+    )
+    return NodeReachResult(reach=view, steps=steps, restarted=restarted_self)
+
+
+def _change_firewall(enabled: bool, ports: tuple[int, ...]) -> tuple[bool, str]:
+    """Add or remove this install's firewall allowance, per platform.
+
+    Windows can do it in place when elevated and through a prompt on the
+    desktop when it is not. Linux and macOS print the command instead:
+    both need root, and the two ways for a web server to have root are a
+    password prompt it has no terminal for and a permanent sudoers
+    entry. Neither is worth a switch, and
+    `easy-default-expert-override` asks for the explanation when the
+    easy path is not safely available.
+    """
+    if sys.platform == "win32":
+        from ..firewall import windows
+
+        return windows.add_rule(ports) if enabled else windows.remove_rule()
+    if sys.platform.startswith("linux"):
+        from ..firewall import linux
+
+        return linux.add_rule(ports) if enabled else linux.remove_rule()
+    if sys.platform == "darwin":
+        from ..firewall import macos
+
+        program = _firewall_program()
+        return macos.add_rule(program) if enabled else macos.remove_rule(program)
+    return False, f"This agent cannot change the firewall on {sys.platform}."
+
+
+async def _announce_reach(request: Request) -> None:
+    """Tell the control root this node's address, now rather than at the
+    next boot. The same thing `PATCH /v1/config` does when the field is
+    edited by hand — kept here rather than imported from the config
+    route because the two are one behaviour with two entry points and
+    the route module is not the place either of them belongs."""
+    identity = _store(request)
+    state: AgentState = request.app.state.agent_state
+    settings = request.app.state.settings
+    if not identity.record.enrolled:
+        return
+    url = await resolve_advertise_url(
+        configured=state.get_config("advertiseUrl"),
+        control_url=identity.record.control_url,
+        bind_port=int(settings.bind_port),
+        persisted=identity.record.advertise_url,
+    )
+    if url is None:
+        return
+    identity.record_advertise_url(url)
+    await announce_address(
+        store=identity,
+        url=url,
+        transport=getattr(request.app.state, "control_transport", None),
+    )
 
 
 # --------------------------------------------------------------------------- #

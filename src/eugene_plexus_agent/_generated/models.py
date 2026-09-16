@@ -741,6 +741,165 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
+class BoundAddress(BaseModel):
+    process: str = Field(
+        ...,
+        description='`agent`, or a `ComponentKind`. Engines are not listed: they\nare deliberately never widened.\n',
+    )
+    host: str = Field(
+        ..., description='The interface bound — `127.0.0.1`, `0.0.0.0`, or one address.'
+    )
+    port: int
+    reachableOffHost: bool | None = Field(
+        None,
+        description='Whether this bind can be reached from another machine at all,\nbefore the firewall gets a say. False for a loopback bind,\nwhich no rule can rescue.\n',
+    )
+
+
+class Mechanism(StrEnum):
+    """
+    What starts this agent. `none` means nothing does — it was
+    launched by hand, and stopping it ends the install until
+    somebody types the command again.
+
+    """
+
+    service = 'service'
+    logon_task = 'logon_task'
+    systemd = 'systemd'
+    launchd = 'launchd'
+    none = 'none'
+    unknown = 'unknown'
+
+
+class AgentRestart(BaseModel):
+    """
+    How this agent would come back if it stopped — which decides
+    whether a switch may restart it, and what a person is told when
+    it may not.
+
+    """
+
+    mechanism: Mechanism = Field(
+        ...,
+        description='What starts this agent. `none` means nothing does — it was\nlaunched by hand, and stopping it ends the install until\nsomebody types the command again.\n',
+    )
+    canSelfRestart: bool = Field(
+        ...,
+        description='This agent can ask its own supervisor to restart it. False is\nnot a failure; it is the case where the switch changes the\nsetting and says plainly that the person has to restart it.\n',
+    )
+    command: str | None = Field(
+        None,
+        description='The command a person runs to restart this agent, for the\ncase above and for a card to print either way.\n',
+    )
+    detail: str | None = None
+
+
+class DefaultInbound(StrEnum):
+    """
+    What happens to an inbound connection no rule matches.
+    **`unknown` is not `allow`.** Windows reports this as
+    `NotConfigured` through its PowerShell cmdlets, which means
+    *block*, and reads as *not blocking* to anyone who compares
+    the string to `Block`.
+
+    """
+
+    block = 'block'
+    allow = 'allow'
+    unknown = 'unknown'
+
+
+class Verdict(StrEnum):
+    """
+    `allowed` — an enabled Allow rule covers this port, or this
+    program, in every profile currently in force.
+    `blocked` — the firewall is on, unmatched inbound traffic is
+    blocked, and nothing covers us; or an explicit Block rule
+    names this program.
+    `unknown` — a third-party firewall is registered, the read
+    failed, or the platform cannot answer. **A verdict is never
+    upgraded to `allowed` by inference.**
+
+    """
+
+    allowed = 'allowed'
+    blocked = 'blocked'
+    unknown = 'unknown'
+
+
+class Scope(StrEnum):
+    """
+    What the deciding rule is bound to. Worth surfacing rather
+    than hiding: the rule Windows creates from its own *Windows
+    Security Alert* dialog is bound to the **program**, and this
+    install's program is a versioned interpreter path under the
+    install directory — so an allow a person clicked once stops
+    covering us the day the interpreter is upgraded, with no
+    message anywhere. A rule this agent adds is bound to the
+    **port**, for that reason.
+
+    """
+
+    port = 'port'
+    program = 'program'
+
+
+class FirewallPort(BaseModel):
+    port: int
+    verdict: Verdict = Field(
+        ...,
+        description='`allowed` — an enabled Allow rule covers this port, or this\nprogram, in every profile currently in force.\n`blocked` — the firewall is on, unmatched inbound traffic is\nblocked, and nothing covers us; or an explicit Block rule\nnames this program.\n`unknown` — a third-party firewall is registered, the read\nfailed, or the platform cannot answer. **A verdict is never\nupgraded to `allowed` by inference.**\n',
+    )
+    rule: str | None = Field(
+        None, description='The name of the rule that decided it, when one did.'
+    )
+    scope: Scope | None = Field(
+        None,
+        description="What the deciding rule is bound to. Worth surfacing rather\nthan hiding: the rule Windows creates from its own *Windows\nSecurity Alert* dialog is bound to the **program**, and this\ninstall's program is a versioned interpreter path under the\ninstall directory — so an allow a person clicked once stops\ncovering us the day the interpreter is upgraded, with no\nmessage anywhere. A rule this agent adds is bound to the\n**port**, for that reason.\n",
+    )
+    profiles: list[str] | None = Field(
+        None, description='The profiles the deciding rule applies to.'
+    )
+    remedy: str | None = Field(
+        None,
+        description='The command that would change a `blocked` verdict, ready to\nrun. Present on `blocked`, and on `unknown` where a command\nwould settle it.\n',
+    )
+
+
+class NodeReachRequest(BaseModel):
+    enabled: bool = Field(
+        ...,
+        description='True to advertise and bind an address other hosts can use;\nfalse to return to loopback.\n',
+    )
+    url: AnyUrl | None = Field(
+        None,
+        description='The address to advertise, for the case the derived one is\nwrong — a host with several interfaces, or a container\npublished on a different port. Defaults to\n`NodeReach.proposedUrl`. A loopback address is refused here:\nit is what `enabled: false` means, and accepting it would\nleave a switch that reads *on* and does nothing.\n',
+    )
+    allowFirewall: bool | None = Field(
+        False,
+        description="Ask the host firewall to allow this install's ports. Adding a\nrule needs administrator rights everywhere: an agent running\nas a service has them, and an agent running in a person's own\nsession raises a prompt on the desktop. Where neither is\npossible the step is reported as not taken, with the command.\n",
+    )
+    restartAgent: bool | None = Field(
+        False,
+        description='Restart this agent afterwards, so its own socket picks up the\nchange. The response is sent first. Refused with\n`restarted: false` when `AgentRestart.canSelfRestart` is\nfalse — this agent will not stop itself with nothing to start\nit again.\n',
+    )
+
+
+class Step(StrEnum):
+    advertise = 'advertise'
+    announce = 'announce'
+    restart_components = 'restart_components'
+    firewall = 'firewall'
+    restart_agent = 'restart_agent'
+
+
+class ReachStep(BaseModel):
+    step: Step
+    ok: bool
+    detail: str | None = None
+
+
 class EnrollRequest(BaseModel):
     controlUrl: AnyUrl = Field(..., description='The control root to join.')
     token: str = Field(
@@ -1676,78 +1835,39 @@ class ComponentEntry(BaseModel):
     safeMode: bool | None = False
 
 
-class NodeIdentity(BaseModel):
+class HostFirewall(BaseModel):
     """
-    What this agent knows about its own host and its own place in an
-    install. The install-wide `Node` view lives on the control root;
-    this is the half only the host itself can answer.
+    What the host firewall says about the ports this install
+    publishes. Read per request and cached no longer than the node
+    view; a stale verdict is worse than a slow one.
 
     """
 
-    enrolled: bool = Field(
+    supported: bool = Field(
         ...,
-        description='False on a fresh agent, and not an error state — supervision\nworks without a trust relationship, which is what lets the\nagent on the control host boot first and start the control\nroot.\n',
+        description="This platform has a firewall this agent knows how to read.\nFalse is a first-class answer: every other field is then\nabsent and every port's verdict is `unknown`.\n",
     )
-    name: str | None = Field(
-        None, description="This node's name in the install. Absent until enrolled."
-    )
-    publicKey: str | None = Field(
+    product: str | None = Field(
         None,
-        description="This node's identity public key. The private half never\nleaves the host; a secret sealed to this key is readable here\nand by the control root's recovery recipient, and nowhere\nelse.\n",
+        description='The firewall being described — `Windows Defender Firewall`,\n`ufw`, `firewalld`, `Application Firewall`.\n',
     )
-    controlUrl: AnyUrl | None = Field(
-        None, description='The control root this node answers to.'
-    )
-    epoch: int | None = Field(
+    enabled: bool | None = None
+    defaultInbound: DefaultInbound | None = Field(
         None,
-        description='Highest control-root epoch this agent has acknowledged. **It\nrefuses any root presenting a lower one**, which fences a\nsuperseded control root without an election, without quorum,\nand without agreeing with any other agent.\n',
-        ge=0,
+        description='What happens to an inbound connection no rule matches.\n**`unknown` is not `allow`.** Windows reports this as\n`NotConfigured` through its PowerShell cmdlets, which means\n*block*, and reads as *not blocking* to anyone who compares\nthe string to `Block`.\n',
     )
-    advertiseUrl: AnyUrl | None = Field(
+    activeProfiles: list[str] | None = Field(
         None,
-        description="Where other hosts reach this agent — the `advertiseUrl` config\nfield, or the value derived at enrollment when none was set.\nWhat the control root holds as this node's `Node.url`.\n",
+        description='The firewall profiles in force on the interfaces this host is\nconnected through — on Windows, `Private`, `Public` or\n`Domain`. A home network Windows has classified as `Public`\nis the commonest cause of "it worked here yesterday", so the\nclassification is reported even when every verdict is\n`allowed`.\n',
     )
-    signingKeyId: str | None = Field(
+    thirdPartyProducts: list[str] | None = Field(
         None,
-        description='The generation of the install signing key this agent holds,\nas the control root named it. During a rotation, the answer\nto "which host is stale" from the host itself.\n',
+        description='Firewalls registered with the OS that are **not** the one\ndescribed above. A third-party firewall makes every verdict\nhere `unknown`, however confident the built-in firewall\'s own\nanswer looks: "Windows Firewall is off" says nothing about\nwhether Norton is letting us through.\n',
     )
-    controlPublicKey: str | None = Field(
-        None,
-        description="The identity public key of the control root this agent\nenrolled with, recorded then and checked against every\n`POST /v1/node/rekey` since. A dashboard can compare it with\nthe root's own `Snapshot.controlPublicKey`.\n",
-    )
-    signingPublicKey: str | None = Field(
-        None,
-        description="This node's **Ed25519** identity public key — the one it\nsigns `PATCH /v1/nodes/{name}` with, recorded at the control\nroot as `Node.signingPublicKey`.\n\nSeparate from `publicKey`, which is X25519 and exists to have\nsecrets sealed *to* it. One key cannot do both jobs: sealing\nis Diffie-Hellman and signing is Ed25519, and deriving one\nfrom the other only runs in the direction we do not have.\n\nAbsent on a node enrolled before this key existed, which is\nalso why its re-advertisements are refused — see\n`PATCH /v1/nodes/{name}` in `control.yaml`.\n",
-    )
-    advertiseSequence: int | None = Field(
-        None,
-        description='How many address announcements this node has made since it\nenrolled. Strictly increasing, persisted here and mirrored at\nthe control root, so a replayed announcement cannot move a\nnode back to an address it used to have.\n',
-        ge=0,
-    )
-    os: Os | None = None
-    arch: Arch | None = None
-    devices: list[ComputeDevice] | None = Field(
-        None,
-        description='What this host can compute on, detected locally. The control\nroot aggregates these into the cross-host inventory M3\ndeferred; detection stays here because only the host can do\nit.\n',
-    )
-    agentVersion: str | None = None
-
-
-class UnenrollResult(BaseModel):
-    identity: NodeIdentity
-    controlNotified: bool = Field(
-        ...,
-        description='Whether the control root accepted the revocation. **False is\nnot a failure of this call** — the node has left either way.\nIt means the install still lists this node and still trusts\nthe key it just discarded, and an operator owes it a\n`DELETE /v1/nodes/{name}`.\n',
-    )
-    previousName: str | None = Field(
-        None, description='The name this node had in the install it just left.'
-    )
-    previousControlUrl: AnyUrl | None = Field(
-        None, description='The control root it answered to.'
-    )
+    ports: list[FirewallPort] | None = None
     detail: str | None = Field(
         None,
-        description='Why the root was not told, when it was not. Present exactly\nwhen `controlNotified` is false and something was attempted.\n',
+        description='Why the answer is what it is, in a sentence — including why a\nread failed, which is the difference between `unknown` and a\nblank card.\n',
     )
 
 
@@ -2051,6 +2171,76 @@ class DirectoryListing(BaseModel):
     )
 
 
+class NodeReach(BaseModel):
+    """
+    Whether other devices can reach this machine, as **evidence**
+    rather than as a setting.
+
+    Three separate things have to be true, and every surface before
+    this one reported at most one of them: a process has to be
+    listening on an address other than loopback, the node has to be
+    advertising that address so the rest of the install and the
+    person's phone know to use it, and the host firewall has to let
+    the connection in. Each is reported on its own here, because
+    each fails on its own and the symptom of all three is the same
+    — *connection refused*.
+
+    **Nothing here is inferred from a setting.** `boundAddresses`
+    comes from the sockets, the firewall verdict from the host
+    firewall, and `lastReachedByRoot` from a connection another
+    machine actually made. Where a thing cannot be determined the
+    answer is `unknown`, never `allowed`.
+
+    Not to be confused with `LibraryFolderReach`, which answers a
+    different question with the same word: whether *this node* can
+    open a folder on *another* machine. This one is whether another
+    machine can open a socket on this one.
+
+    """
+
+    enabled: bool = Field(
+        ...,
+        description='This node advertises an address other hosts can use. It is a\nstatement about the **setting**, not about whether anything\ngot through — read `boundAddresses` and `firewall` for that.\n',
+    )
+    advertiseUrl: AnyUrl | None = Field(
+        None,
+        description='The address currently advertised, repeated from\n`NodeIdentity.advertiseUrl` so a caller rendering this object\nhas everything it needs.\n',
+    )
+    proposedUrl: AnyUrl | None = Field(
+        None,
+        description='The address this host would advertise if reach were turned on\nnow: its own address on the network it routes through, plus\nthe port this agent binds. Derived from the routing table\n(no packet is sent), so it is available on a machine that has\nnever enrolled and on one whose control root is on loopback —\nwhich is every standalone install, and exactly where the\nenrollment-time derivation answers `127.0.0.1`.\n\nAbsent when this host has no non-loopback address at all.\n',
+    )
+    boundAddresses: list[BoundAddress] | None = Field(
+        None,
+        description='What each process of this install is actually listening on,\nthis agent included — read from the process, not from its\nconfiguration. This is where "the setting says one thing and\nthe socket says another" becomes visible.\n',
+    )
+    restartRequired: bool = Field(
+        ...,
+        description="This agent's own socket does not match what the node\nadvertises. A listening socket is fixed for the life of the\nprocess, so an agent started while the node advertised\nloopback answers only on loopback however the setting is\nchanged afterwards. Supervised components do not have this\nproblem — they are restarted when the setting changes.\n",
+    )
+    restart: AgentRestart | None = None
+    firewall: HostFirewall | None = None
+    lastReachedFrom: str | None = Field(
+        None,
+        description="The address of the last connection to this agent that came\nfrom somewhere other than this machine.\n\n**The only proof from outside.** Static inspection of a\nfirewall says what *should* happen; a connection that\narrived says what did. Deliberately *any* off-host caller\nrather than the control root specifically: on a standalone\ninstall there is no root probing from elsewhere, and the\nperson opening this page on their phone is both the test\nthey were told to run and the evidence it passed. The\ncontrol root's own view of the same fact is\n`Node.lastSeenAt` in `control.yaml`, which is where a\nmulti-machine console should read it.\n\nAbsent until something off this machine connects. Not\npersisted: it describes this process, and a restart is\nexactly when a person wants to know whether reach still\nworks rather than whether it once did.\n",
+    )
+    lastReachedAt: AwareDatetime | None = Field(
+        None, description='When that connection arrived.'
+    )
+
+
+class NodeReachResult(BaseModel):
+    reach: NodeReach
+    steps: list[ReachStep] = Field(
+        ...,
+        description='One entry per thing that was attempted, in the order it was\nattempted. A step that failed does not roll back the ones\nbefore it — a firewall rule that could not be added is not a\nreason to stop advertising — so this list, not the status\ncode, is how a caller learns what actually happened.\n',
+    )
+    restarted: bool | None = Field(
+        None,
+        description='A restart of this agent has been scheduled. The caller should\nexpect this connection to close.\n',
+    )
+
+
 class EngineDescriptor(BaseModel):
     """
     One engine adapter, plus what the agent found on this host.
@@ -2114,6 +2304,82 @@ class LibraryFolderReach(BaseModel):
         None, description='Where the library was, or was looked for.'
     )
     folders: list[LibraryFolderStatus]
+
+
+class NodeIdentity(BaseModel):
+    """
+    What this agent knows about its own host and its own place in an
+    install. The install-wide `Node` view lives on the control root;
+    this is the half only the host itself can answer.
+
+    """
+
+    enrolled: bool = Field(
+        ...,
+        description='False on a fresh agent, and not an error state — supervision\nworks without a trust relationship, which is what lets the\nagent on the control host boot first and start the control\nroot.\n',
+    )
+    name: str | None = Field(
+        None, description="This node's name in the install. Absent until enrolled."
+    )
+    publicKey: str | None = Field(
+        None,
+        description="This node's identity public key. The private half never\nleaves the host; a secret sealed to this key is readable here\nand by the control root's recovery recipient, and nowhere\nelse.\n",
+    )
+    controlUrl: AnyUrl | None = Field(
+        None, description='The control root this node answers to.'
+    )
+    epoch: int | None = Field(
+        None,
+        description='Highest control-root epoch this agent has acknowledged. **It\nrefuses any root presenting a lower one**, which fences a\nsuperseded control root without an election, without quorum,\nand without agreeing with any other agent.\n',
+        ge=0,
+    )
+    advertiseUrl: AnyUrl | None = Field(
+        None,
+        description="Where other hosts reach this agent — the `advertiseUrl` config\nfield, or the value derived at enrollment when none was set.\nWhat the control root holds as this node's `Node.url`.\n",
+    )
+    signingKeyId: str | None = Field(
+        None,
+        description='The generation of the install signing key this agent holds,\nas the control root named it. During a rotation, the answer\nto "which host is stale" from the host itself.\n',
+    )
+    controlPublicKey: str | None = Field(
+        None,
+        description="The identity public key of the control root this agent\nenrolled with, recorded then and checked against every\n`POST /v1/node/rekey` since. A dashboard can compare it with\nthe root's own `Snapshot.controlPublicKey`.\n",
+    )
+    signingPublicKey: str | None = Field(
+        None,
+        description="This node's **Ed25519** identity public key — the one it\nsigns `PATCH /v1/nodes/{name}` with, recorded at the control\nroot as `Node.signingPublicKey`.\n\nSeparate from `publicKey`, which is X25519 and exists to have\nsecrets sealed *to* it. One key cannot do both jobs: sealing\nis Diffie-Hellman and signing is Ed25519, and deriving one\nfrom the other only runs in the direction we do not have.\n\nAbsent on a node enrolled before this key existed, which is\nalso why its re-advertisements are refused — see\n`PATCH /v1/nodes/{name}` in `control.yaml`.\n",
+    )
+    advertiseSequence: int | None = Field(
+        None,
+        description='How many address announcements this node has made since it\nenrolled. Strictly increasing, persisted here and mirrored at\nthe control root, so a replayed announcement cannot move a\nnode back to an address it used to have.\n',
+        ge=0,
+    )
+    os: Os | None = None
+    arch: Arch | None = None
+    devices: list[ComputeDevice] | None = Field(
+        None,
+        description='What this host can compute on, detected locally. The control\nroot aggregates these into the cross-host inventory M3\ndeferred; detection stays here because only the host can do\nit.\n',
+    )
+    agentVersion: str | None = None
+    reach: NodeReach | None = None
+
+
+class UnenrollResult(BaseModel):
+    identity: NodeIdentity
+    controlNotified: bool = Field(
+        ...,
+        description='Whether the control root accepted the revocation. **False is\nnot a failure of this call** — the node has left either way.\nIt means the install still lists this node and still trusts\nthe key it just discarded, and an operator owes it a\n`DELETE /v1/nodes/{name}`.\n',
+    )
+    previousName: str | None = Field(
+        None, description='The name this node had in the install it just left.'
+    )
+    previousControlUrl: AnyUrl | None = Field(
+        None, description='The control root it answered to.'
+    )
+    detail: str | None = Field(
+        None,
+        description='Why the root was not told, when it was not. Present exactly\nwhen `controlNotified` is false and something was attempted.\n',
+    )
 
 
 class EngineList(BaseModel):

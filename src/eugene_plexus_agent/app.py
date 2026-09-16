@@ -32,6 +32,7 @@ from . import (
     enrollment,
     keyring_store,
     node_identity,
+    off_host,
     process_signals,
     security,
     ui_assets,
@@ -366,6 +367,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.settings = settings
+    # The only evidence about reach that comes from outside this machine:
+    # somebody's phone, or another node, actually connected. Pure ASGI
+    # and scope-only, so the streaming proxy below is untouched.
+    app.state.off_host = off_host.OffHostWitness()
+    off_host.install(app, app.state.off_host)
 
     # Public routes (no auth required).
     app.include_router(health_routes.router)

@@ -224,6 +224,13 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
         )
 
     app = create_app(settings)
+    # The interface this process will actually listen on, recorded where
+    # `GET /v1/node`'s `reach` can read it. Not the same thing as the
+    # setting: a listening socket is fixed for the life of the process,
+    # so an agent started while the node advertised loopback keeps
+    # answering only on loopback however the setting changes afterwards
+    # -- and that disagreement is what the reach card exists to show.
+    app.state.bind_host = bind_host
     config = uvicorn.Config(app, host=bind_host, port=port, log_level=log_level)
     return uvicorn.Server(config)
 

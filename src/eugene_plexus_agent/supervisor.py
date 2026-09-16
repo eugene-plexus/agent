@@ -510,6 +510,18 @@ class SupervisedProcess:
         `Runtime.argv`: the first question anyone debugging a local engine
         asks is what command actually ran, and every tool that hides the
         answer makes that debugging worse."""
+        self.last_bind_host: str | None = None
+        """The `<KIND>_BIND_HOST` this child was actually spawned with,
+        or None where the plan named none and the component's own
+        loopback default applies.
+
+        Recorded for the same reason as `last_argv` and read by
+        `NodeReach.boundAddresses`: what a child is *listening* on is a
+        property of the spawn, and the setting that decides it can be
+        changed at any time. A reach card that re-derived the value from
+        today's config would describe a restart that has not happened
+        yet -- which is the exact failure the card exists to make
+        visible."""
         self.last_error: str | None = None
         # A bounded tail of the child's own output, kept so a non-zero
         # exit can be explained by whoever understands the engine rather
@@ -795,6 +807,16 @@ class SupervisedProcess:
         self.degraded = plan.degraded
         self._last_port = plan.port
         self.last_argv = list(plan.argv)
+        # `plan.env` is None for an engine -- adapters build argv and
+        # inherit the environment -- and an engine has no bind host to
+        # record anyway. Reading it unguarded raised AttributeError
+        # inside the spawn, which the loop swallowed into a process that
+        # sat in `starting` forever with nothing in `lastError`: the
+        # failure mode a supervisor must never have, bought by one line
+        # of bookkeeping, and caught by an existing engine test.
+        self.last_bind_host = next(
+            (v for k, v in (plan.env or {}).items() if k.endswith("_BIND_HOST")), None
+        )
         self.last_restart = datetime.now(UTC)
         self.last_error = None
 
@@ -1059,6 +1081,20 @@ class Supervisor:
             status = ComponentStatus.running if reachable else ComponentStatus.unreachable
             return status, None, None, None
         return ComponentStatus.unreachable, None, None, None
+
+    def bind_host_for(self, name: str) -> str | None:
+        """What this child was actually spawned with as its bind host.
+
+        `None` means either that this agent does not supervise it or that
+        the spawn named no bind host, in which case the component's own
+        loopback default applies -- two cases the caller tells apart by
+        also knowing whether the component is running.
+        """
+        sp = self._processes.get(name)
+        return sp.last_bind_host if sp is not None else None
+
+    def is_supervised(self, name: str) -> bool:
+        return name in self._processes
 
     # --- internals --------------------------------------------------------
 

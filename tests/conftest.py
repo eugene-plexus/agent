@@ -249,6 +249,33 @@ def authed_client(app: FastAPI) -> Iterator[TestClient]:
 # Same root cause as the acceptance scripts, which clear this explicitly
 # for the same reason; see `scripts/context-honesty-acceptance.sh` in
 # the specs repo for what it costs when it is missed.
+# `GET /v1/node` reads the host firewall and asks what would restart this
+# agent. Both answer differently on every developer machine and again in
+# CI -- the library's `recommend()` test read a live GPU and failed
+# whenever one was busy, and this is the same shape. Pinned to a
+# no-firewall host with nothing supervising the agent; a test about
+# reach overrides them.
+@pytest.fixture(autouse=True)
+def _pin_host_environment_probes(app: FastAPI) -> None:
+    from eugene_plexus_agent._generated.models import (
+        AgentRestart,
+        FirewallPort,
+        HostFirewall,
+        Mechanism,
+        Verdict,
+    )
+
+    app.state.firewall_reader = lambda query: HostFirewall(
+        supported=True,
+        product="Test firewall",
+        enabled=False,
+        ports=[FirewallPort(port=p, verdict=Verdict.allowed) for p in query.ports],
+    )
+    app.state.restart_describer = lambda: AgentRestart(
+        mechanism=Mechanism.none, canSelfRestart=False, command="eugene-plexus-agent"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:

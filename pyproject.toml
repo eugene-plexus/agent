@@ -124,7 +124,15 @@ ignore_errors = true
 # Scoped to the four modules `winservice.py` imports so the rest of the
 # file keeps full checking.
 [[tool.mypy.overrides]]
-module = ["win32serviceutil", "win32service", "win32event", "servicemanager"]
+module = [
+    "win32serviceutil",
+    "win32service",
+    "win32event",
+    "servicemanager",
+    # ...plus the two the firewall detector reaches for.
+    "win32com.*",
+    "pythoncom",
+]
 ignore_missing_imports = true
 
 # -----------------------------------------------------------------------------
