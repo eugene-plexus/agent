@@ -286,6 +286,33 @@ class LlamaCppAdapter(EngineAdapter):
             binary_name=self.binary_name,
         )
 
+    # --- diagnosing -------------------------------------------------------
+
+    def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        """Name the argument the engine refused, when that is why it died.
+
+        `llama-server` prints `error: invalid argument: --x` and exits
+        before it opens a socket, so every network-level surface reports
+        exactly what a still-loading engine reports and the supervisor
+        restarts it into the same wall. Observed live 2026-09-17: four
+        identical crashes, the reason in the log the whole time, and
+        `lastError` saying only that it exited.
+
+        Worth naming the flag rather than saying "bad arguments": the
+        operator did not type an argv, they ticked a field or filled a
+        box, and the flag is the only thing that leads back to it.
+        """
+        match = _INVALID_ARGUMENT_RE.search(output_tail)
+        if not match:
+            return None
+        argument = match.group(1).strip()
+        return (
+            f"llama-server rejected the argument {argument!r} and exited before "
+            f"it could serve. This build does not understand it — check "
+            f"`extraArgs` on this runtime, and the engine flags on its profile, "
+            f"against `{self.binary_name} --help` for the installed build."
+        )
+
     # --- launching --------------------------------------------------------
 
     def build_argv(self, spec: RuntimeSpec, binary: DiscoveredBinary, port: int) -> list[str]:
@@ -308,6 +335,10 @@ class LlamaCppAdapter(EngineAdapter):
 
         flags = spec.flags or {}
         for field in self.flag_schema().fields:
+            if field.key in _LOAD_MODE_KEYS:
+                # Not a presence-only switch any more; handled together
+                # below, because the two collapse into one CLI value.
+                continue
             if field.key not in flags:
                 continue
             value = flags[field.key]
@@ -321,6 +352,8 @@ class LlamaCppAdapter(EngineAdapter):
                     argv.append(cli)
             else:
                 argv += [cli, str(value)]
+
+        argv += _load_mode_argv(flags, binary.path)
 
         # Verbatim, last, so an operator can always override something the
         # curated surface generated above.
@@ -421,6 +454,121 @@ def _status_text(response: httpx.Response) -> str | None:
     return None
 
 
+# --------------------------------------------------------------------------- #
+# How the model is read off disk: `--load-mode` since about b10900, two
+# separate switches before it
+# --------------------------------------------------------------------------- #
+
+# `--no-mmap` and `--mlock` were replaced upstream by one `-lm/--load-mode
+# MODE`, and a build that has the new spelling **rejects the old one**:
+# `error: invalid argument: --no-mmap`, exit non-zero, and the supervisor
+# restarts it into the same wall. Found live 2026-09-17 on b10948, by
+# ticking a field this project's own schema offers.
+#
+# So the spelling is **read off the binary** rather than gated on a build
+# number, which is the same rule the CUDA variant matrix learned on
+# 2026-09-12: upstream's own artifact is the only thing that knows what
+# upstream published. `--help` is one subprocess per binary per process
+# run, memoised below.
+#
+# The two booleans collapse into one value, and the old pair's meaning is
+# preserved exactly: `--mlock` alone used to mean "mmap it AND pin it",
+# because mmap was the default it did not disturb.
+_LOAD_MODE_KEYS = ("noMmap", "mlock")
+
+_LOAD_MODE_BY_FLAGS: dict[tuple[bool, bool], str] = {
+    # (noMmap, mlock)
+    (True, False): "none",
+    (False, True): "mmap+mlock",
+    (True, True): "mlock",
+}
+
+# `error: invalid argument: --no-mmap` — upstream's own wording in
+# `common/arg.cpp`, printed to stderr just before a non-zero exit.
+_INVALID_ARGUMENT_RE = re.compile(r"error:\s*invalid argument:\s*(\S+)")
+
+_HELP_TIMEOUT_SECONDS = 15.0
+_LONG_FLAG_RE = re.compile(r"--[a-z0-9][a-z0-9-]*")
+
+# Keyed by (path, mtime, size): a rebuilt or upgraded binary at the same
+# path is a different binary, and the engine store writes each build to
+# its own directory anyway.
+_help_flags_cache: dict[tuple[str, float, int], frozenset[str]] = {}
+
+
+def _supported_long_flags(binary: Path) -> frozenset[str] | None:
+    """Every `--long-flag` this binary's own `--help` mentions.
+
+    None when the binary could not be asked, which is a different answer
+    from "it supports nothing" and must not be read as one: an argv is
+    still built, on the legacy spelling, because refusing to launch over
+    a failed `--help` would turn a cosmetic probe into an outage.
+    """
+    try:
+        stat = binary.stat()
+        key = (str(binary), stat.st_mtime, stat.st_size)
+    except OSError:
+        return None
+    cached = _help_flags_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            [str(binary), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=_HELP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("help probe for %s failed: %s", binary, e)
+        return None
+    found = frozenset(_LONG_FLAG_RE.findall((proc.stdout or "") + (proc.stderr or "")))
+    if not found:
+        return None
+    _help_flags_cache[key] = found
+    return found
+
+
+def _load_mode_argv(flags: dict, binary: Path) -> list[str]:
+    """Translate `noMmap` / `mlock` into whichever spelling this binary takes.
+
+    Emits nothing when neither is set — the engine's own default (`auto`)
+    is the right answer and naming it would be us deciding something the
+    operator did not.
+    """
+    no_mmap = bool(flags.get("noMmap"))
+    mlock = bool(flags.get("mlock"))
+    if not no_mmap and not mlock:
+        return []
+
+    supported = _supported_long_flags(binary)
+    if supported is None or "--load-mode" in supported:
+        # Unknown binaries take the current spelling: a build old enough
+        # to lack `--load-mode` predates every build this project has ever
+        # installed, and guessing forward ages better than guessing back.
+        mode = _LOAD_MODE_BY_FLAGS[(no_mmap, mlock)]
+        if supported is None:
+            log.debug("could not read --help from %s; assuming --load-mode", binary)
+        return ["--load-mode", mode]
+
+    legacy: list[str] = []
+    if no_mmap and "--no-mmap" in supported:
+        legacy.append("--no-mmap")
+    if mlock and "--mlock" in supported:
+        legacy.append("--mlock")
+    if not legacy:
+        # Neither spelling exists. Dropping the request is the only thing
+        # left that still starts the engine, and it is said out loud
+        # because a flag silently ignored is worse than one refused.
+        log.warning(
+            "%s understands neither --load-mode nor --no-mmap/--mlock; "
+            "ignoring the noMmap/mlock flags on this runtime",
+            binary,
+        )
+    return legacy
+
+
 _CATEGORIES = {
     "memory": "Memory and context",
     "performance": "Performance",
@@ -440,8 +588,6 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     "mainGpu": "--main-gpu",
     "tensorSplit": "--tensor-split",
     "flashAttention": "--flash-attn",
-    "mlock": "--mlock",
-    "noMmap": "--no-mmap",
     "continuousBatching": "--cont-batching",
 }
 
@@ -598,8 +744,13 @@ _FLAG_FIELDS: list[ConfigField] = [
         label="Disable mmap",
         description=(
             "Read the model into memory instead of mapping it from disk. "
-            "Slower to start and needs more RAM; occasionally necessary on "
-            "network filesystems."
+            "Needs enough free RAM to hold the whole file. On a local "
+            "disk this is slower to start; **over a network share it is "
+            "usually much faster**, because a mapped read never gets the "
+            "read-ahead a plain sequential read does. Measured 2026-09-17 "
+            "on a 24.95 GB model over SMB on a 1 Gbps link: 10m01s "
+            "mapped against 4m16s read, where the same share delivers "
+            "113 MB/s to an ordinary sequential read."
         ),
         category="memory",
         valueType=ConfigValueType.boolean,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -319,12 +321,23 @@ def test_flag_schema_is_a_standard_config_schema(adapter: LlamaCppAdapter) -> No
         assert field.category in (schema.categories or {})
 
 
-def test_every_schema_flag_has_a_cli_mapping(adapter: LlamaCppAdapter) -> None:
-    """A flag in the schema with no CLI name would render in the UI and
-    then KeyError at spawn."""
-    from eugene_plexus_agent.engines.llama_cpp import _FLAG_CLI_NAMES
+def test_every_schema_flag_reaches_the_command_line_somehow(
+    adapter: LlamaCppAdapter,
+) -> None:
+    """A flag in the schema that nothing translates would render in the UI
+    and then KeyError at spawn.
 
-    assert {f.key for f in adapter.flag_schema().fields} == set(_FLAG_CLI_NAMES)
+    Two routes now: most keys are a one-to-one CLI name, and `noMmap` /
+    `mlock` collapse into a single `--load-mode` value whose spelling
+    depends on the binary. A key in neither set is the defect this
+    guards; a key in BOTH would be built twice.
+    """
+    from eugene_plexus_agent.engines.llama_cpp import _FLAG_CLI_NAMES, _LOAD_MODE_KEYS
+
+    direct = set(_FLAG_CLI_NAMES)
+    collapsed = set(_LOAD_MODE_KEYS)
+    assert not (direct & collapsed), "a key translated twice would be passed twice"
+    assert {f.key for f in adapter.flag_schema().fields} == direct | collapsed
 
 
 def test_unknown_flags_are_reported_not_dropped(adapter: LlamaCppAdapter) -> None:
@@ -381,3 +394,105 @@ def test_the_contracted_without_adapter_list_is_honest() -> None:
             f"{kind} has an adapter now — remove it from "
             "CONTRACTED_WITHOUT_ADAPTER so parity is enforced again"
         )
+
+
+# --------------------------------------------------------------------------- #
+# load mode: --load-mode since ~b10900, --no-mmap/--mlock before it
+#
+# Found live 2026-09-17 on b10948: ticking `noMmap` in this project's own
+# schema spawned `llama-server --no-mmap`, which that build rejects, and the
+# runtime crash-looped. The spelling is read off the binary rather than gated
+# on a build number.
+# --------------------------------------------------------------------------- #
+
+
+def _binary_whose_help_says(tmp_path: Any, help_text: str) -> DiscoveredBinary:
+    """A stand-in binary that really is executed for `--help`."""
+    script = tmp_path / "llama-server-help.py"
+    script.write_text(
+        f"import sys; sys.stdout.write({help_text!r})",
+        encoding="utf-8",
+    )
+    exe = tmp_path / ("fake-llama-server" + (".bat" if os.name == "nt" else ""))
+    if os.name == "nt":
+        exe.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+    else:
+        exe.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+        exe.chmod(0o755)
+    return DiscoveredBinary(path=exe, origin=Origin.path, version="10948")
+
+
+_NEW_HELP = "-lm,   --load-mode MODE   model loading mode (default: auto)\n"
+_OLD_HELP = "       --no-mmap          do not memory-map model\n       --mlock   force RAM\n"
+
+
+def test_no_mmap_becomes_load_mode_on_a_build_that_has_it(
+    adapter: LlamaCppAdapter, tmp_path: Any
+) -> None:
+    binary = _binary_whose_help_says(tmp_path, _NEW_HELP)
+
+    argv = adapter.build_argv(_spec(flags={"noMmap": True}), binary, port=8090)
+
+    assert "--no-mmap" not in argv, "the old spelling is what the engine rejects"
+    assert argv[argv.index("--load-mode") + 1] == "none"
+
+
+def test_no_mmap_keeps_the_old_spelling_on_a_build_that_only_has_that(
+    adapter: LlamaCppAdapter, tmp_path: Any
+) -> None:
+    binary = _binary_whose_help_says(tmp_path, _OLD_HELP)
+
+    argv = adapter.build_argv(_spec(flags={"noMmap": True}), binary, port=8090)
+
+    assert "--no-mmap" in argv
+    assert "--load-mode" not in argv
+
+
+def test_mlock_alone_still_means_mmap_and_pin(adapter: LlamaCppAdapter, tmp_path: Any) -> None:
+    # `--mlock` used to leave mmap alone because mmap was the default, so
+    # the faithful translation is mmap+mlock, NOT bare mlock.
+    binary = _binary_whose_help_says(tmp_path, _NEW_HELP)
+
+    argv = adapter.build_argv(_spec(flags={"mlock": True}), binary, port=8090)
+
+    assert argv[argv.index("--load-mode") + 1] == "mmap+mlock"
+
+
+def test_both_flags_collapse_into_one_value(adapter: LlamaCppAdapter, tmp_path: Any) -> None:
+    binary = _binary_whose_help_says(tmp_path, _NEW_HELP)
+
+    argv = adapter.build_argv(_spec(flags={"noMmap": True, "mlock": True}), binary, port=8090)
+
+    assert argv.count("--load-mode") == 1, "two --load-mode values would be a conflict"
+    assert argv[argv.index("--load-mode") + 1] == "mlock"
+
+
+def test_neither_flag_names_no_mode_at_all(adapter: LlamaCppAdapter, tmp_path: Any) -> None:
+    # The engine's own default is the right answer; naming it would be us
+    # deciding something the operator did not.
+    binary = _binary_whose_help_says(tmp_path, _NEW_HELP)
+
+    argv = adapter.build_argv(_spec(flags={"contextSize": 4096}), binary, port=8090)
+
+    assert "--load-mode" not in argv
+    assert "--no-mmap" not in argv
+
+
+def test_an_unaskable_binary_still_builds_an_argv(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary
+) -> None:
+    # `binary` is an empty stub that cannot answer --help. Refusing to
+    # launch over a failed cosmetic probe would turn it into an outage.
+    argv = adapter.build_argv(_spec(flags={"noMmap": True}), binary, port=8090)
+
+    assert argv[argv.index("--load-mode") + 1] == "none"
+
+
+def test_a_rejected_argument_is_explained_rather_than_left_as_an_exit_code(
+    adapter: LlamaCppAdapter,
+) -> None:
+    explained = adapter.explain_exit(1, "error: invalid argument: --no-mmap\n")
+
+    assert explained is not None
+    assert "--no-mmap" in explained
+    assert adapter.explain_exit(1, "ggml_cuda_init: failed\n") is None
