@@ -1399,6 +1399,69 @@ class RuntimeSpec(BaseModel):
     )
 
 
+class Source(StrEnum):
+    """
+    Which counter answered. On the wire so that "this host cannot
+    measure it" stays distinguishable from "this engine is not
+    reading" — both of which make the field absent, and only one
+    of which is worth reporting to whoever runs the host.
+
+    """
+
+    windows_io_counters = 'windows_io_counters'
+    proc_io_rchar = 'proc_io_rchar'
+    rusage_diskio = 'rusage_diskio'
+
+
+class LoadProgress(BaseModel):
+    """
+    How far into reading its model an engine is, **present only while
+    that is a thing anyone can honestly say**.
+
+    A large model on shared storage takes minutes to load, and for
+    those minutes a healthy node and a hung one look identical: the
+    status is `loading`, the engine answers 503, and nothing says
+    whether bytes are moving. This is what distinguishes them.
+
+    **Absent is the normal case, not an error.** It is absent
+    whenever the read cannot be observed:
+
+      * the engine **memory-maps** its model, which llama.cpp does by
+        default — faulted pages are not read I/O, so the counter sees
+        a few megabytes of header and then nothing. Measured
+        2026-09-17 on Windows: 268 MB touched through a mapping moved
+        `ReadTransferCount` by 0.0 MB, against +268.4 MB for the same
+        bytes read normally, over SMB and on local disk alike;
+      * the host has no counter this agent knows;
+      * the runtime is not loading, or has no process.
+
+    So a consumer renders a bar when this is present and elapsed time
+    when it is not, and never infers one from the other. A field that
+    was always present would force every consumer to invent the
+    distinction, and one of them would get it wrong by showing a bar
+    frozen at 0.1% for four minutes — which is the question this
+    answers, made worse by looking authoritative.
+
+    """
+
+    bytesRead: int = Field(
+        ...,
+        description='Bytes this engine process has read since it started. Includes\nwhatever else it read — its own binary, CUDA libraries — which\nis noise against a model measured in gigabytes.\n',
+    )
+    totalBytes: int | None = Field(
+        None,
+        description="Size of the model file this runtime is opening, when it could\nbe measured. Null when the path could not be stat'd, which is\na share that has gone away — exactly when a load is worth\nwatching, so progress is still reported without a percentage.\n",
+    )
+    bytesPerSecond: float | None = Field(
+        None,
+        description='Observed over a short window, so it tracks a share that has\njust got slower rather than averaging the whole load. Null on\nthe first pair of readings.\n',
+    )
+    source: Source = Field(
+        ...,
+        description='Which counter answered. On the wire so that "this host cannot\nmeasure it" stays distinguishable from "this engine is not\nreading" — both of which make the field absent, and only one\nof which is worth reporting to whoever runs the host.\n',
+    )
+
+
 class RuntimeStatus(StrEnum):
     """
     Operational state of an engine process. Distinct from
@@ -2010,6 +2073,7 @@ class Runtime(BaseModel):
         None,
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
     )
+    loadProgress: LoadProgress | None = None
 
 
 class StopRequest(BaseModel):

@@ -801,3 +801,90 @@ async def test_a_known_engine_death_reaches_last_error(tmp_path: Path) -> None:
         # The loop respawns after a crash; without this the backoff task
         # outlives the test.
         await proc.stop()
+
+
+# --------------------------------------------------------------------------- #
+# load progress reaches the wire
+#
+# A tracker that is right about bytes says nothing about whether
+# `Runtime.loadProgress` is populated, cleared, or populated in the wrong
+# states -- S7's "a component test is not a wiring test", applied before
+# it could bite. These drive `compose()`, which is what a caller sees.
+# --------------------------------------------------------------------------- #
+
+
+def _loading_supervisor(monkeypatch: Any, readings: list[int]) -> Any:
+    from eugene_plexus_agent import process_io
+
+    seq = list(readings)
+
+    def fake(pid: int) -> tuple[int, str] | None:
+        return (seq.pop(0) if seq else seq_last[0], process_io.SOURCE_WINDOWS)
+
+    seq_last = [readings[-1]]
+    monkeypatch.setattr(process_io, "read_bytes", fake)
+
+    supervisor = RuntimeSupervisor(log=logging.getLogger("test"))
+
+    class _Alive:
+        state = ProcessState.starting
+        pid = 4242
+        last_argv = None
+        last_error = None
+        last_restart = None
+
+    supervisor._processes["q"] = _Alive()  # type: ignore[assignment]
+    return supervisor
+
+
+def _spec_q() -> RuntimeSpec:
+    return RuntimeSpec.model_validate(
+        {"name": "q", "engine": "llama_cpp", "modelPath": "/models/q.gguf", "port": 8090}
+    )
+
+
+def test_a_loading_runtime_carries_load_progress_on_the_wire(monkeypatch: Any) -> None:
+    supervisor = _loading_supervisor(monkeypatch, [0, 500_000_000])
+    spec = _spec_q()
+    supervisor._readiness["q"] = Loading(detail="loading model")
+
+    first = supervisor.compose(spec)
+    assert first.loadProgress is None, "one reading is a baseline, not a rate"
+
+    second = supervisor.compose(spec)
+    assert second.status == RuntimeStatus.loading
+    assert second.loadProgress is not None
+    assert second.loadProgress.bytesRead == 500_000_000
+    assert second.loadProgress.source.value == "windows_io_counters"
+
+
+def test_a_ready_runtime_never_reports_load_progress(monkeypatch: Any) -> None:
+    """A ready engine's read counter keeps climbing as it serves. A bar
+    that filled once and then crept past 100% is worse than none."""
+    supervisor = _loading_supervisor(monkeypatch, [0, 500_000_000, 900_000_000])
+    spec = _spec_q()
+    supervisor._readiness["q"] = Loading(detail="loading model")
+    supervisor.compose(spec)
+    assert supervisor.compose(spec).loadProgress is not None
+
+    supervisor._readiness["q"] = Ready()
+    assert supervisor.compose(spec).loadProgress is None
+
+
+def test_going_ready_forgets_the_samples_so_a_later_load_starts_clean(
+    monkeypatch: Any,
+) -> None:
+    """Otherwise a restart's first reading is compared against bytes this
+    process read while it was serving, and the delta is nonsense."""
+    supervisor = _loading_supervisor(monkeypatch, [0, 500_000_000, 900_000_000, 1_000_000_000])
+    spec = _spec_q()
+    supervisor._readiness["q"] = Loading(detail="loading model")
+    supervisor.compose(spec)
+    supervisor.compose(spec)
+
+    supervisor._readiness["q"] = Ready()
+    supervisor.compose(spec)
+
+    supervisor._readiness["q"] = Loading(detail="loading model")
+    assert supervisor.compose(spec).loadProgress is None, "needs a fresh baseline"
+    assert supervisor.compose(spec).loadProgress is not None

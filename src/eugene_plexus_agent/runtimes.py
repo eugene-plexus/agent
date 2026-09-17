@@ -26,6 +26,7 @@ from ._generated.models import (
     EngineDescriptor,
     EngineInstall,
     EngineKind,
+    LoadProgress,
     ManagedEngine,
     ManualInstall,
     Policy,
@@ -58,6 +59,7 @@ from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
 from .library_folders import RulesProvider, effective_rules
 from .model_paths import PathRule, resolve_model_path, rules_from_config
+from .process_io import LoadProgressTracker
 from .supervisor import (
     ProcessState,
     SpawnPlan,
@@ -279,6 +281,11 @@ class RuntimeSupervisor:
         # `Runtime.stopReason` and never persisted or replicated. Cleared
         # the moment the runtime is started.
         self._stop_reasons: dict[str, StopReason] = {}
+        # Bytes-read samples per runtime; see `process_io`. Sampled
+        # when a view is built rather than on a loop, because a
+        # loading runtime is already read every second or two by the
+        # control root and every three by a console.
+        self._load_progress = LoadProgressTracker()
         self._poll_task: asyncio.Task[None] | None = None
         # This node's name once enrolled, read at compose time so it is
         # filled from the agent's own identity and can never disagree
@@ -321,6 +328,7 @@ class RuntimeSupervisor:
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
         self._stop_reasons.pop(name, None)
+        self._load_progress.forget(name)
         if sp is not None:
             await sp.stop()
 
@@ -424,13 +432,34 @@ class RuntimeSupervisor:
                 StopReason.autoStart if spec.autoStart is False else StopReason.operator,
             )
 
+        # **Only while it is loading.** A ready engine's counter keeps
+        # climbing as it serves, and a bar that filled once and then
+        # crept past 100% would be worse than no bar. `starting` counts:
+        # llama.cpp opens its socket before it has read anything, so the
+        # first seconds of a read are spent in that status.
+        local_path = resolve_model_path(spec.modelPath, self._rules()).local_path
+        load_progress: LoadProgress | None = None
+        if status in (RuntimeStatus.loading, RuntimeStatus.starting):
+            observed = self._load_progress.sample(
+                spec.name, sp.pid if sp is not None else None, local_path
+            )
+            if observed is not None:
+                load_progress = LoadProgress(
+                    bytesRead=observed.bytes_read,
+                    totalBytes=observed.total_bytes,
+                    bytesPerSecond=observed.bytes_per_second,
+                    source=observed.source,  # type: ignore[arg-type]
+                )
+        else:
+            self._load_progress.forget(spec.name)
+
         return Runtime(
             name=spec.name,
             engine=spec.engine,
             modelPath=spec.modelPath,
             # Observed, from the current rules, every time it is read:
             # a stopped runtime shows what its next start would open.
-            localPath=resolve_model_path(spec.modelPath, self._rules()).local_path,
+            localPath=local_path,
             modelAlias=spec.modelAlias or _default_alias(spec),
             host=spec.host,
             port=spec.port,
@@ -456,6 +485,7 @@ class RuntimeSupervisor:
             capabilities=capabilities,
             lastRestart=last_restart,
             lastError=last_error,
+            loadProgress=load_progress,
         )
 
     def _status_for(
