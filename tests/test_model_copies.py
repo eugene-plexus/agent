@@ -437,3 +437,34 @@ def test_settings_survive_a_config_file_someone_edited_by_hand(tmp_path: Path) -
     assert conf.enabled is True
     assert conf.directory == str(tmp_path)
     assert conf.min_free_bytes == mc.DEFAULT_MIN_FREE_GB * mc.GIB
+
+
+def test_a_directory_a_copy_is_about_to_fill_is_not_pruned(tmp_path: Path) -> None:
+    """The live install's first boot with copying on, in one test.
+
+    A copy creates its directory and then opens a temp file in it, and
+    the reconcile that runs on the declaration list walks the same tree.
+    Between those two instants the directory is empty and looks like
+    scaffolding -- so it was deleted out from under the copy, which
+    failed with `No such file or directory` on a path it had just
+    created. A directory we are about to fill is not empty.
+    """
+    rule = share(tmp_path, MODEL)
+    conf = settings(tmp_path)
+    plan = mc.plan_for(MODEL, [rule], conf)
+    assert plan is not None
+    os.makedirs(os.path.dirname(plan.destination), exist_ok=True)
+
+    mc.remove_unwanted(conf.directory, [plan.destination])
+
+    assert os.path.isdir(os.path.dirname(plan.destination))
+
+
+def test_an_empty_directory_nothing_wants_is_still_pruned(tmp_path: Path) -> None:
+    conf = settings(tmp_path)
+    stale = Path(conf.directory or "") / "someone-elses-folder"
+    stale.mkdir(parents=True)
+
+    mc.remove_unwanted(conf.directory, [])
+
+    assert not stale.exists()

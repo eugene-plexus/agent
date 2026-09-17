@@ -522,7 +522,7 @@ def evict_for_headroom(
             continue
         result.deleted.append(path)
         result.bytes_freed += st.size if st is not None else 0
-    _prune_empty_dirs(directory)
+    _prune_empty_dirs(directory, keep)
     return result
 
 
@@ -560,18 +560,33 @@ def remove_unwanted(
         result.deleted.append(path)
         result.bytes_freed += st.size if st is not None else 0
         log.info("removed local copy %s: no runtime points at it any more", path)
-    _prune_empty_dirs(directory)
+    _prune_empty_dirs(directory, keep)
     return result
 
 
-def _prune_empty_dirs(directory: str | None) -> None:
-    """Leave no empty scaffolding behind. The copy directory itself
-    stays: the operator made that choice, and removing it would make the
-    next copy recreate it for no reason."""
+def _prune_empty_dirs(directory: str | None, keep: Iterable[str] = ()) -> None:
+    """Leave no empty scaffolding behind.
+
+    The copy directory itself stays: the operator made that choice, and
+    removing it would make the next copy recreate it for no reason.
+
+    **`keep` is not optional in practice, and the live install proved
+    it.** A copy creates its directory and then opens a temp file in it,
+    and the reconcile that runs on the declaration list walks the same
+    tree. Between those two instants the directory is empty and looks
+    like scaffolding -- so the first boot with copying switched on
+    deleted the directory out from under the copy, which failed with
+    `No such file or directory` on a path it had just created. A
+    directory we are about to fill is not empty.
+    """
     if not directory or not os.path.isdir(directory):
         return
+    protected = {os.path.normcase(os.path.abspath(os.path.dirname(p) or directory)) for p in keep}
     for root, dirs, files in os.walk(directory, topdown=False):
         if os.path.abspath(root) == os.path.abspath(directory):
+            continue
+        here = os.path.normcase(os.path.abspath(root))
+        if any(p == here or p.startswith(here + os.sep) for p in protected):
             continue
         if not dirs and not files:
             with_error = False
