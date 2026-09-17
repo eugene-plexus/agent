@@ -564,9 +564,26 @@ class RuntimeSupervisor:
         sp = self._processes.get(name)
         if sp is None:
             return False
+        planner = self._planners.get(name)
+        if planner is not None and self._copy_wanted(planner.spec):
+            # **A restart is a launch, so it copies first.** Without
+            # this, the most natural gesture after switching copying on
+            # -- press Restart -- re-plans in place, opens the share
+            # again and explains nothing, because `sp.restart()` never
+            # passes through the path that makes a copy. Found on the
+            # live install at step 8 of the design's build order, which
+            # is the first thing that ever pressed it.
+            await self.stop_one(name, reason=StopReason.operator)
+            self.add_and_start(planner.spec.model_copy(update={"autoStart": True}))
+            return True
         self._readiness.pop(name, None)
         await sp.restart()
         return True
+
+    def _copy_wanted(self, spec: RuntimeSpec) -> bool:
+        """Whether this runtime would copy its model if started now."""
+        plan = model_copies.plan_for(spec.modelPath, self._rules(), self.copy_settings())
+        return plan is not None and not model_copies.copy_is_current(plan)
 
     async def stop_one(self, name: str, *, reason: StopReason = StopReason.operator) -> None:
         """Stop the engine but keep the runtime declared.

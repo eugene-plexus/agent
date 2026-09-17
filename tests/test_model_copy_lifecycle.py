@@ -102,6 +102,9 @@ def supervisor_for(
         async def stop() -> None:
             return None
 
+        async def restart() -> None:
+            seen.append(spec.name)
+
         sup._processes[spec.name] = SimpleNamespace(
             state=ProcessState.starting,
             last_error=None,
@@ -109,6 +112,7 @@ def supervisor_for(
             pid=1234,
             last_argv=None,
             stop=stop,
+            restart=restart,
         )
 
     sup._spawn = fake_spawn  # type: ignore[assignment]
@@ -323,3 +327,51 @@ async def test_clear_reports_what_it_skipped_and_stops_nothing(
     assert result.deleted == []
     assert [s.runtime for s in result.skipped] == ["qwen"]
     assert file_exists(copy)
+
+
+@pytest.mark.anyio
+async def test_restart_makes_the_copy_a_plain_restart_would_have_skipped(
+    tmp_path: Path, share: PathRule
+) -> None:
+    """Restart is the gesture right after switching copying on.
+
+    `SupervisedProcess.restart` re-plans in place, which resolves the
+    path but never passes through the code that COPIES -- so before
+    this, pressing Restart opened the share again and explained
+    nothing. Found on the live install, which is the first thing that
+    ever pressed it.
+    """
+    spawned: list[str] = []
+    sup = supervisor_for(tmp_path, share, enabled=False, spawned=spawned)
+    sup.add_and_start(spec())
+    assert spawned == ["qwen"]
+    assert sup.compose(spec()).localPathSource is not None
+    assert sup.compose(spec()).localPathSource.value != "copy"
+
+    # The operator switches copying on and presses Restart.
+    sup._get_config = {  # type: ignore[assignment]
+        "modelCopyEnabled": True,
+        "modelCopyDir": str(tmp_path / "copies"),
+        "modelCopyMinFreeGb": 0,
+    }.get
+    assert await sup.restart("qwen") is True
+    job = sup._copy_jobs.get("qwen")
+    assert job is not None, "a restart with copying on must go through the copy path"
+    await asyncio.wait_for(asyncio.shield(job.task), timeout=10)
+
+    assert spawned == ["qwen", "qwen"]
+    assert sup.compose(spec()).localPathSource.value == "copy"
+
+
+@pytest.mark.anyio
+async def test_restart_with_a_current_copy_stays_a_plain_restart(
+    tmp_path: Path, share: PathRule
+) -> None:
+    """Nothing is re-copied for a restart, which is the whole point:
+    the second start is the fast one."""
+    sup = supervisor_for(tmp_path, share)
+    sup.add_and_start(spec())
+    await asyncio.wait_for(asyncio.shield(sup._copy_jobs["qwen"].task), timeout=10)
+
+    assert await sup.restart("qwen") is True
+    assert "qwen" not in sup._copy_jobs
