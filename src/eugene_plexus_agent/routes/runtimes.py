@@ -31,6 +31,8 @@ from .._generated.models import (
     EngineInstallRequest,
     EngineKind,
     EngineList,
+    ModelCopyClearResult,
+    ModelCopySkipped,
     Runtime,
     RuntimeList,
     RuntimeSpec,
@@ -288,6 +290,9 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
         mappings=effective_rules_for(request),
         node_name=node_name,
         exists=getattr(request.app.state, "model_exists", None),
+        # So admission asks about the file a launch would actually open,
+        # including this node's own copy when it holds one.
+        copy_settings=supervisor.copy_settings() if supervisor is not None else None,
     )
 
 
@@ -738,4 +743,37 @@ async def start_runtime(
             if already
             else f"Start scheduled for engine runtime {name!r}."
         ),
+    )
+
+
+@router.post(
+    "/v1/model-copies/clear",
+    response_model=ModelCopyClearResult,
+    tags=["runtimes"],
+    dependencies=_write_auth,
+)
+async def clear_model_copies(request: Request) -> ModelCopyClearResult:
+    """Delete this node's local copies of its models.
+
+    Operator-only: it deletes files on this host. Deleting nothing is a
+    success -- a node with copying switched off answers with two empty
+    lists rather than an error, because "there was nothing to clear" is
+    the honest answer to "clear this".
+
+    It stops nothing and switches nothing off. A copy a runtime is using
+    is reported in `skipped`, and the copies come back the next time
+    those runtimes start, which is what the operator asked for by
+    leaving the toggle on.
+    """
+    supervisor = _supervisor(request)
+    if supervisor is None:
+        return ModelCopyClearResult(deleted=[], bytesFreed=0, skipped=[])
+    result = await asyncio.to_thread(supervisor.clear_copies)
+    return ModelCopyClearResult(
+        deleted=result.deleted,
+        bytesFreed=result.bytes_freed,
+        skipped=[
+            ModelCopySkipped(path=s.path, runtime=s.runtime, reason=s.reason)
+            for s in result.skipped
+        ],
     )

@@ -1462,6 +1462,86 @@ class LoadProgress(BaseModel):
     )
 
 
+class CopyProgress(BaseModel):
+    """
+    How far into copying a model file to this node's own disk the
+    agent is (`docs/design/node-local-model-copy.md`). Present
+    exactly while `status` is `copying`, and absent otherwise.
+
+    **The same shape as `LoadProgress` and deliberately not the same
+    field**, because the two differ on the question that field
+    exists to answer. `loadProgress` is absent whenever the bytes
+    cannot be observed — llama.cpp maps its model and faulted pages
+    are not read I/O — so a consumer reads *absent* as "show elapsed
+    instead". Here the agent is the process doing the reading and
+    the writing, so the bytes are never unobservable and absent can
+    only mean "no copy is running". One field carrying both meanings
+    would make every consumer invent the distinction, and this
+    project has already paid for that once.
+
+    It reports the copy of ONE model file — the file this runtime
+    points at. Several runtimes over one file (M6 replicas) copy it
+    once, so the second and third report the same copy while it runs
+    and none of them afterwards.
+
+    """
+
+    bytesCopied: int = Field(
+        ..., description='Bytes written to the destination so far.'
+    )
+    totalBytes: int | None = Field(
+        None,
+        description="Size of the source file, when it could be measured. Null\nwhen the source could not be stat'd — a share that has gone\naway mid-copy, which is exactly when this is worth watching,\nso progress is still reported without a percentage.\n",
+    )
+    bytesPerSecond: float | None = Field(
+        None,
+        description='Observed over a short window rather than averaged over the\nwhole copy, so a share that has just got slower shows it.\nNull on the first pair of readings.\n',
+    )
+    destination: str | None = Field(
+        None,
+        description='Where the copy is being written, on this host. Reported\nbecause the operator picked the directory and the commonest\nquestion about a long copy is which disk is filling up.\n\nThis is the **final** path, not the temporary name the bytes\nare actually landing in: a partial copy never carries the\nname an engine would open (§3.3 of the design), and naming\nthe temp file here would invite someone to go looking for a\nfile that exists only until the rename.\n',
+    )
+
+
+class ModelCopySkipped(BaseModel):
+    path: str
+    runtime: str | None = Field(
+        None, description='The runtime holding it open, when that is why.'
+    )
+    reason: str = Field(
+        ...,
+        description='Plain-language reason this copy is still on disk — in use by\na running runtime, permission denied, or the delete failed.\nRendered as written; the UI does not classify it.\n',
+    )
+
+
+class RuntimeLocalPathSource(StrEnum):
+    """
+    Which rule decided this runtime's `localPath`.
+
+    The three values of `FolderReachSource`, plus `copy`. They are a
+    separate enum rather than a shared one because a *folder* can
+    never be a copy — a copy is made per model file, and putting
+    `copy` in the folder enum would hand the Library's Folders page
+    a value it can never receive and must still handle.
+
+    * `same_path` — no rule applied; `modelPath` is opened as
+      written. Every single-host install.
+    * `inherited` — the Library folder's own `mounts` carried an
+      entry of this host's OS shape.
+    * `override` — this node's `pathMappings` named the folder.
+    * `copy` — this node holds its own valid copy of the file and is
+      opening that. Resolved ahead of the other three, which is why
+      it can appear on a node that also has a mount: the mount is
+      how the copy got here.
+
+    """
+
+    same_path = 'same_path'
+    inherited = 'inherited'
+    override = 'override'
+    copy = 'copy'
+
+
 class RuntimeStatus(StrEnum):
     """
     Operational state of an engine process. Distinct from
@@ -1473,6 +1553,19 @@ class RuntimeStatus(StrEnum):
     reports them. That distinction is load-bearing, because the two
     engines report the load phase in opposite ways — see `loading`.
 
+    * `copying` — this node is making its local copy of the model
+      file, and **nothing has been spawned yet**
+      (`docs/design/node-local-model-copy.md`). It is its own state
+      rather than `starting` for the reason the list above is
+      defined by meaning: `starting` says *spawned, and we have no
+      information yet*, and there is no process here at all. Folding
+      it in would put a multi-minute wait behind a word that
+      promises a process — the same "healthy and broken look
+      identical" window this feature exists to close. `copyProgress`
+      says how far along, and unlike `loadProgress` it is always
+      present in this state, because the agent is the one moving the
+      bytes. Only reachable on a node with `modelCopyEnabled`; a
+      copy that is skipped or already valid never enters it.
     * `starting` — spawned, and we have no information yet. Not "the
       probe failed": the honest gap between spawning a process and
       learning anything about it.
@@ -1512,6 +1605,7 @@ class RuntimeStatus(StrEnum):
 
     """
 
+    copying = 'copying'
     starting = 'starting'
     loading = 'loading'
     ready = 'ready'
@@ -2021,8 +2115,14 @@ class Runtime(BaseModel):
     modelPath: str
     localPath: str | None = Field(
         None,
-        description="Where **this host** opens the model: `modelPath` resolved\nthrough the Library folder's `mounts` for this OS and this\nnode's `pathMappings` overrides, or `modelPath` itself when\nno rule applies (M11; the folder half 2026-09-14). Observed,\nnever declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n",
+        description="Where **this host** opens the model: `modelPath` resolved\nthrough the Library folder's `mounts` for this OS and this\nnode's `pathMappings` overrides, or `modelPath` itself when\nno rule applies (M11; the folder half 2026-09-14). Observed,\nnever declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n\n**A local copy is resolved one step ahead of all of that**\n(`docs/design/node-local-model-copy.md`): where this node\nkeeps a valid copy of the file, `localPath` is the copy and\n`localPathSource` says `copy`. Turning the copy off reverts\nthis by itself, because nothing is stored — the answer is\nrecomputed on every read.\n",
     )
+    localPathSource: RuntimeLocalPathSource | None = None
+    localPathNote: str | None = Field(
+        None,
+        description='Why this node is **not** opening a local copy, when it is\nnot and the operator asked for one: not enough free space to\nleave the configured headroom, the copy failed, the source\ncould not be read. Absent when the copy was used, and absent\nwhen copying is switched off — a node that was never asked\nhas nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
+    )
+    copyProgress: CopyProgress | None = None
     modelAlias: str | None = Field(
         None,
         description='Resolved alias — the declared value, or the derived filename.',
@@ -2074,6 +2174,32 @@ class Runtime(BaseModel):
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
     )
     loadProgress: LoadProgress | None = None
+
+
+class ModelCopyClearResult(BaseModel):
+    """
+    What `POST /v1/model-copies/clear` managed to delete, and what it
+    did not.
+
+    **It never stops a runtime to get at a file.** On Windows an open
+    or mapped file cannot be deleted at all, so a running engine's
+    copy is protected by the OS rather than by our code; on Linux the
+    unlink succeeds, the engine keeps its inode, and the space comes
+    back when that process exits — later than an operator watching a
+    disk meter expects. Both are reported rather than smoothed over,
+    because "I pressed Clear and the disk did not change" is
+    otherwise indistinguishable from a bug.
+
+    """
+
+    deleted: list[str] = Field(..., description='Paths removed, on this host.')
+    bytesFreed: int | None = Field(
+        None,
+        description='Total size of what was deleted. On Linux this counts space\nthat is only returned when a runtime still holding an inode\nexits, which is what `skipped` explains.\n',
+    )
+    skipped: list[ModelCopySkipped] = Field(
+        ..., description='One entry per copy that survived, with the reason.'
+    )
 
 
 class StopRequest(BaseModel):

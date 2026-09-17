@@ -52,6 +52,7 @@ from urllib.parse import quote
 
 import httpx
 
+from . import model_copies
 from ._generated.models import (
     Admission,
     AdmissionBasis,
@@ -439,6 +440,7 @@ async def check_admission(
     mappings: Sequence[PathRule] = (),
     node_name: str | None = None,
     exists: Callable[[str], bool] | None = None,
+    copy_settings: model_copies.CopySettings | None = None,
 ) -> Admission:
     """Measure `spec` against the device it targets, right now.
 
@@ -463,7 +465,7 @@ async def check_admission(
     # Where the model is on this host, before any question about memory.
     # The stat runs off the event loop: a dead network share blocks for
     # as long as the OS takes to give up.
-    location = await asyncio.to_thread(_locate, spec, mappings, is_there, sizer)
+    location = await asyncio.to_thread(_locate, spec, mappings, is_there, sizer, copy_settings)
     if not location.exists:
         return _refuse_missing(
             spec, location, node_name=node_name, context_length=context_length, warnings=warnings
@@ -609,10 +611,20 @@ def _locate(
     mappings: Sequence[PathRule],
     is_there: Callable[[str], bool],
     sizer: Callable[[str], int | None],
+    copy_settings: model_copies.CopySettings | None = None,
 ) -> ModelLocation:
-    """Resolve `modelPath` through this node's mappings and stat it."""
+    """Resolve `modelPath` the way a spawn would, and stat it.
+
+    **The same seam as the launch, and that is the point.** If admission
+    resolved a path the spawn would not, the two would disagree about
+    which file is under discussion -- and the shape it would take is
+    admission refusing a model that is sitting on this node's own disk,
+    because it looked for it on a share that is down.
+    """
     resolution = resolve_model_path(spec.modelPath, mappings)
     local = resolution.local_path
+    if copy_settings is not None:
+        local = model_copies.resolve_local_path(spec.modelPath, mappings, copy_settings).path
     present = bool(is_there(local))
     return ModelLocation(
         path=spec.modelPath,

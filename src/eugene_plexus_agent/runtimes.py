@@ -21,7 +21,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from . import model_copies
 from ._generated.models import (
+    CopyProgress,
     EngineAcquisition,
     EngineDescriptor,
     EngineInstall,
@@ -32,6 +34,7 @@ from ._generated.models import (
     Policy,
     Runtime,
     RuntimeCapabilities,
+    RuntimeLocalPathSource,
     RuntimeSpec,
     RuntimeStatus,
     StopReason,
@@ -58,7 +61,8 @@ from .engines.base import DiscoveredBinary
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
 from .library_folders import RulesProvider, effective_rules
-from .model_paths import PathRule, resolve_model_path, rules_from_config
+from .model_copies import resolve_local_path
+from .model_paths import PathRule, rules_from_config
 from .process_io import LoadProgressTracker
 from .supervisor import (
     ProcessState,
@@ -202,24 +206,36 @@ class _RuntimePlanner:
     def _launch_spec(self) -> RuntimeSpec:
         """The declaration as the engine should see it.
 
-        `modelPath` resolved through the Library folder's mount for this
-        host and this node's `pathMappings` overrides, read live so a
-        rule added after the declaration applies at the next start with
-        nothing re-declared. Everything else is the declaration
-        verbatim. Logged when a rule applied, because an argv naming a
-        path nobody typed makes a later bug report unreadable.
+        `modelPath` resolved through **this node's own copy when it has a
+        current one**, else the Library folder's mount for this host and
+        this node's `pathMappings` overrides -- read live, so a rule
+        added after the declaration applies at the next start with
+        nothing re-declared. Everything else is the declaration verbatim.
+        Logged whenever the engine is handed a path nobody typed,
+        because an argv naming an unfamiliar file makes a later bug
+        report unreadable.
+
+        **The copy is never made here.** This runs synchronously while
+        the supervisor builds argv, and a 25 GB transfer would stall it
+        for four minutes. Copying belongs to the runtime's own task, in
+        `RuntimeSupervisor`, which finishes before this is ever called.
         """
-        resolution = resolve_model_path(self.spec.modelPath, self._rules())
-        if resolution.rule is None:
+        resolved = resolve_local_path(self.spec.modelPath, self._rules(), self._copy_settings())
+        if resolved.path == self.spec.modelPath:
             return self.spec
         self._log.info(
-            "%s: opening %s as %s (rule %s)",
+            "%s: opening %s as %s (%s)",
             self.spec.name,
             self.spec.modelPath,
-            resolution.local_path,
-            resolution.rule,
+            resolved.path,
+            resolved.source,
         )
-        return self.spec.model_copy(update={"modelPath": resolution.local_path})
+        return self.spec.model_copy(update={"modelPath": resolved.path})
+
+    def _copy_settings(self) -> model_copies.CopySettings:
+        if self._get_config is None:
+            return model_copies.CopySettings(enabled=False, directory=None, min_free_bytes=0)
+        return model_copies.settings_from_config(self._get_config)
 
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
         """Let the engine's own adapter read the wreckage.
@@ -251,6 +267,27 @@ class _RuntimePlanner:
 
     def reset(self) -> None:
         """Nothing latched, so nothing to clear."""
+
+
+class _CopyJob:
+    """One local copy in flight, and the task doing it."""
+
+    def __init__(self, plan: model_copies.CopyPlan, total_bytes: int | None) -> None:
+        self.plan = plan
+        self.state = model_copies.CopyState(destination=plan.destination, total_bytes=total_bytes)
+        self.cancelled = False
+        self.task: asyncio.Task[None] | None = None
+
+    def cancel(self) -> None:
+        """Ask the worker thread to stop at its next chunk.
+
+        Cancelling the task alone would not do it: the copy runs in a
+        thread, and `asyncio.to_thread` cannot interrupt one. The flag is
+        what the copy loop reads, and it checks it every 4 MB.
+        """
+        self.cancelled = True
+        if self.task is not None:
+            self.task.cancel()
 
 
 class RuntimeSupervisor:
@@ -286,6 +323,19 @@ class RuntimeSupervisor:
         # loading runtime is already read every second or two by the
         # control root and every three by a console.
         self._load_progress = LoadProgressTracker()
+        # A copy in flight, per runtime, and why the last one did not
+        # happen. Both are observations: `_copy_jobs` empties itself when
+        # the copy ends, and `_copy_notes` holds the sentence the
+        # Inference screen prints under a runtime that is opening the
+        # share when the operator asked for a local copy. A skipped copy
+        # is the failure mode of this whole feature -- the launch
+        # succeeds, the model serves, and the only symptom is four
+        # minutes nobody can account for.
+        self._copy_jobs: dict[str, _CopyJob] = {}
+        self._copy_notes: dict[str, str] = {}
+        # The declared model paths this loop last reconciled against.
+        # None until the first pass, so a fresh agent reconciles once.
+        self._last_declared: set[str] | None = None
         self._poll_task: asyncio.Task[None] | None = None
         # This node's name once enrolled, read at compose time so it is
         # filled from the agent's own identity and can never disagree
@@ -314,6 +364,27 @@ class RuntimeSupervisor:
                 spec.engine.value,
             )
             return
+        job = self._copy_job_for(spec)
+        if job is not None:
+            # **Copy first, then launch** (design §4.1). The arithmetic
+            # says so: a plain copy moves bytes faster than an engine
+            # reading them, so copy-then-load is already marginally
+            # faster than loading off the share on the very first start,
+            # and it halves the wire traffic against copying in the
+            # background. The runtime sits in `copying` until it is done
+            # -- no process exists yet, which is exactly why that status
+            # is not `starting`.
+            self._copy_jobs[spec.name] = job
+            self._stop_reasons.pop(spec.name, None)
+            job.task = asyncio.create_task(
+                self._copy_then_spawn(spec, adapter, job), name=f"copy:{spec.name}"
+            )
+            return
+        self._spawn(spec, adapter)
+
+    def _spawn(self, spec: RuntimeSpec, adapter: EngineAdapter) -> None:
+        """Start supervising for real. Reached directly when there is no
+        copy to make, and after the copy when there was one."""
         planner = _RuntimePlanner(
             spec, adapter, self._log, self._get_config, inherited_rules=self._inherited_rules
         )
@@ -323,11 +394,168 @@ class RuntimeSupervisor:
         self._stop_reasons.pop(spec.name, None)
         sp.start()
 
+    # --- the local copy ---------------------------------------------------
+
+    def copy_settings(self) -> model_copies.CopySettings:
+        """This node's copy trio, read live so a toggle takes effect at
+        the next start with no restart."""
+        if self._get_config is None:
+            return model_copies.CopySettings(enabled=False, directory=None, min_free_bytes=0)
+        return model_copies.settings_from_config(self._get_config)
+
+    def _copy_job_for(self, spec: RuntimeSpec) -> _CopyJob | None:
+        """A copy to make before this runtime starts, or None.
+
+        None is the common answer and covers every reason not to copy:
+        the toggle is off, the copy is already current, the source
+        cannot be read, or making it would eat into the headroom the
+        operator asked to keep. Each of the last two leaves a note, so
+        the screen can say why this start is reading over the network.
+        """
+        settings = self.copy_settings()
+        plan = model_copies.plan_for(spec.modelPath, self._rules(), settings)
+        if plan is None:
+            self._copy_notes.pop(spec.name, None)
+            return None
+        if model_copies.copy_is_current(plan):
+            self._copy_notes.pop(spec.name, None)
+            return None
+        try:
+            size = os.path.getsize(plan.source)
+        except OSError as exc:
+            # Not an error here: the model may be on a share that is
+            # down, in which case the launch is about to fail for a
+            # reason of its own and saying "could not copy" first would
+            # bury it.
+            self._copy_notes[spec.name] = f"could not read {plan.source} to copy it: {exc}"
+            return None
+
+        shortfall = model_copies.headroom_shortfall(plan, settings, size)
+        if shortfall > 0:
+            # Try to give the space back from copies nothing is using
+            # before refusing -- this is the one case eviction exists
+            # for. Never evicts to make room for a copy of something
+            # else: only copies no runtime here points at any more.
+            evicted = model_copies.evict_for_headroom(
+                settings.directory, settings, in_use=self._copies_in_use(), keep=[plan.destination]
+            )
+            if evicted.deleted:
+                self._log.info(
+                    "removed %d local copies to keep %d GB free",
+                    len(evicted.deleted),
+                    settings.min_free_bytes // model_copies.GIB,
+                )
+            shortfall = model_copies.headroom_shortfall(plan, settings, size)
+        if shortfall > 0:
+            note = (
+                f"not copied to this machine: {shortfall / model_copies.GIB:.1f} GB more free "
+                f"space is needed to keep {settings.min_free_bytes // model_copies.GIB} GB free. "
+                f"Reading it from {plan.source} instead."
+            )
+            self._copy_notes[spec.name] = note
+            self._log.warning("%s: %s", spec.name, note)
+            return None
+        return _CopyJob(plan, total_bytes=size)
+
+    def _copies_in_use(self) -> dict[str, str]:
+        """Destination -> the runtime holding it open. Nothing here ever
+        stops a runtime to get at its file, so this is what protects a
+        copy from eviction and from Clear."""
+        in_use: dict[str, str] = {}
+        settings = self.copy_settings()
+        if not settings.usable:
+            return in_use
+        rules = self._rules()
+        for name in self._processes:
+            planner = self._planners.get(name)
+            if planner is None:
+                continue
+            plan = model_copies.plan_for(planner.spec.modelPath, rules, settings)
+            if plan is not None:
+                in_use[plan.destination] = name
+        # A copy being written counts as in use, and it is not the
+        # partial that needs protecting -- that name is skipped
+        # everywhere -- but the destination it is about to become. Clear
+        # would otherwise delete a file seconds before the rename put it
+        # back, and report it as freed space that never came back.
+        for name, job in self._copy_jobs.items():
+            in_use[job.plan.destination] = name
+        return in_use
+
+    async def _copy_then_spawn(
+        self, spec: RuntimeSpec, adapter: EngineAdapter, job: _CopyJob
+    ) -> None:
+        """Make the copy, then start the engine -- **whatever happens**.
+
+        A failed copy is not a failed launch. Every path here ends in a
+        spawn that opens whatever `resolve_local_path` then answers,
+        which is the share when the copy did not land. The alternative
+        would be a node that stops serving because a convenience feature
+        could not write a file.
+        """
+        settings = self.copy_settings()
+        note: str | None = None
+        try:
+            await asyncio.to_thread(
+                model_copies.copy_file,
+                job.plan,
+                settings,
+                job.state,
+                should_cancel=lambda: job.cancelled,
+            )
+        except asyncio.CancelledError:
+            # The runtime was removed or stopped mid-copy. Nothing to
+            # spawn, and `copy_file` has already removed its partial.
+            self._copy_jobs.pop(spec.name, None)
+            raise
+        except model_copies.CopyAborted as exc:
+            note = f"{exc}. Reading it from {job.plan.source} instead."
+            self._log.warning("%s: %s", spec.name, note)
+        except OSError as exc:
+            note = f"could not copy the model to this machine: {exc}. Reading it over the network."
+            self._log.warning("%s: %s", spec.name, note)
+        finally:
+            self._copy_jobs.pop(spec.name, None)
+
+        if note is None:
+            self._copy_notes.pop(spec.name, None)
+        else:
+            self._copy_notes[spec.name] = note
+        if job.cancelled:
+            return
+        self._spawn(spec, adapter)
+
+    def reconcile_copies(self, specs: list[RuntimeSpec]) -> None:
+        """Drop copies of models no runtime on this node points at.
+
+        The whole eviction policy for the ordinary case, and the reason
+        there is no LRU here: the set was never anything but a function
+        of the declaration list, so a runtime deleted or repointed takes
+        its copy with it.
+        """
+        settings = self.copy_settings()
+        if not settings.usable:
+            return
+        keep = [
+            plan.destination
+            for plan in model_copies.wanted(
+                [s.modelPath for s in specs], self._rules(), settings
+            ).values()
+        ]
+        model_copies.remove_unwanted(settings.directory, keep, in_use=self._copies_in_use())
+
+    def clear_copies(self) -> model_copies.ClearResult:
+        """Delete every copy this node holds. Stops nothing."""
+        settings = self.copy_settings()
+        return model_copies.clear(settings.directory, in_use=self._copies_in_use())
+
     async def remove_and_stop(self, name: str) -> None:
+        await self._cancel_copy(name)
         sp = self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
         self._stop_reasons.pop(name, None)
+        self._copy_notes.pop(name, None)
         self._load_progress.forget(name)
         if sp is not None:
             await sp.stop()
@@ -348,6 +576,7 @@ class RuntimeSupervisor:
         neither a delete nor a crash. `reason` is recorded so the
         dashboard can say *why* — `idle` when the gateway unloaded it.
         """
+        await self._cancel_copy(name)
         sp = self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
@@ -362,6 +591,8 @@ class RuntimeSupervisor:
             with contextlib.suppress(asyncio.CancelledError, BaseException):
                 await self._poll_task
             self._poll_task = None
+        for name in list(self._copy_jobs):
+            await self._cancel_copy(name)
         await asyncio.gather(
             *(sp.stop() for sp in self._processes.values()),
             return_exceptions=True,
@@ -382,7 +613,24 @@ class RuntimeSupervisor:
         )
 
     def is_running(self, name: str) -> bool:
-        return name in self._processes
+        """Running, or on its way there.
+
+        A runtime whose copy is still being made counts: nothing has
+        been spawned yet, but a second Start would begin a second copy
+        of the same 25 GB file into the same destination.
+        """
+        return name in self._processes or name in self._copy_jobs
+
+    async def _cancel_copy(self, name: str) -> None:
+        """Stop a copy in flight and wait for its thread to notice."""
+        job = self._copy_jobs.pop(name, None)
+        if job is None:
+            return
+        job.cancel()
+        if job.task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await job.task
+        self._log.info("%s: local copy cancelled", name)
 
     # --- read model -------------------------------------------------------
 
@@ -398,7 +646,8 @@ class RuntimeSupervisor:
         planner = self._planners.get(name)
         readiness = self._readiness.get(name)
 
-        status = self._status_for(sp, readiness)
+        job = self._copy_jobs.get(name)
+        status = self._status_for(sp, readiness, copying=job is not None)
         capabilities: RuntimeCapabilities | None = None
         engine_version: str | None = None
         if isinstance(readiness, Ready):
@@ -437,7 +686,8 @@ class RuntimeSupervisor:
         # crept past 100% would be worse than no bar. `starting` counts:
         # llama.cpp opens its socket before it has read anything, so the
         # first seconds of a read are spent in that status.
-        local_path = resolve_model_path(spec.modelPath, self._rules()).local_path
+        resolved = resolve_local_path(spec.modelPath, self._rules(), self.copy_settings())
+        local_path = resolved.path
         load_progress: LoadProgress | None = None
         if status in (RuntimeStatus.loading, RuntimeStatus.starting):
             observed = self._load_progress.sample(
@@ -460,6 +710,22 @@ class RuntimeSupervisor:
             # Observed, from the current rules, every time it is read:
             # a stopped runtime shows what its next start would open.
             localPath=local_path,
+            localPathSource=RuntimeLocalPathSource(resolved.source),
+            # Only when a copy was asked for and is not being used --
+            # otherwise there is nothing to explain, and a note on every
+            # runtime would train the operator to ignore the one that
+            # matters.
+            localPathNote=None if resolved.is_copy else self._copy_notes.get(name),
+            copyProgress=(
+                CopyProgress(
+                    bytesCopied=job.state.bytes_copied,
+                    totalBytes=job.state.total_bytes,
+                    bytesPerSecond=job.state.bytes_per_second,
+                    destination=job.plan.destination,
+                )
+                if job is not None
+                else None
+            ),
             modelAlias=spec.modelAlias or _default_alias(spec),
             host=spec.host,
             port=spec.port,
@@ -492,6 +758,8 @@ class RuntimeSupervisor:
         self,
         sp: SupervisedProcess | None,
         readiness: Loading | Ready | None,
+        *,
+        copying: bool = False,
     ) -> RuntimeStatus:
         """Map loop state + readiness onto the wire enum.
 
@@ -501,6 +769,13 @@ class RuntimeSupervisor:
         distinction. This is the same shape as the component mapping,
         which pairs loop state with a /healthz observation.
         """
+        if copying:
+            # Before `sp` exists at all: this node is making its local
+            # copy of the model file. Reported ahead of everything else
+            # because `sp is None` would otherwise read as `stopped`,
+            # which says the operator asked for this -- and they asked
+            # for the opposite.
+            return RuntimeStatus.copying
         if sp is None:
             # Declared but not running: autoStart false, or explicitly
             # stopped. Not an error.
@@ -526,6 +801,7 @@ class RuntimeSupervisor:
         try:
             while True:
                 specs: list[RuntimeSpec] = get_specs()  # type: ignore[operator]
+                await self._reconcile_copies_if_changed(specs)
                 await asyncio.gather(
                     *(self._probe_one(s) for s in specs),
                     return_exceptions=True,
@@ -533,6 +809,22 @@ class RuntimeSupervisor:
                 await asyncio.sleep(_READINESS_POLL_SECONDS)
         except asyncio.CancelledError:
             return
+
+    async def _reconcile_copies_if_changed(self, specs: list[RuntimeSpec]) -> None:
+        """Drop copies nothing points at, when the declarations change.
+
+        Hung off this loop because it is the one place that already sees
+        the current declaration list. Gated on the set actually changing
+        so the common case costs a set comparison rather than a walk of
+        the copy directory every two seconds -- which on a spinning disk
+        holding 200 GB of models is not free.
+        """
+        declared = {s.modelPath for s in specs}
+        if declared == self._last_declared:
+            return
+        self._last_declared = declared
+        with contextlib.suppress(OSError):
+            await asyncio.to_thread(self.reconcile_copies, specs)
 
     async def _probe_one(self, spec: RuntimeSpec) -> None:
         sp = self._processes.get(spec.name)

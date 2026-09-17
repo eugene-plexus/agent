@@ -41,7 +41,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from . import model_paths
+from . import model_copies, model_paths
 from ._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -177,13 +177,60 @@ CONFIG_FIELDS: list[ConfigField] = [
             "rest of the path is carried over; the most specific rule wins; an "
             "override beats the folder's mount. Applied at every launch, so a "
             "change takes effect at the next start without re-declaring "
-            "anything; `Runtime.localPath` shows what was opened. Nothing is "
-            "copied or cached: you mount the share, this says where. Test checks "
+            "anything; `Runtime.localPath` shows what was opened. This only says "
+            "where the share is; whether this machine also keeps its own copy of "
+            "the models it runs is the Model storage setting below. Test checks "
             "the rule against the Library's real files before you save it."
         ),
         category="storage",
         valueType=ConfigValueType.path_mappings,
         default=[],
+    ),
+    ConfigField(
+        key="modelCopyEnabled",
+        label="Keep a local copy of the models this machine runs",
+        description=(
+            "Copy each model this machine runs onto its own disk the first time "
+            "it starts, and open the copy from then on. Reading a 25 GB model "
+            "over a gigabit share takes about four minutes every single start; "
+            "from a local SSD it takes seconds. The first start after you turn "
+            "this on is no faster -- that is when the copying happens -- and "
+            "every start after it is. Only the models this machine's own "
+            "runtimes point at are copied, nothing else, ever: delete a runtime "
+            "and its copy goes with it. The folder the models came from is "
+            "never written to. Where the share itself is mounted is the Library "
+            "folder overrides setting above."
+        ),
+        category="modelStorage",
+        valueType=ConfigValueType.boolean,
+        default=False,
+    ),
+    ConfigField(
+        key="modelCopyDir",
+        label="Where to keep them",
+        description=(
+            "A folder on this machine's own disk, on the fastest drive with room "
+            "to spare. Copies are named exactly as the model is named, in the "
+            "same folder structure, so what is here stays readable and useful "
+            "with or without Eugene Plexus. Everything in this folder is ours to "
+            "delete; do not point it at a folder that holds anything else."
+        ),
+        category="modelStorage",
+        valueType=ConfigValueType.file_path,
+    ),
+    ConfigField(
+        key="modelCopyMinFreeGb",
+        label="Always leave at least this much free (GB)",
+        description=(
+            "A copy is skipped when making it would leave less than this much "
+            "free space on that drive, and the model is read over the network "
+            "as usual -- starting a model never fails because of this setting. "
+            "If free space drops below this for any other reason, copies are "
+            "deleted oldest first until it is back."
+        ),
+        category="modelStorage",
+        valueType=ConfigValueType.integer,
+        default=model_copies.DEFAULT_MIN_FREE_GB,
     ),
 ]
 CATEGORY_LABELS: dict[str, str] = {
@@ -193,6 +240,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "engines": "Engines",
     "node": "Node",
     "storage": "Library",
+    "modelStorage": "Model storage",
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}

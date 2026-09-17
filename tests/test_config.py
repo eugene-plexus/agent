@@ -19,7 +19,19 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "vllmBinary",
         "advertiseUrl",
         "pathMappings",
+        "modelCopyEnabled",
+        "modelCopyDir",
+        "modelCopyMinFreeGb",
     }
+    # The copy trio is its own category, next to but not inside the
+    # Library folder overrides: "where the share is mounted here" and
+    # "does this machine keep its own copy" are different questions with
+    # the same subject, and each field's text points at the other
+    # (`cross-link-related-settings`).
+    copy_enabled = next(f for f in body["fields"] if f["key"] == "modelCopyEnabled")
+    assert copy_enabled["valueType"] == "boolean"
+    assert copy_enabled["category"] == "modelStorage"
+    assert body["categories"]["modelStorage"] == "Model storage"
     # `vllmBinary` is a plain config field on purpose — the generic editor
     # renders a `file_path` with no engine-specific UI code.
     vllm_binary = next(f for f in body["fields"] if f["key"] == "vllmBinary")
