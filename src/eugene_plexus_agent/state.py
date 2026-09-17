@@ -624,6 +624,17 @@ def _validate(field: ConfigField, value: Any) -> str | None:
         if not isinstance(value, str):
             return f"expected string, got {type(value).__name__}"
         return None
+    if vt == ConfigValueType.integer:
+        # `isinstance(True, int)` is True in Python, and a boolean here
+        # is a client sending the wrong field rather than a number it
+        # meant. Floats are refused rather than truncated for the same
+        # reason: 49.5 GB of headroom is a value someone typed, and
+        # silently storing 49 is worse than saying no.
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"expected a whole number, got {type(value).__name__}"
+        if value < 0:
+            return "must not be negative"
+        return None
     if vt == ConfigValueType.path_mappings:
         # Shape only. Existence is checked by `POST /v1/config/test`, for
         # the reason `file_path` gives above: a share about to be mounted

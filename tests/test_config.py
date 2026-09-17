@@ -109,3 +109,31 @@ def test_first_run_complete_flips_through_patch(authed_client: TestClient) -> No
 
     follow = authed_client.get("/v1/config")
     assert follow.json()["firstRunComplete"] is True
+
+
+def test_an_integer_field_can_actually_be_saved(authed_client: TestClient) -> None:
+    """Found by the model-copy acceptance run, not by a unit test.
+
+    `_validate` had no `integer` branch, so the first integer field this
+    agent ever declared -- `modelCopyMinFreeGb` -- fell through to
+    "unsupported valueType" and every PATCH of it was refused. The
+    refusal is reported inside a 200 (`ConfigUpdateResult.errors`), so
+    nothing that checked the status code could see it, and the value
+    could only ever be set by editing agent.yaml by hand: the setting was
+    invisible to the UI that exists to expose it.
+    """
+    response = authed_client.patch("/v1/config", json={"modelCopyMinFreeGb": 120})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["rejected"] == [], body["rejected"]
+    assert "modelCopyMinFreeGb" in body["applied"]
+    assert authed_client.get("/v1/config").json()["modelCopyMinFreeGb"] == 120
+
+
+def test_an_integer_field_refuses_what_is_not_a_whole_number(authed_client: TestClient) -> None:
+    for bad_value in (True, 12.5, "120"):
+        body = authed_client.patch("/v1/config", json={"modelCopyMinFreeGb": bad_value}).json()
+        assert [r["key"] for r in body["rejected"]] == ["modelCopyMinFreeGb"], bad_value
+        assert body["applied"] == [], bad_value
+    negative = authed_client.patch("/v1/config", json={"modelCopyMinFreeGb": -1}).json()
+    assert negative["rejected"][0]["message"] == "must not be negative"
