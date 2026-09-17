@@ -86,15 +86,25 @@ _BUILD_TAG_RE = re.compile(r"^b(\d+)$")
 # `llama-b10867-bin-win-cuda-13.3-x64.zip` -> variant `win-cuda-13.3-x64`.
 _ASSET_RE = re.compile(r"^llama-b\d+-bin-(?P<variant>.+)\.(?:zip|tar\.gz)$")
 
-# Windows CUDA is a two-asset install: the server zip carries no CUDA
-# runtime, and the DLLs live in a companion archive whose filename has no
-# build number even though it sits under the same release tag. Installing
-# only the first produces a binary that dies on a missing cudart DLL.
-_CUDART_RE = re.compile(r"^cudart-llama-bin-(?P<variant>.+)\.(?:zip|tar\.gz)$")
+# CUDA is a two-asset install on both platforms: the server archive
+# carries no CUDA runtime, and the libraries live in a companion archive
+# under the same release tag. Installing only the first produces a binary
+# that dies on a missing cudart DLL (Windows) or libcudart (Linux).
+#
+# **The two filenames are not the same shape**, measured against b11010:
+#   cudart-llama-bin-win-cuda-13.4-x64.zip            <- no build number
+#   cudart-llama-b11010-bin-ubuntu-cuda-13.3-x64.tar.gz  <- has one
+# The build number is optional here for exactly that reason. A pattern
+# that required the Windows form matched no Linux companion at all, which
+# would install a server and report success, then fail at load.
+_CUDART_RE = re.compile(r"^cudart-llama-(?:b\d+-)?bin-(?P<variant>.+)\.(?:zip|tar\.gz)$")
 
-# `win-cuda-13.3-x64` -> ('13', '3'). Used to pick the highest published
+# `win-cuda-13.3-x64` or `ubuntu-cuda-13.3-x64` -> ('13', '3'). Used to
+# pick the highest published
 # CUDA build the installed driver can actually load.
-_CUDA_VARIANT_RE = re.compile(r"^win-cuda-(?P<major>\d+)\.(?P<minor>\d+)-(?P<arch>x64|arm64)$")
+_CUDA_VARIANT_RE = re.compile(
+    r"^(?P<platform>win|ubuntu)-cuda-(?P<major>\d+)\.(?P<minor>\d+)-(?P<arch>x64|arm64)$"
+)
 
 # How many builds back `plan_latest` looks for one that carries this host's
 # assets. Upstream publishes several a day and an incomplete upload lasts
@@ -629,19 +639,12 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
             return f"win-rocm-10.0-{host.arch.value}"
         return f"win-cpu-{host.arch.value}"
 
-    # Linux.
+    # Linux. **Upstream publishes CUDA builds here now**, and it did not
+    # when this branch was written -- see `_cuda_variant`'s note. The
+    # refusal that stood here, and the Vulkan-with-a-badge plan drawn up
+    # to replace it, were both answers to a fact that has since changed.
     if accelerator is Accelerator.cuda:
-        return Unavailable(
-            reason=(
-                "llama.cpp publishes no prebuilt CUDA build for Linux, so there is "
-                "nothing to install for an NVIDIA GPU here. Build llama.cpp from "
-                "source with GGML_CUDA=ON, or use the official CUDA container, then "
-                "set `binary` on the runtime to the llama-server you built. A Vulkan "
-                "build would install cleanly and run on this card, but it is "
-                "materially slower at prompt processing and we will not substitute "
-                "it for CUDA without being asked."
-            )
-        )
+        return _cuda_variant(host, release)
     if accelerator is Accelerator.rocm:
         return f"ubuntu-rocm-10.0-{host.arch.value}"
     if accelerator is Accelerator.sycl:
@@ -650,7 +653,7 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
 
 
 def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
-    """The Windows CUDA build this driver can load, from what the release publishes.
+    """The CUDA build this driver can load, from what the release publishes.
 
     Two rules, in order, both NVIDIA's rather than ours:
 
@@ -681,13 +684,27 @@ def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
     table. The table this replaced was written from b10867 and went stale
     the moment upstream moved from 13.3 to 13.4; a stale table cannot
     fail loudly when its defect is an entry it lacks.
+
+    **Both platforms, since 2026-09-16.** This was Windows-only because
+    Linux+NVIDIA was refused outright: *"llama.cpp publishes no prebuilt
+    CUDA build for Linux"*, a claim re-verified against upstream on
+    2026-09-11 and **false five days later**. b11010 publishes
+    `ubuntu-cuda-12.8-x64`, `ubuntu-cuda-13.3-x64` and
+    `ubuntu-cuda-13.3-arm64`, with cudart companions for each. The same
+    two rules pick among them, because they are NVIDIA's rules and not
+    ours. Found by the first acceptance run that ever walked the
+    hobbyist golden path on Linux with an NVIDIA card, which is also the
+    only reason anyone looked again.
     """
     arch = host.arch or Arch.x64
-    published = _published_cuda_variants(release, arch)
+    platform = "win" if host.os is Os.windows else "ubuntu"
+    # The asset prefix is what we match on; the name is what a person reads.
+    platform_name = "Windows" if host.os is Os.windows else "Linux"
+    published = _published_cuda_variants(release, arch, platform)
     if not published:
         return Unavailable(
             reason=(
-                f"release {release.version} publishes no Windows CUDA build for "
+                f"release {release.version} publishes no {platform_name} CUDA build for "
                 f"{arch.value}. Published variants: "
                 f"{', '.join(_published_variants(release)) or '(none)'}."
             ),
@@ -722,7 +739,7 @@ def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
         return Unavailable(
             reason=(
                 f"this driver supports CUDA up to {driver}, and release {release.version} "
-                f"publishes Windows CUDA builds only for {offered}. A CUDA build runs "
+                f"publishes {platform_name} CUDA builds only for {offered}. A CUDA build runs "
                 f"only on a driver of the same major version. Update the NVIDIA "
                 f"driver, or set `binary` on the runtime to a build you compiled."
             ),
@@ -755,12 +772,14 @@ def _published_variants(release: Release) -> list[str]:
     )
 
 
-def _published_cuda_variants(release: Release, arch: Arch) -> list[tuple[int, int, str]]:
-    """`(major, minor, variant)` for each Windows CUDA server build in the release."""
+def _published_cuda_variants(
+    release: Release, arch: Arch, platform: str
+) -> list[tuple[int, int, str]]:
+    """`(major, minor, variant)` for each CUDA server build this host could take."""
     out: set[tuple[int, int, str]] = set()
     for variant in _published_variants(release):
         m = _CUDA_VARIANT_RE.match(variant)
-        if m is None or m.group("arch") != arch.value:
+        if m is None or m.group("arch") != arch.value or m.group("platform") != platform:
             continue
         out.add((int(m.group("major")), int(m.group("minor")), variant))
     return sorted(out)
@@ -797,8 +816,8 @@ def _match_assets(release: Release, variant: str) -> tuple[ReleaseAsset, ...] | 
 
     assets = [main]
 
-    # Windows CUDA needs the companion runtime archive.
-    if variant.startswith("win-cuda-"):
+    # A CUDA build needs its companion runtime archive, on either platform.
+    if variant.startswith(("win-cuda-", "ubuntu-cuda-")):
         cudart = next(
             (
                 asset

@@ -110,24 +110,83 @@ def test_variant_selection(host: HostAccelerator, expected: str) -> None:
     assert plan.variant == expected
 
 
-def test_linux_with_nvidia_is_refused_not_given_vulkan() -> None:
-    """Upstream publishes no Linux CUDA build. The Vulkan build would
-    install cleanly and run on the card, which is exactly the trap:
-    it is materially slower at prompt processing, so substituting it
-    silently means the operator concludes the product is slow instead
-    of learning they need a source build."""
+# Upstream started publishing Linux CUDA builds between 2026-09-11 and
+# 2026-09-16. These names are b11010's, copied from the release.
+_LINUX_CUDA_NAMES = [
+    "cudart-llama-b11010-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    "cudart-llama-b11010-bin-ubuntu-cuda-13.3-x64.tar.gz",
+    "llama-b11010-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    "llama-b11010-bin-ubuntu-cuda-13.3-x64.tar.gz",
+    "llama-b11010-bin-ubuntu-vulkan-x64.tar.gz",
+    "llama-b11010-bin-ubuntu-x64.tar.gz",
+]
+
+
+def test_linux_with_nvidia_takes_the_cuda_build() -> None:
+    """Upstream publishes Linux CUDA builds now, so we install one.
+
+    This replaces `test_linux_with_nvidia_is_refused_not_given_vulkan`,
+    which asserted the opposite and was correct when it was written. The
+    refusal rested on *"llama.cpp publishes no prebuilt CUDA build for
+    Linux"* -- re-verified against upstream on 2026-09-11, and false by
+    2026-09-16, when b11010 shipped `ubuntu-cuda-12.8-x64`,
+    `ubuntu-cuda-13.3-x64` and `ubuntu-cuda-13.3-arm64`.
+
+    Nobody noticed for five days because nothing had ever walked the
+    install path on Linux with an NVIDIA card; S10's WSL2 run was the
+    first, and it stopped here. A whole design section (a Vulkan build
+    with a permanent degradation badge) had been written to work around
+    a fact that had already changed.
+    """
+    plan = LlamaCppAdapter().plan_acquisition(
+        _host(Os.linux, Arch.x64, Accelerator.cuda, "13.3"),
+        _release("b11010", names=_LINUX_CUDA_NAMES),
+    )
+    assert not isinstance(plan, Unavailable), getattr(plan, "reason", "")
+    # The exact minor this driver reports, not the higher one.
+    assert plan.variant == "ubuntu-cuda-13.3-x64"
+
+
+def test_linux_cuda_pulls_its_cudart_companion() -> None:
+    """The Linux companion archive has a build number and the Windows one
+    does not, so one pattern has to match both.
+
+    `cudart-llama-bin-win-cuda-13.4-x64.zip` against
+    `cudart-llama-b11010-bin-ubuntu-cuda-13.3-x64.tar.gz`. A matcher
+    written for the Windows shape finds no Linux companion, and because
+    the companion is only *required* for a variant it recognises, the
+    install would have succeeded and produced a server that dies on a
+    missing libcudart.
+    """
+    plan = LlamaCppAdapter().plan_acquisition(
+        _host(Os.linux, Arch.x64, Accelerator.cuda, "13.3"),
+        _release("b11010", names=_LINUX_CUDA_NAMES),
+    )
+    assert not isinstance(plan, Unavailable), getattr(plan, "reason", "")
+    names = sorted(a.name for a in plan.assets)
+    assert names == [
+        "cudart-llama-b11010-bin-ubuntu-cuda-13.3-x64.tar.gz",
+        "llama-b11010-bin-ubuntu-cuda-13.3-x64.tar.gz",
+    ]
+
+
+def test_linux_with_nvidia_is_never_quietly_given_vulkan() -> None:
+    """The rule the old refusal existed to protect, which still holds.
+
+    When a release publishes no Linux CUDA build but does publish
+    `ubuntu-vulkan-x64`, we refuse rather than substitute. Vulkan runs on
+    the card and is materially slower at prompt processing, so a silent
+    swap means the operator concludes the product is slow instead of
+    learning what happened. `_release()`'s default fixture is exactly
+    that release.
+    """
     plan = LlamaCppAdapter().plan_acquisition(
         _host(Os.linux, Arch.x64, Accelerator.cuda, "13.3"), _release()
     )
     assert isinstance(plan, Unavailable)
-    assert "no prebuilt CUDA build for Linux" in plan.reason
-    # It must name the way forward, not just decline.
-    assert "source" in plan.reason and "binary" in plan.reason
-    # And it must say out loud that Vulkan exists and why it wasn't used.
-    # Naming the road not taken is the difference between a refusal an
-    # operator can act on and one that reads as a missing feature.
-    assert "Vulkan" in plan.reason
-    assert "slower" in plan.reason
+    assert "publishes no Linux CUDA build" in plan.reason
+    # And it names what it did see, so "vulkan was right there" is answerable.
+    assert "ubuntu-vulkan-x64" in plan.reason
 
 
 def test_windows_cuda_pulls_the_cudart_companion() -> None:
@@ -411,9 +470,22 @@ def test_plan_latest_stops_at_once_on_a_reason_about_the_host(
             _release("b10991", names=_B10991_PARTIAL),
         ],
     )
-    plan = adapter.plan_latest(_host(Os.linux, Arch.x64, Accelerator.cuda, "13.3"))
+    # A host whose OS could not be identified. That is a fact about the
+    # machine, not about what upstream published, so walking back through
+    # older releases could not change the answer -- which is what
+    # `release_bound` is for, and why this one stops at the first.
+    #
+    # Linux+CUDA used to be the example here and no longer is: upstream
+    # publishes those builds now, so its absence from any one release is
+    # release-bound and SHOULD be walked back. "No CUDA version reported"
+    # does not work either, because the published-assets check runs
+    # before the driver check and returns a release-bound reason first.
+    unknown_host = HostAccelerator(
+        os=None, arch=None, accelerator=Accelerator.cuda, acceleratorVersion="13.3"
+    )
+    plan = adapter.plan_latest(unknown_host)
     assert isinstance(plan, Unavailable)
-    assert "no prebuilt CUDA build for Linux" in plan.reason
+    assert "could not identify this operating system" in plan.reason
     assert calls == ["b10991"]
 
 
