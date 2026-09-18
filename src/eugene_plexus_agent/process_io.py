@@ -60,6 +60,17 @@ SOURCE_RUSAGE = "rusage_diskio"
 
 
 def _windows_read_bytes(pid: int) -> int:
+    # **The guard is for the type checker as much as for the runtime.**
+    # `ctypes.WinDLL` and `ctypes.get_last_error` exist only on Windows, and
+    # CI type-checks on Linux, so mypy reported three attr-defined errors on
+    # code no Linux process can reach -- and the agent's CI had been red on
+    # exactly those three since at least 2026-09-17, which is the third time
+    # this project has found a suite failing unnoticed. A `sys.platform`
+    # narrowing fixes it on both platforms at once, where a `type: ignore`
+    # would be unused on Windows and so fail there instead.
+    if sys.platform != "win32":
+        raise OSError("process I/O counters are a Windows-only API")
+
     import ctypes
     import ctypes.wintypes as wintypes
 
