@@ -74,7 +74,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 import nacl.exceptions
 import nacl.public
@@ -190,6 +190,54 @@ def is_loopback_host(host: str | None) -> bool:
         return ipaddress.ip_address(host.strip("[]")).is_loopback
     except ValueError:
         return False
+
+
+def not_a_node_address(url: str | None) -> str | None:
+    """Why this URL can never be a node's address, or None if it can be.
+
+    R2.4 / review §6.2 #15. The control root refuses to *record* these
+    now, which is where the rule belongs; this is the second copy, at
+    the point of **use**, because that is where the credential is spent.
+    A registry written before that fix still holds whatever a node told
+    it, and `install_proxy` forwards the operator's own bearer to
+    whatever address it finds there -- so a link-local address in the
+    registry is the operator's token handed to a cloud
+    instance-metadata service.
+
+    Two copies rather than a shared helper, deliberately: components
+    share schemas, not code, and this one answers "may I dial it"
+    where the root's answers "may I write it down".
+    """
+    if not url or not url.strip():
+        return "the address is empty"
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError as exc:
+        return f"it does not parse as a URL ({exc})"
+    if parts.scheme.lower() not in ("http", "https"):
+        return (
+            f"the scheme is {parts.scheme or '(none)'!r}; an agent is reached over "
+            "http or https and nothing else"
+        )
+    host = parts.hostname
+    if not host:
+        return "it names no host"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    if address.is_unspecified:
+        return f"{host} is a bind wildcard, not an address anything can dial"
+    if address.is_multicast:
+        return f"{host} is a multicast group, not a host"
+    if address.is_link_local:
+        return (
+            f"{host} is link-local -- not routable between hosts, and where cloud "
+            "instance-metadata services listen"
+        )
+    if address.is_reserved and not address.is_loopback:
+        return f"{host} is in a reserved range and cannot be a host on this network"
+    return None
 
 
 def format_url(host: str, port: int, *, scheme: str = "http") -> str:
@@ -616,6 +664,7 @@ __all__ = [
     "generate_control_identity_for_tests",
     "is_loopback_host",
     "local_agent_url",
+    "not_a_node_address",
     "rekey_message",
     "sign_address",
     "sign_rekey_message",

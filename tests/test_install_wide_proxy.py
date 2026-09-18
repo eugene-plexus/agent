@@ -570,3 +570,51 @@ def test_an_unenrolled_node_knows_no_other_nodes(
     response = client.get("/api/proxy/node:anything/v1/engines")
     assert response.status_code == 503
     assert "not enrolled" in detail(response)
+
+
+# --------------------------------------------------------------------------
+# what a registry entry may be (R2.4, review §6.2 #15)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://169.254.169.254/",
+        "http://[fe80::1]:8079/",
+        "http://0.0.0.0:8079/",
+        "file:///etc/shadow",
+        # **The sabotage pass added this one.** Removing the scheme
+        # check entirely changed no result, because `file:///...` has no
+        # host and was refused by the next branch anyway -- so the four
+        # cases above could not tell whether the scheme was looked at.
+        # A scheme this agent does not speak, with a perfectly ordinary
+        # host, is the case that can.
+        "gopher://10.0.0.1:8079/",
+    ],
+)
+def test_the_callers_token_is_not_spent_on_an_address_that_is_not_a_node(
+    app: FastAPI, client: TestClient, upstream: Upstream, url: str
+) -> None:
+    """The hop spends the **operator's own bearer**, by design -- and
+    dials a base URL a *node* chose. Until R2.4 the control root took
+    any URL a correctly signed announcement named, so a worker with a
+    leaked signing key could point every console in the install at a
+    cloud instance-metadata service and read the operator's token off it.
+
+    The root refuses those addresses now. This is the second half, and
+    it is not redundant: a registry written before that fix still holds
+    whatever it was told, and this agent is the process that would spend
+    the credential. Checked where it is used, not only where it is
+    recorded.
+    """
+    app.state.control_transport = control_transport([], nodes=[{"name": "root", "url": url}])
+    enroll(app)
+
+    response = client.get(
+        "/api/proxy/gateway/v1/models",
+        headers={"Authorization": "Bearer operators-token"},
+    )
+    assert response.status_code == 503
+    assert upstream.requests == [], "the operator's token was sent to a non-node address"
+    assert "cannot be a node" in detail(response).lower()

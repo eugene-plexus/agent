@@ -67,7 +67,7 @@ from typing import Any
 import httpx
 
 from ._http import internal_client
-from .node_identity import advertise_host, is_loopback_host
+from .node_identity import advertise_host, is_loopback_host, not_a_node_address
 
 log = logging.getLogger(__name__)
 
@@ -267,12 +267,27 @@ def _reachable_url(snapshot: _Snapshot, node: str, subject: str) -> str:
     one is the failure the live install actually had: without it the
     proxy would connect to that port on the *asking* machine and report
     the component as not answering -- on the wrong host entirely.
+
+    The first check is newer and is about the credential rather than
+    about reaching anything: see `not_a_node_address`.
     """
     url = snapshot.node_urls.get(node)
     if not url:
         raise InstallLookupError(
             f"{subject} on node {node!r}, but that node has no address in the install's "
             "registry, so nothing here can reach it."
+        )
+    unusable = not_a_node_address(url)
+    if unusable is not None:
+        # R2.4: this hop spends the **caller's own** bearer, which is the
+        # right design and is exactly why the base URL cannot be
+        # anything a node felt like naming. The control root refuses to
+        # record these now; a registry written before that fix still
+        # holds them, and this is the process that would dial one.
+        raise InstallLookupError(
+            f"{subject} on node {node!r}, which advertises {url} -- that cannot be a "
+            f"node's address: {unusable}. Nothing here will send your credential to it. "
+            "Set `advertiseUrl` on that node to the address other hosts use for it."
         )
     if is_loopback_host(advertise_host(url)):
         raise InstallLookupError(
