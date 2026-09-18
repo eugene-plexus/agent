@@ -277,22 +277,31 @@ def test_the_task_detector_actually_consults_the_query(monkeypatch) -> None:
     from eugene_plexus_agent import reach as reach_module
 
     class _Result:
-        def __init__(self, code: int, out: str) -> None:
+        def __init__(self, code: int, out: bytes) -> None:
             self.returncode = code
             self.stdout = out
+
+    # COM is the primary reader and this box has a real task, so it has
+    # to be taken out of the way for the text path to be the subject.
+    monkeypatch.setattr(reach_module, "_task_action_via_com", lambda name: None)
+    enc = reach_module.oem_encoding()
 
     other = os.path.join(
         "C:" + os.sep, "OtherInstall", "venv", "Scripts", "eugene-plexus-agent.exe"
     )
-    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result(0, "Task To Run:   " + other + NL))
+    monkeypatch.setattr(
+        sp, "run", lambda *a, **k: _Result(0, ("Task To Run:   " + other + NL).encode(enc))
+    )
     assert reach_module._windows_task_runs_this_install() is False
 
     mine = os.path.join(sys.prefix, "Scripts", "eugene-plexus-agent.exe")
-    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result(0, "Task To Run:   " + mine + NL))
+    monkeypatch.setattr(
+        sp, "run", lambda *a, **k: _Result(0, ("Task To Run:   " + mine + NL).encode(enc))
+    )
     assert reach_module._windows_task_runs_this_install() is True
 
     # No such task at all.
-    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result(1, ""))
+    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result(1, b""))
     assert reach_module._windows_task_runs_this_install() is False
 
 
@@ -633,3 +642,136 @@ def test_reach_is_operator_only(client: TestClient, app: FastAPI) -> None:
         headers={"Authorization": f"Bearer {service}"},
     )
     assert response.status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# R2.2 / review §6.3 #34 -- a non-ASCII install prefix
+# --------------------------------------------------------------------------- #
+
+
+@windows_only
+def test_a_non_ascii_prefix_survives_the_task_read() -> None:
+    r"""**The reproduction: `schtasks` output is not UTF-8.**
+
+    `_windows_task_runs_this_install` ran `schtasks` with
+    `encoding="utf-8"`. A console program on Windows writes its output
+    in the **OEM code page** -- 437 or 850 on an English install -- so a
+    prefix with any non-ASCII character in it comes back with that
+    character replaced, the path no longer matches `sys.prefix`, and the
+    detector answers *nothing starts this agent automatically*. The
+    Reach card then says so, affirmatively, and withholds the one action
+    it exists to offer.
+
+    This is not a fixture: the bytes are produced by encoding the path
+    the way the OS encodes it, and read back both ways. The wrong
+    reading has to fail and the right one has to pass, or the assertion
+    is about neither.
+    """
+    import codecs
+
+    from eugene_plexus_agent.reach import oem_encoding, task_runs_from_prefix
+
+    oem = oem_encoding()
+    # A prefix a real person produces: a Windows account name with an
+    # accent, which is where `%LOCALAPPDATA%` lives.
+    prefix = os.path.join("C:" + os.sep, "Users", "José", "EugenePlexus", "venv")
+    exe = os.path.join(prefix, "Scripts", "eugene-plexus-agent.exe")
+    line = "Task To Run:   " + exe + " --unattended" + NL
+
+    try:
+        raw = line.encode(oem)
+    except (UnicodeEncodeError, LookupError):  # pragma: no cover - exotic code page
+        pytest.skip(f"{oem} cannot represent the test path")
+
+    # What the console actually hands back, decoded the way the code did.
+    as_utf8 = raw.decode("utf-8", errors="replace")
+    assert task_runs_from_prefix(as_utf8, prefix) is False, (
+        "the defect did not reproduce: decoding OEM bytes as UTF-8 kept the path intact, "
+        f"which means {oem} and utf-8 agree about U+00E9 on this box"
+    )
+
+    # And decoded the way this module decodes it now.
+    assert codecs.lookup(oem)  # the name is a real codec, not a guess
+    assert task_runs_from_prefix(raw.decode(oem, errors="replace"), prefix) is True
+
+
+@windows_only
+def test_the_task_detector_prefers_the_com_reader(monkeypatch) -> None:
+    """COM is consulted first, and its answer is used as it stands.
+
+    `Schedule.Service` hands back a `str` that Windows decoded itself,
+    so the code page cannot corrupt it -- which is why it is first and
+    why the `schtasks` path below it is a fallback for an install
+    without `pywin32` rather than the primary.
+
+    Driving the caller, not the helper: the sabotage that escaped in S5
+    was a helper asserted in isolation while the function that decides
+    whether this agent may stop itself went untested.
+    """
+    from eugene_plexus_agent import reach as reach_module
+
+    mine = os.path.join(sys.prefix, "Scripts", "eugene-plexus-agent.exe")
+    other = os.path.join("C:" + os.sep, "OtherInstall", "venv", "Scripts", "agent.exe")
+
+    # COM answers -> schtasks is never run. Proved by making schtasks
+    # answer the opposite; if it were consulted the assertion flips.
+    monkeypatch.setattr(reach_module, "_task_action_via_com", lambda name: mine)
+    monkeypatch.setattr(
+        reach_module, "_task_query_via_schtasks", lambda name: "Task To Run:   " + other + NL
+    )
+    assert reach_module._windows_task_runs_this_install() is True
+
+    monkeypatch.setattr(reach_module, "_task_action_via_com", lambda name: other)
+    monkeypatch.setattr(
+        reach_module, "_task_query_via_schtasks", lambda name: "Task To Run:   " + mine + NL
+    )
+    assert reach_module._windows_task_runs_this_install() is False
+
+    # COM unavailable (no pywin32, no such task) -> the text path decides.
+    monkeypatch.setattr(reach_module, "_task_action_via_com", lambda name: None)
+    assert reach_module._windows_task_runs_this_install() is True
+    monkeypatch.setattr(
+        reach_module, "_task_query_via_schtasks", lambda name: "Task To Run:   " + other + NL
+    )
+    assert reach_module._windows_task_runs_this_install() is False
+
+    # Neither answers: no task, so nothing starts this agent.
+    monkeypatch.setattr(reach_module, "_task_query_via_schtasks", lambda name: None)
+    assert reach_module._windows_task_runs_this_install() is False
+
+
+@windows_only
+def test_the_schtasks_reader_decodes_what_the_console_wrote(monkeypatch) -> None:
+    """**A sabotage escaped here, and it named this test.**
+
+    Putting `encoding="utf-8"` back on the `schtasks` read passed every
+    other check in this file: one encodes the bytes itself and never
+    calls the reader, another patches the reader out, and the caller
+    test uses an ASCII path, where cp437 and UTF-8 agree. So the one
+    line the finding is about was ungated.
+
+    This drives `_task_query_via_schtasks` with the bytes a console
+    hands back -- OEM-encoded, with an accent in the path -- and asserts
+    the string that comes out still names the path.
+    """
+    import subprocess as sp
+
+    from eugene_plexus_agent import reach as reach_module
+
+    oem = reach_module.oem_encoding()
+    exe = os.path.join(
+        "C:" + os.sep, "Users", "José", "EugenePlexus", "venv", "Scripts", "eugene-plexus-agent.exe"
+    )
+    try:
+        raw = ("Task To Run:   " + exe + " --unattended" + NL).encode(oem)
+    except (UnicodeEncodeError, LookupError):  # pragma: no cover - exotic code page
+        pytest.skip(f"{oem} cannot represent the test path")
+
+    class _Result:
+        returncode = 0
+        stdout = raw
+
+    monkeypatch.setattr(sp, "run", lambda *a, **k: _Result())
+    got = reach_module._task_query_via_schtasks("whatever")
+    assert got is not None
+    assert exe in got, f"the reader mangled the path: {got!r}"

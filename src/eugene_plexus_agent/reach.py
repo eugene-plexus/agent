@@ -45,6 +45,7 @@ it.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import platform
@@ -297,6 +298,100 @@ def _running_as_windows_service() -> bool:
         return False
 
 
+def oem_encoding() -> str:
+    r"""The code page a console program's output is written in.
+
+    **Not UTF-8, and that is review §6.3 #34.** `schtasks` is a console
+    program; Windows hands its stdout back in the *OEM* code page -- 437
+    or 850 on an English install, 866 on a Russian one -- so decoding it
+    as UTF-8 turns every non-ASCII byte into U+FFFD. A person whose
+    Windows account name carries an accent has `%LOCALAPPDATA%` under it,
+    so the installer's per-user prefix carries it too, and the task's
+    program path then never matched `sys.prefix`. The Reach card said
+    *nothing starts this agent automatically* -- affirmatively, and
+    wrongly -- and withheld the restart it exists to offer.
+
+    `sys.stdout.encoding` is the wrong source: this process's stdout may
+    be a pipe, a log file or a ConPTY, none of which says what a child
+    console program writes. `GetOEMCP()` is the thing that does.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            return f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+        except Exception:  # pragma: no cover - defensive
+            pass
+    return "utf-8"
+
+
+def _task_action_via_com(task_name: str) -> str | None:
+    r"""The task's program path, read through `Schedule.Service`.
+
+    **The primary reader, because COM never goes near a code page.** The
+    Task Scheduler hands back a `str` that Windows decoded itself, from
+    the XML definition it stores in UTF-16 -- so a prefix with an accent
+    in it survives the trip, which is the whole of #34.
+
+    Same instrument, same reason, as `firewall/windows.py`: `pywin32`
+    arrives with the Windows `[service]` extra that both installer paths
+    take, and an install without it falls through to the text reader
+    below rather than guessing.
+
+    None means *could not read it here* -- no pywin32, no such task, or
+    a scheduler that refused -- never *no such task*, because the caller
+    has a second way to look.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return None
+    try:
+        # Idempotent, and deliberately not torn down: a FastAPI worker
+        # thread is pooled, and uninitialising COM under a pooled thread
+        # is how you get a hang. Same note as `firewall/windows.py`.
+        with contextlib.suppress(Exception):
+            pythoncom.CoInitialize()
+        service = win32com.client.Dispatch("Schedule.Service")
+        service.Connect()
+        folder = service.GetFolder("\\")
+        task = folder.GetTask(task_name)
+        for action in task.Definition.Actions:
+            # TASK_ACTION_EXEC is 0; the installer registers exactly one
+            # and it is an exec action. Anything else has no Path.
+            path = getattr(action, "Path", None)
+            if path:
+                return str(path)
+    except Exception:
+        return None
+    return None
+
+
+def _task_query_via_schtasks(task_name: str) -> str | None:
+    """`schtasks /Query` output, decoded in the console's own code page.
+
+    The fallback for an install with no `pywin32`. It is still wrong
+    about a path the OEM code page cannot represent at all -- a Cyrillic
+    account name on an English machine -- which is precisely why the COM
+    reader is first and this one is not.
+    """
+    try:
+        proc = subprocess.run(
+            ["schtasks", "/Query", "/TN", task_name, "/FO", "LIST", "/V"],
+            capture_output=True,
+            timeout=10.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or b"").decode(oem_encoding(), errors="replace")
+
+
 def _windows_task_runs_this_install() -> bool:
     r"""Is the logon task the thing that started *this* process?
 
@@ -321,46 +416,60 @@ def _windows_task_runs_this_install() -> bool:
     Deliberately not `sys.executable`: in a uv-made virtualenv that is
     the *base* interpreter under `pythons\cpython-...`, which is outside
     the prefix and shared between installs.
+
+    **Two readers, in that order (review §6.3 #34).** COM first, because
+    it cannot lose a character to a code page; `schtasks` decoded in the
+    OEM code page second, for an install with no `pywin32`.
     """
+    action = _task_action_via_com(WINDOWS_TASK_NAME)
+    if action is not None:
+        return task_runs_from_prefix(action, sys.prefix)
+    query = _task_query_via_schtasks(WINDOWS_TASK_NAME)
+    if query is None:
+        return False
+    return task_runs_from_prefix(query, sys.prefix)
+
+
+def action_runs_from_prefix(action: str, prefix: str) -> bool:
+    r"""Is this program path inside `prefix`?
+
+    The one comparison both readers end at. `<prefix>` itself is not a
+    match -- only something *under* it -- so `...\.venv2\Scripts\...`
+    cannot be read as inside `...\.venv`, which is the sibling-install
+    case a sabotage found in S5.
+    """
+    wanted = os.path.normcase(os.path.normpath(prefix))
+    # A "Task To Run" value is `<exe> <args>`; the exe is what matters,
+    # and an installed console script has no spaces in its path.
+    head = action.strip().strip('"').split(" --")[0].strip().strip('"')
+    if not head:
+        return False
     try:
-        proc = subprocess.run(
-            ["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME, "/FO", "LIST", "/V"],
-            capture_output=True,
-            text=True,
-            timeout=10.0,
-            check=False,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except (OSError, subprocess.SubprocessError):
+        normalised = os.path.normcase(os.path.normpath(head))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
         return False
-    if proc.returncode != 0:
-        return False
-    return task_runs_from_prefix(proc.stdout or "", sys.prefix)
+    return normalised.startswith(wanted + os.sep)
 
 
 def task_runs_from_prefix(query_output: str, prefix: str) -> bool:
-    """Does `schtasks /V /FO LIST` output name a program inside `prefix`?
+    r"""Does `schtasks /V /FO LIST` output name a program inside `prefix`?
 
     Split out so it can be tested against real output without a task
     existing, and without this test being the one that has to be right
     about `schtasks`' localised field names -- it looks for the path, not
     for the label in front of it.
+
+    **A bare path is valid input too**, which is what the COM reader
+    hands it: `C:\...` has a colon in it, so the label-stripping below
+    would eat the drive letter if it were applied unconditionally.
     """
-    wanted = os.path.normcase(os.path.normpath(prefix))
     for line in query_output.splitlines():
-        _, _, value = line.partition(":")
-        candidate = (value or line).strip().strip('"')
-        if not candidate:
-            continue
-        # A "Task To Run" line is `<exe> <args>`; the exe is what matters
-        # and an installed console script has no spaces in its path.
-        head = candidate.split(" --")[0].strip().strip('"')
-        try:
-            normalised = os.path.normcase(os.path.normpath(head))
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            continue
-        if normalised.startswith(wanted + os.sep):
+        # Try the line whole first: a bare `C:\...` path must not be
+        # split at its drive colon.
+        if action_runs_from_prefix(line, prefix):
+            return True
+        _, sep, value = line.partition(":")
+        if sep and action_runs_from_prefix(value, prefix):
             return True
     return False
 
