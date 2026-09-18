@@ -29,6 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
+from eugene_plexus_agent import _http
 from eugene_plexus_agent._generated.models import (
     Accelerator,
     Arch,
@@ -103,13 +104,22 @@ def _spec(**overrides: Any) -> RuntimeSpec:
 
 
 def _patch_client(monkeypatch: pytest.MonkeyPatch, handler: Any) -> None:
-    real_init = httpx.AsyncClient.__init__
+    """Route the adapter's probes through a MockTransport.
 
-    def init(self: httpx.AsyncClient, *args: Any, **kwargs: Any) -> None:
-        kwargs["transport"] = httpx.MockTransport(handler)
-        real_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(httpx.AsyncClient, "__init__", init)
+    **Injection, not a patched constructor.** This used to monkeypatch
+    `httpx.AsyncClient.__init__`, which only worked while every probe
+    built its own client inside the call under test. Adapters now share
+    one client for the life of the process (that construction cost
+    ~104 ms of synchronous CPU on the event loop, every 2 s, per
+    runtime), so a patched constructor would miss an already-built
+    client -- and, worse, leak this test's transport into every later
+    test in the process. The shared slot is the seam; `conftest.py`
+    clears it between tests.
+    """
+    del monkeypatch  # kept in the signature so call sites do not all change
+    _http.set_shared_client(
+        "engine-probe", httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
 
 
 # --------------------------------------------------------------------------- #

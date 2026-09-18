@@ -49,9 +49,9 @@ def spin_until(predicate) -> None:  # type: ignore[no-untyped-def]
     is how a sabotage run turned a red test into a hung suite. Bounded,
     the same case fails.
     """
-    deadline = time.monotonic() + SPIN_TIMEOUT_SECONDS
+    deadline = time.perf_counter() + SPIN_TIMEOUT_SECONDS
     while not predicate():
-        if time.monotonic() > deadline:
+        if time.perf_counter() > deadline:
             raise TimeoutError("the fake copy was never released or cancelled")
         time.sleep(0.005)
 

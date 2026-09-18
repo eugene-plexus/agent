@@ -66,6 +66,7 @@ from typing import Any
 
 import httpx
 
+from ._http import internal_client
 from .node_identity import advertise_host, is_loopback_host
 
 log = logging.getLogger(__name__)
@@ -198,7 +199,7 @@ class InstallTopology:
         self, *, control_url: str, authorization: str | None, transport: Any
     ) -> _Snapshot:
         cached = self._snapshot
-        if cached is not None and cached.expires_at > time.monotonic():
+        if cached is not None and cached.expires_at > time.perf_counter():
             return cached
 
         async with self._lock:
@@ -206,12 +207,12 @@ class InstallTopology:
             # arrive together, and the point of the lock is that they
             # share one read rather than starting four.
             cached = self._snapshot
-            if cached is not None and cached.expires_at > time.monotonic():
+            if cached is not None and cached.expires_at > time.perf_counter():
                 return cached
             snapshot = await self._read(
                 control_url=control_url, authorization=authorization, transport=transport
             )
-            snapshot.expires_at = time.monotonic() + (
+            snapshot.expires_at = time.perf_counter() + (
                 _MISS_TTL_SECONDS if snapshot.error is not None else _HIT_TTL_SECONDS
             )
             if snapshot.cacheable:
@@ -226,7 +227,7 @@ class InstallTopology:
         if authorization:
             headers["authorization"] = authorization
         try:
-            async with httpx.AsyncClient(timeout=_LOOKUP_TIMEOUT, transport=transport) as client:
+            async with internal_client(timeout=_LOOKUP_TIMEOUT, transport=transport) as client:
                 components, nodes = await asyncio.gather(
                     client.get(f"{base}/v1/components", headers=headers),
                     client.get(f"{base}/v1/nodes", headers=headers),

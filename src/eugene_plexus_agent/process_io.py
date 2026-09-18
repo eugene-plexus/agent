@@ -267,7 +267,7 @@ class LoadProgressTracker:
             return None
         value, source = reading
 
-        at = time.monotonic() if now is None else now
+        at = time.perf_counter() if now is None else now
         track = self._tracks.get(name)
         if track is None or track.pid != pid:
             # A restart is a new process and a new file to size. Never

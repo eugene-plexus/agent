@@ -46,6 +46,7 @@ from typing import Any
 import httpx
 
 from . import __version__
+from ._http import internal_client
 from .node_identity import (
     NodeIdentityStore,
     address_message,
@@ -198,7 +199,7 @@ async def perform_enrollment(
         payload["url"] = advertise_url
 
     try:
-        async with httpx.AsyncClient(timeout=ENROLL_TIMEOUT_SECONDS, transport=transport) as client:
+        async with internal_client(timeout=ENROLL_TIMEOUT_SECONDS, transport=transport) as client:
             response = await client.post(f"{control_url}/v1/nodes/enroll", json=payload)
     except httpx.HTTPError as exc:
         raise EnrollmentError(
@@ -279,9 +280,7 @@ async def announce_address(
     }
     target = f"{record.control_url.rstrip('/')}/v1/nodes/{record.name}"
     try:
-        async with httpx.AsyncClient(
-            timeout=ANNOUNCE_TIMEOUT_SECONDS, transport=transport
-        ) as client:
+        async with internal_client(timeout=ANNOUNCE_TIMEOUT_SECONDS, transport=transport) as client:
             response = await client.patch(target, json=body)
     except httpx.HTTPError as exc:
         log.warning("could not announce this node's address to %s: %s", record.control_url, exc)

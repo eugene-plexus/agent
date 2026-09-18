@@ -66,6 +66,7 @@ from ._generated.models import (
     RuntimeSpec,
     RuntimeStatus,
 )
+from ._http import internal_client, shared_internal_client
 from .engines.devices import DeviceSnapshot
 from .model_paths import PathRule, resolve_model_path
 
@@ -146,6 +147,27 @@ class LibraryFitClient:
         # Injectable so a test can stand in for the library without a
         # socket; production leaves it None.
         self._transport = transport
+        self._own_client: httpx.AsyncClient | None = None
+
+    def _client(self) -> httpx.AsyncClient:
+        """The client these three reads share.
+
+        An admission makes up to three calls to the library and used to
+        build a client for each -- three certifi parses, ~104 ms of
+        synchronous CPU apiece on the event loop, and the UI calls
+        admission every time the new-profile form opens. In production
+        the client is process-wide, keyed by the library's URL, so a
+        second admission pays nothing at all. With an injected transport
+        (tests) it is per-instance, because a shared one would outlive
+        the fixture that owns the transport.
+        """
+        if self._transport is None:
+            return shared_internal_client(f"library:{self._base}", timeout=_LIBRARY_TIMEOUT_SECONDS)
+        if self._own_client is None:
+            self._own_client = internal_client(
+                timeout=_LIBRARY_TIMEOUT_SECONDS, transport=self._transport
+            )
+        return self._own_client
 
     @property
     def base_url(self) -> str:
@@ -155,15 +177,13 @@ class LibraryFitClient:
         """Every model the library knows, raw -- for the mapping check
         behind `POST /v1/config/test`. None when it could not answer."""
         try:
-            async with httpx.AsyncClient(
-                timeout=_LIBRARY_TIMEOUT_SECONDS, transport=self._transport
-            ) as client:
-                response = await client.get(f"{self._base}/v1/models", headers=self._headers)
-                if response.status_code >= 400:
-                    log.info("library model list returned %d", response.status_code)
-                    return None
-                models = response.json().get("models")
-                return models if isinstance(models, list) else None
+            client = self._client()
+            response = await client.get(f"{self._base}/v1/models", headers=self._headers)
+            if response.status_code >= 400:
+                log.info("library model list returned %d", response.status_code)
+                return None
+            models = response.json().get("models")
+            return models if isinstance(models, list) else None
         except (httpx.HTTPError, ValueError) as e:
             log.info("library unreachable for its model list (%s)", e)
             return None
@@ -173,15 +193,13 @@ class LibraryFitClient:
         inherits its path rules from (2026-09-14). None when it could not
         answer, and the node keeps its last copy."""
         try:
-            async with httpx.AsyncClient(
-                timeout=_LIBRARY_TIMEOUT_SECONDS, transport=self._transport
-            ) as client:
-                response = await client.get(f"{self._base}/v1/folders", headers=self._headers)
-                if response.status_code >= 400:
-                    log.info("library folder list returned %d", response.status_code)
-                    return None
-                folders = response.json().get("folders")
-                return folders if isinstance(folders, list) else None
+            client = self._client()
+            response = await client.get(f"{self._base}/v1/folders", headers=self._headers)
+            if response.status_code >= 400:
+                log.info("library folder list returned %d", response.status_code)
+                return None
+            folders = response.json().get("folders")
+            return folders if isinstance(folders, list) else None
         except (httpx.HTTPError, ValueError) as e:
             log.info("library unreachable for its folder list (%s)", e)
             return None
@@ -195,66 +213,64 @@ class LibraryFitClient:
         ram_bytes: int | None,
     ) -> LibraryFit | None:
         try:
-            async with httpx.AsyncClient(
-                timeout=_LIBRARY_TIMEOUT_SECONDS, transport=self._transport
-            ) as client:
-                lookup = await client.get(
-                    f"{self._base}/v1/models",
-                    params={"path": model_path},
-                    headers=self._headers,
-                )
-                if lookup.status_code >= 400:
-                    log.info("library lookup for %s returned %d", model_path, lookup.status_code)
-                    return None
-                models = lookup.json().get("models") or []
-                if not models:
-                    log.info("library does not know %s; falling back to file size", model_path)
-                    return None
-                model = models[0]
-                params: dict[str, Any] = {}
-                if context_length is not None:
-                    params["contextLength"] = context_length
-                elif isinstance(model.get("contextLength"), int):
-                    # The spec left context to the engine, which takes
-                    # the model's own. Ask about that, not the library's
-                    # guidance default.
-                    params["contextLength"] = model["contextLength"]
-                if vram_bytes is not None:
-                    params["vramBytes"] = vram_bytes
-                if ram_bytes is not None:
-                    params["ramBytes"] = ram_bytes
-                response = await client.get(
-                    f"{self._base}/v1/models/{quote(str(model['id']), safe='')}/fit",
-                    params=params,
-                    headers=self._headers,
-                )
-                if response.status_code >= 400:
-                    log.info("library fit for %s returned %d", model_path, response.status_code)
-                    return None
-                fit = response.json().get("fit") or {}
-                required = fit.get("requiredBytes")
-                verdict = fit.get("verdict")
-                if not isinstance(required, int) or not isinstance(verdict, str):
-                    return None
-                context = fit.get("contextLength")
-                max_context = response.json().get("maxContextLength")
-                size = model.get("sizeBytes")
-                weights = next(
-                    (
-                        f.get("sizeBytes")
-                        for f in model.get("files") or []
-                        if isinstance(f, dict) and f.get("role") == "weights"
-                    ),
-                    size if model.get("fileCount") == 1 else None,
-                )
-                return LibraryFit(
-                    required_bytes=required,
-                    verdict=verdict,
-                    context_length=context if isinstance(context, int) else None,
-                    max_context_length=max_context if isinstance(max_context, int) else None,
-                    size_bytes=size if isinstance(size, int) else None,
-                    weights_size_bytes=weights if isinstance(weights, int) else None,
-                )
+            client = self._client()
+            lookup = await client.get(
+                f"{self._base}/v1/models",
+                params={"path": model_path},
+                headers=self._headers,
+            )
+            if lookup.status_code >= 400:
+                log.info("library lookup for %s returned %d", model_path, lookup.status_code)
+                return None
+            models = lookup.json().get("models") or []
+            if not models:
+                log.info("library does not know %s; falling back to file size", model_path)
+                return None
+            model = models[0]
+            params: dict[str, Any] = {}
+            if context_length is not None:
+                params["contextLength"] = context_length
+            elif isinstance(model.get("contextLength"), int):
+                # The spec left context to the engine, which takes
+                # the model's own. Ask about that, not the library's
+                # guidance default.
+                params["contextLength"] = model["contextLength"]
+            if vram_bytes is not None:
+                params["vramBytes"] = vram_bytes
+            if ram_bytes is not None:
+                params["ramBytes"] = ram_bytes
+            response = await client.get(
+                f"{self._base}/v1/models/{quote(str(model['id']), safe='')}/fit",
+                params=params,
+                headers=self._headers,
+            )
+            if response.status_code >= 400:
+                log.info("library fit for %s returned %d", model_path, response.status_code)
+                return None
+            fit = response.json().get("fit") or {}
+            required = fit.get("requiredBytes")
+            verdict = fit.get("verdict")
+            if not isinstance(required, int) or not isinstance(verdict, str):
+                return None
+            context = fit.get("contextLength")
+            max_context = response.json().get("maxContextLength")
+            size = model.get("sizeBytes")
+            weights = next(
+                (
+                    f.get("sizeBytes")
+                    for f in model.get("files") or []
+                    if isinstance(f, dict) and f.get("role") == "weights"
+                ),
+                size if model.get("fileCount") == 1 else None,
+            )
+            return LibraryFit(
+                required_bytes=required,
+                verdict=verdict,
+                context_length=context if isinstance(context, int) else None,
+                max_context_length=max_context if isinstance(max_context, int) else None,
+                size_bytes=size if isinstance(size, int) else None,
+                weights_size_bytes=weights if isinstance(weights, int) else None,
+            )
         except (httpx.HTTPError, ValueError) as e:
             log.info("library unreachable for fit (%s); falling back to file size", e)
             return None

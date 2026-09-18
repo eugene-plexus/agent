@@ -37,6 +37,7 @@ from . import (
     security,
     ui_assets,
 )
+from ._http import aclose_shared
 from .auth_state import AuthState
 from .client_keys import KEYS_FILE, ClientKeyStore
 from .dependencies import require_operator_session
@@ -290,6 +291,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await runtime_supervisor.stop_all()
         if owns_supervisor:
             await supervisor.stop_all()
+        # Last: the process-wide clients (`_http.shared_internal_client`)
+        # -- the engine readiness probe and the library reads admission
+        # makes. Last because everything above may still be probing on
+        # the way down, and closing a pool under an in-flight probe
+        # turns an orderly shutdown into a traceback.
+        await aclose_shared()
 
 
 async def _announce_address(

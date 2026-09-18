@@ -282,6 +282,23 @@ def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+# Process-wide HTTP clients (`_http.shared_internal_client`) outlive a
+# test by construction -- that is the point of them, since building one
+# parses certifi's PEM bundle at ~104 ms of synchronous CPU on the event
+# loop. The cost in a test session is that a test which installs a
+# `MockTransport` would leave it in front of every later test, which is
+# how eight tests failed the first time this landed. Every test starts
+# with an empty registry. Dropped rather than closed: a test owns
+# whatever it installed, and nothing here holds a real socket.
+@pytest.fixture(autouse=True)
+def _isolate_shared_http_clients() -> Iterator[None]:
+    from eugene_plexus_agent import _http
+
+    _http.reset_shared()
+    yield
+    _http.reset_shared()
+
+
 # `GET /v1/auth/status` probes the OS keyring once per process. In a test
 # that is the developer's real Credential Manager or a CI runner's absent
 # Secret Service - neither is the subject. Every test starts with the

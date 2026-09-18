@@ -71,6 +71,7 @@ from fastapi.responses import StreamingResponse
 
 from .. import install_proxy
 from .._generated.common_models import Problem
+from .._http import internal_client
 from ..node_identity import local_agent_url
 from ..settings import Settings
 from ..state import AgentState
@@ -336,7 +337,12 @@ def get_client(request: Request) -> httpx.AsyncClient:
     """
     client: httpx.AsyncClient | None = getattr(request.app.state, "ui_proxy_client", None)
     if client is None:
-        client = httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False)
+        # `internal_client`: one shared SSL context instead of a fresh
+        # certifi parse, and no proxy -- every target is a component of
+        # this install, on this host or another node, and a user's
+        # `HTTP_PROXY` (which the Windows logon task inherits) would
+        # otherwise swallow every call the browser makes.
+        client = internal_client(timeout=_TIMEOUT, follow_redirects=False)
         request.app.state.ui_proxy_client = client
     return client
 

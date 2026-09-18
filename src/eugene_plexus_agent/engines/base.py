@@ -25,6 +25,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
+
 from .._generated.models import (
     ConfigSchema,
     EngineKind,
@@ -37,7 +39,28 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimeSpec,
 )
+from .._http import shared_internal_client
 from .acquisition import ManagedStore, engine_root
+
+
+def probe_client() -> httpx.AsyncClient:
+    """The one HTTP client every engine readiness probe shares.
+
+    **The readiness loop is the hottest path in this process**: every
+    2 s, per ready runtime, each adapter probes `/health` and then reads
+    capabilities back. Those used to be two fresh `httpx.AsyncClient()`
+    objects, and constructing one parses certifi's PEM bundle -- 104 ms
+    of *synchronous* CPU, measured on the Python both installers
+    provision -- on the event loop that also serves the UI and the
+    browser proxy. Four resident runtimes spent ~0.84 s of every 2 s
+    blocking, which is why the console felt slow with models loaded.
+
+    One client, no `base_url` (the probes pass absolute URLs), no proxy
+    (an engine is always on this machine, and the Windows logon task
+    inherits the user's `HTTP_PROXY`). Each probe passes its own
+    `timeout=`. Closed by the app lifespan through `aclose_shared()`.
+    """
+    return shared_internal_client("engine-probe")
 
 
 @dataclass(frozen=True)

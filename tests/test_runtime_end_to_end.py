@@ -44,14 +44,14 @@ def opt(name, default=None):
 
 PORT = int(opt("--port", "0"))
 READY_AFTER = float(opt("--ready-after", "0"))
-STARTED = time.monotonic()
+STARTED = time.perf_counter()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
     def do_GET(self):
-        loading = (time.monotonic() - STARTED) < READY_AFTER
+        loading = (time.perf_counter() - STARTED) < READY_AFTER
         if self.path == "/health":
             if loading:
                 self._send(503, {"status": "loading model"})

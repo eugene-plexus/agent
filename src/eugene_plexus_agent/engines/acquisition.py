@@ -179,7 +179,7 @@ class GitHubReleases:
         check has to be invisible: it leaves the last-known state stale
         rather than turning a UI panel into an error.
         """
-        now = time.monotonic()
+        now = time.perf_counter()
         if (
             not force
             and self._cached is not None

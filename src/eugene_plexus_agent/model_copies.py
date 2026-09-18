@@ -352,7 +352,7 @@ def copy_file(
     os.makedirs(os.path.dirname(plan.destination) or ".", exist_ok=True)
     partial = plan.partial
     copied = 0
-    started = time.monotonic()
+    started = time.perf_counter()
     try:
         with open(plan.source, "rb") as src, open(partial, "wb") as dst:
             chunks = 0
@@ -365,7 +365,7 @@ def copy_file(
                 dst.write(chunk)
                 copied += len(chunk)
                 chunks += 1
-                state.note(copied, time.monotonic())
+                state.note(copied, time.perf_counter())
                 if chunks % HEADROOM_CHECK_EVERY == 0:
                     remaining = (state.total_bytes or copied) - copied
                     free = free_bytes(os.path.dirname(plan.destination) or ".")
@@ -384,13 +384,13 @@ def copy_file(
     # file the operator may well go looking at in a file manager.
     shutil.copystat(plan.source, partial)
     os.replace(partial, plan.destination)
-    state.note(copied, time.monotonic())
+    state.note(copied, time.perf_counter())
     log.info(
         "copied %s to %s (%.1f GB in %.0fs)",
         plan.source,
         plan.destination,
         copied / GIB,
-        time.monotonic() - started,
+        time.perf_counter() - started,
     )
 
 

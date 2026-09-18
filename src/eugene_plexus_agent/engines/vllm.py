@@ -57,6 +57,9 @@ from .base import (
     Ready,
     default_model_alias,
 )
+from .base import (
+    probe_client as _probe_client,
+)
 
 log = logging.getLogger(__name__)
 
@@ -302,8 +305,7 @@ class VllmAdapter(EngineAdapter):
         """
         url = base_url.rstrip("/")
         try:
-            async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as client:
-                response = await client.get(f"{url}/health")
+            response = await _probe_client().get(f"{url}/health", timeout=_PROBE_TIMEOUT_SECONDS)
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             return NotAnswering(detail=str(e), reached=False)
         except httpx.HTTPError as e:
@@ -347,15 +349,15 @@ class VllmAdapter(EngineAdapter):
         version: str | None = None
         capabilities: RuntimeCapabilities | None = None
         try:
-            async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as client:
-                v = await client.get(f"{url}/version")
-                if v.is_success:
-                    body = v.json()
-                    if isinstance(body, dict) and isinstance(body.get("version"), str):
-                        version = body["version"]
-                models = await client.get(f"{url}/v1/models")
-                if models.is_success:
-                    capabilities = _capabilities_from_models(models.json())
+            client = _probe_client()
+            v = await client.get(f"{url}/version", timeout=_PROBE_TIMEOUT_SECONDS)
+            if v.is_success:
+                body = v.json()
+                if isinstance(body, dict) and isinstance(body.get("version"), str):
+                    version = body["version"]
+            models = await client.get(f"{url}/v1/models", timeout=_PROBE_TIMEOUT_SECONDS)
+            if models.is_success:
+                capabilities = _capabilities_from_models(models.json())
         except (httpx.HTTPError, json.JSONDecodeError, ValueError) as e:
             log.debug("read-back from %s failed: %s", url, e)
         return version, capabilities

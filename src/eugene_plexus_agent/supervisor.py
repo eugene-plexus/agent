@@ -49,6 +49,7 @@ import httpx
 
 from . import orphan_kill, ports, process_signals, security
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
+from ._http import internal_client
 from .auth_state import AuthState
 
 # How long an exiting child gets to finish flushing before we SIGKILL it
@@ -1018,7 +1019,15 @@ class Supervisor:
         if self._health_task is not None:
             return
         # Short timeout so a hung child doesn't block the whole poll round.
-        self._health_client = httpx.AsyncClient(timeout=2.0)
+        # `internal_client` and NOT a bare `httpx.AsyncClient()`: children
+        # are on loopback, and with `trust_env` on, a user's `HTTP_PROXY`
+        # -- which the Windows logon task inherits from the user
+        # environment -- routes every health probe through a corporate
+        # proxy that cannot reach 127.0.0.1. This poller gates the
+        # `starting` -> `running` promotion rather than restarting
+        # anything, so the whole install then sits at `starting` while
+        # actually serving, and no screen explains it.
+        self._health_client = internal_client(timeout=2.0)
         self._health_task = asyncio.create_task(
             self._health_loop(get_components), name="supervisor-health"
         )
@@ -1118,7 +1127,7 @@ class Supervisor:
         if client is None:
             return
         url = str(entry.url).rstrip("/") + "/healthz"
-        start = time.monotonic()
+        start = time.perf_counter()
         try:
             response = await client.get(url)
         except httpx.HTTPError:
@@ -1127,7 +1136,7 @@ class Supervisor:
         finally:
             # Defensive: an unexpectedly slow probe shouldn't cascade
             # into a long poll round.
-            elapsed = time.monotonic() - start
+            elapsed = time.perf_counter() - start
             if elapsed > _HEALTH_POLL_SECONDS:
                 self._log.debug(
                     "healthz probe for %s took %.2fs (poll interval %.2fs)",

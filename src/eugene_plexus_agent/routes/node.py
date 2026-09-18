@@ -56,6 +56,7 @@ from .._generated.models import (
     UnenrollRequest,
     UnenrollResult,
 )
+from .._http import internal_client
 from ..auth_state import AuthState
 from ..dependencies import require_operator_or_service, require_operator_session
 from ..engines.devices import DeviceSnapshot, detect_devices
@@ -396,9 +397,7 @@ async def _revoke_at_root(
     transport = getattr(request.app.state, "control_transport", None)
     target = f"{control_url.rstrip('/')}/v1/nodes/{name}"
     try:
-        async with httpx.AsyncClient(
-            timeout=_REVOKE_TIMEOUT_SECONDS, transport=transport
-        ) as client:
+        async with internal_client(timeout=_REVOKE_TIMEOUT_SECONDS, transport=transport) as client:
             response = await client.delete(target, headers={"Authorization": credentials})
     except httpx.HTTPError as exc:
         return False, (

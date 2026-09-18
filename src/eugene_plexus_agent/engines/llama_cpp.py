@@ -44,6 +44,9 @@ from .base import (
     Ready,
     default_model_alias,
 )
+from .base import (
+    probe_client as _probe_client,
+)
 
 log = logging.getLogger(__name__)
 
@@ -373,8 +376,7 @@ class LlamaCppAdapter(EngineAdapter):
         """
         url = base_url.rstrip("/")
         try:
-            async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as client:
-                response = await client.get(f"{url}/health")
+            response = await _probe_client().get(f"{url}/health", timeout=_PROBE_TIMEOUT_SECONDS)
         except httpx.HTTPError as e:
             return NotAnswering(detail=str(e), reached=False)
 
@@ -401,8 +403,7 @@ class LlamaCppAdapter(EngineAdapter):
         ready.
         """
         try:
-            async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT_SECONDS) as client:
-                response = await client.get(f"{url}/props")
+            response = await _probe_client().get(f"{url}/props", timeout=_PROBE_TIMEOUT_SECONDS)
             if not response.is_success:
                 return None
             props = response.json()
