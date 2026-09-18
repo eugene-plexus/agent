@@ -17,6 +17,14 @@ to spawned children that need to decrypt at-rest secrets.
 Rate-limiting: bucket per source IP, 5 failures within 60 seconds
 locks the source out for 60 seconds. Cleared on success.
 
+**And "source IP" means the browser's, not the proxy's.** Every login
+in this product arrives through this agent's own loopback proxy, so
+`request.client.host` is `127.0.0.1` for every caller there has ever
+been: one bucket for the whole install, which five mistyped passphrases
+from one person emptied for everybody. `peer.peer_of` reads the address
+the proxy saw. See `peer.py` for why that header is believable and
+`X-Forwarded-For` was not.
+
 **Client keys (S4, 2026-09-15)** live at the bottom of this file. A
 different kind of credential: not a session, not a component's service
 token, but a long-lived named bearer an operator hands to an app
@@ -38,7 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
-from .. import client_keys, keyring_store, security
+from .. import client_keys, keyring_store, peer, security
 from .._generated.common_models import (
     AuthLoginRequest,
     AuthLoginResponse,
@@ -200,7 +208,13 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     derived master key. Rate-limited per source IP."""
     state: AgentState = request.app.state.agent_state
     auth: AuthState = request.app.state.auth_state
-    remote = request.client.host if request.client else "unknown"
+    remote = (
+        peer.peer_of(
+            request.client.host if request.client else None,
+            request.headers.get(peer.PEER_HEADER),
+        )
+        or "unknown"
+    )
 
     if not state.has_passphrase():
         # **An enrolled node is a different situation and needs different

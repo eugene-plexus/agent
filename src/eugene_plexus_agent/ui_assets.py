@@ -168,6 +168,25 @@ def unavailable_page(assets: UIAssets) -> str:
 # recorded here rather than discovered later.
 _API_PREFIXES = ("/v1/", "/api/", "/healthz", "/openapi.json", "/docs", "/redoc")
 
+# **The console must not be framed** (review §6.3 #32, roadmap R1.2).
+# Cheap defence in depth rather than a fix for a known attack: this
+# origin carries an operator session in browser storage *and* an
+# unauthenticated proxy to every component in the install, so a page
+# that can frame it is a page that can sit in front of an operator
+# using it. Two headers because `frame-ancestors` is the one browsers
+# still honour and `X-Frame-Options` is the one that covers the rest.
+#
+# **`frame-ancestors` and nothing else.** A full CSP over a Next static
+# export means enumerating its inline bootstrap and its chunk origins,
+# which is a real slice with a real chance of shipping a blank page;
+# this is the directive that needs no inventory. R5 or later can widen
+# it, and will be able to tell whether it broke anything because this
+# one already passes.
+FRAME_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
+
 
 class _UIStaticFiles(StaticFiles):
     """The UI bundle, refusing to answer for the API's paths."""
@@ -185,7 +204,9 @@ class _UIStaticFiles(StaticFiles):
                     component="agent",
                 ).model_dump(exclude_none=True),
             )
-        return await super().get_response(path, scope)
+        response = await super().get_response(path, scope)
+        response.headers.update(FRAME_HEADERS)
+        return response
 
 
 def mount(app: FastAPI, ui_dir: Path | None) -> None:
@@ -203,7 +224,13 @@ def mount(app: FastAPI, ui_dir: Path | None) -> None:
 
         @app.get("/", include_in_schema=False)
         async def ui_unavailable() -> HTMLResponse:
-            return HTMLResponse(unavailable_page(assets), status_code=503)
+            # Same headers as the real thing. A header only some of `/`'s
+            # answers carry is a header an attacker asks for the other of
+            # -- and this page is reachable on a headless node, which is
+            # exactly the install nobody is watching.
+            return HTMLResponse(
+                unavailable_page(assets), status_code=503, headers=dict(FRAME_HEADERS)
+            )
 
         return
 

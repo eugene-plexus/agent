@@ -17,6 +17,10 @@ moment somebody wants to know whether reach still works, not whether it
 once did, and a timestamp that survived the restart would answer the
 wrong one of those two questions.
 
+**And the address is the caller's, not the proxy's.** Which one that
+is, and why a header can be believed for it where `X-Forwarded-For`
+could not, is `peer.py`.
+
 The cost is one address parse per request, off the ASGI scope's
 client tuple, before routing. Pure ASGI rather than
 `BaseHTTPMiddleware` for the reason `cors.py` in the gateway gives:
@@ -29,6 +33,8 @@ import ipaddress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+from . import peer
 
 __all__ = ["OffHostWitness", "install"]
 
@@ -89,8 +95,20 @@ class OffHostMiddleware:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") == "http":
             client = scope.get("client")
-            if client and _is_off_host(str(client[0])):
-                self.witness.saw(str(client[0]))
+            # **The socket is not always the caller.** A browser on a
+            # phone reaches a component through this agent's own proxy,
+            # so the peer on that inner request is loopback and the one
+            # request this whole module exists to notice would go
+            # unnoticed. `peer.peer_of` prefers what the proxy saw, and
+            # only where the peer is loopback -- which is also what
+            # stops a local caller inventing a witness out of a header,
+            # as `X-Forwarded-For` let it (review §6.1 #1).
+            origin = peer.peer_of(
+                str(client[0]) if client else None,
+                peer.header_of(scope.get("headers") or ()),
+            )
+            if origin and _is_off_host(origin):
+                self.witness.saw(origin)
         await self.app(scope, receive, send)
 
 

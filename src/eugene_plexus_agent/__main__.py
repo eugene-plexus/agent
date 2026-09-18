@@ -231,7 +231,18 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # answering only on loopback however the setting changes afterwards
     # -- and that disagreement is what the reach card exists to show.
     app.state.bind_host = bind_host
-    config = uvicorn.Config(app, host=bind_host, port=port, log_level=log_level)
+    # **`forwarded_allow_ips=[]`: trust no forwarding header from anyone.**
+    # uvicorn's default is `"127.0.0.1"`, and the browser reaches every
+    # component through this process's own loopback proxy -- so the
+    # default trusts `X-Forwarded-For` from exactly the peer that is
+    # always us, which let any caller pick the login limiter's bucket
+    # and forge the Reach card's only proof. What the proxy saw travels
+    # as `peer.PEER_HEADER` instead, which is trustworthy because it is
+    # stripped on the way in. See `peer.py`; review §6.1 #1, roadmap
+    # R1.2.
+    config = uvicorn.Config(
+        app, host=bind_host, port=port, log_level=log_level, forwarded_allow_ips=[]
+    )
     return uvicorn.Server(config)
 
 

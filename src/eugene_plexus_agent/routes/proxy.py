@@ -69,7 +69,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from .. import install_proxy
+from .. import install_proxy, peer
 from .._generated.common_models import Problem
 from .._http import internal_client
 from ..node_identity import local_agent_url
@@ -113,7 +113,20 @@ _STRIPPED_REQUEST_HEADERS = frozenset(
         # Ours, read below and re-set deliberately when we forward. A
         # component has no use for it and should never see it.
         install_proxy.HOP_HEADER,
+        # Ours for the same reason, and load-bearing for the same
+        # reason: `peer.PEER_HEADER` is believed downstream *because* a
+        # caller's copy cannot survive this hop. Strip it and it is
+        # evidence; forward it and it is a form field.
+        peer.PEER_HEADER,
     }
+    # Every header that claims to say where a request came from, all of
+    # them written by whoever sent it. This install has no reverse proxy
+    # in front of it that we configured, so one arriving is either an
+    # invention or a deployment we know nothing about -- and forwarding
+    # it let a caller choose the login limiter's bucket and forge the
+    # Reach card's proof (review §6.1 #1). `peer.PEER_HEADER` carries
+    # the one address we can actually see instead.
+    | peer.FORWARDING_HEADERS
 )
 
 _STRIPPED_RESPONSE_HEADERS = frozenset(
@@ -367,6 +380,19 @@ def _request_headers(request: Request, route: Route) -> dict[str, str]:
         if key.lower() not in _STRIPPED_REQUEST_HEADERS
     }
     headers["accept-encoding"] = "identity"
+
+    # Who this request is really from, said by the only process in the
+    # chain that can see it. `peer_of` keeps the original across a
+    # second hop of ours (the inner peer is loopback there) and takes
+    # the socket's word for it otherwise, so a caller who sets the
+    # header from off-host is simply overwritten with their own address.
+    origin = peer.peer_of(
+        request.client.host if request.client else None,
+        request.headers.get(peer.PEER_HEADER),
+    )
+    if origin:
+        headers[peer.PEER_HEADER] = origin
+
     if route.node is not None:
         # Set only on the hop to another node's agent, and it carries
         # this node's name so the receiver's refusal can say who sent it.
