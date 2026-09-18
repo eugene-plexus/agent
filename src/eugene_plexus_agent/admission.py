@@ -556,6 +556,18 @@ async def check_admission(
         else "Nothing else of ours holds memory on it."
     )
     ctx_text = f" at {context_length} context" if context_length else ""
+    # Slots divide the context they do not multiply the memory --
+    # measured, see `per_request_context`. Said here because the runtime
+    # will read back the divided number and the contract calls that
+    # "clamped", which is the wrong diagnosis with the wrong remedy.
+    slots_flag = flags.get("parallelSlots")
+    slot_note = slot_division_note(
+        context_length,
+        int(slots_flag)
+        if isinstance(slots_flag, int | float | str) and str(slots_flag).isdigit()
+        else None,
+    )
+    slot_text = f" {slot_note[0].upper()}{slot_note[1:]}." if slot_note else ""
     # The number a refusal hands back. Discover scores at the library's
     # guidance context and a profile that leaves contextSize to the engine
     # is scored at the model's own, so the two screens disagreed about
@@ -582,7 +594,7 @@ async def check_admission(
                 if not full_offload and fit is not AdmissionFit.fits
                 else ""
             )
-            + f". {held}"
+            + f". {held}{slot_text}"
         )
         warning = "; ".join(warnings) or None
     else:
@@ -601,7 +613,7 @@ async def check_admission(
         reason = (
             f"refuse: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) but "
             f"{where} has {_gib(free)} free of {_gib(total)}; verdict {fit.value}.{fits_up_to} "
-            f"{held} {fix}"
+            f"{held}{slot_text} {fix}"
         )
         warning = "; ".join(warnings) or None
 
@@ -619,6 +631,52 @@ async def check_admission(
         location=location,
         reason=reason,
         warning=warning,
+    )
+
+
+def per_request_context(context_length: int | None, parallel_slots: int | None) -> int | None:
+    """The window ONE request gets, which is not what was configured.
+
+    **Measured against llama-server b11001** (0.4.1-dev, f266648fa) with
+    a real model on this box: `-c 32768 --parallel 4` logs
+    `llama_context: n_ctx = 32768` and `n_ctx_slot = 8192`, four slots of
+    it, `kv_unified = 'false'`. `-c` is the TOTAL KV budget and
+    `--parallel` divides it.
+
+    That measurement is the whole of roadmap R1.3's half of review §6.3
+    #36, which was a contradiction inside this repo: the config copy
+    said `-c` was per-slot and that memory multiplied with slots, while
+    `fit.py` and `admission.py` computed the opposite. The arithmetic was
+    right. The copy is fixed, and this is the number it now needs.
+
+    Why it matters past the copy: `/props` exposes only
+    `default_generation_settings.n_ctx`, the per-slot value (`props.n_ctx`
+    was absent on b11001), so a runtime launched at 32768 with 4 slots
+    reports `capabilities.contextLength: 8192` — and the contract's word
+    for a number that differs from the request is *clamped*, which sends
+    an operator looking for memory they are not short of.
+    """
+    if context_length is None:
+        return None
+    slots = parallel_slots or 1
+    return max(context_length // slots, 1) if slots > 1 else context_length
+
+
+def slot_division_note(context_length: int | None, parallel_slots: int | None) -> str | None:
+    """One sentence, only when the division actually happens.
+
+    `None` at one slot on purpose. The default is one slot, so a
+    sentence about division on every launch would appear on almost all
+    of them and train people to skip the reason — which is the surface
+    that has to carry a refusal's arithmetic.
+    """
+    if context_length is None or not parallel_slots or parallel_slots < 2:
+        return None
+    window = per_request_context(context_length, parallel_slots)
+    assert window is not None
+    return (
+        f"{parallel_slots} slots divide that context, so each request gets "
+        f"{window:,} tokens; the memory is the same either way"
     )
 
 

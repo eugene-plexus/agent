@@ -597,11 +597,15 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="contextSize",
         label="Context size",
         description=(
-            "Maximum tokens the model can attend to, per slot. The single "
-            "biggest lever on memory use. Leave unset to take the model's "
-            "trained context — the engine clamps anything larger than the "
-            "model or than available memory, and the clamped value is what "
-            "the runtime reports back."
+            "Total tokens this runtime keeps in memory, shared by its "
+            "slots. The single biggest lever on memory use. With more "
+            "than one slot the engine divides this between them, so each "
+            "request sees a smaller window and the memory is unchanged. "
+            "Leave unset to take the model's trained context — the engine "
+            "clamps anything larger than the model or than available "
+            "memory. A runtime reports back the window one slot gets, "
+            "which is this value divided by the slot count — not a sign "
+            "it ran short of memory."
         ),
         category="memory",
         valueType=ConfigValueType.integer,
@@ -626,11 +630,13 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="parallelSlots",
         label="Parallel slots",
         description=(
-            "Concurrent requests this runtime serves. Context size is "
-            "per-slot, so 4 slots at 8k needs roughly the memory of 1 slot "
-            "at 32k — raising this without lowering context is the usual "
-            "way to run out of VRAM. This is also the unit of capacity the "
-            "gateway divides work across."
+            "Concurrent requests this runtime serves. The slots divide "
+            "the context size between them rather than each getting "
+            "their own, so 4 slots at 32k gives every request 8k and "
+            "costs exactly what 1 slot at 32k costs — raise this and "
+            "raise context together if each request needs the same room "
+            "as before. This is also the unit of capacity the gateway "
+            "divides work across."
         ),
         category="performance",
         valueType=ConfigValueType.integer,
