@@ -27,10 +27,13 @@ refusal can be wrong; an explanation of a real failure cannot.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
+import socket
 import subprocess
 import sys
+from collections.abc import Iterable
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +51,86 @@ _IN_USE = re.compile(
 def looks_like_address_in_use(output: str) -> bool:
     """Does this child's output tail read as a bind collision?"""
     return bool(output) and bool(_IN_USE.search(output))
+
+
+def is_free(port: int, *, host: str = "127.0.0.1") -> bool:
+    """Could something bind `port` on `host` right now?
+
+    **Asking the socket, not the topology** (review §6.1 #7). The wizard
+    already walks past a taken inference-driver port, and it walks past
+    *declared URLs* — which says nothing about the operator's own web
+    server, their Docker publish, or the JupyterLab that owns 8080 on
+    most development boxes. This is the same walk keyed on the only
+    thing that decides a bind.
+
+    `SO_EXCLUSIVEADDRUSE` on Windows, nothing on POSIX. **And no check
+    covers it, which was measured rather than assumed.** Against an
+    actively listening socket on this box every variant refuses -- no
+    option 10048, `SO_REUSEADDR` 13, `SO_EXCLUSIVEADDRUSE` 10048 -- so
+    the option changes no answer this function can be asked about in a
+    test, and neither can `SO_REUSEADDR`, which was expected to break it
+    outright and does not. What the exclusive flag buys is the
+    `TIME_WAIT` case, which no check here can arrange deterministically.
+    It is kept as correct hygiene for a probe whose whole job is to
+    answer the question uvicorn will ask a second later, and the
+    sabotage pass records it as uncovered rather than dressing it up.
+
+    Never raises: a probe that cannot be performed answers "free", so a
+    platform quirk degrades to today's behaviour rather than refusing to
+    seed a topology at all.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        sock.bind((host, port))
+    except OSError:
+        return False
+    except Exception:  # pragma: no cover - defensive
+        log.debug("could not probe port %d", port, exc_info=True)
+        return True
+    finally:
+        sock.close()
+    return True
+
+
+def first_free(
+    preferred: int, *, reserved: Iterable[int] = (), limit: int = 64, host: str = "127.0.0.1"
+) -> int:
+    """`preferred` if nothing holds it, else the next port that is free.
+
+    **The preferred port is a preference, not a fallback order.** Every
+    document, every acceptance script and the UI's guessed gateway base
+    URL assume the specs' `servers` defaults, so a free 8080 must stay
+    8080 — the walk exists only for the box where it is not free.
+
+    `reserved` is the rest of the install's own ports, so walking off
+    8080 cannot land on the inference-driver default and produce a
+    second collision at the first Launch.
+
+    Returns `preferred` if the whole window is taken. At that point the
+    box has sixty-four consecutive occupied ports and the honest answer
+    is the documented one plus the diagnosis `explain_collision` gives
+    when the child fails — an eager refusal can be wrong and an
+    explanation of a real failure cannot.
+    """
+    blocked = set(reserved)
+    for candidate in range(preferred, preferred + limit):
+        if candidate != preferred and candidate in blocked:
+            continue
+        if is_free(candidate, host=host):
+            return candidate
+    log.warning(
+        "no free TCP port between %d and %d on %s; keeping %d and letting the component "
+        "report the collision",
+        preferred,
+        preferred + limit - 1,
+        host,
+        preferred,
+    )
+    return preferred
 
 
 def describe_holder(port: int) -> str | None:

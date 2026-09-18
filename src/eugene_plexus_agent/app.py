@@ -69,10 +69,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             "/v1/components, then restart without the env var.",
             settings.config_file,
         )
+        config_error: str | None = None
     else:
-        state.load()
+        # **Degraded, not dead** (review §6.1 #6). This was a bare
+        # `state.load()` into an uncaught lifespan, so a half-written
+        # `agent.yaml` was an install that would not start and could not
+        # be repaired from the browser -- the exact failure mode
+        # `degraded-mode-required` exists to forbid, unapplied to the
+        # component that owns the rule's own file. See
+        # `AgentState.load_or_degrade` for what a failure preserves.
+        config_error = state.load_or_degrade()
     app.state.agent_state = state
     app.state.safe_mode = settings.safe_mode
+    app.state.config_error = config_error
 
     # This host's identity in the install (M7): node.yaml beside
     # agent.yaml. Loaded before auth state, because an enrolled agent

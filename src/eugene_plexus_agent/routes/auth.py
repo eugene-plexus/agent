@@ -158,12 +158,38 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
     auth: AuthState = request.app.state.auth_state
 
     if state.has_passphrase():
+        # **The remedy is to sign in, and it used to be to edit a YAML
+        # file** (review §6.1 #7). A first-time user whose trust root
+        # cannot start reaches this 409 on the wizard's second attempt,
+        # and telling them to remove the auth block by hand from the
+        # file that holds their install's key material is both the most
+        # destructive available instruction and one the browser they are
+        # sitting in cannot carry out.
         raise _problem(
             status.HTTP_409_CONFLICT,
-            "Already initialized",
-            "This install already has a passphrase set. Use the change-"
-            "passphrase flow (planned v0.3) or reset the install by "
-            "removing agent.yaml's auth block by hand.",
+            "Already set up",
+            "This install already has a passphrase. Sign in with it instead of setting it "
+            "up again. If you have forgotten it, there is no recovery: the install's keys "
+            "are sealed with it.",
+        )
+
+    if state.lost_its_passphrase():
+        # **The file held a passphrase and we cannot read it** (review
+        # §6.1 #6). `yaml.safe_dump` sorts keys, so a half-written
+        # `agent.yaml` keeps its `auth` block and loses the tail: the
+        # file comes up degraded, the loaded state has no passphrase,
+        # and this endpoint is what the UI offers next. Running the
+        # wizard here is the one thing that makes it worse — a fresh
+        # `masterSalt` orphans every secret the old one sealed,
+        # including the install signing key on every enrolled node, and
+        # nothing would say that had happened.
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "Set up, but its keys are missing",
+            "This install has been set up before, and the part of its configuration that "
+            "holds the passphrase is missing. Setting a new one would lock you out of "
+            "everything the old one sealed, so it is refused. Restore the configuration "
+            "file from a backup, or from the copy kept beside it, and start again.",
         )
 
     # Hash the passphrase (for verification on future logins) and

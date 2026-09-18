@@ -28,6 +28,7 @@ from ._generated.models import (
     EngineDescriptor,
     EngineInstall,
     EngineKind,
+    HostAccelerator,
     LoadProgress,
     ManagedEngine,
     ManualInstall,
@@ -912,7 +913,12 @@ def _manual_reason(adapter: EngineAdapter, manual: ManualInstall | None) -> str:
     return " ".join(parts)
 
 
-def plan_for(kind: EngineKind, *, version: str | None = None) -> AcquisitionPlan | Unavailable:
+def plan_for(
+    kind: EngineKind,
+    *,
+    version: str | None = None,
+    host: HostAccelerator | None = None,
+) -> AcquisitionPlan | Unavailable:
     """What we would fetch for this host, or why we cannot.
 
     A `manual` engine is always `Unavailable`, on every host, and the
@@ -922,10 +928,19 @@ def plan_for(kind: EngineKind, *, version: str | None = None) -> AcquisitionPlan
     Otherwise adapter-specific by necessity — asset naming is engine
     knowledge, the same kind as argv construction — so this dispatches
     rather than generalising over an interface with one implementation.
+
+    **`host` is passed in by a caller that already resolved it** (review
+    §6.1 #5). `detect_host()` shells out to a vendor tool with a 5 s cap
+    per probe and is not cached, and `GET /v1/engines` used to reach it
+    three times per request — once here, once in `_acquisition_for`, and
+    once more for the manual engine's install command. Defaulted rather
+    than required so the install route, which resolves nothing else,
+    keeps its one call.
     """
+    detected = host if host is not None else detect_host()
     adapter = adapter_for(kind)
     if adapter is not None and adapter.install_policy is Policy.manual:
-        return Unavailable(reason=_manual_reason(adapter, adapter.manual_install(detect_host())))
+        return Unavailable(reason=_manual_reason(adapter, adapter.manual_install(detected)))
     if not isinstance(adapter, LlamaCppAdapter):
         return Unavailable(
             reason=f"engine {kind.value!r} has no managed-install support in this build"
@@ -935,7 +950,7 @@ def plan_for(kind: EngineKind, *, version: str | None = None) -> AcquisitionPlan
         # The newest build that carries THIS host's assets, which since
         # 2026-09-15 is not always the newest build with assets: a release
         # mid-upload has some and not ours.
-        return adapter.plan_latest(detect_host())
+        return adapter.plan_latest(detected)
     release = next(
         (r for r in adapter.releases.list_releases() if r.version == version),
         None,
@@ -947,18 +962,22 @@ def plan_for(kind: EngineKind, *, version: str | None = None) -> AcquisitionPlan
                 f"{adapter.binary_name}; only recent builds can be installed"
             )
         )
-    return adapter.plan_acquisition(detect_host(), release)
+    return adapter.plan_acquisition(detected, release)
 
 
-def _acquisition_for(kind: EngineKind) -> EngineAcquisition:
+def _acquisition_for(kind: EngineKind, host: HostAccelerator) -> EngineAcquisition:
     """The acquisition half of an `EngineDescriptor`.
 
     Never raises and never blocks on the network beyond the release cache:
     this backs `GET /v1/engines`, which the UI polls, and a failed upstream
     check has to leave the panel stale rather than turn it into an error.
+
+    `host` is required rather than optional here, unlike `plan_for`'s:
+    this function has exactly one caller and the whole point is that the
+    caller resolved the host once for every adapter.
     """
     adapter = adapter_for(kind)
-    detected = detect_host()
+    detected = host
 
     if adapter is not None and adapter.install_policy is Policy.manual:
         # Not by us, anywhere. `installable` is false by decision rather
@@ -982,7 +1001,7 @@ def _acquisition_for(kind: EngineKind) -> EngineAcquisition:
     if isinstance(adapter, LlamaCppAdapter):
         latest = adapter.latest_release()
         checked_at = adapter.releases.checked_at
-    plan = plan_for(kind)
+    plan = plan_for(kind, host=detected)
 
     if isinstance(plan, Unavailable):
         return EngineAcquisition(
@@ -1031,9 +1050,13 @@ def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescr
     engine reported here as unavailable — which reads as a contradiction
     on a dashboard and is worth saying out loud in the `error` text.
     """
+    # **Once, for every adapter.** See `plan_for`'s note: this was three
+    # `detect_host()` calls per request, each one up to two subprocess
+    # probes at a 5 s cap, on a route two pollers hit continuously.
+    host = detect_host()
     out: list[EngineDescriptor] = []
     for kind, adapter in ADAPTERS.items():
-        acquisition = _acquisition_for(kind)
+        acquisition = _acquisition_for(kind, host)
         managed = _managed_for(adapter)
 
         error: str | None = None

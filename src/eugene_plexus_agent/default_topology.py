@@ -58,6 +58,7 @@ import importlib.util
 import logging
 from dataclasses import dataclass
 
+from . import ports
 from ._generated.common_models import ConfigUpdateRequest
 from ._generated.models import ComponentEntry, ComponentKind, SpawnConfig
 from .state import AgentState
@@ -98,11 +99,20 @@ def is_installed(module: str) -> bool:
         return False
 
 
-def entry_for(component: DefaultComponent, state: AgentState) -> ComponentEntry:
+#: Every port this install claims for itself, so a walk off one default
+#: cannot land on another. 8079 is the agent, 8081 the inference-driver
+#: default the wizard and every companion use.
+RESERVED_PORTS: frozenset[int] = frozenset({8079, 8081} | {c.port for c in DEFAULTS})
+
+
+def entry_for(
+    component: DefaultComponent, state: AgentState, *, port: int | None = None
+) -> ComponentEntry:
+    chosen = component.port if port is None else port
     return ComponentEntry(
         name=component.name,
         kind=component.kind,
-        url=f"http://127.0.0.1:{component.port}",  # type: ignore[arg-type]
+        url=f"http://127.0.0.1:{chosen}",  # type: ignore[arg-type]
         spawn=SpawnConfig(configFile=str(state.path.parent / f"{component.name}.yaml")),
         safeMode=False,
     )
@@ -164,6 +174,23 @@ def seed(state: AgentState) -> list[str]:
     Idempotent by name, so a partially-seeded install completes rather
     than conflicting. The caller decides *whether* to seed; this decides
     *what*.
+
+    **A port something else is holding is not a port this install can
+    have** (review §6.1 #7). Seeded onto a taken one, a component exits
+    within a second of every spawn with `exited with code 1`, and the
+    consequences differ by which port it was: **8083** and the wizard's
+    first Continue has already set the agent's passphrase before the
+    trust root fails, so the operator is stranded half-initialized;
+    **8080** — the commonest occupied port on any development box — and
+    the wizard *completes*, the install is silently useless, Home shows
+    nothing routable and Try it never appears.
+
+    So the port is probed before it is declared, and the walk skips the
+    rest of the install's own defaults. This is not reclamation: nothing
+    is killed, because at boot the agent cannot tell its own orphan from
+    a server the operator meant to be running. It is the choice the
+    wizard already makes for a companion driver's port, applied to the
+    three components nobody chose.
     """
     declared: list[str] = []
     for component in DEFAULTS:
@@ -178,9 +205,39 @@ def seed(state: AgentState) -> list[str]:
                 component.module,
             )
             continue
-        state.add_topology_entry(entry_for(component, state))
+        # Ports already handed to an earlier component in this same loop
+        # count as taken: nothing is listening on them yet.
+        taken = {_port_of(entry) for entry in state.list_topology_entries()}
+        port = ports.first_free(component.port, reserved=RESERVED_PORTS | taken)
+        if port != component.port:
+            holder = ports.describe_holder(component.port)
+            log.warning(
+                "port %d is already in use%s, so %s is declared on %d instead. Change it "
+                "from Config in the web UI if you want the usual port back.",
+                component.port,
+                f" by {holder}" if holder else "",
+                component.name,
+                port,
+            )
+        state.add_topology_entry(entry_for(component, state, port=port))
         declared.append(component.name)
     return declared
 
 
-__all__ = ["DEFAULTS", "DefaultComponent", "entry_for", "is_installed", "seed", "should_seed"]
+def _port_of(entry: ComponentEntry) -> int:
+    """The port out of a declared URL, or 0 when it carries none."""
+    try:
+        return int(str(entry.url).rstrip("/").rsplit(":", 1)[-1])
+    except ValueError:
+        return 0
+
+
+__all__ = [
+    "DEFAULTS",
+    "RESERVED_PORTS",
+    "DefaultComponent",
+    "entry_for",
+    "is_installed",
+    "seed",
+    "should_seed",
+]

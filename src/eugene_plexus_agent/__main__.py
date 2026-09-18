@@ -181,7 +181,12 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
 
     bootstrap_state = AgentState(settings.config_file)
     if not settings.safe_mode:
-        bootstrap_state.load()
+        # Degraded, not dead: this read only decides a bind host and a
+        # port, and refusing to start over a damaged file is what R1.5
+        # removed. `create_app` loads again and reports the reason on
+        # `/healthz`; here it is enough not to die. See
+        # `AgentState.load_or_degrade`.
+        bootstrap_state.load_or_degrade()
 
     # 8079 unless EUGENE_PLEXUS_AGENT_BIND_PORT says otherwise. A
     # bootstrap setting rather than a config field: it has to be known

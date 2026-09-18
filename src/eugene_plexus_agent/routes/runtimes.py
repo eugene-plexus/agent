@@ -303,10 +303,24 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
 
 @router.get("/v1/engines", response_model=EngineList, tags=["engines"], dependencies=_read_auth)
 async def list_engines(request: Request) -> EngineList:
+    """What this agent can start, and what it found on disk.
+
+    **In a thread, because none of it is I/O the loop can await**
+    (review §6.1 #5). One call resolves the host with vendor-tool
+    subprocesses at a 5 s cap each, walks the managed store on disk, and
+    may reach `api.github.com` with a blocking `urlopen`. Home polls this
+    every 15 s and the Issues badge every 30 s per node, so on a box
+    whose driver stack is unhappy the agent — which is also the process
+    serving the browser its own UI and proxying every other component —
+    was stalled for seconds at a time. The codebase already does this at
+    five comparable sites; `asyncio.to_thread` here is the same move.
+    """
     # The agent's own config is where an install-wide engine path
-    # (`vllmBinary`) lives, so discovery reads through it.
+    # (`vllmBinary`) lives, so discovery reads through it. `get_config`
+    # takes a `threading.Lock`, so it is safe to call from the worker.
     state: AgentState = request.app.state.agent_state
-    return EngineList(engines=describe_engines(get_config=state.get_config))
+    engines = await asyncio.to_thread(describe_engines, get_config=state.get_config)
+    return EngineList(engines=engines)
 
 
 def _engine_kind(engine: str) -> EngineKind:
@@ -359,7 +373,10 @@ async def install_engine(engine: str, body: EngineInstallRequest | None = None) 
             ),
         )
 
-    plan = plan_for(kind, version=body.version if body else None)
+    # Same thread treatment as the listing above, for the same reason:
+    # this resolves the host and may reach upstream, and the operator
+    # who pressed Install is not the only person using this agent.
+    plan = await asyncio.to_thread(plan_for, kind, version=body.version if body else None)
     if isinstance(plan, Unavailable):
         # 422, not 404 or 500: the request was well-formed and the engine
         # exists — this host simply has nothing installable, which on

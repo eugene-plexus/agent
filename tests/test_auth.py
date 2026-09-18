@@ -64,7 +64,7 @@ def test_initialize_refuses_when_already_initialized(client: TestClient) -> None
     )
     second = client.post("/v1/auth/initialize", json={"passphrase": "another-passphrase"})
     assert second.status_code == 409
-    assert "Already initialized" in second.json()["detail"]["title"]
+    assert "Already set up" in second.json()["detail"]["title"]
 
 
 def test_initialize_rejects_empty_passphrase(client: TestClient) -> None:

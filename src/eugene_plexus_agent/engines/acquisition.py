@@ -54,7 +54,23 @@ DEFAULT_ENGINE_ROOT = Path.home() / ".eugene-plexus" / "engines"
 # this process does, not just us.
 RELEASE_CACHE_SECONDS = 24 * 60 * 60
 
+# **A failure is cached too, and it has to be** (review §6.1 #5). The
+# success cache above is a day wide and the failure path had none at all,
+# so an upstream that does not answer was re-dialled on every single
+# request — and `GET /v1/engines` is polled by Home every 15 s and by
+# `useIssues` every 30 s per node. Five minutes is short enough that an
+# operator who fixes their network does not wait for it and long enough
+# that a captive portal or a blocked egress costs one request per poll
+# cycle rather than all of them.
+RELEASE_FAILURE_BACKOFF_SECONDS = 5 * 60
+
 _DOWNLOAD_TIMEOUT_SECONDS = 60.0
+# **Metadata is not a download.** The same 60 s sat under a one-JSON-body
+# read that a polled route waits on, so a box behind a firewall that
+# blackholes rather than refuses held the agent's event loop for a
+# minute. The listing is retried on the next poll; the download cannot
+# be, so the two deserve different patience.
+_METADATA_TIMEOUT_SECONDS = 10.0
 _DOWNLOAD_CHUNK = 1024 * 256
 
 # Retention: the current build and the one before it. Every build is not
@@ -153,12 +169,22 @@ class GitHubReleases:
     also ships from GitHub.
     """
 
-    def __init__(self, repo: str, *, cache_seconds: float = RELEASE_CACHE_SECONDS) -> None:
+    def __init__(
+        self,
+        repo: str,
+        *,
+        cache_seconds: float = RELEASE_CACHE_SECONDS,
+        failure_backoff_seconds: float = RELEASE_FAILURE_BACKOFF_SECONDS,
+    ) -> None:
         self._repo = repo
         self._cache_seconds = cache_seconds
+        self._failure_backoff_seconds = failure_backoff_seconds
         self._cached: list[Release] | None = None
         self._cached_at: float | None = None
         self._checked_at: datetime | None = None
+        # Monotonic, like `_cached_at` and for the same reason: this one
+        # gates a retry rather than being shown to anybody.
+        self._failed_at: float | None = None
 
     @property
     def checked_at(self) -> datetime | None:
@@ -178,6 +204,13 @@ class GitHubReleases:
         An empty list means "we don't know", not "there are none". A failed
         check has to be invisible: it leaves the last-known state stale
         rather than turning a UI panel into an error.
+
+        **Both outcomes are stamped.** Until R1.5 only success was, so
+        `GET /v1/engines` — polled every 15 s by Home and every 30 s per
+        node by the Issues badge — paid the full network timeout on every
+        request for as long as upstream was unreachable. `force` skips
+        both stamps, because it comes from an operator pressing a button
+        and an operator is allowed to ask again.
         """
         now = time.perf_counter()
         if (
@@ -187,11 +220,23 @@ class GitHubReleases:
             and now - self._cached_at < self._cache_seconds
         ):
             return self._cached
+        if (
+            not force
+            and self._failed_at is not None
+            and now - self._failed_at < self._failure_backoff_seconds
+        ):
+            return self._cached or []
 
         try:
             raw = self._fetch(f"https://api.github.com/repos/{self._repo}/releases?per_page=30")
         except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
-            log.debug("could not list releases for %s: %s", self._repo, e)
+            self._failed_at = now
+            log.debug(
+                "could not list releases for %s: %s; not asking again for %.0fs",
+                self._repo,
+                e,
+                self._failure_backoff_seconds,
+            )
             return self._cached or []
 
         releases: list[Release] = []
@@ -221,6 +266,7 @@ class GitHubReleases:
 
         self._cached = releases
         self._cached_at = now
+        self._failed_at = None
         self._checked_at = datetime.now(UTC)
         return releases
 
@@ -233,7 +279,7 @@ class GitHubReleases:
                 "User-Agent": "eugene-plexus-agent",
             },
         )
-        with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(request, timeout=_METADATA_TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8"))
 
 

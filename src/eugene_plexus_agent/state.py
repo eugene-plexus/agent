@@ -34,6 +34,10 @@ shape the generic config editor doesn't natively understand.
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -65,6 +69,35 @@ from ._generated.models import (
 # outbound socket the OS handed out.
 _RUNTIME_PORT_BASE = 8090
 _RUNTIME_PORT_SPAN = 100
+
+log = logging.getLogger(__name__)
+
+#: Where a config file that would not load is kept, so coming up on
+#: defaults is never the same thing as losing the operator's topology.
+#: One fixed name rather than a timestamped series: the next degraded
+#: boot has the same file to preserve, and a directory that fills with
+#: `agent.yaml.broken-17897...` is litter nobody reads.
+UNREADABLE_SUFFIX = ".unreadable"
+
+#: Signs, in the RAW TEXT of a file that would not parse, that this
+#: install held a passphrase. The structured read is the thing that
+#: failed, so this is deliberately a text scan.
+#:
+#: **`firstRunComplete` is deliberately NOT one of these.** It is also
+#: the flag that means *skip onboarding*: every multi-host acceptance
+#: script since M0 pre-writes it and then sets a passphrase, and an
+#: enrolled node carries it with no passphrase of its own by design. Only
+#: the auth keys themselves are evidence that a master salt existed, and
+#: this predicate exists to refuse minting a second one.
+#:
+#: Truncation is why the scan finds them: `yaml.safe_dump` sorts keys, so
+#: `auth` is written first and a half-finished file keeps it and loses
+#: the tail — which is exactly the shape the old non-atomic write left
+#: behind.
+_AUTH_MARKERS = (
+    re.compile(r"^\s+masterSalt\s*:", re.MULTILINE),
+    re.compile(r"^\s+passphraseHash\s*:", re.MULTILINE),
+)
 
 CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
@@ -277,6 +310,12 @@ class AgentState:
         # masterSalt:     base64-encoded 16-byte salt used to derive the
         #                 master key from the passphrase via Argon2id raw.
         self._auth: dict[str, Any] = {}
+        # Why this agent is running on defaults, when it is (R1.5,
+        # review §6.1 #6). None on the ordinary path.
+        self._degraded_reason: str | None = None
+        # Whether the file we could not read carried auth keys. Decides
+        # whether first-run setup is offered or refused.
+        self._lost_passphrase = False
 
     @property
     def path(self) -> Path:
@@ -314,6 +353,101 @@ class AgentState:
                 self._runtimes = {}
                 self._auth = {}
                 self._write_locked()
+
+    def load_or_degrade(self) -> str | None:
+        """Load, or come up on defaults and return why.
+
+        **`degraded-mode-required`, applied at last to the file that
+        rule's own component owns** (review §6.1 #6). `load()` raised
+        into an uncaught lifespan, so a half-written `agent.yaml` was an
+        install that would not boot and could not be repaired from the
+        UI; the only escape was an environment variable a
+        scheduled-task user cannot know or set, and the Windows task
+        gives up after three restarts.
+
+        Three things happen on a failure, and the pair of the last two
+        is what makes coming up on defaults safe:
+
+        * **The in-memory state is reset.** `load()` mutates as it
+          parses, so a raise part-way leaves a half-built topology — and
+          the next `PATCH /v1/config` would persist that, turning a
+          damaged file into a damaged install.
+        * **The file is preserved** beside itself, so the first repair
+          write cannot be the thing that loses the operator's topology.
+        * **Whether the file carried auth keys is remembered**, because
+          they went with the rest and `POST /v1/auth/initialize` must
+          refuse rather than mint a second master salt.
+
+        Deliberately one method rather than a try/except at each of the
+        two call sites: `app.py` and `__main__.py` both load, and a rule
+        enforced by remembering to write the same four lines twice is a
+        rule that will be half-applied.
+        """
+        try:
+            self.load()
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            raw_text = ""
+            with contextlib.suppress(OSError):
+                raw_text = self._path.read_text(encoding="utf-8", errors="replace")
+            with self._lock:
+                self._config = _config_defaults()
+                self._components = {}
+                self._runtimes = {}
+                self._auth = {}
+                self._degraded_reason = reason
+                self._lost_passphrase = any(m.search(raw_text) for m in _AUTH_MARKERS)
+            self._preserve_unreadable()
+            log.error(
+                "%s could not be read (%s); running on defaults with no topology. A copy is "
+                "at %s. Repair it from Config in the web UI, or restore that copy and "
+                "restart.",
+                self._path,
+                reason,
+                self._path.with_suffix(self._path.suffix + UNREADABLE_SUFFIX),
+            )
+            return reason
+        with self._lock:
+            self._degraded_reason = None
+            self._lost_passphrase = False
+        return None
+
+    def _preserve_unreadable(self) -> None:
+        """Keep the file we could not read, beside itself.
+
+        Best-effort and never raises: this runs while explaining a
+        failure, and an exception here would turn one fault into two.
+        A copy rather than a move, so an operator who fixes the original
+        by hand is not surprised to find it gone.
+        """
+        target = self._path.with_suffix(self._path.suffix + UNREADABLE_SUFFIX)
+        try:
+            target.write_bytes(self._path.read_bytes())
+        except OSError as exc:  # pragma: no cover - defensive
+            log.warning("could not preserve %s as %s: %s", self._path, target, exc)
+
+    @property
+    def degraded_reason(self) -> str | None:
+        """Why this agent is on defaults, or None. Reported by `/healthz`."""
+        with self._lock:
+            return self._degraded_reason
+
+    def lost_its_passphrase(self) -> bool:
+        """Did this install hold a passphrase that we can no longer read?
+
+        True only in the narrow case that is actually reachable: the file
+        would not load, and its raw text carries the auth keys. The one
+        caller is the refusal in `POST /v1/auth/initialize`, where
+        answering *no* here mints a second master salt and orphans
+        every secret the first one sealed — every provider API key, and
+        the install signing key on every enrolled node — with nothing
+        saying that had happened.
+
+        Deliberately narrower than "has this install been set up".
+        `firstRunComplete` is not evidence: see `_AUTH_MARKERS`.
+        """
+        with self._lock:
+            return self._lost_passphrase
 
     # ----- config trio ------------------------------------------------
 
@@ -569,6 +703,27 @@ class AgentState:
     # ----- internals --------------------------------------------------
 
     def _write_locked(self) -> None:
+        """Persist the whole file, atomically (review §6.1 #6).
+
+        **A bare `open("w")` truncates before the first byte is
+        written**, so anything failing between the truncate and the
+        flush — a power cut, a full disk, a process killed by the
+        supervisor's escalation deadline — left a zero-length or
+        half-written `agent.yaml`, which until R1.5's other half was an
+        install that would not boot at all. Temp + `fsync` +
+        `os.replace` cannot do that: the target is only ever swapped for
+        a file already complete on disk, and `os.replace` is atomic on
+        both platforms within one directory.
+
+        **The write frequency is higher than it looks**, which is what
+        makes the window reachable rather than theoretical: every config
+        PATCH and every companion declaration rewrites this file, and
+        M6 declares one companion per runtime.
+
+        `fsync` before the replace, not after: the ordering is what the
+        durability depends on, and skipping it would leave the metadata
+        rename ahead of the data on a crash.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         out: dict[str, Any] = dict(self._config)
         out["components"] = [
@@ -579,8 +734,23 @@ class AgentState:
         ]
         if self._auth:
             out["auth"] = dict(self._auth)
-        with self._path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(out, f, sort_keys=True, default_flow_style=False)
+
+        # Same directory, so `os.replace` is a rename within one volume.
+        # A temp file under the system temp dir would make it a copy,
+        # which is exactly the non-atomic thing being removed here.
+        tmp = self._path.with_suffix(self._path.suffix + f".tmp-{os.getpid()}")
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(out, f, sort_keys=True, default_flow_style=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
+        except BaseException:
+            # Including `KeyboardInterrupt`/`SystemExit`: a half-written
+            # temp file left behind is litter, and the reason this
+            # method exists is that interruptions happen mid-write.
+            tmp.unlink(missing_ok=True)
+            raise
 
 
 def _to_component(entry: ComponentEntry) -> Component:
