@@ -1172,6 +1172,22 @@ class Accelerator(StrEnum):
     separate Metal asset - the plain macOS build has it compiled
     in, and saying `none` there would read as "no GPU".
 
+    `vulkan` is how a non-NVIDIA GPU on **Windows** is served,
+    and it exists because until 2026-09-18 there was no answer
+    at all: the ROCm probe looked for `rocm-smi` or `/opt/rocm`
+    and the SYCL probe for `sycl-ls` or Linux sysfs, none of
+    which exists on Windows, so every AMD and Intel card there
+    fell through to `none` - a CPU build, a fit scored against
+    RAM, and the starter set inverted to the smallest model, on
+    a machine built around a graphics card.
+
+    Vulkan rather than ROCm or SYCL for that case because
+    upstream publishes `win-vulkan-x64` in every release, it
+    needs no vendor SDK, and one build covers AMD and Intel
+    alike. `rocm` is still reported on Windows when the HIP SDK
+    is actually installed, which is what makes
+    `win-rocm-10.0-x64` reachable rather than dead code.
+
     """
 
     none = 'none'
@@ -1179,6 +1195,7 @@ class Accelerator(StrEnum):
     rocm = 'rocm'
     metal = 'metal'
     sycl = 'sycl'
+    vulkan = 'vulkan'
 
 
 class HostAccelerator(BaseModel):
@@ -1194,7 +1211,7 @@ class HostAccelerator(BaseModel):
     arch: Arch | None = None
     accelerator: Accelerator | None = Field(
         None,
-        description='`metal` is reported on Apple silicon even though there is no\nseparate Metal asset - the plain macOS build has it compiled\nin, and saying `none` there would read as "no GPU".\n',
+        description='`metal` is reported on Apple silicon even though there is no\nseparate Metal asset - the plain macOS build has it compiled\nin, and saying `none` there would read as "no GPU".\n\n`vulkan` is how a non-NVIDIA GPU on **Windows** is served,\nand it exists because until 2026-09-18 there was no answer\nat all: the ROCm probe looked for `rocm-smi` or `/opt/rocm`\nand the SYCL probe for `sycl-ls` or Linux sysfs, none of\nwhich exists on Windows, so every AMD and Intel card there\nfell through to `none` - a CPU build, a fit scored against\nRAM, and the starter set inverted to the smallest model, on\na machine built around a graphics card.\n\nVulkan rather than ROCm or SYCL for that case because\nupstream publishes `win-vulkan-x64` in every release, it\nneeds no vendor SDK, and one build covers AMD and Intel\nalike. `rocm` is still reported on Windows when the HIP SDK\nis actually installed, which is what makes\n`win-rocm-10.0-x64` reachable rather than dead code.\n',
     )
     acceleratorVersion: str | None = Field(
         None,

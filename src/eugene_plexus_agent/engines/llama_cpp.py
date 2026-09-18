@@ -795,6 +795,13 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
             return _cuda_variant(host, release)
         if accelerator is Accelerator.rocm:
             return f"win-rocm-10.0-{host.arch.value}"
+        if accelerator is Accelerator.vulkan:
+            # **The build every non-NVIDIA Windows GPU gets** (review
+            # §6.1 #11). One asset covers AMD and Intel, needs no vendor
+            # SDK, and upstream publishes it in every release -- which is
+            # why it is Vulkan and not `win-sycl-x64`, a name that
+            # appears nowhere this repo can verify.
+            return f"win-vulkan-{host.arch.value}"
         return f"win-cpu-{host.arch.value}"
 
     # Linux. **Upstream publishes CUDA builds here now**, and it did not
