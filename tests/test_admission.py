@@ -146,7 +146,12 @@ async def test_a_small_model_is_admitted_by_file_size(tmp_path: Path) -> None:
     assert result.decision is AdmissionDecision.admit
     assert result.fit is AdmissionFit.fits
     assert result.basis is AdmissionBasis.file_size
-    assert result.requiredBytes == int(2 * GIB * 1.1)
+    # Weights, an estimated KV cache at the context the fallback assumes
+    # when the spec names none, and the overhead allowance. It was a flat
+    # `size * 1.1` until 2026-09-19, which made the number the same at 4k
+    # and at 128k (R3.2, review §6.2 #19) -- this assertion was one of
+    # the two locking that in.
+    assert result.requiredBytes == int(2 * GIB * 1.15) + GIB
     assert result.freeBytes == 24 * GIB
     assert result.device is not None and result.device.index == 0
     assert result.reason.startswith("admit:")
@@ -164,7 +169,10 @@ async def test_a_model_larger_than_free_memory_is_refused_with_the_numbers(
     )
     assert result.decision is AdmissionDecision.refuse
     assert result.fit is AdmissionFit.split
-    assert "33.0 GiB" in result.reason  # 30 GiB plus the allowance
+    # 30 GiB of weights, its estimated cache at the assumed context, and
+    # the overhead allowance. Was "33.0 GiB" while the allowance was a
+    # flat tenth whatever context was asked for.
+    assert "35.5 GiB" in result.reason
     assert "24.0 GiB free of 32.0 GiB" in result.reason
     assert "?force=true" in result.reason
 

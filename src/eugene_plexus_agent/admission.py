@@ -21,8 +21,12 @@ Two inputs, both measured on the host that will spawn:
 * **Required bytes**, from the library's fit computation when a
   `library` component is in this agent's topology (the same arithmetic
   the discovery screen shows, at the context this spec asks for), and
-  from the model file's size plus a fixed allowance otherwise. `basis`
-  says which.
+  from the model file's size plus an estimated KV cache at that same
+  context otherwise. `basis` says which.
+* **Memory already promised**, from `reservations.py`. Free memory is a
+  live reading and a launch spends it over the minutes it takes to copy
+  and load a file, so what is left after the launches already under way
+  is the budget rather than what the card reports (review §6.2 #19).
 
 `unknown` never refuses. A verdict computed from a budget that could
 not be measured is worse than no verdict, and three of the detection
@@ -69,14 +73,38 @@ from ._generated.models import (
 from ._http import internal_client, shared_internal_client
 from .engines.devices import DeviceSnapshot
 from .model_paths import PathRule, resolve_model_path
+from .reservations import Reservation, held_bytes
 
 log = logging.getLogger(__name__)
 
 # Without the library's metadata the only number the agent has is the
-# file's size; weights plus a tenth is the allowance for KV cache and
-# compute buffers at a modest context. Labelled `file_size` so nobody
-# mistakes it for arithmetic.
-FILE_SIZE_ALLOWANCE = 0.10
+# file's size. Labelled `file_size` so nobody mistakes it for
+# arithmetic -- but it is no longer a flat fraction, and that mattered.
+#
+# **A flat tenth was context-blind** (review §6.2 #19): an 8B Q4 asked
+# for at 128k needs about 17 GB once its KV cache is counted and was
+# admitted against 5.5 GB. A KV cache is linear in context by
+# construction -- one entry per token, per attention layer -- so a
+# constant makes the discovery screen's context control change its own
+# label, change the number echoed back, and change no verdict.
+#
+# The three constants below are the library's own fallback, duplicated
+# rather than shared: components share schemas, not code. Keep them in
+# step with `fit.py`'s `ESTIMATED_KV_FRACTION`,
+# `ESTIMATED_KV_BASELINE_CONTEXT` and `DEFAULT_OVERHEAD_BYTES` -- two
+# estimates of the same quantity that disagree is this project's
+# signature defect, and the library's copy carries the reasoning.
+ESTIMATED_KV_FRACTION = 0.15
+ESTIMATED_KV_BASELINE_CONTEXT = 8192
+OVERHEAD_BYTES = 1024**3
+
+# What the estimate assumes when the spec leaves `contextSize` to the
+# engine, which is what every profile that has not been edited does. Not
+# the model's trained context: current files declare 262144 and almost
+# nothing holds that, so assuming it would refuse everything. The number
+# is reported on `Admission.contextLength`, because an assumption the
+# caller cannot see is one they cannot argue with.
+ASSUMED_CONTEXT_LENGTH = 8192
 
 # llama.cpp: `--n-gpu-layers` at or above this is "everything". 99 is the
 # idiom — no model this project has met has 99 layers, `-ngl 99` is what
@@ -91,7 +119,26 @@ _LIBRARY_TIMEOUT_SECONDS = 5.0
 
 _PIN_ENV_VARS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
 
-_RUNNING = frozenset({RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.ready})
+# Statuses in which a runtime holds memory on its device, or is on its
+# way to holding it. `copying` is here since 2026-09-19: no process
+# exists during it, which is why it was missed, and on a remote mount it
+# is the longest part of a first launch (measured: 266 s for 23.8 GB
+# over SMB). A runtime the operator would have to stop to make room is
+# one this list has to name.
+_HOLDING = frozenset(
+    {
+        RuntimeStatus.copying,
+        RuntimeStatus.starting,
+        RuntimeStatus.loading,
+        RuntimeStatus.ready,
+    }
+)
+
+# The subset that has not taken its memory yet, so a reservation for it
+# still stands. `ready` is deliberately absent: the device snapshot
+# counts a loaded model, and counting both would refuse a third launch
+# that fits.
+PENDING_STATUSES = frozenset({RuntimeStatus.copying, RuntimeStatus.starting, RuntimeStatus.loading})
 
 # The existence check, as a module attribute so a test can describe a
 # file that is not there the same way `model_size_bytes` lets it
@@ -368,6 +415,24 @@ def model_size_bytes(model_path: str) -> int | None:
     return None
 
 
+def file_size_requirement(size_bytes: int, context_length: int | None) -> int:
+    """What a launch needs, when the file's size is all we know.
+
+    Weights, plus a KV cache estimated as a fraction of them **per
+    `ESTIMATED_KV_BASELINE_CONTEXT` tokens**, plus a flat overhead for
+    compute buffers and the device context. The middle term is the whole
+    of the fix: it is the one that moves when the operator moves the
+    context control, and it was a constant.
+
+    It is still an estimate and `basis: file_size` still says so. It is
+    now an estimate of the right *shape* -- wrong by a factor, not by a
+    factor that grows with the number being turned.
+    """
+    context = context_length if context_length else ASSUMED_CONTEXT_LENGTH
+    kv = size_bytes * ESTIMATED_KV_FRACTION * (context / ESTIMATED_KV_BASELINE_CONTEXT)
+    return int(size_bytes + kv) + OVERHEAD_BYTES
+
+
 def local_verdict(
     required: int,
     *,
@@ -418,7 +483,7 @@ def _blockers(
     target_indices = {d.index for d in targets if d.index is not None}
     out: list[AdmissionBlocker] = []
     for other in running:
-        if other.spec.name == spec.name or other.status not in _RUNNING:
+        if other.spec.name == spec.name or other.status not in _HOLDING:
             continue
         theirs = target_devices(other.spec, snapshot)
         their_indices = {d.index for d in theirs if d.index is not None}
@@ -452,6 +517,7 @@ async def check_admission(
     snapshot: DeviceSnapshot,
     library: FitSource | None,
     running: list[RunningRuntime],
+    reservations: Sequence[Reservation] = (),
     size_of: Callable[[str], int | None] | None = None,
     mappings: Sequence[PathRule] = (),
     node_name: str | None = None,
@@ -502,10 +568,27 @@ async def check_admission(
         )
 
     # Largest single device by free memory — the card the engine would
-    # actually have to fit on.
-    device = max(targets, key=lambda d: (d.memoryFreeBytes or -1, -(d.index or 0)))
+    # actually have to fit on — MINUS what this node has already promised
+    # to launches that have not taken their memory yet. Free memory is a
+    # live reading, so the card a second launch picks has to be the one
+    # with room left after the first, not the one that still looks empty.
+    def _spare(device: ComputeDevice) -> int:
+        free = device.memoryFreeBytes
+        if free is None:
+            return -1
+        return max(0, free - held_bytes(reservations, device_index=device.index, exclude=spec.name))
+
+    device = max(targets, key=lambda d: (_spare(d), -(d.index or 0)))
     free = device.memoryFreeBytes
     total = device.memoryTotalBytes
+    # This runtime's own reservation is never counted against it: a
+    # restart re-measures a runtime that already holds one, and counting
+    # it would refuse every restart.
+    reserved = held_bytes(reservations, device_index=device.index, exclude=spec.name)
+    # The budget the verdict is computed against. `freeBytes` on the wire
+    # stays the card's own reading, because reporting the reduced number
+    # there would be a claim about the card that is not true.
+    budget = max(0, free - reserved) if free is not None else None
     ram_available = snapshot.ram_available_bytes if device.kind is not ComputeDeviceKind.cpu else 0
     blockers = _blockers(spec, targets, snapshot, running)
     full_offload = wants_full_offload(spec)
@@ -518,13 +601,13 @@ async def check_admission(
         answer = await library.fit(
             spec.modelPath,
             context_length=context_length,
-            vram_bytes=free,
+            vram_bytes=budget,
             ram_bytes=ram_available if device.kind is not ComputeDeviceKind.cpu else None,
         )
         if answer is not None:
             required = answer.required_bytes
             basis = AdmissionBasis.metadata
-            fit = _library_verdict(answer.verdict) if free is not None else AdmissionFit.unknown
+            fit = _library_verdict(answer.verdict) if budget is not None else AdmissionFit.unknown
             if answer.context_length is not None:
                 context_length = answer.context_length
             max_context_length = answer.max_context_length
@@ -536,8 +619,12 @@ async def check_admission(
         # was resolved.
         size = location.sizeBytes
         if size is not None:
-            required = int(size * (1 + FILE_SIZE_ALLOWANCE))
-            fit = local_verdict(required, free=free, total=total, ram_available=ram_available)
+            # The context the cache was sized for is reported, assumption
+            # included: an assumption the caller cannot see is one they
+            # cannot argue with, and this one decides the verdict.
+            context_length = context_length or ASSUMED_CONTEXT_LENGTH
+            required = file_size_requirement(size, context_length)
+            fit = local_verdict(required, free=budget, total=total, ram_available=ram_available)
         else:
             warnings.append(f"{spec.modelPath} could not be sized on disk")
 
@@ -576,19 +663,34 @@ async def check_admission(
     fits_up_to = (
         f" It fits up to {max_context_length} context on this device." if max_context_length else ""
     )
-    basis_text = "library metadata" if basis is AdmissionBasis.metadata else "file size plus 10%"
+    basis_text = (
+        "library metadata"
+        if basis is AdmissionBasis.metadata
+        else "file size plus an estimated KV cache"
+    )
+    # Named separately from `held`, which lists runtimes. This is memory
+    # nothing is holding yet and everything about the verdict turns on
+    # it, so a card that reads 24 GiB free and refuses a 20 GiB model has
+    # to say why in the same sentence as the numbers.
+    reserved_text = (
+        f" {_gib(reserved)} of it is reserved for a launch already under way, "
+        f"leaving {_gib(budget)}."
+        if reserved
+        else ""
+    )
 
     if fit is AdmissionFit.unknown:
         reason = (
             f"admit on faith: {spec.modelPath} could not be fully measured against {where} "
-            f"(free {_gib(free)} of {_gib(total)}; required {_gib(required)} by {basis_text}). "
+            f"(free {_gib(free)} of {_gib(total)}; required {_gib(required)} by {basis_text})."
+            f"{reserved_text} "
             f"{held}"
         )
         warning: str | None = "; ".join(warnings) or "budget or size could not be measured"
     elif decision is AdmissionDecision.admit:
         reason = (
             f"admit: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) and "
-            f"{where} has {_gib(free)} free of {_gib(total)}; verdict {fit.value}"
+            f"{where} has {_gib(free)} free of {_gib(total)};{reserved_text} verdict {fit.value}"
             + (
                 " with partial offload requested, so the spill is the operator's choice"
                 if not full_offload and fit is not AdmissionFit.fits
@@ -603,16 +705,23 @@ async def check_admission(
             if max_context_length
             else "lower contextSize"
         )
-        fix = (
-            f"Stop one of them, {lower}, set gpuLayers below full for partial offload, "
+        # The remedy for a reservation is time, and it is the only one
+        # on this list the operator does not have to do anything for --
+        # so it goes first, or they go looking for memory they are about
+        # to be given back.
+        waiting = "Wait for the launch already under way, " if reserved else ""
+        rest = (
+            f"stop one of them, {lower}, set gpuLayers below full for partial offload, "
             "or pass ?force=true to launch anyway."
             if blockers
-            else f"{lower[0].upper()}{lower[1:]}, set gpuLayers below full for partial offload, "
+            else f"{lower}, set gpuLayers below full for partial offload, "
             "pick a smaller quant, or pass ?force=true to launch anyway."
         )
+        fix = waiting + rest if waiting else f"{rest[0].upper()}{rest[1:]}"
         reason = (
             f"refuse: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) but "
-            f"{where} has {_gib(free)} free of {_gib(total)}; verdict {fit.value}.{fits_up_to} "
+            f"{where} has {_gib(free)} free of {_gib(total)};{reserved_text} "
+            f"verdict {fit.value}.{fits_up_to} "
             f"{held}{slot_text} {fix}"
         )
         warning = "; ".join(warnings) or None
@@ -623,6 +732,7 @@ async def check_admission(
         basis=basis,
         requiredBytes=required,
         freeBytes=free,
+        reservedBytes=reserved or None,
         totalBytes=total,
         device=device,
         contextLength=context_length,
@@ -773,7 +883,8 @@ def _refuse_missing(
 
 
 __all__ = [
-    "FILE_SIZE_ALLOWANCE",
+    "ASSUMED_CONTEXT_LENGTH",
+    "ESTIMATED_KV_FRACTION",
     "FULL_OFFLOAD_LAYERS",
     "FitSource",
     "LibraryFit",
@@ -781,6 +892,7 @@ __all__ = [
     "RunningRuntime",
     "check_admission",
     "decide",
+    "file_size_requirement",
     "local_verdict",
     "model_size_bytes",
     "path_exists",

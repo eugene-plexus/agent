@@ -2317,6 +2317,12 @@ class Admission(BaseModel):
     there, and a `refuse` with `fit: unknown` is that answer being
     no.
 
+    Since 2026-09-19 it also answers against memory that is spoken
+    for but not yet taken: `reservedBytes`. Free memory is a live
+    reading, and a launch spends it over the minutes it takes to
+    copy and load a file, so two launches in quick succession were
+    both admitted against the same free card.
+
     """
 
     decision: AdmissionDecision
@@ -2324,12 +2330,17 @@ class Admission(BaseModel):
     basis: AdmissionBasis
     requiredBytes: int | None = Field(
         None,
-        description='What the launch is estimated to need on the device — weights\nplus KV cache at the requested context plus an overhead\nallowance when the library computed it; file size plus a\nfixed allowance when it did not.\n',
+        description='What the launch is estimated to need on the device — weights\nplus KV cache at the requested context plus an overhead\nallowance when the library computed it; file size plus an\nestimated KV cache at that same context, plus an overhead\nallowance, when it did not.\n\nThe fallback estimate scales with the context asked for, and\nsaid so from 2026-09-19. A flat fraction of the file was the\nsame defect the library had already fixed in its own\nestimate: the context control changes the number echoed back\non the screen and cannot change a verdict, so an 8B Q4 asked\nfor at 128k was admitted against 5.5 GB when the cache alone\nis about three times the weights.\n',
         ge=0,
     )
     freeBytes: int | None = Field(
         None,
-        description='Free memory on the largest single target device at the\nmoment of measurement. Free, not total: M3 measured 2.9 GiB\nof a 32 GiB card held on an idle desktop.\n',
+        description='Free memory on the largest single target device at the\nmoment of measurement. Free, not total: M3 measured 2.9 GiB\nof a 32 GiB card held on an idle desktop.\n\n**The verdict is computed against this minus\n`reservedBytes`**, not against this. Reporting the reduced\nnumber here instead would be a claim about the card that is\nnot true.\n',
+        ge=0,
+    )
+    reservedBytes: int | None = Field(
+        None,
+        description='Memory this node has already promised to launches that have\nnot taken it yet, on that same device, and which was\ntherefore subtracted from `freeBytes` before the verdict.\nAbsent or `0` when nothing is in flight.\n\nIt exists because free memory is a live reading and a launch\nspends it slowly. A runtime that was admitted three seconds\nago has read no weights; one that is `copying` has no\nprocess at all, for as long as the file takes to cross the\nwire. Without this, two launches in quick succession both\nmeasured the same free memory and both were told `fits`, the\nsecond one for memory the first had already spent.\n\nReleased when the runtime is next observed past its start,\nwhen it is stopped or deleted, or on a timeout, so an\nabandoned launch cannot hold a card for the life of the\nprocess. A dry run never adds to it; declaring a runtime\nthat starts does, `force` included, because `force` is the\noperator overriding the verdict and not the launch becoming\nfree.\n',
         ge=0,
     )
     totalBytes: int | None = Field(None, ge=0)
@@ -2338,7 +2349,7 @@ class Admission(BaseModel):
     )
     contextLength: int | None = Field(
         None,
-        description="The context the KV cache was sized for — the spec's\n`contextSize`, or the model's own context when the spec\nleaves it to the engine.\n",
+        description="The context the KV cache was sized for — the spec's\n`contextSize`, or the model's own context when the spec\nleaves it to the engine, and the default this agent\nassumed when neither was known and the estimate came from\nthe file's size.\n",
         ge=0,
     )
     maxContextLength: int | None = Field(
@@ -2348,7 +2359,7 @@ class Admission(BaseModel):
     )
     blockers: list[AdmissionBlocker] | None = Field(
         None,
-        description="Runtimes currently holding memory on that device, most idle\nfirst. What an operator would stop to make room, and the\nlist the gateway's opt-in eviction walks — restricted there\nto runtimes that declared `idleUnloadSeconds`.\n",
+        description="Runtimes holding memory on that device, or on their way to\nholding it, most idle first. `copying` counts: no process\nexists yet, and it is the longest part of a first launch on\na remote mount. What an operator would stop to make room, and the\nlist the gateway's opt-in eviction walks — restricted there\nto runtimes that declared `idleUnloadSeconds`.\n",
     )
     location: ModelLocation | None = Field(
         None,

@@ -39,7 +39,12 @@ from .._generated.models import (
     StopReason,
     StopRequest,
 )
-from ..admission import LibraryFitClient, RunningRuntime, check_admission
+from ..admission import (
+    PENDING_STATUSES,
+    LibraryFitClient,
+    RunningRuntime,
+    check_admission,
+)
 from ..companions import (
     CompanionConflict,
     companion_name,
@@ -56,6 +61,7 @@ from ..dependencies import (
 from ..engines.acquisition import AcquisitionError, Unavailable
 from ..engines.devices import detect_devices
 from ..model_paths import PathRule, rules_from_config
+from ..reservations import ReservationLedger
 from ..runtimes import (
     RuntimeSupervisor,
     describe_engines,
@@ -268,17 +274,59 @@ def require_library_folder(request: Request, model_path: str) -> None:
         )
 
 
+def _ledger(request: Request) -> ReservationLedger:
+    """This node's record of memory promised to launches in flight.
+
+    On `app.state` rather than inside the supervisor because the routes
+    are what can tell a dry run from a launch, and a supervisor that
+    reserved on `add_and_start` would have no bytes to reserve -- the
+    arithmetic lives one layer up.
+    """
+    ledger = getattr(request.app.state, "reservations", None)
+    if ledger is None:
+        ledger = ReservationLedger()
+        request.app.state.reservations = ledger
+    return ledger
+
+
+def _reserve(request: Request, spec: RuntimeSpec, admission: Admission | None) -> None:
+    """Promise the memory a launch we just scheduled is about to take.
+
+    Called at the point of committing to a start and nowhere else, so a
+    declaration that 409s or a spec that is only being previewed leaves
+    nothing behind. `requiredBytes` is absent when nothing could be
+    measured -- an `unknown` fit, a file that could not be sized -- and
+    a promise of an unknown quantity is not a promise.
+    """
+    if admission is None or not admission.requiredBytes:
+        return
+    _ledger(request).reserve(
+        spec.name,
+        device_index=admission.device.index if admission.device is not None else None,
+        size_bytes=admission.requiredBytes,
+    )
+
+
 async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     await refresh_library_folders(request)
     detector = getattr(request.app.state, "device_detector", None) or detect_devices
     snapshot = await asyncio.to_thread(detector)
+    observed = [(other, _compose(other, supervisor).status) for other in state.list_runtime_specs()]
     running = [
-        RunningRuntime(spec=other, status=_compose(other, supervisor).status)
-        for other in state.list_runtime_specs()
+        RunningRuntime(spec=other, status=status)
+        for other, status in observed
         if other.name != spec.name
     ]
+    # Read is where the ledger is reconciled: a reservation stands only
+    # while its runtime is still on its way up. Past that it either holds
+    # the memory for real -- and the snapshot below counts it, so
+    # counting both would refuse a third launch that fits -- or holds
+    # none. Reconciling here rather than on a loop means the sweep runs
+    # exactly when its answer is about to be used.
+    ledger = _ledger(request)
+    ledger.reconcile(other.name for other, status in observed if status in PENDING_STATUSES)
     identity = getattr(request.app.state, "node_identity", None)
     node_name = identity.record.name if identity is not None and identity.record.enrolled else None
     return await check_admission(
@@ -286,6 +334,7 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
         snapshot=snapshot,
         library=await library_client_for(request),
         running=running,
+        reservations=ledger.entries(),
         size_of=getattr(request.app.state, "model_size_of", None),
         mappings=effective_rules_for(request),
         node_name=node_name,
@@ -535,11 +584,16 @@ async def create_runtime(
             )
 
     # A launch that will not fit is refused before it spawns. Measured
-    # only when it *is* a launch: `autoStart: false` is measured when it
-    # starts, and `force` is the operator saying they know better.
-    if body.autoStart is not False and not force:
+    # whenever it *is* a launch -- `autoStart: false` is measured when it
+    # starts instead -- and `force` is the operator saying they know
+    # better, which overrides the refusal and not the arithmetic: a
+    # forced launch still spends the memory, so it is still measured and
+    # still reserved. Before that, a forced launch was invisible to the
+    # next admission.
+    admission: Admission | None = None
+    if body.autoStart is not False:
         admission = await _admission_for(request, body)
-        if admission.decision is AdmissionDecision.refuse:
+        if admission.decision is AdmissionDecision.refuse and not force:
             raise _refused(admission)
 
     try:
@@ -570,6 +624,10 @@ async def create_runtime(
 
     if supervisor is not None:
         supervisor.add_and_start(spec)
+        # Last, and only once the start is actually scheduled: a
+        # declaration that 409'd or 400'd above never promised anything,
+        # so there is no failure path here that needs a release.
+        _reserve(request, spec, admission)
     return _compose(spec, supervisor)
 
 
@@ -645,6 +703,11 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     # restarts the engine. The response reports the post-restart state,
     # normally `starting` or `loading` rather than `ready`.
     if supervisor is not None:
+        # A PATCH restarts the engine, and every field is baked into the
+        # argv, so the old promise describes a launch that no longer
+        # exists. Released rather than re-measured: the restart is not
+        # admitted either, which is the pre-existing shape here.
+        _ledger(request).release(name)
         await supervisor.remove_and_stop(name)
         supervisor.add_and_start(updated)
     return _compose(updated, supervisor)
@@ -656,6 +719,7 @@ async def delete_runtime(request: Request, name: str) -> Response:
     supervisor = _supervisor(request)
     if state.get_runtime_spec(name) is None:
         raise _not_found(name)
+    _ledger(request).release(name)
     if supervisor is not None:
         await supervisor.remove_and_stop(name)
     # The companion goes with its runtime; the model file is never
@@ -709,6 +773,10 @@ async def stop_runtime(
         raise _not_found(name)
     reason = body.reason if body is not None and body.reason is not None else StopReason.operator
     supervisor = _supervisor(request)
+    # The promise is about a launch. Stopped is the launch being over --
+    # waiting for the ledger's timeout would hold the card for half an
+    # hour after the operator freed it.
+    _ledger(request).release(name)
     if supervisor is not None:
         await supervisor.stop_one(name, reason=reason)
     return RestartResult(
@@ -739,17 +807,20 @@ async def start_runtime(
         raise _not_found(name)
     supervisor = _supervisor(request)
     already = supervisor is not None and supervisor.is_running(name)
-    if not already and not force:
+    admission: Admission | None = None
+    if not already:
         # Where a runtime declared with `autoStart: false` meets
         # admission — it was not measured at declaration because it was
-        # not being launched then.
+        # not being launched then. Measured under `force` too, because
+        # the reservation comes off this number.
         admission = await _admission_for(request, spec)
-        if admission.decision is AdmissionDecision.refuse:
+        if admission.decision is AdmissionDecision.refuse and not force:
             raise _refused(admission)
     if supervisor is not None and not already:
         # `autoStart: false` means "don't start at boot", not "never
         # start" — an explicit start overrides it for this session.
         supervisor.add_and_start(spec.model_copy(update={"autoStart": True}))
+        _reserve(request, spec, admission)
     return RestartResult(
         # `scheduled` reports whether this call caused a start, so an
         # idempotent second press is distinguishable from the first.
