@@ -703,11 +703,11 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     # restarts the engine. The response reports the post-restart state,
     # normally `starting` or `loading` rather than `ready`.
     if supervisor is not None:
-        # A PATCH restarts the engine, and every field is baked into the
-        # argv, so the old promise describes a launch that no longer
-        # exists. Released rather than re-measured: the restart is not
-        # admitted either, which is the pre-existing shape here.
-        _ledger(request).release(name)
+        # The reservation is deliberately NOT released here. A PATCH
+        # restarts the engine, so the runtime is about to take memory
+        # again; the standing promise is stale in size and right in
+        # kind, and dropping it would reopen the defect for exactly as
+        # long as the restart takes.
         await supervisor.remove_and_stop(name)
         supervisor.add_and_start(updated)
     return _compose(updated, supervisor)
@@ -719,7 +719,6 @@ async def delete_runtime(request: Request, name: str) -> Response:
     supervisor = _supervisor(request)
     if state.get_runtime_spec(name) is None:
         raise _not_found(name)
-    _ledger(request).release(name)
     if supervisor is not None:
         await supervisor.remove_and_stop(name)
     # The companion goes with its runtime; the model file is never
@@ -773,10 +772,6 @@ async def stop_runtime(
         raise _not_found(name)
     reason = body.reason if body is not None and body.reason is not None else StopReason.operator
     supervisor = _supervisor(request)
-    # The promise is about a launch. Stopped is the launch being over --
-    # waiting for the ledger's timeout would hold the card for half an
-    # hour after the operator freed it.
-    _ledger(request).release(name)
     if supervisor is not None:
         await supervisor.stop_one(name, reason=reason)
     return RestartResult(

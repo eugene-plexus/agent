@@ -30,14 +30,21 @@ record of intent -- so this is a ledger, not a formula.
   23.8 GB over SMB) and the one state in which there is nothing to
   observe at all.
 
-* **An abandoned launch must not strand memory forever.** A reservation
-  is released when the runtime is next observed to be past its start --
-  `ready` holds real memory that the snapshot now counts, and a stopped
-  or crashed one holds none -- and by a TTL when it is never observed
-  again, which is the case a supervisor restart or a vanished topology
-  entry produces. Without the TTL the failure mode of this module is a
-  card that can never be launched on until the agent is restarted, which
-  is worse than the defect it fixes.
+* **An abandoned launch must not strand memory forever.** Releasing is
+  `reconcile`, and it is the only release there is: a promise stands
+  while its runtime is observed `copying`, `starting` or `loading`, and
+  is dropped the moment it is anything else -- `ready` holds real memory
+  that the snapshot now counts, a stopped or crashed one holds none, and
+  a deleted one is not in the topology to observe. Explicit releases on
+  stop and delete were written first and then removed: **no check could
+  tell them from the sweep**, because the sweep runs at every read and
+  both paths change the status it reads. One mechanism, exercised by
+  every admission, beats two of which only one is ever load-bearing.
+
+  The TTL is the backstop for the case the sweep cannot see: a runtime
+  that is never observed again at all. Without it the failure mode of
+  this module is a card that cannot be launched on until the agent is
+  restarted, which is worse than the defect it fixes.
 
 **Deliberately in memory only.** A reservation describes a launch this
 process started and is meaningless to the next one: a restarted agent
@@ -124,11 +131,6 @@ class ReservationLedger:
             size_bytes=size_bytes,
             at=self._clock(),
         )
-
-    def release(self, runtime: str) -> None:
-        """Hand a promise back: the launch failed, was stopped, or the
-        runtime was deleted."""
-        self._held.pop(runtime, None)
 
     def reconcile(self, pending: Iterable[str]) -> None:
         """Keep only the runtimes still on their way up.

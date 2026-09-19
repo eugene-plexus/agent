@@ -448,3 +448,163 @@ async def test_the_refusal_names_waiting_as_the_remedy_for_a_reservation(
     assert result.decision is AdmissionDecision.refuse
     assert result.reason.endswith("launch anyway.")
     assert "Wait for the launch already under way" in result.reason
+
+
+@pytest.mark.anyio
+async def test_the_device_pick_avoids_the_card_that_is_already_spoken_for(
+    tmp_path: Path,
+) -> None:
+    """Two cards, one of them promised away. Picking by the card's own
+    free reading lands the launch on the one that only LOOKS emptier."""
+    ledger = ReservationLedger()
+    # Device 0 reads emptier and is spoken for; device 1 has room left.
+    snapshot = fake_devices(free=24 * GIB, total=32 * GIB, count=2)
+    ledger.reserve("a", device_index=0, size_bytes=22 * GIB)
+    result = await check_admission(
+        _spec("b", _model(tmp_path, 10 * GIB, "pick")),
+        snapshot=snapshot,
+        library=None,
+        running=[],
+        reservations=ledger.entries(),
+    )
+    assert result.device is not None and result.device.index == 1
+    assert result.decision is AdmissionDecision.admit
+
+
+@pytest.mark.anyio
+async def test_an_unset_context_is_measured_at_the_number_it_reports(
+    tmp_path: Path,
+) -> None:
+    """The reported context and the one the arithmetic used have to be
+    the same number. Two places assume a default; if they ever drift, the
+    wire says 8,192 and the verdict was computed at something else."""
+    path = _model(tmp_path, EIGHT_B_Q4)
+    unset = await check_admission(
+        _spec("u", path),
+        snapshot=fake_devices(free=64 * GIB, total=64 * GIB),
+        library=None,
+        running=[],
+    )
+    assert unset.contextLength is not None
+    explicit = await check_admission(
+        _spec("e", path, flags={"contextSize": unset.contextLength}),
+        snapshot=fake_devices(free=64 * GIB, total=64 * GIB),
+        library=None,
+        running=[],
+    )
+    assert unset.requiredBytes == explicit.requiredBytes
+
+
+def test_a_dry_run_about_one_runtime_does_not_reserve_for_another(
+    authed_client: TestClient, tmp_path: Path
+) -> None:
+    """The pair the first dry-run check could not make.
+
+    A reservation is never counted against the runtime it belongs to, so
+    asking about the SAME spec twice cannot tell a reserving dry run from
+    a silent one. Ask about a different one.
+    """
+    authed_client.post("/v1/runtimes/admission", json=_body("a", _model(tmp_path, 20 * GIB, "x1")))
+    other = authed_client.post(
+        "/v1/runtimes/admission", json=_body("b", _model(tmp_path, 20 * GIB, "x2"))
+    )
+    assert other.json().get("reservedBytes") in (None, 0), other.text
+    assert other.json()["decision"] == "admit"
+
+
+def test_a_forced_start_reserves_too(authed_client: TestClient, tmp_path: Path) -> None:
+    """`autoStart: false` then a forced Start is the path a refused
+    launch takes when the operator insists. It spends the memory like any
+    other start."""
+    declared = authed_client.post(
+        "/v1/runtimes",
+        json=_body("a", _model(tmp_path, 30 * GIB, "fs"), autoStart=False),
+    )
+    assert declared.status_code == 201, declared.text
+    started = authed_client.post("/v1/runtimes/a/start", params={"force": "true"})
+    assert started.status_code == 202, started.text
+    asked = authed_client.post(
+        "/v1/runtimes/admission", json=_body("b", _model(tmp_path, 2 * GIB, "fs2"))
+    )
+    assert asked.json()["reservedBytes"] > 0
+
+
+def test_a_runtime_that_reached_ready_stops_being_reserved_for(
+    authed_client: TestClient, tmp_path: Path, stub_runtime_supervisor: object
+) -> None:
+    """The release that matters, and the only one there is.
+
+    `ready` means the weights are on the card, so the device snapshot
+    counts them. Keeping the promise as well would charge the model
+    twice and refuse a third launch that fits.
+    """
+    authed_client.post("/v1/runtimes", json=_body("a", _model(tmp_path, 20 * GIB, "rd")))
+    question = _body("b", _model(tmp_path, 2 * GIB, "rd2"))
+    assert authed_client.post("/v1/runtimes/admission", json=question).json()["reservedBytes"] > 0
+
+    # The supervisor now observes the engine answering its readiness
+    # probe. Nothing calls a route; the sweep is what has to notice.
+    original = stub_runtime_supervisor.compose  # type: ignore[attr-defined]
+    stub_runtime_supervisor.compose = lambda spec: original(spec).model_copy(  # type: ignore[attr-defined]
+        update={"status": RuntimeStatus.ready}
+    )
+    asked = authed_client.post("/v1/runtimes/admission", json=question)
+    assert asked.json().get("reservedBytes") in (None, 0), asked.text
+
+
+def test_a_zero_byte_promise_is_not_recorded_at_all() -> None:
+    """An `unknown` fit or a file that could not be sized measures
+    nothing, and a promise of nothing is not a promise. Asserted on
+    `entries()` rather than on the byte total, because a zero-sized
+    entry sums to zero either way -- the difference is junk in the
+    ledger that the sweep and the TTL would then carry."""
+    ledger = ReservationLedger()
+    ledger.reserve("a", device_index=0, size_bytes=0)
+    assert ledger.entries() == []
+    # And a measurement that comes back unmeasurable clears the promise
+    # a previous one made, rather than leaving it standing.
+    ledger.reserve("b", device_index=0, size_bytes=8 * GIB)
+    ledger.reserve("b", device_index=0, size_bytes=0)
+    assert ledger.entries() == []
+
+
+def test_a_copying_runtime_keeps_its_promise_through_the_sweep(
+    authed_client: TestClient, tmp_path: Path, stub_runtime_supervisor: object
+) -> None:
+    """`copying` is the state with no process to observe and the longest
+    window there is. A sweep that only knows `starting` and `loading`
+    throws the promise away at the first read, which is the defect at its
+    widest."""
+    authed_client.post("/v1/runtimes", json=_body("a", _model(tmp_path, 20 * GIB, "cp")))
+    original = stub_runtime_supervisor.compose  # type: ignore[attr-defined]
+    stub_runtime_supervisor.compose = lambda spec: original(spec).model_copy(  # type: ignore[attr-defined]
+        update={"status": RuntimeStatus.copying}
+    )
+    asked = authed_client.post(
+        "/v1/runtimes/admission", json=_body("b", _model(tmp_path, 2 * GIB, "cp2"))
+    )
+    assert asked.json()["reservedBytes"] > 0, asked.text
+
+
+def test_previewing_a_declared_runtime_does_not_rewrite_its_promise(
+    authed_client: TestClient, tmp_path: Path
+) -> None:
+    """The dry run the launch panel makes on every keystroke, against a
+    runtime that already exists and is starting.
+
+    This is the shape in which a reserving dry run is actually
+    observable: the preview measures a smaller edit of `a`, and if it
+    reserved it would overwrite `a`'s real promise with the small
+    number -- after which `b` is admitted onto a card that has none of
+    the memory the answer claims.
+    """
+    authed_client.post("/v1/runtimes", json=_body("a", _model(tmp_path, 20 * GIB, "pv")))
+    # The operator drags the context down and the panel re-measures.
+    authed_client.post("/v1/runtimes/admission", json=_body("a", _model(tmp_path, GIB, "pv-small")))
+    # 5 GiB, not 20: a model that cannot fit the card on its own would
+    # be refused whatever the ledger said, and the check would pass
+    # against a dry run that reserves.
+    asked = authed_client.post(
+        "/v1/runtimes/admission", json=_body("b", _model(tmp_path, 5 * GIB, "pv2"))
+    )
+    assert asked.json()["decision"] == "refuse", asked.text

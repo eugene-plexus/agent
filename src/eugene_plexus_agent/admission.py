@@ -415,7 +415,7 @@ def model_size_bytes(model_path: str) -> int | None:
     return None
 
 
-def file_size_requirement(size_bytes: int, context_length: int | None) -> int:
+def file_size_requirement(size_bytes: int, context_length: int) -> int:
     """What a launch needs, when the file's size is all we know.
 
     Weights, plus a KV cache estimated as a fraction of them **per
@@ -427,9 +427,13 @@ def file_size_requirement(size_bytes: int, context_length: int | None) -> int:
     It is still an estimate and `basis: file_size` still says so. It is
     now an estimate of the right *shape* -- wrong by a factor, not by a
     factor that grows with the number being turned.
+
+    `context_length` is required rather than defaulted. The caller has
+    to settle on a number it can also report, and a second default here
+    would be a place for the two to disagree that no check could see --
+    the sabotage pass found exactly that and this is the answer to it.
     """
-    context = context_length if context_length else ASSUMED_CONTEXT_LENGTH
-    kv = size_bytes * ESTIMATED_KV_FRACTION * (context / ESTIMATED_KV_BASELINE_CONTEXT)
+    kv = size_bytes * ESTIMATED_KV_FRACTION * (context_length / ESTIMATED_KV_BASELINE_CONTEXT)
     return int(size_bytes + kv) + OVERHEAD_BYTES
 
 
