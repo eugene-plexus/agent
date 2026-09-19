@@ -139,8 +139,28 @@ if PYWIN32_AVAILABLE:
                 servicemanager.PYS_SERVICE_STARTED,
                 (self._svc_name_, ""),
             )
+            from . import process_signals
             from .__main__ import build_server
             from .settings import load_settings
+
+            # **Before anything else, and before the first child.** The
+            # SCM hands a service no console, so `GenerateConsoleCtrlEvent`
+            # fails with WinError 6 and every supervised child -- every
+            # component and every engine -- gets `TerminateProcess`
+            # instead of its shutdown hooks. One call fixes it; see
+            # `process_signals.ensure_console` for the measurement, and
+            # for why the ordering against the first spawn is
+            # load-bearing rather than tidy.
+            process_signals.ensure_console()
+
+            # **A service's working directory is `%SystemRoot%\\system32`.**
+            # `sc.exe` has no knob for it and `InstallService` sets none,
+            # so it is set here or not at all. The agent resolves its own
+            # paths absolutely, so this is a safety net rather than a
+            # dependency -- but a relative path written by anything the
+            # agent spawns would otherwise land in a system directory
+            # LocalSystem can write to, which is the worst combination.
+            _chdir_to_prefix()
 
             settings = load_settings()
             # A service has no console at all, so `has_tty()` would
@@ -158,6 +178,31 @@ if PYWIN32_AVAILABLE:
             # Bound the wait rather than hang a `sc stop` forever on a
             # child that will not go.
             thread.join(timeout=90)
+
+
+def _chdir_to_prefix() -> str | None:
+    """Move off `%SystemRoot%\\system32`, onto the install's own directory.
+
+    The install prefix is wherever `agent.yaml` lives, which the service
+    learns from `EUGENE_PLEXUS_AGENT_CONFIG_FILE` — a **Machine**-scope
+    variable for a service install, because `HKCU\\Environment` belongs to
+    a user LocalSystem is not. Returns the directory it moved to, or None
+    if it could not work one out or could not get there; never raises,
+    because a wrong working directory is a hazard and not a reason to
+    refuse to start.
+    """
+    import os
+
+    config = os.environ.get("EUGENE_PLEXUS_AGENT_CONFIG_FILE")
+    if not config:
+        return None
+    prefix = os.path.dirname(os.path.abspath(config))
+    try:
+        os.chdir(prefix)
+    except OSError:
+        log.warning("could not change the working directory to %s", prefix)
+        return None
+    return prefix
 
 
 def service_class() -> type:

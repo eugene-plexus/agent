@@ -64,6 +64,7 @@ from ..auth_state import AuthState
 from ..client_keys import ClientKeyStore
 from ..dependencies import require_operator_or_gateway, require_operator_session
 from ..state import AgentState
+from .config import connect_shares
 
 log = logging.getLogger(__name__)
 
@@ -328,6 +329,12 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     # churn for no reason.
     if not had_master_key:
         await _restart_supervised_children_if_present(request)
+        # **And log in to the file servers, for the same reason.** The
+        # share passwords are sealed with the master key, so an agent on
+        # `prompt_on_startup` had nothing to unseal at boot. This is the
+        # moment it does — and it is the moment before the respawned
+        # children go looking for models.
+        await connect_shares(request)
 
     token, exp = security.issue_operator_token(signing_key=auth.signing_key)
     log.info("operator login from %s", remote)

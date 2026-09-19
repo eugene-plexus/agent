@@ -19,6 +19,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "vllmBinary",
         "advertiseUrl",
         "pathMappings",
+        "shareCredentials",
         "modelCopyEnabled",
         "modelCopyDir",
         "modelCopyMinFreeGb",

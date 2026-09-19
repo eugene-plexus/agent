@@ -49,6 +49,15 @@ dependencies = [
 service = [
     "pywin32>=306; sys_platform == 'win32'",
 ]
+# The notification-area icon (R2.6). Same wheel as `service` and a
+# separate name anyway, because they are separate decisions: the service
+# is how the install comes back after a reboot, the icon is how a person
+# turns it off to play a game. An unattended box wants the first and has
+# nobody to show the second to. `install.ps1` asks for both on a desktop
+# install and for `service` alone with `-NoTray`.
+tray = [
+    "pywin32>=306; sys_platform == 'win32'",
+]
 dev = [
     "pytest==8.4.2",
     "pytest-asyncio==0.26.0",
@@ -60,6 +69,7 @@ dev = [
 
 [project.scripts]
 eugene-plexus-agent = "eugene_plexus_agent.__main__:main"
+eugene-plexus-tray = "eugene_plexus_agent.tray:main"
 
 [project.urls]
 Homepage = "https://github.com/eugene-plexus"
@@ -132,6 +142,10 @@ module = [
     # ...plus the two the firewall detector reaches for.
     "win32com.*",
     "pythoncom",
+    # ...plus the three the tray icon's message loop needs (R2.6).
+    "win32api",
+    "win32con",
+    "win32gui",
 ]
 ignore_missing_imports = true
 

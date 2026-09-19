@@ -235,11 +235,12 @@ def describe_restart() -> AgentRestart:
 
 
 def _windows_restart() -> AgentRestart:
-    if _running_as_windows_service():
+    if _windows_service_runs_this_install():
         return AgentRestart(
             mechanism=Mechanism.service,
             canSelfRestart=True,
             command=f"Restart-Service {WINDOWS_SERVICE_NAME}",
+            detail="This agent starts at boot, before anyone signs in.",
         )
     if _windows_task_runs_this_install():
         return AgentRestart(
@@ -262,8 +263,99 @@ def _windows_restart() -> AgentRestart:
     )
 
 
+def _windows_service_runs_this_install() -> bool:
+    """Is this process **this install's** Windows service?
+
+    **Two questions, and only the second is install-scoped.** Session 0
+    says *this could be a service at all*; the registered service's own
+    `ImagePath` says *and it is ours*. Asking only the first is the
+    defect the S5 acceptance run caught on the other branch and this one
+    was never given: session 0 is where a service runs, and equally
+    where a scheduled task with a SYSTEM principal runs, where
+    `PsExec -s` puts you, and — the case that matters — where **another
+    install's** service runs. Answering `service` /
+    `canSelfRestart: True` / `sc stop EugenePlexusAgent` for any of those
+    would hand the reach switch a command that stops somebody else's
+    agent, which is exactly the note S5 recorded as its most dangerous.
+
+    `sys.prefix`, not `sys.executable`, for the reason
+    `_windows_task_runs_this_install` gives: in a uv-made virtualenv the
+    executable is the base interpreter under `pythons\\cpython-...`,
+    outside the prefix and shared between installs.
+
+    **Measured 2026-09-18 and it needs no new comparison logic:**
+    `win32serviceutil.LocatePythonServiceExe` puts the service host at
+    `os.path.join(sys.exec_prefix, "pythonservice.exe")`, which in a venv
+    is `<sys.prefix>\\pythonservice.exe` — inside the prefix, so
+    `action_runs_from_prefix` discriminates two installs with the helper
+    that already exists and is already sabotage-checked.
+    """
+    if not _running_as_windows_service():
+        return False
+    image = _service_image_path(WINDOWS_SERVICE_NAME)
+    if image is None:
+        # **Session 0 with no readable service entry is not this
+        # install's service.** The alternative — falling back to "well,
+        # we are in session 0" — is the unscoped answer this function
+        # exists to replace, and it fails open onto somebody else's
+        # `sc stop`.
+        return False
+    return action_runs_from_prefix(image, sys.prefix)
+
+
+def _service_image_path(service_name: str) -> str | None:
+    """The registered `ImagePath` of a service, or None if it cannot be read.
+
+    Two readers, because the preferred one has a dependency the
+    unelevated install does not carry. `QueryServiceConfig` is the
+    authority; the registry holds the same value and `winreg` is in the
+    standard library and readable without elevation. None means *could
+    not read it here* and never *there is no such service* — same
+    contract as `_task_action_via_com`, and for the same reason: the
+    caller must not treat a refusal as evidence.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import win32service
+
+        manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+        try:
+            handle = win32service.OpenService(
+                manager, service_name, win32service.SERVICE_QUERY_CONFIG
+            )
+            try:
+                # QueryServiceConfig returns a tuple whose index 3 is the
+                # binary path name, quoted as the SCM stores it.
+                path = win32service.QueryServiceConfig(handle)[3]
+            finally:
+                win32service.CloseServiceHandle(handle)
+        finally:
+            win32service.CloseServiceHandle(manager)
+        if path:
+            return str(path)
+    except Exception:
+        pass
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            rf"SYSTEM\CurrentControlSet\Services\{service_name}",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "ImagePath")
+        return str(value) if value else None
+    except Exception:
+        return None
+
+
 def _running_as_windows_service() -> bool:
-    """Is this process the Windows service, rather than a task or a shell?
+    """Is this process in session 0 — where a service runs, and not only one?
+
+    **A precondition, never the answer.** Callers must be
+    `_windows_service_runs_this_install`, which pairs this with the
+    service's own `ImagePath`; see its docstring for what goes wrong when
+    this is asked alone.
 
     **Session 0**, which is where the SCM runs every service and where
     nothing interactive ever runs. `ProcessIdToSessionId` comes straight
@@ -271,12 +363,16 @@ def _running_as_windows_service() -> bool:
     unelevated install too.
 
     The first version of this asked `GetConsoleWindow() == 0` -- a
-    service has no console, which is true and is the property step 2's
-    graceful-shutdown work turns on. It is not a *test* for one: this
-    module was smoke-tested from a Git Bash shell, which uses a ConPTY
-    with no classic console window, and the answer came back `service`
-    on a box whose agent is a logon task. A property every service has
-    is not a property only services have.
+    service has no console, which was true. It is not a *test* for one:
+    this module was smoke-tested from a Git Bash shell, which uses a
+    ConPTY with no classic console window, and the answer came back
+    `service` on a box whose agent is a logon task. A property every
+    service has is not a property only services have.
+
+    **And as of R2.6 the service does not even have that property.**
+    `process_signals.ensure_console()` allocates one in `SvcDoRun` so
+    engines can be stopped gracefully, so the old probe would now be
+    wrong in both directions at once. Session id is unaffected by it.
     """
     if sys.platform != "win32":
         # For mypy on Linux, which knows `ctypes.windll` is not there --
@@ -524,6 +620,60 @@ def _launchd_restart() -> AgentRestart:
     )
 
 
+#: How long each retry waits before trying the start again, as `ping -n`
+#: counts — `ping -n N` takes about N-1 seconds. Cumulative: ~2s, ~7s,
+#: ~17s, ~37s. `SvcStop` allows the uvicorn thread up to 90 s
+#: (`winservice.py`), and supervised children escalate concurrently at
+#: 5 s each, so a real stop lands in the first one or two.
+_RESTART_PACES = (3, 6, 11, 21)
+
+
+def _retry_until_started(stop: str, start: str) -> str:
+    """A `cmd /c` line that stops, then retries the start until it takes.
+
+    **The wait this replaces never happened.** Both Windows branches used
+    `<stop> & timeout /t 3 /nobreak >nul & <start>`, and `spawn_restart`
+    detaches the helper with `stdin=subprocess.DEVNULL`. `timeout`
+    refuses to run without a console input handle. Measured 2026-09-18:
+
+        cmd /c "timeout /t 3 /nobreak >nul & echo done"   0.18s, rc 125
+        cmd /c "ping -n 4 127.0.0.1 >nul"                 3.17s
+
+    So the start was issued ~0.18 s after the stop, against a `SvcStop`
+    that may take up to 90 s — and the helper's output goes to DEVNULL,
+    so an `sc start` refused with 1053/1056 was indistinguishable from a
+    working restart. **That defect is live on the `logon_task` branch
+    today**, not only on the service branch R2.6 lights up.
+
+    **And the obvious fix is a worse trap.** `Restart-Service` does the
+    waiting for you, which makes PowerShell the tempting host — but
+    measured the same day, isolating one flag at a time:
+
+        no creationflags            2.16s  rc=0  'done'
+        CREATE_NEW_PROCESS_GROUP    2.17s  rc=0  'done'
+        DETACHED_PROCESS            0.05s  rc=0  ''      <-- never ran
+        DETACHED|NEW_PROCESS_GROUP  0.05s  rc=0  ''      <-- never ran
+
+    `DETACHED_PROCESS` — which `spawn_restart` must pass, so the helper
+    outlives the agent it is restarting — makes `powershell.exe` exit
+    immediately, successfully, having done nothing. A silent no-op that
+    still reports success is precisely the failure this function exists
+    to remove.
+
+    So: plain `cmd`, `ping` as the pacer, and **the start itself is the
+    probe**. `sc start` fails while the service is STOP_PENDING and
+    `schtasks /Run` fails while the task is still running, so a start
+    that *succeeds* is proof the stop finished — no sleep has to guess a
+    duration, it only has to space the attempts. Measured with a stand-in
+    that fails a chosen number of times: 0.01 s when the first attempt
+    takes, 2.13 s for the second, 7.31 s for the third. Nothing is waited
+    that does not need waiting.
+    """
+    attempts = [start]
+    attempts += [f"(ping -n {n} 127.0.0.1 >nul & {start})" for n in _RESTART_PACES]
+    return f"{stop} & " + " || ".join(attempts)
+
+
 def restart_argv(restart: AgentRestart) -> list[str] | None:
     """The argv a detached helper runs to bring this agent back.
 
@@ -542,23 +692,22 @@ def restart_argv(restart: AgentRestart) -> list[str] | None:
         return None
     if restart.mechanism is Mechanism.service:
         # `sc stop` returns as soon as the SCM has the request, so the
-        # start has to wait for the stop to finish; `cmd /c` sequences
-        # them in the detached helper rather than here, where this
-        # process is about to be the thing that stops.
+        # start has to wait for the stop to finish.
         return [
             "cmd",
             "/c",
-            f"sc stop {WINDOWS_SERVICE_NAME} & "
-            f"timeout /t 3 /nobreak >nul & "
-            f"sc start {WINDOWS_SERVICE_NAME}",
+            _retry_until_started(
+                f"sc stop {WINDOWS_SERVICE_NAME}", f"sc start {WINDOWS_SERVICE_NAME}"
+            ),
         ]
     if restart.mechanism is Mechanism.logon_task:
         return [
             "cmd",
             "/c",
-            f'schtasks /End /TN "{WINDOWS_TASK_NAME}" & '
-            f"timeout /t 3 /nobreak >nul & "
-            f'schtasks /Run /TN "{WINDOWS_TASK_NAME}"',
+            _retry_until_started(
+                f'schtasks /End /TN "{WINDOWS_TASK_NAME}"',
+                f'schtasks /Run /TN "{WINDOWS_TASK_NAME}"',
+            ),
         ]
     if restart.mechanism is Mechanism.systemd:
         user = ["--user"] if _euid() != 0 else []

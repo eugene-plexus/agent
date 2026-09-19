@@ -35,6 +35,7 @@ from . import (
     off_host,
     process_signals,
     security,
+    share_credentials,
     ui_assets,
 )
 from ._http import aclose_shared
@@ -135,6 +136,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "securityMode is os_keyring but no stored key was retrievable; "
                 "operator must log in via POST /v1/auth/login to populate it"
             )
+
+    # **Log in to the file servers before anything opens a model.** This
+    # is the whole of R2.6's first measurement: an agent running as a
+    # Windows service holds none of the credentials the person who
+    # installed it typed into Explorer, so a share that opened yesterday
+    # answers `WinError 1272` today with every health check still green.
+    # It sits here, after the keyring recovery above, because the
+    # passwords are sealed with the master key -- on `prompt_on_startup`
+    # there is nothing to unseal yet and the same call runs again at
+    # login. Off the event loop: an unreachable server blocks for as long
+    # as the network stack allows.
+    await _connect_configured_shares(app)
 
     if state.has_passphrase():
         log.info("agent initialized; operator may log in via POST /v1/auth/login")
@@ -306,6 +319,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # the way down, and closing a pool under an in-flight probe
         # turns an orderly shutdown into a traceback.
         await aclose_shared()
+
+
+async def _connect_configured_shares(app: FastAPI) -> None:
+    """Ask the OS to log this host in to every configured file server.
+
+    Never fatal. `degraded-mode-required` applies as it does everywhere
+    else here: a server that is off, a password that has rotated or a
+    typo in a host name leaves the rest of the install supervising
+    normally, and the operator finds out from the model that will not
+    load — which already says which path it tried.
+    """
+    state: AgentState = app.state.agent_state
+    auth = app.state.auth_state
+    entries = share_credentials.unseal_entries(
+        state.get_config("shareCredentials"),
+        auth.master_key if auth.has_master_key() else None,
+    )
+    if not entries:
+        return
+    try:
+        await asyncio.to_thread(share_credentials.connect_all, entries)
+    except Exception:  # pragma: no cover - defensive
+        log.warning("could not log in to the configured file servers", exc_info=True)
 
 
 async def _announce_address(

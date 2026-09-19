@@ -775,3 +775,114 @@ def test_the_schtasks_reader_decodes_what_the_console_wrote(monkeypatch) -> None
     got = reach_module._task_query_via_schtasks("whatever")
     assert got is not None
     assert exe in got, f"the reader mangled the path: {got!r}"
+
+
+# --------------------------------------------------------------------------- #
+# R2.6 — the Windows service, and the wait that never happened
+# --------------------------------------------------------------------------- #
+
+
+def test_the_restart_helper_never_reaches_for_timeout_or_powershell() -> None:
+    """The reproduction for two measured no-ops, on both Windows branches.
+
+    `timeout /t 3 /nobreak` exits rc 125 in 0.18 s when stdin is DEVNULL,
+    which is what `spawn_restart` passes — so the start was issued
+    0.18 s after the stop and the "three second" wait never existed.
+    And `powershell.exe` under `DETACHED_PROCESS` exits in 0.05 s having
+    run nothing, so the obvious fix (`Restart-Service`, which waits for
+    you) would replace a short wait with no wait at all and still report
+    success.
+
+    Both measurements are in `_retry_until_started`'s docstring. This
+    asserts the shape that replaced them, because neither program can be
+    caught by a unit test that runs one.
+    """
+    for mechanism in (Mechanism.service, Mechanism.logon_task):
+        argv = reach.restart_argv(AgentRestart(mechanism=mechanism, canSelfRestart=True))
+        assert argv is not None
+        line = " ".join(argv)
+        assert "timeout /t" not in line, f"{mechanism.value} still waits with `timeout`"
+        assert "powershell" not in line.lower(), (
+            f"{mechanism.value} uses PowerShell, which does not run detached"
+        )
+        assert "ping -n" in line, f"{mechanism.value} has no pacer between attempts"
+
+
+def test_the_restart_helper_retries_the_start_rather_than_guessing_a_duration() -> None:
+    """A start that succeeds IS the proof the stop finished.
+
+    `sc start` fails while the service is STOP_PENDING and
+    `schtasks /Run` fails while the task is still running, so retrying
+    the start on a widening pacer needs no sleep to be the right length.
+    One attempt would be the old defect with a different spelling.
+    """
+    for mechanism, starter in (
+        (Mechanism.service, "sc start"),
+        (Mechanism.logon_task, "schtasks /Run"),
+    ):
+        argv = reach.restart_argv(AgentRestart(mechanism=mechanism, canSelfRestart=True))
+        assert argv is not None
+        line = argv[2]
+        assert line.count(starter) == len(reach._RESTART_PACES) + 1
+        # The first attempt is unpaced: a service that stops in
+        # milliseconds must not be made to wait for a pacer.
+        assert line.split(" & ", 1)[1].startswith(starter)
+
+
+@windows_only
+def test_session_zero_alone_does_not_make_this_installs_service(monkeypatch) -> None:
+    """The S5 finding, on the branch it was never applied to.
+
+    Session 0 is where a service runs. It is also where a scheduled task
+    with a SYSTEM principal runs, where `PsExec -s` puts you, and where
+    **another install's** service runs. Answering `service` /
+    `canSelfRestart: True` for any of those hands the reach switch an
+    `sc stop` aimed at somebody else's agent — the most dangerous note
+    the S5 acceptance run recorded, reproduced here on the other branch.
+    """
+    monkeypatch.setattr(reach, "_running_as_windows_service", lambda: True)
+
+    # A service registered from a different install must not count.
+    monkeypatch.setattr(
+        reach,
+        "_service_image_path",
+        lambda name: r"C:\Users\someone\AppData\Local\EugenePlexus\venv\pythonservice.exe",
+    )
+    assert reach._windows_service_runs_this_install() is False
+
+    # Nor may an unreadable service entry fall back to "well, session 0".
+    monkeypatch.setattr(reach, "_service_image_path", lambda name: None)
+    assert reach._windows_service_runs_this_install() is False
+
+    # This install's own service does count, and the path pywin32 really
+    # uses is inside `sys.prefix`.
+    monkeypatch.setattr(
+        reach,
+        "_service_image_path",
+        lambda name: os.path.join(sys.prefix, "pythonservice.exe"),
+    )
+    assert reach._windows_service_runs_this_install() is True
+
+    described = reach._windows_restart()
+    assert described.mechanism is Mechanism.service
+    assert described.canSelfRestart is True
+    assert described.detail, "the service branch must say what a service means"
+    assert "before anyone signs in" in described.detail
+
+
+@windows_only
+def test_a_session_zero_process_with_no_service_is_not_supervised(monkeypatch) -> None:
+    """`PsExec -s` and a SYSTEM-principal task both land here.
+
+    With no matching service and no matching task, the honest answer is
+    `none` — nothing would start this agent again, so the switch must
+    refuse to stop it.
+    """
+    monkeypatch.setattr(reach, "_running_as_windows_service", lambda: True)
+    monkeypatch.setattr(reach, "_service_image_path", lambda name: None)
+    monkeypatch.setattr(reach, "_windows_task_runs_this_install", lambda: False)
+
+    described = reach._windows_restart()
+    assert described.mechanism is Mechanism.none
+    assert described.canSelfRestart is False
+    assert reach.restart_argv(described) is None

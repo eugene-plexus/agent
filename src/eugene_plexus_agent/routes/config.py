@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from .. import enrollment, keyring_store, library_folders, model_paths
+from .. import enrollment, keyring_store, library_folders, model_paths, share_credentials
 from .._generated.common_models import (
     ConfigDocument,
     ConfigFieldError,
@@ -37,7 +37,17 @@ router = APIRouter(tags=["config"])
 @router.get("/v1/config", response_model=ConfigDocument)
 async def get_config(request: Request) -> ConfigDocument:
     state: AgentState = request.app.state.agent_state
-    return state.as_config_document()
+    document = state.as_config_document()
+    # **The one field here that holds a secret.** Redaction is per entry
+    # rather than per field: host and user name are the half a person
+    # edits, so a row has to come back renderable, and a UI has to be
+    # able to tell *a password is stored* from *there is none*. The merge
+    # in `_seal_share_credentials` is what makes writing the redacted row
+    # back safe.
+    stored = getattr(document, SHARE_CREDENTIALS_KEY, None)
+    if stored:
+        setattr(document, SHARE_CREDENTIALS_KEY, share_credentials.redact_entries(stored))
+    return document
 
 
 @router.get("/v1/config/schema", response_model=ConfigSchema)
@@ -142,6 +152,27 @@ async def test_config(
         if error is not None:
             problems.append(error)
 
+    # Share logins, which is the one thing here that can be tried for
+    # real without changing anything: `WNetAddConnection2W` either
+    # establishes a session or says why, and a session this host would
+    # have made at the next restart anyway is not a side effect worth
+    # avoiding. An override in the body is honoured so the Test button
+    # beside the editor answers about the row being typed, not the row
+    # last saved -- and a password the operator just typed is used as
+    # given, because it has not been sealed yet.
+    auth_state = request.app.state.auth_state
+    master_key = auth_state.master_key if auth_state.has_master_key() else None
+    saved = share_credentials.unseal_entries(state.get_config(SHARE_CREDENTIALS_KEY), master_key)
+    credential_entries = (
+        share_credentials.overlay_typed(overrides[SHARE_CREDENTIALS_KEY], saved)
+        if SHARE_CREDENTIALS_KEY in overrides
+        else saved
+    )
+    if credential_entries:
+        results = await asyncio.to_thread(share_credentials.connect_all, credential_entries)
+        for outcome in results:
+            (notes if outcome.ok else problems).append(outcome.summary)
+
     elapsed_ms = int((time.perf_counter() - start) * 1000)
     return ConfigTestResult(
         ok=not problems,
@@ -163,10 +194,19 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     prior_mode = state.get_config("securityMode")
     prior_advertise = state.get_config("advertiseUrl")
     body, folder_rejection = await _check_overrides_name_folders(request, body)
+    body, credential_rejection = _seal_share_credentials(request, body)
     result = state.apply_config_patch(body)
     if folder_rejection is not None:
         result.rejected.append(folder_rejection)
+    if credential_rejection is not None:
+        result.rejected.append(credential_rejection)
     new_mode = state.get_config("securityMode")
+
+    # Log in to whatever the new list names, now, rather than at the next
+    # restart. An operator who has just typed a password is watching, and
+    # the model that would not open is the reason they typed it.
+    if SHARE_CREDENTIALS_KEY in result.applied:
+        await connect_shares(request)
 
     # An operator who changes where this host is reachable has to reach
     # the control root with it, or the root keeps routing to the old
@@ -198,6 +238,60 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
             log.info("securityMode changed to os_keyring; persisted master key for auto-unlock")
 
     return result
+
+
+SHARE_CREDENTIALS_KEY = "shareCredentials"
+
+
+def _seal_share_credentials(
+    request: Request, body: ConfigUpdateRequest
+) -> tuple[ConfigUpdateRequest, ConfigFieldError | None]:
+    """Seal the passwords in a `shareCredentials` patch before it lands.
+
+    **At this layer and not in `AgentState`, for the reason the
+    securityMode side-effects are here**: the state object owns a YAML
+    file and a lock and has deliberately never known about the master
+    key. It is also the only layer that can merge — `GET` redacts, so an
+    entry arriving with no password is a UI writing back a row it was
+    shown, not an operator clearing one, and the stored secret has to
+    survive that round trip or it is lost at the next reboot with
+    nothing saying so.
+    """
+    patch = body.model_dump(exclude_unset=True)
+    if SHARE_CREDENTIALS_KEY not in patch:
+        return body, None
+    state: AgentState = request.app.state.agent_state
+    auth = request.app.state.auth_state
+    sealed, error = share_credentials.merge_and_seal(
+        patch[SHARE_CREDENTIALS_KEY],
+        state.get_config(SHARE_CREDENTIALS_KEY),
+        auth.master_key if auth.has_master_key() else None,
+    )
+    if error is not None:
+        del patch[SHARE_CREDENTIALS_KEY]
+        return ConfigUpdateRequest.model_validate(patch), ConfigFieldError(
+            key=SHARE_CREDENTIALS_KEY, message=error
+        )
+    patch[SHARE_CREDENTIALS_KEY] = sealed
+    return ConfigUpdateRequest.model_validate(patch), None
+
+
+async def connect_shares(request: Request) -> list[share_credentials.ConnectResult]:
+    """Ask the OS to log this host in to every configured file server.
+
+    Off the event loop: `WNetAddConnection2W` against an unreachable
+    server blocks for as long as the network stack allows, and this runs
+    inside a config PATCH the browser is waiting on.
+    """
+    state: AgentState = request.app.state.agent_state
+    auth = request.app.state.auth_state
+    entries = share_credentials.unseal_entries(
+        state.get_config(SHARE_CREDENTIALS_KEY),
+        auth.master_key if auth.has_master_key() else None,
+    )
+    if not entries:
+        return []
+    return await asyncio.to_thread(share_credentials.connect_all, entries)
 
 
 def _install_id(state: AgentState) -> str:

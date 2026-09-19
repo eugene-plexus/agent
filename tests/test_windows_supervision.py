@@ -24,6 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import textwrap
 from typing import Any
 
 import pytest
@@ -464,3 +470,127 @@ def test_console_detection_uses_the_probe_that_does_not_lie() -> None:
     finding elsewhere.
     """
     assert process_signals.console_attached() is True
+
+
+# --------------------------------------------------------------------------- #
+# R2.6 — a service can keep a console, and the 2026-09-11 cost was never real
+# --------------------------------------------------------------------------- #
+
+
+def test_ensure_console_is_a_no_op_where_there_is_already_one() -> None:
+    """Idempotent, and it must not allocate a second console.
+
+    `SvcDoRun` calls it unconditionally; so would anything else that
+    wanted to be safe. A call that tore down and rebuilt the console
+    would orphan every child already attached to the old one.
+    """
+    calls: list[str] = []
+
+    def fake_attached() -> bool:
+        calls.append("asked")
+        return True
+
+    original = process_signals.console_attached
+    process_signals.console_attached = fake_attached  # type: ignore[assignment]
+    try:
+        assert process_signals.ensure_console() is True
+    finally:
+        process_signals.console_attached = original  # type: ignore[assignment]
+    assert calls == ["asked"], "it allocated without checking first"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="AllocConsole is Windows-only")
+def test_a_console_less_parent_regains_the_graceful_stop() -> None:
+    """The measurement that overturns install-paths §7, run as a test.
+
+    That table lists *"Real service + AllocConsole()"* with the cost
+    *"can reassign the agent's std handles — logs vanish"*, and concludes
+    *"we do not conjure a console"*. **The cost was asserted, never
+    measured.** Three arms, each in its own process because `FreeConsole`
+    is not undoable within one:
+
+        A  inherited console        signalled, ~0.03s   (the logon task)
+        B  after FreeConsole()      WinError 6, never   (the service today)
+        C  after ensure_console()   signalled, ~0.03s   (the fix)
+
+    Arm B is the negative control: without it, arm C proves nothing,
+    because a child that exits for its own reasons looks identical.
+    """
+    child = textwrap.dedent(
+        """
+        import signal, sys, time
+        signal.signal(signal.SIGBREAK, lambda *a: sys.exit(7))
+        print("ready", flush=True)
+        # **Short sleeps, not one long one.** CPython's Windows console
+        # handler unblocks `time.sleep` for CTRL_C_EVENT and not for
+        # CTRL_BREAK_EVENT, so a `time.sleep(30)` here reports "the child
+        # was never signalled" for a child that was signalled perfectly
+        # well -- a harness lie of exactly the shape this project keeps
+        # catching. A real engine has its own handler and does not care.
+        for _ in range(300):
+            time.sleep(0.1)
+        sys.exit(3)
+        """
+    )
+    # Raw, because the generated script contains a `\n` escape of its own
+    # and an interpreted literal turns it into a real newline mid-source —
+    # which dedent then reads as a zero-indent line and gives up.
+    parent = textwrap.dedent(
+        r"""
+        import ctypes, subprocess, sys
+        from eugene_plexus_agent import process_signals
+
+        arm = sys.argv[1]
+        child_py = sys.argv[2]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if arm in ("B", "C"):
+            k32.FreeConsole()
+        if arm == "C":
+            process_signals.ensure_console()
+
+        proc = subprocess.Popen(
+            [sys.executable, child_py],
+            stdout=subprocess.PIPE, text=True,
+            **process_signals.spawn_kwargs(),
+        )
+        proc.stdout.readline()          # wait for the handler to be installed
+        sent = process_signals.request_stop(proc, name="child", logger=None)
+        try:
+            rc = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            rc = None
+        sys.stderr.write(f"RESULT {arm} sent={sent} rc={rc}\n")
+        """
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        child_py = os.path.join(tmp, "child.py")
+        parent_py = os.path.join(tmp, "parent.py")
+        pathlib.Path(child_py).write_text(child, encoding="utf-8")
+        pathlib.Path(parent_py).write_text(parent, encoding="utf-8")
+
+        results = {}
+        for arm in ("A", "B", "C"):
+            done = subprocess.run(
+                [sys.executable, parent_py, arm, child_py],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            line = [x for x in done.stderr.splitlines() if x.startswith("RESULT")]
+            assert line, f"arm {arm} produced no result: {done.stderr[-400:]}"
+            results[arm] = line[-1]
+
+        assert "rc=7" in results["A"], f"the control arm did not signal: {results['A']}"
+        assert "rc=7" not in results["B"], (
+            f"the negative control signalled, so arm C proves nothing: {results['B']}"
+        )
+        assert "TerminateProcess" in results["B"], (
+            f"a console-less parent should have fallen back: {results['B']}"
+        )
+        assert "rc=7" in results["C"], (
+            f"ensure_console did not restore the graceful stop: {results['C']}"
+        )
+        assert "CTRL_BREAK_EVENT" in results["C"], (
+            f"arm C stopped the child, but not with a console event: {results['C']}"
+        )

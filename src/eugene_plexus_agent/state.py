@@ -45,7 +45,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from . import model_copies, model_paths
+from . import model_copies, model_paths, share_credentials
 from ._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -217,6 +217,26 @@ CONFIG_FIELDS: list[ConfigField] = [
         ),
         category="storage",
         valueType=ConfigValueType.path_mappings,
+        default=[],
+    ),
+    ConfigField(
+        key="shareCredentials",
+        label="Logins for file servers",
+        description=(
+            "Only if a Library folder lives on a server that asks this machine "
+            "to log in. One row per server -- `192.168.16.252`, not a whole "
+            "path -- and it covers every folder on it, because Windows allows "
+            "one login per server. Leave it empty if models open fine today. "
+            "You will need a row once Eugene starts on its own at boot: before "
+            "you sign in there is no such thing as 'the password you saved in "
+            "File Explorer', and a server can refuse an anonymous visitor even "
+            "when the folder itself has no password on it. Where the folder is "
+            "mounted is the Library folder overrides setting above; this is who "
+            "this machine says it is when it gets there. Test tries the login "
+            "before you save it."
+        ),
+        category="storage",
+        valueType=ConfigValueType.share_credentials,
         default=[],
     ),
     ConfigField(
@@ -810,4 +830,10 @@ def _validate(field: ConfigField, value: Any) -> str | None:
         # the reason `file_path` gives above: a share about to be mounted
         # is an environment the operator is about to create.
         return model_paths.validate_rules(value)
+    if vt == ConfigValueType.share_credentials:
+        # Shape only, same argument one step further: whether a server
+        # accepts a login is a fact about a machine that may not be
+        # switched on yet, and refusing to SAVE it would leave an
+        # operator unable to prepare an install before the NAS arrives.
+        return share_credentials.validate_entries(value)
     return f"unsupported valueType for agent config: {vt}"

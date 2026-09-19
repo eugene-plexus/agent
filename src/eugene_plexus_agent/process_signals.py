@@ -153,16 +153,81 @@ def console_attached() -> bool:
         return False
 
 
+def ensure_console() -> bool:
+    """Give this process a console if it has none. Windows only.
+
+    **This is what makes a Windows service stop its engines gracefully,
+    and the cost that ruled it out was never measured.**
+    `install-paths-and-distribution.md` §7 lists *"Real service +
+    `AllocConsole()`"* with the cost *"can reassign the agent's std
+    handles — logs vanish"*, and concludes *"we do not conjure a
+    console"*. Measured 2026-09-18, three arms, each in its own process,
+    child spawned with `CREATE_NEW_PROCESS_GROUP` and a SIGBREAK
+    handler:
+
+        inherited console            event sent, child out in 0.034 s
+        after FreeConsole()          WinError 6, child never signalled
+        after FreeConsole()+Alloc    event sent, child out in 0.036 s
+
+    and after the third, the `RotatingFileHandler` kept writing and
+    neither `print` nor `sys.stderr.write` raised. It was never going to:
+    the durable sink is a file handler, children are `stdout=PIPE`
+    (`supervisor.py`), and under pywin32's service host `sys.__stdout__`
+    is already `None` — a case `console_logging` handles today. A
+    session-0 console is invisible and valid, which is all
+    `GenerateConsoleCtrlEvent` needs.
+
+    **Call it before the first child is spawned.** `spawn_kwargs` sets no
+    console flag, so a child inherits whatever console the parent holds
+    *at spawn time*; a console allocated afterwards is one that child is
+    not attached to, and the event would still fail for it alone —
+    which is worse than failing for all of them, because it fails for
+    some.
+
+    Returns True when this process has a console when the call returns,
+    whether or not this call is what gave it one. Never raises: an agent
+    that cannot allocate a console still supervises, it just goes back
+    to hard-killing children and says so at boot.
+    """
+    if sys.platform != "win32":
+        return True
+    if console_attached():
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
+        # AllocConsole returns 0 and sets ERROR_ACCESS_DENIED (5) when
+        # the process already has one, which `console_attached()` above
+        # has ruled out — so a 0 here is a real refusal. Ask
+        # `console_attached()` again rather than trusting the return
+        # value, for the same reason `winservice.main` re-asks the SCM:
+        # the question is "is there a console now", not "did the call
+        # say yes".
+        kernel32.AllocConsole()
+    except Exception:  # pragma: no cover - defensive
+        log.warning("could not allocate a console; children will be hard-killed")
+        return False
+    got = console_attached()
+    if got:
+        log.info("allocated a console, so supervised children can be stopped gracefully")
+    else:
+        log.warning("could not allocate a console; children will be hard-killed")
+    return got
+
+
 def describe_stop_capability() -> tuple[bool, str]:
     """`(graceful, why)` — for an announcement at startup, not at first stop.
 
-    **The degradation is accepted and therefore has to be visible.**
-    Troy's call, 2026-09-11: Windows ships a real service, and a service
-    has no console, so children there are hard-killed. That is the same
-    shape as the Vulkan decision (§7 of the install-paths design) —
-    ship it, and badge it permanently — and the badge is worth more at
-    boot than at the first stop, because at the first stop the operator
-    is already watching something else go wrong.
+    **The degradation was accepted on 2026-09-11 and is no longer
+    necessary, but the badge stays.** Troy's call then: Windows ships a
+    real service, a service has no console, so children there are
+    hard-killed, and that is badged permanently rather than hidden.
+    R2.6 removed the cause — `ensure_console()` above — so the service
+    now takes the first branch. The console-less string stays because it
+    is still the truth for anything that reaches that state another way:
+    an `AllocConsole` that is refused, or a future host that starts the
+    agent without one and without going through `winservice`.
     """
     if sys.platform != "win32":
         return True, "children are stopped with SIGTERM, then SIGKILL if they hang"
