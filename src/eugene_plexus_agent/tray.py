@@ -49,6 +49,7 @@ from __future__ import annotations
 import logging
 import subprocess
 import sys
+import time
 import webbrowser
 
 log = logging.getLogger(__name__)
@@ -147,6 +148,101 @@ def open_ui(port: int = DEFAULT_PORT) -> None:
     webbrowser.open(f"http://127.0.0.1:{port}/")
 
 
+#: How long `open_and_wait` gives the service to answer before opening
+#: the browser anyway. A cold start loads no models -- it is the agent,
+#: the control root, the gateway and the library -- so this is generous
+#: for the slow case and invisible in the common one.
+READY_TIMEOUT_SECONDS = 30.0
+
+
+def wait_until_answering(port: int, timeout: float = READY_TIMEOUT_SECONDS) -> bool:
+    """Poll `/healthz` until the agent answers, or the budget runs out.
+
+    **`sc start` returning success is not the thing to wait for.** It
+    means the Service Control Manager accepted the request; the agent
+    still has to load its config, recover its key and bring up four
+    children. Opening a browser at that moment shows *connection
+    refused*, which reads as *Eugene is broken* rather than *Eugene is
+    starting* -- and it is the person's first impression after clicking
+    a Start menu entry.
+
+    `urllib`, not `httpx`: this is one request at a time in a tiny GUI
+    process, and R1.1's whole finding was the cost of building an
+    `httpx` client -- 104 ms of certifi parsing -- for exactly this kind
+    of one-shot call. A loopback `http://` URL builds no SSL context at
+    all.
+    """
+    import urllib.error
+    import urllib.request
+
+    # Deliberately `perf_counter`, not `monotonic`: on the Python both
+    # installers provision, Windows `monotonic()` sits on a 15.6 ms grid.
+    deadline = time.perf_counter() + timeout
+    url = f"http://127.0.0.1:{port}/healthz"
+    while time.perf_counter() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2.0) as response:
+                if response.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def open_and_wait(port: int = DEFAULT_PORT) -> tuple[bool, str]:
+    """Make Eugene usable and show it. `(ok, why)`.
+
+    **This is what the Start menu entry does**, and it exists because
+    stopping Eugene takes the web UI with it -- so the obvious way back
+    (*open the page*) is the one that cannot work. Start it if it is
+    stopped, wait for it to answer, then open the browser.
+
+    A person who stopped Eugene to play a game and then clicks
+    "Eugene Plexus" has asked for it back. There is no confirmation,
+    because there is no other reading of that click.
+    """
+    state = query_state()
+    if state == ServiceState.stopped:
+        started, why = start_service()
+        if not started:
+            return False, why
+    if state in (ServiceState.stopped, ServiceState.unknown):
+        # `unknown` covers START_PENDING and a service we could not
+        # read; waiting costs at most the budget and answers both.
+        wait_until_answering(port)
+    open_ui(port)
+    return True, ""
+
+
+def claim_single_instance(name: str = "EugenePlexusTray") -> bool:
+    """True if this process is the only tray icon in this session.
+
+    **Session-local, deliberately not `Global\\`.** Two people signed in
+    to one box each get their own icon, which is right: the icon belongs
+    to a desktop, and the service it controls is shared.
+
+    Without this, the Start menu entry -- whose whole job is to bring the
+    icon back after somebody hid it -- would put a SECOND icon beside an
+    existing one every time it was clicked. The handle is deliberately
+    leaked: it must live as long as the process, and the OS releases it
+    at exit.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
+        kernel32.CreateMutexW(None, False, name)
+        return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+    except Exception:  # pragma: no cover - defensive
+        # A mutex we could not take is not a reason to refuse to show an
+        # icon. Two icons is a worse outcome than one, and no icon is
+        # worse than two.
+        return True
+
+
 def menu_for(state: str) -> list[tuple[int, str, bool]]:
     """`(command id, label, enabled)` for the current state.
 
@@ -166,7 +262,13 @@ def menu_for(state: str) -> list[tuple[int, str, bool]]:
         (_ID_OPEN, "Open Eugene", True),
         (_ID_STOP, "Stop Eugene (frees the graphics card)", running),
         (_ID_START, "Start Eugene", stopped),
-        (_ID_QUIT, "Hide this icon", True),
+        # **Named for where it comes back from**, because this is the one
+        # entry here that takes something away. Before the Start menu
+        # entry existed it was a one-way door: hide the icon with Eugene
+        # stopped and the only routes back were services.msc, an elevated
+        # Start-Service, or signing out and in. The label is the fix's
+        # visible half.
+        (_ID_QUIT, "Hide this icon (it is in your Start menu)", True),
     ]
 
 
@@ -197,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError:
                 print(f"--port needs a number, got {args[index + 1]!r}", file=sys.stderr)
                 return 2
+    # `--open`: start Eugene if it is stopped, wait for it, show it. What
+    # the Start menu entry passes. `--no-icon`: do that and exit, for an
+    # install that asked for no tray icon but still wants a way in.
+    wants_open = "--open" in args
+    wants_icon = "--no-icon" not in args
     if sys.platform != "win32":
         print(
             "The Eugene Plexus tray icon is Windows-only. On Linux and macOS the "
@@ -204,6 +311,26 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    # **The open action runs before the single-instance check**, because
+    # an icon already sitting in the tray is exactly the case where
+    # somebody clicked the Start menu entry to get Eugene back. Refusing
+    # to act because an icon exists would make the entry do nothing in
+    # the state it is most useful in.
+    if wants_open:
+        opened, why = open_and_wait(port)
+        if not opened:
+            print(why, file=sys.stderr)
+            # Not exit 2: Eugene may be fine and only the START failed,
+            # and there is nothing here for a person to correct.
+            return 1
+
+    if not wants_icon:
+        return 0
+
+    # A second icon beside the first is worse than no second process.
+    if not claim_single_instance():
+        return 0
+
     try:
         from ._tray_window import run_message_loop
     except ImportError:

@@ -145,3 +145,141 @@ def test_it_refuses_off_windows_with_a_sentence(capsys) -> None:
 def test_a_bad_port_is_refused_before_anything_else(capsys) -> None:
     assert tray.main(["--port", "not-a-number"]) == 2
     assert "needs a number" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# the way back in (2026-09-19)
+# --------------------------------------------------------------------------- #
+
+
+def test_hiding_the_icon_says_where_it_comes_back_from() -> None:
+    """The one entry here that takes something away.
+
+    Troy, 2026-09-19: *"does it register as a Program the user can run
+    again from the Start menu, since the UI goes with it?"* It did not,
+    and that made this a one-way door -- stop Eugene, hide the icon, and
+    the routes back were services.msc, an elevated Start-Service, or
+    signing out and in. The label carries the fix's visible half.
+    """
+    hide = [label for _, label, _ in tray.menu_for("running") if "Hide" in label]
+    assert hide, "there is no way to dismiss the icon at all"
+    assert "Start menu" in hide[0]
+
+
+def test_open_starts_a_stopped_service_before_showing_it(monkeypatch) -> None:
+    """The Start menu entry's whole job.
+
+    Opening the page is the obvious way back and the one that cannot
+    work: stopping Eugene takes the web UI with it, so the browser gets
+    connection refused. The entry starts it first.
+    """
+    calls: list[str] = []
+    states = iter(["stopped", "running"])
+    monkeypatch.setattr(tray, "query_state", lambda *a, **k: next(states, "running"))
+    monkeypatch.setattr(
+        tray, "start_service", lambda *a, **k: (calls.append("start"), (True, ""))[1]
+    )
+    monkeypatch.setattr(tray, "wait_until_answering", lambda *a, **k: True)
+    monkeypatch.setattr(tray, "open_ui", lambda *a, **k: calls.append("open"))
+
+    ok, why = tray.open_and_wait(8079)
+    assert ok is True, why
+    assert calls == ["start", "open"], "the browser was opened before the service was started"
+
+
+def test_open_does_not_restart_a_service_that_is_already_running(monkeypatch) -> None:
+    """Clicking the entry while Eugene is up just opens it."""
+    calls: list[str] = []
+    monkeypatch.setattr(tray, "query_state", lambda *a, **k: "running")
+    monkeypatch.setattr(
+        tray, "start_service", lambda *a, **k: (calls.append("start"), (True, ""))[1]
+    )
+    monkeypatch.setattr(tray, "open_ui", lambda *a, **k: calls.append("open"))
+
+    assert tray.open_and_wait(8079)[0] is True
+    assert calls == ["open"]
+
+
+def test_open_does_not_show_a_browser_it_could_not_start(monkeypatch) -> None:
+    """A page that says connection refused is worse than a sentence.
+
+    The failure that produces this is `sc start` refused for want of the
+    installer's grant, and its remedy is not in the browser.
+    """
+    opened: list[str] = []
+    monkeypatch.setattr(tray, "query_state", lambda *a, **k: "stopped")
+    monkeypatch.setattr(tray, "start_service", lambda *a, **k: (False, "Access is denied"))
+    monkeypatch.setattr(tray, "open_ui", lambda *a, **k: opened.append("open"))
+
+    ok, why = tray.open_and_wait(8079)
+    assert ok is False
+    assert "denied" in why
+    assert opened == [], "it opened a browser at a service it had just failed to start"
+
+
+def test_open_waits_for_the_agent_rather_than_for_the_scm(monkeypatch) -> None:
+    """`sc start` returning success is not the thing to wait for.
+
+    It means the SCM accepted the request. The agent still has to load
+    its config, recover its key and bring up four children.
+    """
+    waited: list[int] = []
+    states = iter(["stopped", "running"])
+    monkeypatch.setattr(tray, "query_state", lambda *a, **k: next(states, "running"))
+    monkeypatch.setattr(tray, "start_service", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(
+        tray, "wait_until_answering", lambda port, *a, **k: (waited.append(port), True)[1]
+    )
+    monkeypatch.setattr(tray, "open_ui", lambda *a, **k: None)
+
+    tray.open_and_wait(8179)
+    assert waited == [8179]
+
+
+def test_a_second_icon_is_not_added_beside_the_first(monkeypatch) -> None:
+    """The Start menu entry's job is to bring the icon BACK.
+
+    Without a guard, clicking it while an icon is already there puts a
+    second one beside it -- every time.
+    """
+    import sys as _sys
+
+    if _sys.platform != "win32":
+        pytest.skip("the mutex is a Windows object")
+    name = "EugenePlexusTrayTestGuard"
+    first = tray.claim_single_instance(name)
+    second = tray.claim_single_instance(name)
+    assert first is True
+    assert second is False, "a second instance claimed the icon too"
+
+
+def test_open_runs_even_when_an_icon_is_already_showing(monkeypatch) -> None:
+    """Which is exactly when somebody clicks the Start menu entry.
+
+    Refusing to act because an icon exists would make the entry do
+    nothing in the state it is most useful in -- Eugene stopped, icon
+    still sitting there.
+    """
+    acted: list[str] = []
+    monkeypatch.setattr(
+        tray, "open_and_wait", lambda *a, **k: (acted.append("open"), (True, ""))[1]
+    )
+    monkeypatch.setattr(tray, "claim_single_instance", lambda *a, **k: False)
+
+    assert tray.main(["--open", "--port", "8079"]) == 0
+    assert acted == ["open"], "the open action was skipped because an icon was already there"
+
+
+def test_no_icon_does_the_open_and_leaves(capsys, monkeypatch) -> None:
+    """For an install that asked for no tray icon but still wants a way in."""
+    acted: list[str] = []
+    monkeypatch.setattr(
+        tray, "open_and_wait", lambda *a, **k: (acted.append("open"), (True, ""))[1]
+    )
+
+    def refuse(*a, **k):
+        raise AssertionError("it claimed the single-instance mutex with --no-icon")
+
+    monkeypatch.setattr(tray, "claim_single_instance", refuse)
+    assert tray.main(["--open", "--no-icon"]) == 0
+    assert acted == ["open"]
