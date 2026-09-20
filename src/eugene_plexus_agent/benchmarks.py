@@ -7,7 +7,6 @@ import contextlib
 import json
 import logging
 import math
-import os
 import re
 import subprocess
 from datetime import UTC, datetime
@@ -343,7 +342,7 @@ class Benchmarks:
                 env=env,
                 cwd=str(Path(argv[0]).parent),
                 limit=MAX_OUTPUT,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 **orphan_kill.kwargs_for_platform(),
             )
             win_job = orphan_kill.windows_job()

@@ -62,7 +62,7 @@ def prepare_binary(body: BenchmarkRequest, get_config):  # type: ignore[no-untyp
         timeout=15,
         env=child_environment(),
         cwd=binary.parent,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if probe.returncode:
         raise ValueError(
