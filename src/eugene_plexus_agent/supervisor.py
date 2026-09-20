@@ -396,9 +396,11 @@ class _ComponentPlanner:
         # the single-host trust model M5 exists to replace.
         if self._auth_state is not None and self.entry.kind not in _TRUST_ROOT_KINDS:
             kind_value = self.entry.kind.value  # "gateway", "inference-driver"
-            env[f"{prefix}_AUTH_SIGNING_KEY"] = base64.b64encode(
-                self._auth_state.signing_key
-            ).decode("ascii")
+            key = self._auth_state.signing_key
+            suffix = "AUTH_SIGNING_KEY" if len(key) == 32 else "AUTH_VERIFY_KEY"
+            env[f"{prefix}_{suffix}"] = base64.b64encode(security.verification_key(key)).decode(
+                "ascii"
+            )
             env[f"{prefix}_SERVICE_TOKEN"] = security.issue_service_token(
                 signing_key=self._auth_state.signing_key,
                 kind=kind_value,

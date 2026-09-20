@@ -273,8 +273,11 @@ async def test_auth_state_threads_signing_key_and_service_token(
     await sp.stop()
 
     env = captured["env"]
-    # Signing key is the shared base64-encoded HMAC key.
-    assert base64.b64decode(env["EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY"]) == auth.signing_key
+    # The child gets only the public verification half.
+    assert "EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY" not in env
+    assert base64.b64decode(
+        env["EUGENE_PLEXUS_DRIVER_AUTH_VERIFY_KEY"]
+    ) == security.verification_key(auth.signing_key)
     # Service token must validate against the same signing key with the
     # correct service audience.
     payload = security.decode_token(

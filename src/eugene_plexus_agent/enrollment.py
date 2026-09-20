@@ -45,7 +45,7 @@ from typing import Any
 
 import httpx
 
-from . import __version__
+from . import __version__, security
 from ._http import internal_client
 from .node_identity import (
     NodeIdentityStore,
@@ -127,7 +127,11 @@ def decode_signing_key(value: str) -> bytes | None:
         raw = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError):
         return None
-    return raw if len(raw) == 32 else None
+    try:
+        security.validate_signing_key(raw)
+    except (ValueError, TypeError):
+        return None
+    return raw
 
 
 async def resolve_advertise_url(
@@ -233,7 +237,9 @@ async def perform_enrollment(
         raise _malformed(control_url, f"`epoch` is {epoch!r}")
     signing_key = decode_signing_key(signing_key_b64) if isinstance(signing_key_b64, str) else None
     if signing_key is None:
-        raise _malformed(control_url, "`signingKey` is not 32 base64 bytes")
+        raise _malformed(
+            control_url, "`signingKey` must be base64 Ed25519 private PEM or a legacy 32-byte key"
+        )
 
     store.record_enrollment(
         name=granted_name,

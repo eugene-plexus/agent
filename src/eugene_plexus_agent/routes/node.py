@@ -191,7 +191,11 @@ def _decode_signing_key(value: str) -> bytes | None:
         raw = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError):
         return None
-    return raw if len(raw) == 32 else None
+    try:
+        security.validate_signing_key(raw)
+    except (ValueError, TypeError):
+        return None
+    return raw
 
 
 # --------------------------------------------------------------------------- #
@@ -463,7 +467,7 @@ async def rekey_node(request: Request, body: RekeyRequest) -> NodeIdentity:
             status.HTTP_400_BAD_REQUEST,
             "malformed-signing-key",
             "Malformed signing key",
-            "`signingKey` must be 32 bytes, base64.",
+            "`signingKey` must be base64 Ed25519 private PEM or a legacy 32-byte key.",
         )
 
     try:

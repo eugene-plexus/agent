@@ -1,37 +1,7 @@
-"""v0.2 security primitives for the agent.
-
-The agent is the install's trust root. This module owns:
-
-  - **Passphrase verification** via Argon2id. The operator's passphrase
-    set in the first-run wizard is hashed (Argon2id) and stored in
-    `agent.yaml`. Login compares against this hash.
-
-  - **Master-key derivation** via Argon2id raw mode. The same
-    passphrase, with a separately-stored salt, deterministically
-    derives a 32-byte key the agent uses to encrypt sensitive
-    config fields on each child component (libsodium secretbox).
-    The master key NEVER lands on disk in plaintext — it lives in
-    process memory after derivation, and (optionally) in the OS
-    secret store when `securityMode == os_keyring`.
-
-  - **Session token issuance + validation** via JWT-HS256. The
-    agent generates a per-restart signing key, distributes it to
-    spawned children via env var, and every component validates
-    bearer tokens independently using the shared key. Restarting
-    the agent rotates signing keys which invalidates all
-    existing tokens — good-enough revocation for v0.2.
-
-  - **Service token issuance** for component-internal calls.
-    Same JWT shape as session tokens; different `aud` claim
-    (`service:<kind>`) so a leaked service token can't be used
-    against the UI surface and vice versa.
-
-  - **At-rest envelope encryption** via libsodium secretbox.
-    `seal()` produces `MasterKeyEnvelope` records; `open()` inverts.
-    Used by children to encrypt apiKey-style fields on disk; the
-    agent itself doesn't store anything sensitive that needs
-    this (the master key is in memory, the passphrase hash isn't
-    reversible).
+"""Token minter for the install: Ed25519 for new keys and rotations.
+Trusted agents/control retain private PEM; children receive public PEM.
+Existing 32-byte HS256 keys remain usable until an explicit rotation.
+The token-signing key is independent of the master encryption key.
 """
 
 from __future__ import annotations
@@ -49,6 +19,8 @@ import jwt
 import nacl.exceptions
 import nacl.secret
 import nacl.utils
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 log = logging.getLogger(__name__)
 
@@ -61,11 +33,43 @@ _ARGON2_MEMORY_COST = 65_536  # KiB
 _ARGON2_PARALLELISM = 4
 _ARGON2_HASH_LEN = 32  # bytes — drives the secretbox key length
 
-# JWT algorithm + lifetime. HS256 because the signing key is shared
-# with children that need to validate independently; asymmetric
-# would force every child to do a agent roundtrip or hold a
-# public key, neither of which simplifies the v0.2 model.
-_JWT_ALG = "HS256"
+
+def validate_signing_key(key: bytes) -> None:
+    """Minters accept Ed25519 PKCS8 PEM or the existing legacy HMAC key."""
+    if len(key) == 32:
+        return
+    parsed = serialization.load_pem_private_key(key, password=None)
+    if not isinstance(parsed, Ed25519PrivateKey):
+        raise ValueError("token signing requires an Ed25519 private key")
+
+
+def signing_algorithm(key: bytes) -> str:
+    validate_signing_key(key)
+    return "HS256" if len(key) == 32 else "EdDSA"
+
+
+def verification_key(key: bytes) -> bytes:
+    """Validate public Ed25519 PEM, or an explicitly legacy 32-byte HMAC key."""
+    if len(key) == 32:
+        return key
+    if key.startswith(b"-----BEGIN PRIVATE KEY-----"):
+        parsed_private = serialization.load_pem_private_key(key, password=None)
+        if not isinstance(parsed_private, Ed25519PrivateKey):
+            raise ValueError("token signing requires an Ed25519 private key")
+        key = parsed_private.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+    parsed = serialization.load_pem_public_key(key)
+    if not isinstance(parsed, Ed25519PublicKey):
+        raise ValueError("token verification requires an Ed25519 public key")
+    return key
+
+
+def verification_algorithm(key: bytes) -> str:
+    """Select from trusted key material, never an untrusted JWT header."""
+    return "HS256" if len(key) == 32 else "EdDSA"
+
+
 _DEFAULT_SESSION_TTL_SECONDS = 14 * 24 * 3600  # 14 days
 
 # Audience claim values.
@@ -259,13 +263,12 @@ class TokenPayload:
 
 
 def generate_signing_key() -> bytes:
-    """32 random bytes — used as the HMAC key for JWT signing.
-
-    The agent generates one of these at every startup and
-    distributes it to children via env var. Restarting the
-    agent rotates the key, invalidating all existing tokens
-    (good-enough v0.2 revocation)."""
-    return secrets.token_bytes(32)
+    """New installs and explicit rotations use Ed25519, never a new HMAC key."""
+    return Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
 
 
 def issue_operator_token(
@@ -289,7 +292,7 @@ def issue_operator_token(
         "iat": issued_at,
         "exp": expires_at,
     }
-    token = jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
+    token = jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
     return token, expires_at
 
 
@@ -322,7 +325,7 @@ def issue_service_token(
         "iat": issued_at,
         "exp": expires_at,
     }
-    return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
+    return jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
 
 
 def issue_client_token(
@@ -358,7 +361,7 @@ def issue_client_token(
         "exp": expires_at,
         "jti": key_id,
     }
-    token = jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
+    token = jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
     return token, expires_at
 
 
@@ -423,8 +426,8 @@ def decode_token(
     """
     options: dict[str, Any] = {"require": ["sub", "aud", "iat", "exp"]}
     decode_kwargs: dict[str, Any] = {
-        "key": signing_key,
-        "algorithms": [_JWT_ALG],
+        "key": verification_key(signing_key),
+        "algorithms": [verification_algorithm(signing_key)],
         "options": options,
     }
     if expected_audience is not None:

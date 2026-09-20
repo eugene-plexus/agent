@@ -81,6 +81,8 @@ import nacl.public
 import nacl.signing
 import yaml
 
+from . import security
+
 log = logging.getLogger(__name__)
 
 NODE_FILE = "node.yaml"
@@ -379,7 +381,11 @@ class IdentityRecord:
             raw = base64.b64decode(self.signing_key, validate=True)
         except (binascii.Error, ValueError):
             return None
-        return raw if len(raw) == 32 else None
+        try:
+            security.validate_signing_key(raw)
+        except (ValueError, TypeError):
+            return None
+        return raw
 
 
 _FIELDS: tuple[tuple[str, str], ...] = (
@@ -622,6 +628,11 @@ class NodeIdentityStore:
                     f"node holds generation {self._record.signing_key_id!r}. A lower generation at "
                     f"the same epoch is a replayed rotation."
                 )
+            held_key = self._record.signing_key_bytes
+            offered_key = base64.b64decode(signing_key, validate=True)
+            security.validate_signing_key(offered_key)
+            if held_key is not None and len(held_key) != 32 and len(offered_key) == 32:
+                raise FencedError("refusing an HS256 downgrade after this node adopted Ed25519")
             changed = signing_key != self._record.signing_key
             self._record = replace(
                 self._record,

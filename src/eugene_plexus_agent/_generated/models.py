@@ -558,7 +558,7 @@ class AuthLoginResponse(BaseModel):
 
     sessionToken: str = Field(
         ...,
-        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`.\n',
+        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`. New installs and key rotations use JWT\n`alg: EdDSA` with Ed25519. Existing HS256 installs retain\ntheir 32-byte key until explicit rotation. Agent and control\nhold private signing keys; gateway, library and driver hold\npublic verification keys after migration. Verifiers select\nexactly one algorithm from trusted key material, not from\ntoken headers. Rotation invalidates all prior tokens;\nthere is no simultaneous HS256/EdDSA acceptance window.\n',
     )
     expiresAt: AwareDatetime
     operatorName: str | None = Field(
@@ -995,7 +995,7 @@ class RekeyRequest(BaseModel):
 
     signingKey: str = Field(
         ...,
-        description="The install's service-token signing key, base64. During a\npromotion's announcement this is the key the agent already\nholds.\n",
+        description="Base64 of the install's unencrypted Ed25519 private key in\nPKCS8 PEM format. Trusted agents mint operator, service and\nclient JWTs with `alg: EdDSA`; verifier children receive only\nthe corresponding SubjectPublicKeyInfo public PEM through\n`AUTH_VERIFY_KEY`. The master encryption key is separate.\nDuring upgrade, an existing 32-byte HS256 key is accepted\nuntil rotation. A node that has adopted Ed25519 refuses an\nHS256 downgrade, even at a higher epoch or generation.\nThe algorithm is determined by trusted key material, never\nthe incoming JWT header. Promotion announces the held key;\nexplicit rotation generates Ed25519 and invalidates old tokens.\n",
     )
     signingKeyId: str = Field(
         ..., description="The key's generation, as `Snapshot.signingKeyId` names it."

@@ -91,8 +91,14 @@ only library and inference-driver receive the master encryption key. `spawn.env`
 cannot override credential wiring, and runtime `env` cannot reintroduce Plexus
 variables even with the expert switch enabled. Backend credentials, proxy settings,
 and accelerator variables are preserved. This is an inheritance boundary, not an
-OS sandbox: executables still run as the agent's user. Asymmetric token signing
-and its migration are the remaining R7 work.
+OS sandbox: executables still run as the agent's user.
+
+New installs and signing-key rotations use Ed25519. Agent and control retain
+private signing material; gateway, library and driver receive public verification
+PEM through `AUTH_VERIFY_KEY`. Existing installs keep HS256 until an explicit
+control-root key rotation. Update all components and standby roots before rotating;
+then log in again and replace client keys. Enrollment survives the switch.
+See the [migration contract](https://github.com/eugene-plexus/specs/blob/main/docs/design/r7-asymmetric-signing.md).
 
 As of **2026-09-11**: llama.cpp lifecycle and admission passed the M6 live run;
 **vLLM ran for real** in WSL2 on an RTX 5090 with no change to the adapter

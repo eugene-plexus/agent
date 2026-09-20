@@ -2,10 +2,9 @@
 
 Holds runtime secrets the agent should never persist:
 
-  * `signing_key` — 32 random bytes generated at every startup. HMAC
-    signs all JWTs (session + service tokens). Rotating at every
-    restart effectively revokes all outstanding tokens (good-enough
-    v0.2 revocation).
+  * `signing_key` — Ed25519 private PEM, or the retained legacy HMAC
+    key until rotation. Enrolled agents restore the install's key from
+    node.yaml; only unenrolled agents generate a key at startup.
   * `master_key` — 32 bytes derived from the operator's passphrase
     via Argon2id. Encrypts apiKey-style fields on each child's disk.
     Threaded to spawned children via env var at startup.
@@ -26,12 +25,14 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
+from . import security
+
 
 @dataclass
 class AuthState:
     """Per-process auth state. NOT persisted; rebuilt at every startup."""
 
-    # HMAC signing key for all JWTs. Random per restart on an agent that
+    # Private signing material for all JWTs. New per restart on an agent that
     # has not enrolled; the INSTALL'S key, persisted in node.yaml and
     # adopted at boot, on one that has (M7). Replaced in place by
     # enrollment and by a signed re-key from the control root — the
@@ -66,8 +67,7 @@ class AuthState:
         control root rotates it. Every token this agent minted under the
         previous key stops verifying here, which is the point of a
         rotation and the price of enrollment."""
-        if len(key) != 32:
-            raise ValueError("signing key must be 32 bytes")
+        security.validate_signing_key(key)
         with self._lock:
             self.signing_key = key
 

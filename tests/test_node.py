@@ -510,6 +510,18 @@ def test_a_signed_rekey_is_adopted_and_children_restart(
     assert control.signing_key_b64 not in text
 
 
+def test_rekey_cannot_downgrade_an_asymmetric_node(authed_client, control):
+    assert _enroll(authed_client, control).status_code == 200
+    held = _auth(authed_client).signing_key
+    response = authed_client.post(
+        "/v1/node/rekey", json=control.rekey(signing_key=b"L" * 32, key_id="99", epoch=99)
+    )
+    assert response.status_code == 409
+    assert "HS256" in response.text
+    assert _auth(authed_client).signing_key == held
+    assert _restarts(authed_client) == 1
+
+
 def test_a_rekey_with_a_bad_signature_is_401_and_changes_nothing(
     authed_client: TestClient, control: FakeControl
 ) -> None:
