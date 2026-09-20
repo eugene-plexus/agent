@@ -34,6 +34,82 @@ from eugene_plexus_agent.__main__ import build_server
 from eugene_plexus_agent.settings import Settings
 
 
+@pytest.mark.skipif(not winservice.PYWIN32_AVAILABLE, reason="Windows service loader")
+def test_service_host_loads_from_a_venv_without_python_on_path(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    """Load the real host, but name a nonexistent service: no SCM writes/start."""
+    import ctypes
+    import os
+    import shutil
+    import subprocess
+
+    import win32service
+
+    prefix = tmp_path / "isolated venv"
+    site = prefix / "Lib" / "site-packages"
+    site.mkdir(parents=True)
+    (prefix / "pyvenv.cfg").write_text(
+        f"home = {sys.base_prefix}\ninclude-system-site-packages = false\n", encoding="utf-8"
+    )
+    installed_site = Path(win32service.__file__).parent.parent
+    (site / "probe.pth").write_text(
+        "\n".join(
+            str(p) for p in (installed_site, installed_site / "win32", installed_site / "win32/lib")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Earlier pywin32 registration can move the wheel's host to the venv root.
+    packaged = Path(win32service.__file__).with_name("pythonservice.exe")
+    if not packaged.is_file():
+        packaged = Path(sys.prefix) / "pythonservice.exe"
+    shutil.copy2(packaged, prefix / "pythonservice.exe")
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    host = winservice._prepare_service_host()
+    assert host.parent == prefix / "Scripts"
+    env = {
+        k: v for k, v in os.environ.items() if not k.upper().startswith(("PYTHON", "EUGENE_PLEXUS"))
+    }
+    env["PATH"] = str(Path(os.environ["SYSTEMROOT"]) / "System32")
+    old_mode = ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)
+    try:
+        result = subprocess.run(
+            [str(host), "-debug", "__EP_NONEXISTENT_LOADER_TEST__"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            timeout=20,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    finally:
+        ctypes.windll.kernel32.SetErrorMode(old_mode)
+    output = result.stdout.decode("utf-16-le", errors="replace")
+    assert result.returncode == 0, (hex(result.returncode & 0xFFFFFFFF), result.stderr)
+    assert "Debugging service __EP_NONEXISTENT_LOADER_TEST__" in output
+    assert "PythonClass" in output  # reaches the expected missing registry entry
+
+
+@pytest.mark.skipif(not winservice.PYWIN32_AVAILABLE, reason="Windows service registration")
+def test_registration_uses_prepared_host_and_propagates_scm_error(tmp_path, monkeypatch):  # type: ignore[no-untyped-def]
+    import win32serviceutil
+
+    host = tmp_path / "Scripts" / "pythonservice.exe"
+    monkeypatch.setattr(winservice.service_class(), "_exe_name_", None, raising=False)
+    monkeypatch.setattr(winservice, "_is_elevated", lambda: True)
+    monkeypatch.setattr(winservice, "_prepare_service_host", lambda: host)
+    observed = []
+
+    def handle(cls, argv):
+        observed.append((cls._exe_name_, argv[-1]))
+        return 5
+
+    monkeypatch.setattr(win32serviceutil, "HandleCommandLine", handle)
+    monkeypatch.setattr(winservice, "_service_exists", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        winservice.main(["update"])
+    assert exc.value.code == 5
+    assert observed == [(str(host), "update")]
+
+
 def test_module_imports_off_windows() -> None:
     """Importable everywhere, so it can be checked everywhere.
 

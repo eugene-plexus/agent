@@ -50,8 +50,10 @@ not have. `install.ps1 -Verify` prints the two commands that close it.
 from __future__ import annotations
 
 import logging
+import shutil
 import sys
 import threading
+from pathlib import Path
 from typing import Any
 
 SERVICE_NAME = "EugenePlexusAgent"
@@ -239,7 +241,7 @@ def main(argv: list[str] | None = None) -> None:
     # still exists when nothing is running it as a script.
     from eugene_plexus_agent import winservice as canonical
 
-    cls = canonical.service_class()
+    cls: Any = canonical.service_class()
 
     if len(argv) == 1:
         # No arguments is how the SCM starts us: it expects the process
@@ -260,7 +262,11 @@ def main(argv: list[str] | None = None) -> None:
     if command in {"install", "update", "remove"} and not _is_elevated():
         raise SystemExit(_elevation_message(command))
 
-    win32serviceutil.HandleCommandLine(cls, argv=argv)
+    if command in {"install", "update"}:
+        cls._exe_name_ = str(_prepare_service_host())
+    result = win32serviceutil.HandleCommandLine(cls, argv=argv)
+    if result:
+        raise SystemExit(result)
 
     # **`HandleCommandLine` reports failure by printing and exiting 0.**
     # Measured, 2026-09-11: an unelevated `install` prints "Error
@@ -272,6 +278,40 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(_elevation_message(command))
     if command == "remove" and _service_exists():
         raise SystemExit(f"The {SERVICE_NAME} service is still registered after 'remove'.")
+
+
+def _prepare_service_host() -> Path:
+    """Keep the service executable and its loader dependencies in this venv.
+
+    pywin32's default puts the host in the venv root, where Python 3.12
+    does not discover pyvenv.cfg. It also lacks the managed Python DLL.
+    Scripts is the venv executable directory; explicit exeName avoids
+    pywin32 moving the host or writing a helper beside a shared interpreter.
+    """
+    _require_pywin32()
+    import win32api
+
+    target = Path(sys.prefix) / "Scripts"
+    target.mkdir(parents=True, exist_ok=True)
+    packaged = Path(win32service.__file__).with_name("pythonservice.exe")
+    host = target / "pythonservice.exe"
+    # An earlier pywin32 registration may have MOVED the wheel's host.
+    if not packaged.is_file():
+        packaged = Path(sys.prefix) / "pythonservice.exe"
+    if packaged.is_file():
+        shutil.copy2(packaged, host)
+    elif not host.is_file():
+        raise FileNotFoundError("pywin32's pythonservice.exe is missing; reinstall pywin32")
+    if sys.platform != "win32":  # pragma: no cover - _require_pywin32 rejects this
+        raise RuntimeError("Windows service host requires Windows")
+    runtime = Path(win32api.GetModuleFileName(sys.dllhandle))
+    helper = Path(win32serviceutil.pywintypes.__file__)
+    # Some Python distributions ship the CRT privately, outside system PATH.
+    for dependency in (runtime, helper, *runtime.parent.glob("vcruntime*.dll")):
+        destination = target / dependency.name
+        if dependency.resolve() != destination.resolve():
+            shutil.copy2(dependency, destination)
+    return host
 
 
 def _is_elevated() -> bool:
