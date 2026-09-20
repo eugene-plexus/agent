@@ -42,6 +42,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 from urllib.parse import urlparse
 
@@ -305,6 +306,20 @@ class SpawnPlanner(Protocol):
         return None
 
 
+def _component_python() -> str:
+    """Use this venv's interpreter when hosted by the Windows service.
+
+    pythonservice.exe embeds Python but cannot execute ``-m`` commands.
+    Never substitute an unrelated interpreter from PATH.
+    """
+    if Path(sys.executable).name.lower() != "pythonservice.exe":
+        return sys.executable
+    python = Path(sys.prefix) / "Scripts" / "python.exe"
+    if not python.is_file():
+        raise SpawnPlanError(f"The service's Python interpreter is missing: {python}")
+    return str(python)
+
+
 class _ComponentPlanner:
     """Launch plans for one Eugene Plexus component.
 
@@ -436,7 +451,7 @@ class _ComponentPlanner:
         env["PYTHONUNBUFFERED"] = "1"
 
         return SpawnPlan(
-            argv=[sys.executable, "-m", spec.module],
+            argv=[_component_python(), "-m", spec.module],
             env=env,
             degraded=degraded,
             port=port,

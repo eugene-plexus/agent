@@ -79,7 +79,9 @@ HOP_HEADER = "x-eugene-plexus-proxy-hop"
 # The lookup must be brisk. A component page that has to wait out the
 # proxy's own ten-second connect budget before it can say "the control
 # root is unreachable" is worse than one that says it in two.
-_LOOKUP_TIMEOUT = httpx.Timeout(connect=2.0, read=5.0, write=5.0, pool=2.0)
+# Control's default fan-out waits five seconds for an unreachable node.
+# The read budget must leave room for its useful partial result to arrive.
+_LOOKUP_TIMEOUT = httpx.Timeout(connect=2.0, read=10.0, write=5.0, pool=2.0)
 
 _HIT_TTL_SECONDS = 30.0
 # Shorter, so an install that has just come back does not keep answering
@@ -237,7 +239,7 @@ class InstallTopology:
                 expires_at=0.0,
                 error=(
                     f"The control root at {control_url} did not answer, so this node cannot "
-                    f"find out where the rest of the install is: {exc}"
+                    f"find out where the rest of the install is: {str(exc) or type(exc).__name__}"
                 ),
             )
 

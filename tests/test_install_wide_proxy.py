@@ -16,8 +16,12 @@ it. One address per node is the thing the install already maintains.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import threading
+import time
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import httpx
@@ -299,6 +303,57 @@ def test_a_loopback_registry_entry_is_explained_not_dialled(
     assert "advertises http://127.0.0.1:8079/" in detail(response)
     assert "`advertiseUrl`" in detail(response)
     assert upstream.requests == []
+
+
+async def test_partial_topology_arrives_after_a_node_times_out() -> None:
+    """Real socket: mock transports do not enforce HTTP read deadlines."""
+
+    class RootHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/v1/components":
+                time.sleep(5.2)  # control's default five-second fan-out plus transit
+                body = {
+                    "components": [{"node": "root", "name": "gateway", "kind": "gateway"}],
+                    "unreachableNodes": ["worker"],
+                }
+            else:
+                body = {"nodes": [{"name": "root", "url": "http://root.invalid:8279/"}]}
+            self.send_response(200)
+            self.end_headers()
+            with contextlib.suppress(OSError):
+                self.wfile.write(json.dumps(body).encode())
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), RootHandler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            owner = await install_proxy.InstallTopology().owner_of(
+                "gateway",
+                control_url=f"http://127.0.0.1:{server.server_port}",
+                authorization=None,
+                transport=None,
+            )
+            assert owner.name == "root"
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
+
+def test_empty_timeout_names_the_failure(
+    app: FastAPI,
+    client: TestClient,
+) -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    app.state.control_transport = httpx.MockTransport(fail)
+    enroll(app)
+    response = client.get("/api/proxy/gateway/v1/models")
+    assert response.status_code == 503
+    assert "ReadTimeout" in detail(response)
 
 
 def test_an_unreachable_control_root_says_so(

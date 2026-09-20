@@ -16,7 +16,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -88,6 +90,37 @@ def driver_entry() -> ComponentEntry:
         spawn=SpawnConfig(configFile="/tmp/left/config.yaml"),
         safeMode=False,
     )
+
+
+def test_service_spawns_with_its_venv_python(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows service interpreter")
+    from eugene_plexus_agent.supervisor import _component_python
+
+    monkeypatch.setattr(sys, "executable", str(Path(sys.prefix) / "Scripts/pythonservice.exe"))
+    result = subprocess.run(
+        [_component_python(), "-c", "import sys; print(sys.prefix)"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    assert Path(result.stdout.strip()) == Path(sys.prefix)
+    sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"))
+    assert sp._planner.plan().argv[0] == _component_python()
+
+
+def test_service_missing_python_does_not_fall_back_to_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_agent.supervisor import _component_python
+
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "pythonservice.exe"))
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    with pytest.raises(SpawnPlanError, match="interpreter is missing"):
+        _component_python()
 
 
 async def test_spawn_invokes_correct_command_and_env(
