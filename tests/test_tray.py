@@ -13,6 +13,7 @@ granted the right.
 from __future__ import annotations
 
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -260,6 +261,8 @@ def test_open_runs_even_when_an_icon_is_already_showing(monkeypatch) -> None:
     nothing in the state it is most useful in -- Eugene stopped, icon
     still sitting there.
     """
+    # Exercise Windows command routing on Linux without changing global sys.
+    monkeypatch.setattr(tray, "sys", SimpleNamespace(platform="win32"))
     acted: list[str] = []
     monkeypatch.setattr(
         tray, "open_and_wait", lambda *a, **k: (acted.append("open"), (True, ""))[1]
@@ -272,6 +275,7 @@ def test_open_runs_even_when_an_icon_is_already_showing(monkeypatch) -> None:
 
 def test_no_icon_does_the_open_and_leaves(capsys, monkeypatch) -> None:
     """For an install that asked for no tray icon but still wants a way in."""
+    monkeypatch.setattr(tray, "sys", SimpleNamespace(platform="win32"))
     acted: list[str] = []
     monkeypatch.setattr(
         tray, "open_and_wait", lambda *a, **k: (acted.append("open"), (True, ""))[1]

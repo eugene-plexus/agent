@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -477,7 +478,9 @@ def test_console_detection_uses_the_probe_that_does_not_lie() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_ensure_console_is_a_no_op_where_there_is_already_one() -> None:
+def test_ensure_console_is_a_no_op_where_there_is_already_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Idempotent, and it must not allocate a second console.
 
     `SvcDoRun` calls it unconditionally; so would anything else that
@@ -490,12 +493,9 @@ def test_ensure_console_is_a_no_op_where_there_is_already_one() -> None:
         calls.append("asked")
         return True
 
-    original = process_signals.console_attached
-    process_signals.console_attached = fake_attached  # type: ignore[assignment]
-    try:
-        assert process_signals.ensure_console() is True
-    finally:
-        process_signals.console_attached = original  # type: ignore[assignment]
+    monkeypatch.setattr(process_signals, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(process_signals, "console_attached", fake_attached)
+    assert process_signals.ensure_console() is True
     assert calls == ["asked"], "it allocated without checking first"
 
 

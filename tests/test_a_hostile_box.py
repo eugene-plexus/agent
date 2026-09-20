@@ -382,7 +382,9 @@ def test_a_fresh_install_whose_file_never_held_a_passphrase_still_sets_up(
 # --------------------------------------------------------------------------- #
 
 
-def test_seeding_declares_a_port_nothing_is_holding(tmp_path: Path) -> None:
+def test_seeding_declares_a_port_nothing_is_holding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """8080 is the commonest occupied port on any development box.
 
     Seeded onto it, the wizard completes, the gateway never comes up,
@@ -391,6 +393,8 @@ def test_seeding_declares_a_port_nothing_is_holding(tmp_path: Path) -> None:
     companion driver's port, applied to the three components nobody
     chose.
     """
+    # CI installs only this repo. Package discovery is not the port policy.
+    monkeypatch.setattr(default_topology, "is_installed", lambda module: True)
     held = socket.socket()
     try:
         held.bind(("127.0.0.1", 8080))
@@ -411,10 +415,13 @@ def test_seeding_declares_a_port_nothing_is_holding(tmp_path: Path) -> None:
         held.close()
 
 
-def test_seeding_keeps_the_default_port_when_it_is_free(tmp_path: Path) -> None:
+def test_seeding_keeps_the_default_port_when_it_is_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The walk is a fallback, never a preference. Every doc, the UI's
     guessed base URL and every acceptance script assume the specs'
     `servers` defaults, so a free 8080 must still be 8080."""
+    monkeypatch.setattr(default_topology, "is_installed", lambda module: True)
     state = AgentState(tmp_path / "agent.yaml")
     state.load()
     default_topology.seed(state)
