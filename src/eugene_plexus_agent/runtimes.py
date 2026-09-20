@@ -389,7 +389,7 @@ class RuntimeSupervisor:
         planner = _RuntimePlanner(
             spec, adapter, self._log, self._get_config, inherited_rules=self._inherited_rules
         )
-        sp = SupervisedProcess(planner, self._log)
+        sp = SupervisedProcess(planner, self._log, stop_on_startup_crash=True)
         self._planners[spec.name] = planner
         self._processes[spec.name] = sp
         self._stop_reasons.pop(spec.name, None)
@@ -848,11 +848,21 @@ class RuntimeSupervisor:
         sp = self._processes.get(spec.name)
         if sp is None or spec.port is None:
             return
+        if sp.pid is None:
+            self._readiness.pop(spec.name, None)
+            return
         adapter = adapter_for(spec.engine)
         if adapter is None:
             return
+        started_at = sp.last_restart
         base = f"http://{spec.host or '127.0.0.1'}:{spec.port}"
         outcome = await adapter.probe_readiness(base)
+        if (
+            self._processes.get(spec.name) is not sp
+            or sp.last_restart != started_at
+            or sp.pid is None
+        ):
+            return
         # The probe saw the network. This is where what the supervisor
         # knows — the pid is alive, and for how long — is added: for an
         # engine that answers nothing while it loads, alive-and-refusing
@@ -866,6 +876,7 @@ class RuntimeSupervisor:
             process_alive=sp.pid is not None,
             elapsed_seconds=elapsed,
         )
+        sp.observe_readiness(isinstance(outcome, Ready))
         if isinstance(outcome, Ready | Loading):
             self._readiness[spec.name] = outcome
         else:

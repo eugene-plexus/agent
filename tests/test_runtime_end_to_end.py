@@ -21,15 +21,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from eugene_plexus_agent._generated.models import Origin, RuntimeSpec, RuntimeStatus
-from eugene_plexus_agent.engines.base import DiscoveredBinary
+from eugene_plexus_agent.engines.base import DiscoveredBinary, Loading, Ready
 from eugene_plexus_agent.engines.llama_cpp import LlamaCppAdapter
 from eugene_plexus_agent.runtimes import RuntimeSupervisor
+
+from .test_supervisor import _FakeProcess
 
 # A minimal llama-server impersonator. Reports `loading model` for its
 # first few polls, then `ok` — so the test observes the real transition
@@ -233,3 +238,269 @@ async def test_stop_releases_the_process(fake_engine: Path) -> None:
         await supervisor.stop_all()
         runtimes_module.ADAPTERS.clear()
         runtimes_module.ADAPTERS.update(original)
+
+
+async def test_a_crash_during_load_is_not_automatically_retried(
+    fake_engine: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_agent import runtimes as runtimes_module
+
+    spec = _spec(8399)
+    adapter = _FakeEngineAdapter(fake_engine, ready_after=0)
+    processes: list[_FakeProcess] = []
+    original_sleep = asyncio.sleep
+
+    async def loading(_base: str) -> Loading:
+        return Loading(detail="reading model from the share")
+
+    async def create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        process = _FakeProcess()
+        processes.append(process)
+        if len(processes) > 1:
+            process._finish(1)
+        return process
+
+    async def short_backoff(seconds: float) -> None:
+        await original_sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(adapter, "probe_readiness", loading)
+    monkeypatch.setitem(runtimes_module.ADAPTERS, spec.engine, adapter)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(asyncio, "sleep", short_backoff)
+    monkeypatch.setattr("eugene_plexus_agent.orphan_kill.windows_job", lambda: None)
+    supervisor = RuntimeSupervisor(log=logging.getLogger("test"))
+    try:
+        supervisor.add_and_start(spec)
+        async with asyncio.timeout(2):
+            while not processes:
+                await original_sleep(0)
+            await supervisor._probe_one(spec)
+            assert supervisor.compose(spec).status == RuntimeStatus.loading
+            processes[0]._finish(1)
+            await supervisor._processes[spec.name]._task
+        assert len(processes) == 1, "a failed model load was repeated without any changed settings"
+        runtime = supervisor.compose(spec)
+        assert runtime.status == RuntimeStatus.crashed
+        assert "before becoming ready" in runtime.lastError
+        assert "restart" in runtime.lastError
+        assert "retry" in runtime.lastError
+        assert runtime.pid is None
+    finally:
+        await supervisor.stop_all()
+
+
+@dataclass
+class _RuntimeHarness:
+    supervisor: RuntimeSupervisor
+    spec: RuntimeSpec
+    adapter: _FakeEngineAdapter
+    spawned: asyncio.Queue[_FakeProcess] = field(default_factory=asyncio.Queue)
+    now: float = 0.0
+    outcome: Loading | Ready | None = None
+    backoffs: list[float] = field(default_factory=list)
+
+    async def next_process(self) -> _FakeProcess:
+        return await asyncio.wait_for(self.spawned.get(), 2)
+
+    async def probe(self, outcome: Loading | Ready | None) -> None:
+        self.outcome = outcome
+        await self.supervisor._probe_one(self.spec)
+
+    async def settled(self) -> None:
+        await asyncio.wait_for(self.supervisor._processes[self.spec.name]._task, 2)
+
+
+@pytest.fixture
+async def controlled_runtime(
+    fake_engine: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[_RuntimeHarness]:
+    from eugene_plexus_agent import runtimes as runtimes_module
+    from eugene_plexus_agent import supervisor as supervisor_module
+
+    harness = _RuntimeHarness(
+        RuntimeSupervisor(log=logging.getLogger("test")),
+        _spec(8399),
+        _FakeEngineAdapter(fake_engine, ready_after=0),
+    )
+    original_sleep = asyncio.sleep
+
+    async def create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        process = _FakeProcess()
+        harness.spawned.put_nowait(process)
+        return process
+
+    async def probe(_base: str) -> Loading | Ready | None:
+        return harness.outcome
+
+    async def backoff(seconds: float) -> None:
+        harness.backoffs.append(seconds)
+        await original_sleep(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(asyncio, "sleep", backoff)
+    monkeypatch.setattr(
+        supervisor_module, "time", SimpleNamespace(perf_counter=lambda: harness.now)
+    )
+    monkeypatch.setattr("eugene_plexus_agent.orphan_kill.windows_job", lambda: None)
+    monkeypatch.setattr(harness.adapter, "probe_readiness", probe)
+    monkeypatch.setitem(runtimes_module.ADAPTERS, harness.spec.engine, harness.adapter)
+    try:
+        harness.supervisor.add_and_start(harness.spec)
+        yield harness
+    finally:
+        await harness.supervisor.stop_all()
+
+
+@pytest.mark.parametrize("seconds", [0.1, 240.0])
+async def test_loading_time_is_not_healthy_uptime(
+    controlled_runtime: _RuntimeHarness, seconds: float
+) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    await harness.probe(Loading(detail="loading model"))
+    harness.now += seconds
+    process._finish(1)
+    await harness.settled()
+    assert harness.spawned.empty()
+    assert harness.backoffs == []
+
+
+async def test_brief_ready_crashes_keep_the_backoff_and_eventually_stop(
+    controlled_runtime: _RuntimeHarness,
+) -> None:
+    harness = controlled_runtime
+    for _ in range(5):
+        process = await harness.next_process()
+        await harness.probe(Ready())
+        harness.now += 1
+        process._finish(1)
+    await harness.settled()
+    assert harness.spawned.empty()
+    assert harness.backoffs == [2.0, 4.0, 6.0, 8.0]
+    assert harness.supervisor.compose(harness.spec).status == RuntimeStatus.crashed
+
+
+@pytest.mark.parametrize("ready_seconds, expected_backoff", [(59.0, 4.0), (60.0, 2.0)])
+async def test_only_stable_ready_time_resets_crash_history(
+    controlled_runtime: _RuntimeHarness, ready_seconds: float, expected_backoff: float
+) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    await harness.probe(Ready())
+    harness.now += 1
+    process._finish(1)
+    process = await harness.next_process()
+    await harness.probe(Loading(detail="long load"))
+    harness.now += 240
+    await harness.probe(Ready())
+    harness.now += ready_seconds / 2
+    await harness.probe(Ready())
+    harness.now += ready_seconds / 2
+    process._finish(1)
+    await harness.next_process()
+    assert harness.backoffs == [2.0, expected_backoff]
+
+
+async def test_lost_readiness_restarts_the_stability_window(
+    controlled_runtime: _RuntimeHarness,
+) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    await harness.probe(Ready())
+    process._finish(1)
+    process = await harness.next_process()
+    await harness.probe(Ready())
+    harness.now += 50
+    await harness.probe(None)
+    harness.now += 100
+    await harness.probe(Ready())
+    harness.now += 20
+    process._finish(1)
+    await harness.next_process()
+    assert harness.backoffs == [2.0, 4.0]
+
+
+async def test_a_fast_replacement_does_not_inherit_the_stability_clock(
+    controlled_runtime: _RuntimeHarness,
+) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    await harness.probe(Ready())
+    harness.now += 1
+    process._finish(1)
+    process = await harness.next_process()
+    harness.now += 240
+    await harness.probe(Ready())
+    harness.now += 1
+    process._finish(1)
+    await harness.next_process()
+    assert harness.backoffs == [2.0, 4.0]
+
+
+async def test_a_replacement_must_earn_its_own_readiness(
+    controlled_runtime: _RuntimeHarness,
+) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    await harness.probe(Ready())
+    process._finish(1)
+    replacement = await harness.next_process()
+    harness.now += 240
+    replacement._finish(1)
+    await harness.settled()
+    assert harness.spawned.empty()
+    assert harness.backoffs == [2.0]
+
+
+async def test_manual_restart_retries_a_terminal_load_failure(
+    controlled_runtime: _RuntimeHarness,
+) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    process._finish(1)
+    await harness.settled()
+    assert await harness.supervisor.restart(harness.spec.name)
+    await harness.next_process()
+    await harness.probe(Ready())
+    assert harness.supervisor.compose(harness.spec).status == RuntimeStatus.ready
+    assert harness.supervisor.compose(harness.spec).lastError is None
+    assert harness.backoffs == []
+
+
+async def test_a_clean_exit_still_respawns(controlled_runtime: _RuntimeHarness) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    process._finish(0)
+    await harness.next_process()
+    assert harness.backoffs == [0.0]
+
+
+async def test_late_ready_probe_cannot_belong_to_a_replacement(
+    controlled_runtime: _RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = controlled_runtime
+    process = await harness.next_process()
+    await harness.probe(Ready())
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed(_base: str) -> Ready:
+        entered.set()
+        await release.wait()
+        return Ready()
+
+    monkeypatch.setattr(harness.adapter, "probe_readiness", delayed)
+    probe = asyncio.create_task(harness.supervisor._probe_one(harness.spec))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        process._finish(1)
+        replacement = await harness.next_process()
+        release.set()
+        await probe
+        replacement._finish(1)
+        await harness.settled()
+        assert harness.spawned.empty()
+        assert harness.backoffs == [2.0]
+    finally:
+        release.set()
+        await probe

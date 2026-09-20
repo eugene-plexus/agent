@@ -70,6 +70,8 @@ _HEALTH_POLL_SECONDS = 1.5
 # /v1/components/<name>/restart to clear the crashed state.
 _CRASH_BACKOFF_THRESHOLD = 5
 
+_STABLE_READY_SECONDS = 60.0
+
 # Successful /healthz probes fire every 1.5s per component and contribute
 # nothing to debugging — they push real signal out of the scrollback. We
 # suppress 2xx healthz lines at the supervisor's output reader (one place,
@@ -485,13 +487,18 @@ class SupervisedProcess:
     called or the planner declines to recover.
     """
 
-    def __init__(self, planner: SpawnPlanner, log: logging.Logger) -> None:
+    def __init__(
+        self, planner: SpawnPlanner, log: logging.Logger, *, stop_on_startup_crash: bool = False
+    ) -> None:
         self._planner = planner
         self._log = log
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
         self._stop_requested = False
         self._consecutive_crashes = 0
+        self._stop_on_startup_crash = stop_on_startup_crash
+        self._was_ready = False
+        self._ready_since: float | None = None
         self._last_port: int | None = None
         """The port the current plan asked for, if the planner knew it.
         Read only when explaining a crash."""
@@ -579,6 +586,8 @@ class SupervisedProcess:
             sent = process_signals.request_stop(proc, name=self.name, logger=self._log)
             self._log.info("restart requested for %s; sent %s to pid %d", self.name, sent, proc.pid)
             await self._escalate_if_still_alive(proc)
+        elif self._task is None or self._task.done():
+            self.start()
 
     async def stop(self) -> None:
         """Stop the supervision loop and ensure the child is dead.
@@ -639,6 +648,15 @@ class SupervisedProcess:
     def pid(self) -> int | None:
         proc = self._proc
         return proc.pid if proc is not None and proc.returncode is None else None
+
+    def observe_readiness(self, ready: bool) -> None:
+        """Track useful uptime for this spawn, not time spent loading its model."""
+        if ready:
+            self._was_ready = True
+            if self._ready_since is None:
+                self._ready_since = time.perf_counter()
+        else:
+            self._ready_since = None
 
     # --- internals ---------------------------------------------------------
 
@@ -735,6 +753,18 @@ class SupervisedProcess:
                 # process for a spawn-less entry. Making `plan() -> None`
                 # a first-class outcome makes it reachable.)
                 return
+            if (
+                self._stop_on_startup_crash
+                and self.state == ProcessState.crashed
+                and not self._was_ready
+            ):
+                self.last_error = (
+                    f"{self.last_error}. Stopped automatic retries because the engine failed "
+                    "before becoming ready. Check its settings and engine log, then restart "
+                    "the runtime to retry."
+                )
+                self._log.error("%s: %s", self.name, self.last_error)
+                return
             if self._consecutive_crashes >= _CRASH_BACKOFF_THRESHOLD:
                 self._log.error(
                     "%s crash threshold reached (last error: %s)",
@@ -749,6 +779,8 @@ class SupervisedProcess:
 
     async def _spawn_once(self) -> None:
         """One spawn / wait / mark-state iteration."""
+        self._was_ready = False
+        self._ready_since = None
         try:
             plan = self._planner.plan()
         except SpawnPlanError as e:
@@ -832,6 +864,7 @@ class SupervisedProcess:
 
         try:
             return_code = await self._proc.wait()
+            exited_at = time.perf_counter()
         finally:
             # Give the reader a moment to drain any final lines the child
             # wrote on its way out, then cancel if it's still hung.
@@ -867,6 +900,11 @@ class SupervisedProcess:
             self.state = ProcessState.exited
             self._consecutive_crashes = 0
         else:
+            if (
+                self._ready_since is not None
+                and exited_at - self._ready_since >= _STABLE_READY_SECONDS
+            ):
+                self._consecutive_crashes = 0
             self._consecutive_crashes += 1
             self.last_error = self._explain_exit(return_code) or (f"exited with code {return_code}")
             # **The explanation goes to the log, not only to the API.**

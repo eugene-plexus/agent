@@ -1683,9 +1683,14 @@ class RuntimeStatus(StrEnum):
       `autoStart: false`. Not an error; the respawn loop is
       suppressed.
     * `exited` — exited cleanly and is being respawned (transient).
-    * `crashed` — exited non-zero repeatedly and the agent has
-      given up. `lastError` and the captured engine output say why;
-      `POST .../restart` retries.
+    * `crashed` — could not be launched, or exited non-zero. If this
+      process never became ready, automatic retries stop immediately
+      rather than repeating a failed model load. After readiness,
+      unexpected non-zero exits retry with back-off up to five
+      consecutive crashes; 60 seconds of continuously observed ready
+      time resets that history. Loading time does not count as useful
+      uptime. `lastError` and the captured engine output say why;
+      `POST .../restart` retries after settings have been corrected.
 
     """
 
