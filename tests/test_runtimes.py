@@ -513,7 +513,12 @@ def test_planner_builds_a_plan_with_argv_cwd_and_accelerator_env(tmp_path: Any) 
             "env": {"CUDA_VISIBLE_DEVICES": "1"},
         }
     )
-    planner = _RuntimePlanner(spec, LlamaCppAdapter(), logging.getLogger("test"))
+    planner = _RuntimePlanner(
+        spec,
+        LlamaCppAdapter(),
+        logging.getLogger("test"),
+        get_config={"engineBinaryRoots": [str(tmp_path)]}.get,
+    )
     plan = planner.plan()
 
     assert plan.argv[0] == str(exe)
@@ -542,7 +547,12 @@ def test_missing_engine_binary_is_a_spawn_plan_error() -> None:
             "binary": "/nope/llama-server",
         }
     )
-    planner = _RuntimePlanner(spec, LlamaCppAdapter(), logging.getLogger("test"))
+    planner = _RuntimePlanner(
+        spec,
+        LlamaCppAdapter(),
+        logging.getLogger("test"),
+        get_config={"engineBinaryRoots": ["/nope"]}.get,
+    )
     with pytest.raises(SpawnPlanError, match="does not exist"):
         planner.plan()
 

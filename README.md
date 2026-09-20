@@ -75,6 +75,25 @@ for enrollment and rekey semantics.
 
 ## Verification Status
 
+### Engine launch boundaries (R7 step 1)
+
+Runtime binaries must resolve inside the managed engine store, an agent Config
+**Trusted engine directories** (`engineBinaryRoots`) entry, or match the engine
+found on PATH or the configured `vllmBinary`. Symlinks are checked after resolution.
+For an existing custom build, add its directory before its next launch. Raw
+`extraArgs` and unrestricted binary paths require the explicit **Allow unrestricted
+engine launch** (`allowUnrestrictedEngineLaunch`) switch in the agent's Config.
+Both settings apply to subsequent launches, including restarts of saved runtimes.
+
+Engine processes and their version/help probes receive no `EUGENE_PLEXUS_*`
+environment variables. Component children receive their own deliberate credentials;
+only library and inference-driver receive the master encryption key. `spawn.env`
+cannot override credential wiring, and runtime `env` cannot reintroduce Plexus
+variables even with the expert switch enabled. Backend credentials, proxy settings,
+and accelerator variables are preserved. This is an inheritance boundary, not an
+OS sandbox: executables still run as the agent's user. Asymmetric token signing
+and its migration are the remaining R7 work.
+
 As of **2026-09-11**: llama.cpp lifecycle and admission passed the M6 live run;
 **vLLM ran for real** in WSL2 on an RTX 5090 with no change to the adapter
 ([record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m4-vllm-run.md)); and enrollment, advertised

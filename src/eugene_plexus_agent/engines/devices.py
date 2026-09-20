@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from .._generated.models import ComputeDevice, ComputeDeviceKind
+from ..child_env import child_environment
 
 log = logging.getLogger(__name__)
 
@@ -80,6 +81,7 @@ def _run(argv: list[str]) -> str | None:
         proc = subprocess.run(
             argv,
             capture_output=True,
+            env=child_environment(),
             text=True,
             timeout=_PROBE_TIMEOUT_SECONDS,
             check=False,

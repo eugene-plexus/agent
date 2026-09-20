@@ -523,7 +523,7 @@ async def check_runtime_admission(request: Request, body: RuntimeSpec) -> Admiss
     nothing; readable with a service token so the gateway can ask it
     before waking a runtime.
     """
-    if (reason := validate_spec(body)) is not None:
+    if (reason := validate_spec(body, request.app.state.agent_state.get_config)) is not None:
         raise _problem(
             code=status.HTTP_400_BAD_REQUEST,
             slug="invalid-runtime-spec",
@@ -551,7 +551,7 @@ async def create_runtime(
     # Validate before persisting: a declaration that can only fail at
     # spawn is worse than a 400, because the failure surfaces minutes
     # later in a log rather than in the form the operator is looking at.
-    if (reason := validate_spec(body)) is not None:
+    if (reason := validate_spec(body, state.get_config)) is not None:
         raise _problem(
             code=status.HTTP_400_BAD_REQUEST,
             slug="invalid-runtime-spec",
@@ -650,7 +650,7 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     supervisor = _supervisor(request)
     components = _component_supervisor(request)
 
-    if (reason := validate_spec(body)) is not None:
+    if (reason := validate_spec(body, state.get_config)) is not None:
         raise _problem(
             code=status.HTTP_400_BAD_REQUEST,
             slug="invalid-runtime-spec",

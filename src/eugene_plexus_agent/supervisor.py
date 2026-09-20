@@ -51,6 +51,7 @@ from . import orphan_kill, ports, process_signals, security
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 from ._http import internal_client
 from .auth_state import AuthState
+from .child_env import child_environment, reserved_override
 
 # How long an exiting child gets to finish flushing before we SIGKILL it
 # during agent shutdown. Long enough for a /v1/admin/restart-style
@@ -366,8 +367,11 @@ class _ComponentPlanner:
                 f"predates it"
             )
 
-        env = os.environ.copy()
         prefix = spec.env_prefix
+        reserved = reserved_override(spawn.env or {}, component_prefix=prefix)
+        if reserved is not None:
+            raise SpawnPlanError(f"spawn.env variable {reserved!r} is reserved for agent wiring")
+        env = child_environment(component_prefix=prefix)
         env[f"{prefix}_CONFIG_FILE"] = str(spawn.configFile)
         port = urlparse(str(self.entry.url)).port
         if port is not None:
@@ -399,7 +403,10 @@ class _ComponentPlanner:
                 signing_key=self._auth_state.signing_key,
                 kind=kind_value,
             )
-            if self._auth_state.master_key is not None:
+            if (
+                kind_value in {"library", "inference-driver"}
+                and self._auth_state.master_key is not None
+            ):
                 env[f"{prefix}_MASTER_KEY"] = base64.b64encode(self._auth_state.master_key).decode(
                     "ascii"
                 )

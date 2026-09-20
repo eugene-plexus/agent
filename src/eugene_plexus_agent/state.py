@@ -153,6 +153,30 @@ CONFIG_FIELDS: list[ConfigField] = [
         enumLabels=["Small", "Medium", "Large"],
     ),
     ConfigField(
+        key="engineBinaryRoots",
+        label="Trusted engine directories",
+        description=(
+            "Allow runtime binaries in these directories, in addition to managed builds, "
+            "the engine found on PATH, and vllmBinary. Symlinks must resolve inside a trusted "
+            "directory. Changes apply on the next launch."
+        ),
+        category="engines",
+        valueType=ConfigValueType.path_list,
+        default=[],
+    ),
+    ConfigField(
+        key="allowUnrestrictedEngineLaunch",
+        label="Allow unrestricted engine launch",
+        description=(
+            "Expert override: allow arbitrary runtime binary paths and raw extraArgs. "
+            "These can execute code as the agent's OS user. Plexus credentials are still "
+            "removed from the child environment. Changes apply on the next launch."
+        ),
+        category="engines",
+        valueType=ConfigValueType.boolean,
+        default=False,
+    ),
+    ConfigField(
         key="vllmBinary",
         label="vLLM binary",
         description=(
@@ -794,6 +818,12 @@ def _validate(field: ConfigField, value: Any) -> str | None:
     if value is None:
         return None
     vt = field.valueType
+    if vt == ConfigValueType.path_list:
+        if not isinstance(value, list) or any(
+            not isinstance(path, str) or not path.strip() for path in value
+        ):
+            return "expected a list of non-empty directory paths"
+        return None
     if vt == ConfigValueType.boolean:
         if not isinstance(value, bool):
             return f"expected boolean, got {type(value).__name__}"

@@ -28,6 +28,7 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimeSpec,
 )
+from ..child_env import child_environment
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -142,6 +143,7 @@ class LlamaCppAdapter(EngineAdapter):
         try:
             proc = subprocess.run(
                 [str(binary), "--version"],
+                env=child_environment(),
                 capture_output=True,
                 text=True,
                 timeout=_VERSION_TIMEOUT_SECONDS,
@@ -517,6 +519,7 @@ def _supported_long_flags(binary: Path) -> frozenset[str] | None:
         proc = subprocess.run(
             [str(binary), "--help"],
             capture_output=True,
+            env=child_environment(),
             text=True,
             timeout=_HELP_TIMEOUT_SECONDS,
             check=False,

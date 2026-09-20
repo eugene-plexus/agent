@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 
 from .._generated.models import Accelerator, Arch, HostAccelerator, Os
+from ..child_env import child_environment
 
 log = logging.getLogger(__name__)
 
@@ -153,6 +154,7 @@ def _run(argv: list[str]) -> Probe | str:
         proc = subprocess.run(
             [exe, *argv[1:]],
             capture_output=True,
+            env=child_environment(),
             text=True,
             timeout=_PROBE_TIMEOUT_SECONDS,
             check=False,

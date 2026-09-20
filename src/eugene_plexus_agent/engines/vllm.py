@@ -49,6 +49,7 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimeSpec,
 )
+from ..child_env import child_environment
 from .base import (
     DiscoveredBinary,
     EngineAdapter,
@@ -433,6 +434,7 @@ def _probe_interpreter(interpreter: str) -> dict[str, str | None] | None:
         proc = subprocess.run(
             [interpreter, "-I", "-c", _ENV_PROBE_SCRIPT],
             capture_output=True,
+            env=child_environment(),
             text=True,
             timeout=_ENV_PROBE_TIMEOUT_SECONDS,
             check=False,

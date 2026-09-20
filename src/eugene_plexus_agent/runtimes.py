@@ -17,8 +17,10 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from . import model_copies
@@ -40,6 +42,7 @@ from ._generated.models import (
     RuntimeStatus,
     StopReason,
 )
+from .child_env import child_environment, reserved_override
 from .companions import companion_name
 from .engines import (
     ADAPTERS,
@@ -94,6 +97,44 @@ def _configured_binary(adapter: EngineAdapter, get_config: ConfigGetter | None) 
     return str(value) if isinstance(value, str) and value.strip() else None
 
 
+def _launch_policy(
+    spec: RuntimeSpec, adapter: EngineAdapter, get_config: ConfigGetter | None
+) -> str | None:
+    """Check declarations before even a --version probe can execute code."""
+    reserved = reserved_override(spec.env or {})
+    if reserved is not None:
+        return f"runtime env variable {reserved!r} is reserved for Plexus"
+    if get_config is not None and get_config("allowUnrestrictedEngineLaunch") is True:
+        return None
+    if spec.extraArgs:
+        return "extraArgs requires allowUnrestrictedEngineLaunch in this agent's Config"
+    if not spec.binary:
+        return None  # discovery chooses a managed, configured, or PATH engine
+    try:
+        binary = Path(spec.binary).resolve()
+        roots = [adapter.managed_store().directory]
+        configured_roots = get_config("engineBinaryRoots") if get_config else None
+        if isinstance(configured_roots, list):
+            roots.extend(
+                Path(root).expanduser() for root in configured_roots if isinstance(root, str)
+            )
+        if any(binary.is_relative_to(root.resolve()) for root in roots):
+            return None
+        configured = _configured_binary(adapter, get_config)
+        discovered = shutil.which(adapter.binary_name)
+        if any(
+            binary == Path(path).expanduser().resolve() for path in (configured, discovered) if path
+        ):
+            return None
+    except (OSError, ValueError, RuntimeError):
+        return "cannot resolve runtime binary or engineBinaryRoots"
+    return (
+        "runtime binary is outside the managed engine store and configured paths; "
+        "add its directory to engineBinaryRoots in this agent's Config, or explicitly "
+        "enable allowUnrestrictedEngineLaunch"
+    )
+
+
 class _RuntimePlanner:
     """Launch plans for one engine runtime.
 
@@ -133,6 +174,9 @@ class _RuntimePlanner:
         return f"[engine: {self.spec.name}] "
 
     def plan(self) -> SpawnPlan:
+        reason = _launch_policy(self.spec, self._adapter, self._get_config)
+        if reason is not None:
+            raise SpawnPlanError(reason)
         try:
             binary = self._adapter.resolve_binary(
                 self.spec,
@@ -175,7 +219,7 @@ class _RuntimePlanner:
         # fail, which is an expert's prerogative. Anything we actually
         # injected is logged, because an environment variable nobody
         # typed makes a later bug report unreadable.
-        env = os.environ.copy()
+        env = child_environment()
         injected = {}
         for key, value in self._adapter.default_env(launch_spec, binary).items():
             if key not in env:
@@ -1124,7 +1168,7 @@ def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescr
     return out
 
 
-def validate_spec(spec: RuntimeSpec) -> str | None:
+def validate_spec(spec: RuntimeSpec, get_config: ConfigGetter | None = None) -> str | None:
     """Reject a runtime we cannot honour. Returns a reason, or None.
 
     Runs before persisting, so `POST /v1/runtimes` fails loudly instead
@@ -1140,9 +1184,10 @@ def validate_spec(spec: RuntimeSpec) -> str | None:
             return (
                 f"unknown flag(s) for {spec.engine.value}: {', '.join(unknown)}. "
                 f"Known flags: {', '.join(known)}. Anything not in the curated "
-                f"surface goes in extraArgs."
+                f"surface goes in extraArgs, which requires allowUnrestrictedEngineLaunch "
+                f"in this agent's Config."
             )
-    return None
+    return _launch_policy(spec, adapter, get_config)
 
 
 def _default_alias(spec: RuntimeSpec) -> str:
