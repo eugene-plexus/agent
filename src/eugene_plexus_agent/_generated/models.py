@@ -6,7 +6,37 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, SecretStr
+from pydantic import (
+    AnyUrl,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    SecretStr,
+)
+
+
+class Sample(RootModel[float]):
+    root: float = Field(..., gt=0.0)
+
+
+class BenchmarkPoint(BaseModel):
+    depth: int = Field(..., ge=0)
+    tokensPerSecond: float = Field(..., gt=0.0)
+    standardDeviation: float = Field(..., ge=0.0)
+    samples: list[Sample]
+
+
+class BenchmarkState(StrEnum):
+    running = 'running'
+    completed = 'completed'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class Depth(RootModel[int]):
+    root: int = Field(..., ge=0)
 
 
 class ComponentKind(StrEnum):
@@ -1893,6 +1923,45 @@ class FolderReachSource(StrEnum):
     same_path = 'same_path'
     inherited = 'inherited'
     override = 'override'
+
+
+class BenchmarkRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    modelId: str = Field(..., max_length=256, min_length=1)
+    profileId: str = Field(..., max_length=256, min_length=1)
+    profileName: str = Field(..., max_length=256, min_length=1)
+    runtime: RuntimeSpec
+    repetitions: int | None = Field(3, ge=1, le=5)
+    tokens: int | None = Field(128, ge=16, le=256)
+
+
+class Benchmark(BaseModel):
+    id: str
+    request: BenchmarkRequest
+    node: str
+    state: BenchmarkState
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str
+    depths: list[Depth]
+    points: list[BenchmarkPoint]
+    binary: str | None = None
+    engineVersion: str | None = None
+    localPath: str | None = None
+    modelSizeBytes: int | None = Field(None, ge=0)
+    modelModifiedAt: AwareDatetime | None = None
+    command: list[str] | None = None
+    hardware: dict[str, str] | None = Field(
+        None,
+        description='CPU/GPU/backend identity reported by the benchmark executable.',
+    )
+
+
+class BenchmarkList(BaseModel):
+    benchmarks: list[Benchmark]
 
 
 class Component(BaseModel):

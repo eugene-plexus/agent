@@ -44,6 +44,7 @@ from .client_keys import KEYS_FILE, ClientKeyStore
 from .dependencies import require_operator_session
 from .library_folders import FOLDERS_FILE, LibraryFolderCache
 from .routes import auth as auth_routes
+from .routes import benchmarks as benchmark_routes
 from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import directories as directories_routes
@@ -294,6 +295,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        benchmarks = getattr(app.state, "benchmarks", None)
+        if benchmarks is not None:
+            await benchmarks.close()
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
         # The browser's upstream connections. Closed first because it is
@@ -447,6 +451,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # — or, from M6, the gateway's own token, because it is the one
     # component that sees demand.
     app.include_router(runtimes_routes.router)
+    app.include_router(benchmark_routes.router)
     # This host's identity and devices; reads only, operator or service.
     app.include_router(node_routes.router)
 

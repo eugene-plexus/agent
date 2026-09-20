@@ -61,6 +61,7 @@ from ..dependencies import (
 from ..engines.acquisition import AcquisitionError, Unavailable
 from ..engines.devices import detect_devices
 from ..model_paths import PathRule, rules_from_config
+from ..node_work import runtime_launch
 from ..reservations import ReservationLedger
 from ..runtimes import (
     RuntimeSupervisor,
@@ -538,7 +539,7 @@ async def check_runtime_admission(request: Request, body: RuntimeSpec) -> Admiss
     response_model=Runtime,
     status_code=201,
     tags=["runtimes"],
-    dependencies=_declare_auth,
+    dependencies=[*_declare_auth, Depends(runtime_launch)],
 )
 async def create_runtime(
     request: Request,
@@ -643,7 +644,10 @@ async def get_runtime(request: Request, name: str) -> Runtime:
 
 
 @router.patch(
-    "/v1/runtimes/{name}", response_model=Runtime, tags=["runtimes"], dependencies=_write_auth
+    "/v1/runtimes/{name}",
+    response_model=Runtime,
+    tags=["runtimes"],
+    dependencies=[*_write_auth, Depends(runtime_launch)],
 )
 async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runtime:
     state: AgentState = request.app.state.agent_state
@@ -734,7 +738,7 @@ async def delete_runtime(request: Request, name: str) -> Response:
     response_model=RestartResult,
     status_code=202,
     tags=["runtimes"],
-    dependencies=_write_auth,
+    dependencies=[*_write_auth, Depends(runtime_launch)],
 )
 async def restart_runtime(request: Request, name: str) -> RestartResult:
     state: AgentState = request.app.state.agent_state
@@ -789,7 +793,7 @@ async def stop_runtime(
     response_model=RestartResult,
     status_code=202,
     tags=["runtimes"],
-    dependencies=_lifecycle_auth,
+    dependencies=[*_lifecycle_auth, Depends(runtime_launch)],
 )
 async def start_runtime(
     request: Request,
