@@ -51,11 +51,13 @@ def test_service_host_loads_from_a_venv_without_python_on_path(tmp_path, monkeyp
         f"home = {sys.base_prefix}\ninclude-system-site-packages = false\n", encoding="utf-8"
     )
     installed_site = Path(win32service.__file__).parent.parent
+    imported = prefix / "crypto-imported.txt"
     (site / "probe.pth").write_text(
         "\n".join(
             str(p) for p in (installed_site, installed_site / "win32", installed_site / "win32/lib")
         )
-        + "\n",
+        + "\n"
+        + f"import nacl.public; import cryptography.hazmat.bindings._rust; open({str(imported)!r}, 'w').write('ok')\n",
         encoding="utf-8",
     )
     # Earlier pywin32 registration can move the wheel's host to the venv root.
@@ -86,6 +88,7 @@ def test_service_host_loads_from_a_venv_without_python_on_path(tmp_path, monkeyp
     assert result.returncode == 0, (hex(result.returncode & 0xFFFFFFFF), result.stderr)
     assert "Debugging service __EP_NONEXISTENT_LOADER_TEST__" in output
     assert "PythonClass" in output  # reaches the expected missing registry entry
+    assert imported.is_file(), result.stderr
 
 
 @pytest.mark.skipif(not winservice.PYWIN32_AVAILABLE, reason="Windows service registration")

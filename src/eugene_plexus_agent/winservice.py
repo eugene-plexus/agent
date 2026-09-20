@@ -307,7 +307,13 @@ def _prepare_service_host() -> Path:
     runtime = Path(win32api.GetModuleFileName(sys.dllhandle))
     helper = Path(win32serviceutil.pywintypes.__file__)
     # Some Python distributions ship the CRT privately, outside system PATH.
-    for dependency in (runtime, helper, *runtime.parent.glob("vcruntime*.dll")):
+    # ABI3 extensions (PyNaCl/cryptography) link to python3.dll as well.
+    for dependency in (
+        runtime,
+        helper,
+        *runtime.parent.glob("python3.dll"),
+        *runtime.parent.glob("vcruntime*.dll"),
+    ):
         destination = target / dependency.name
         if dependency.resolve() != destination.resolve():
             shutil.copy2(dependency, destination)
