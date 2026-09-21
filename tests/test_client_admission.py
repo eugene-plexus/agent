@@ -55,6 +55,20 @@ def test_legacy_remains_explicitly_unrestricted_until_edited(tmp_path):
     assert caught.value.status == 409
 
 
+def test_local_only_survives_restart_and_changes_invalidate_existing_lease(tmp_path):
+    path = tmp_path / "keys.json"
+    store = ClientKeyStore(path)
+    store.add(replace(_record(), limits={"localOnly": True}))
+    store = ClientKeyStore(path)
+    store.load()
+    result = store.admit(key_id="abc", action="acquire", request_id="one", model="m")
+    assert result["limits"]["localOnly"] is True
+    store.set_limits("abc", {"localOnly": False})
+    with pytest.raises(AdmissionRefusal) as caught:
+        store.admit(key_id="abc", action="renew", request_id="one", model="m")
+    assert caught.value.status == 409
+
+
 def test_standalone_http_limits_and_operator_edit(authed_client):
     c = authed_client
     made = c.post("/v1/auth/client-keys", json={"name": "test"}).json()

@@ -27,9 +27,12 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         "allowedModels",
         "maxConcurrentRequests",
         "requestsPerMinute",
+        "localOnly",
     }:
         raise ValueError("invalid client limits")
     allowed = value.get("allowedModels")
+    if "localOnly" in value and not isinstance(value["localOnly"], bool):
+        raise ValueError("localOnly must be a boolean")
     if allowed is not None and (
         not isinstance(allowed, list)
         or len(allowed) > 100
@@ -43,6 +46,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
     if type(rate) is not int or not 1 <= rate <= 10_000:
         raise ValueError("invalid request rate limit")
     return {
+        **({"localOnly": True} if value.get("localOnly") else {}),
         "allowedModels": allowed,
         "maxConcurrentRequests": concurrency,
         "requestsPerMinute": rate,
