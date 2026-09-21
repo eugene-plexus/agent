@@ -136,11 +136,6 @@ if PYWIN32_AVAILABLE:
             win32event.SetEvent(self._stopped)
 
         def SvcDoRun(self) -> None:
-            servicemanager.LogMsg(
-                servicemanager.EVENTLOG_INFORMATION_TYPE,
-                servicemanager.PYS_SERVICE_STARTED,
-                (self._svc_name_, ""),
-            )
             from . import process_signals
             from .__main__ import build_server
             from .settings import load_settings
@@ -170,6 +165,19 @@ if PYWIN32_AVAILABLE:
             # rather than inferred everywhere else this project starts
             # the agent, and a service is the least-watched of the lot.
             self._server = build_server(settings, unattended=True)
+            # Event Log permissions can fail independently of service/agent
+            # permissions (observed in the LocalSystem recovery acceptance).
+            # Console capture is ready now, so retain the warning in agent.log
+            # and keep serving rather than turning optional logging into a
+            # service-start dependency.
+            try:
+                servicemanager.LogMsg(
+                    servicemanager.EVENTLOG_INFORMATION_TYPE,
+                    servicemanager.PYS_SERVICE_STARTED,
+                    (self._svc_name_, ""),
+                )
+            except Exception as exc:
+                log.warning("Windows event log unavailable; continuing service startup: %s", exc)
             # The run loop goes on a thread so SvcStop, which the SCM
             # calls on *its* thread, is not waiting behind it.
             thread = threading.Thread(target=self._server.run, name="agent", daemon=False)

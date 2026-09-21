@@ -227,3 +227,32 @@ def test_unattended_skips_the_first_boot_question(tmp_path: Path, monkeypatch) -
 
     entry.build_server(settings, unattended=False)
     assert asked == [1], "without --unattended and with a TTY, the question must still be asked"
+
+
+@pytest.mark.skipif(not winservice.PYWIN32_AVAILABLE, reason="needs Windows service host")
+def test_event_log_denial_does_not_prevent_service_start(monkeypatch, caplog):  # type: ignore[no-untyped-def]
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent import __main__, process_signals, settings
+
+    observed = []
+
+    def denied(*args):
+        raise PermissionError("RegisterEventSource: access denied")
+
+    monkeypatch.setattr(winservice.servicemanager, "LogMsg", denied)
+    monkeypatch.setattr(process_signals, "ensure_console", lambda: None)
+    monkeypatch.setattr(winservice, "_chdir_to_prefix", lambda: None)
+    monkeypatch.setattr(settings, "load_settings", lambda: None)
+    monkeypatch.setattr(
+        __main__,
+        "build_server",
+        lambda *args, **kwargs: SimpleNamespace(run=lambda: observed.append("ran")),
+    )
+    monkeypatch.setattr(winservice.win32event, "WaitForSingleObject", lambda *args: None)
+    cls = winservice.service_class()
+    instance = cls.__new__(cls)
+    instance._stopped = object()
+    instance.SvcDoRun()
+    assert observed == ["ran"]
+    assert "event log" in caplog.text.lower()
