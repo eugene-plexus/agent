@@ -40,6 +40,7 @@ from . import (
 )
 from ._http import aclose_shared
 from .auth_state import AuthState
+from .client_key_registry import ClientKeyRegistry
 from .client_keys import KEYS_FILE, ClientKeyStore
 from .dependencies import require_operator_session
 from .library_folders import FOLDERS_FILE, LibraryFolderCache
@@ -208,8 +209,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # document the config trio serves.
     if not hasattr(app.state, "client_keys"):
         key_store = ClientKeyStore(settings.config_file.resolve().parent / KEYS_FILE)
-        if not settings.safe_mode:
-            key_store.load()
+        key_store.load()
         app.state.client_keys = key_store
 
     if not hasattr(app.state, "runtime_supervisor"):
@@ -292,9 +292,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not settings.safe_mode and identity.record.enrolled:
         announce_task = asyncio.create_task(_announce_address(app, settings, state, identity))
 
+    registry = ClientKeyRegistry(app)
+    app.state.client_key_registry = registry
+    registry_task = asyncio.create_task(registry.run())
     try:
         yield
     finally:
+        registry_task.cancel()
+        await asyncio.gather(registry_task, return_exceptions=True)
+        await registry.close()
         benchmarks = getattr(app.state, "benchmarks", None)
         if benchmarks is not None:
             await benchmarks.close()

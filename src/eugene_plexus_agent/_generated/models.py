@@ -1084,75 +1084,94 @@ class AuthStatus(BaseModel):
 
 
 class ClientKey(BaseModel):
-    """
-    A long-lived bearer this install minted for an app outside it
-    (hobbyist UX S4, 2026-09-15) — as a *record*, never as the token.
-
-    Before these existed the only key a person could paste into
-    Continue or Open WebUI was the operator session token: full
-    authority, expired in fourteen days, and shown only inside the
-    playground's diagnostic panel. A client key carries
-    `aud: client`, which the gateway accepts on its three
-    OpenAI-compatible paths and nothing else accepts anywhere.
-
-    """
-
-    id: str = Field(
-        ...,
-        description="The token's `jti` claim, and what `DELETE` takes. Random per\nkey; the only thing the gateway needs in order to refuse one.\n",
-    )
-    name: str = Field(
-        ...,
-        description='What the operator called it — "Continue on the laptop",\n"phone". Not unique: two keys for the same app are a normal\nthing to want, and refusing the second would be a rule\ninvented for the list\'s benefit rather than the person\'s.\n',
-    )
-    tail: str = Field(
-        ...,
-        description='The last few characters of the token, so a key in this list\ncan be matched against one already pasted into an app.\n\n**Deliberately the tail and not a prefix.** The token is a\nJWT: every key this install mints begins with the same\n`eyJhbGciOiJIUzI1NiIs…` header, so a prefix identifies\nnothing. Short enough to be useless on its own.\n',
-    )
+    id: str = Field(..., max_length=128, min_length=1)
+    name: str = Field(..., max_length=64, min_length=1)
+    tail: str = Field(..., max_length=6)
     createdAt: AwareDatetime
-    expiresAt: AwareDatetime = Field(
-        ...,
-        description='The `exp` claim. Past it the gateway refuses the token on\nsignature validation alone, with no list to consult.\n',
-    )
-    revokedAt: AwareDatetime | None = Field(
-        None,
-        description='Set once the key has been revoked. The record is kept until\n`expiresAt` passes so the list can say "turned off" rather\nthan going silent.\n',
-    )
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
     lastUsedAt: AwareDatetime | None = Field(
-        None,
-        description='Reserved. Nothing writes it: the agent never sees a client\nkey — the gateway does — and reporting a *last used* the\ninstall cannot observe would be worse than reporting none.\nKept in the shape so a future gateway-side counter has\nsomewhere to land.\n',
+        None, description='Reserved; not currently measured.'
     )
+    originNode: str | None = None
+    migrated: bool | None = Field(
+        None,
+        description='True for a record imported from a pre-A3 node-local registry.',
+    )
+
+
+class Scope1(StrEnum):
+    install = 'install'
+    standalone = 'standalone'
+
+
+class Migration(StrEnum):
+    complete = 'complete'
+    pending = 'pending'
+    error = 'error'
+    standalone = 'standalone'
 
 
 class ClientKeyList(BaseModel):
     keys: list[ClientKey]
+    authority: str | None = None
+    revision: int | None = Field(None, ge=0)
+    scope: Scope1 | None = None
+    migration: Migration | None = None
+    detail: str | None = None
 
 
 class ClientKeyCreateRequest(BaseModel):
-    name: str = Field(
-        ...,
-        description="What this key is for, in the operator's words. Shown in the\nlist and nowhere else; it is not part of the token.\n",
-        max_length=64,
-        min_length=1,
-    )
-    ttlDays: int | None = Field(
-        365,
-        description='How long the key lives. A year by default: long enough that\na person who set up Continue once does not come back to a\ndead key, short enough that a key forgotten in a config file\neventually stops working. **No "never expires" option** —\nthe revocation path here is a bounded-staleness list, and a\ntoken with no expiry at all leans on it entirely.\n',
-        ge=1,
-        le=3650,
-    )
+    name: str = Field(..., max_length=64, min_length=1)
+    ttlDays: int | None = Field(365, ge=1, le=3650)
 
 
 class ClientKeyCreated(BaseModel):
-    """
-    The one and only time the token is on the wire from this agent.
-
-    """
-
     key: ClientKey
     token: str = Field(
         ...,
-        description='The bearer itself. Not stored: the agent keeps the record\nand forgets this. A caller that does not keep it mints\nanother.\n',
+        description='Returned once; never persisted in the registry or gateway cache.',
+    )
+
+
+class ClientKeyPolicyEntry(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=128, min_length=1)
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+
+
+class ClientKeyPolicy(BaseModel):
+    """
+    Positive registry: only listed, unrevoked, unexpired identifiers may be
+    authorized. Default refresh 15 seconds, maximum age 60 seconds (up to
+    five seconds clock tolerance). Missing/stale policy causes client-only
+    503; known revoked keys remain refused. Operator/service auth is unaffected.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    authority: str = Field(..., min_length=1)
+    revision: int = Field(..., ge=0)
+    generatedAt: float = Field(
+        ...,
+        description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
+    )
+    keys: list[ClientKeyPolicyEntry]
+
+
+class ClientKeyImport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keys: list[ClientKey] = Field(..., max_length=10000)
+    signature: str = Field(
+        ...,
+        description='Base64 Ed25519 signature by the enrolled node over UTF-8\n\'eugene-plexus/client-keys/import/v1\\n\' followed by canonical JSON\n{"node":name,"keys":keys}, sorted keys, compact separators, ensure_ascii=false.\nIdempotent; imported revocations cannot be cleared by replay.\n',
     )
 
 

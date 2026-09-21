@@ -42,7 +42,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -58,9 +58,11 @@ from .._generated.models import (
     ClientKeyCreated,
     ClientKeyCreateRequest,
     ClientKeyList,
+    ClientKeyPolicy,
     ClientKeyRevocations,
 )
 from ..auth_state import AuthState
+from ..client_key_registry import registry
 from ..client_keys import ClientKeyStore
 from ..dependencies import require_operator_or_gateway, require_operator_session
 from ..state import AgentState
@@ -464,7 +466,25 @@ def _to_model(record: client_keys.ClientKeyRecord) -> ClientKey:
 )
 async def list_client_keys(request: Request) -> ClientKeyList:
     """The records, newest first. Never the tokens -- see `client_keys`."""
-    return ClientKeyList(keys=[_to_model(r) for r in _keys(request).records()])
+    owner = registry(request)
+    if owner.enrolled:
+        await owner.migrate()
+        data = await owner.forward(
+            "GET", "/v1/auth/client-keys", authorization=request.headers.get("authorization")
+        )
+        data.update(migration=owner.migration, detail=owner.detail)
+        return ClientKeyList.model_validate(data)
+    try:
+        return ClientKeyList.model_validate(
+            dict(
+                keys=[_to_model(r) for r in _keys(request).records()],
+                scope="standalone",
+                migration="standalone",
+                revision=_keys(request).revision,
+            )
+        )
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
 
 
 @router.post(
@@ -475,20 +495,21 @@ async def list_client_keys(request: Request) -> ClientKeyList:
     dependencies=[Depends(require_operator_session)],
 )
 async def create_client_key(request: Request, body: ClientKeyCreateRequest) -> ClientKeyCreated:
-    """Mint a long-lived key for an app outside the install.
+    """Mint at the control root when enrolled, or in this standalone registry.
 
-    The token comes back here and nowhere else, ever. What is persisted
-    is the record beside it; the agent forgets the token as soon as this
-    response is serialized.
-
-    Signed with `auth.signing_key`, which on an enrolled node is **the
-    install's** -- so the key verifies at a gateway on any machine in
-    the install, which is what makes one key work for one person's
-    whole setup. On an unenrolled single box it is that box's
-    per-restart key, and the token dies with the process; that is the
-    same bargain every operator session already makes there, and the
-    reason first-boot enrollment exists.
+    Forward the caller's operator credential; never upgrade a service token.
+    The bearer is returned once and only metadata is durably stored.
     """
+    owner = registry(request)
+    if owner.enrolled:
+        return ClientKeyCreated.model_validate(
+            await owner.forward(
+                "POST",
+                "/v1/auth/client-keys",
+                authorization=request.headers.get("authorization"),
+                body=body.model_dump(mode="json"),
+            )
+        )
     name = body.name.strip()
     if not name:
         raise _problem(
@@ -512,17 +533,53 @@ async def create_client_key(request: Request, body: ClientKeyCreateRequest) -> C
         ttl_seconds=int(ttl_days) * 24 * 3600,
         now=issued_at,
     )
-    record = _keys(request).add(
-        client_keys.ClientKeyRecord(
-            id=key_id,
-            name=name,
-            tail=client_keys.tail_of(token),
-            created_at=float(issued_at),
-            expires_at=float(expires_at),
+    try:
+        record = _keys(request).add(
+            client_keys.ClientKeyRecord(
+                id=key_id,
+                name=name,
+                tail=client_keys.tail_of(token),
+                created_at=float(issued_at),
+                expires_at=float(expires_at),
+            )
         )
-    )
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
     log.info("minted client key %r (id %s), valid %d day(s)", name, key_id, ttl_days)
     return ClientKeyCreated(key=_to_model(record), token=token)
+
+
+@router.get(
+    "/v1/auth/client-keys/policy",
+    response_model=ClientKeyPolicy,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator_or_gateway)],
+)
+async def client_key_policy(request: Request, response: Response) -> ClientKeyPolicy:
+    response.headers["Cache-Control"] = "no-store"
+    owner = registry(request)
+    if owner.enrolled:
+        # Migration runs independently; a timeout there must not renew or delay policy.
+        return ClientKeyPolicy.model_validate(
+            await owner.forward("GET", "/v1/auth/client-keys/policy")
+        )
+    try:
+        store = _keys(request)
+        return ClientKeyPolicy.model_validate(
+            dict(
+                authority="standalone",
+                revision=store.revision,
+                generatedAt=time.time(),
+                keys=[
+                    _to_model(r).model_dump(
+                        mode="json", include={"id", "expiresAt", "revokedAt"}, exclude_none=True
+                    )
+                    for r in store.records()
+                ],
+            )
+        )
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
 
 
 @router.get(
@@ -540,7 +597,17 @@ async def list_revoked_client_keys(request: Request) -> ClientKeyRevocations:
     -- the set of components that legitimately need a surface is
     usually one, and "any service" is what makes a leak useful.
     """
-    ids, revision = _keys(request).revoked()
+    owner = registry(request)
+    if owner.enrolled:
+        data = await owner.forward("GET", "/v1/auth/client-keys/policy")
+        return ClientKeyRevocations(
+            ids=[key["id"] for key in data["keys"] if key.get("revokedAt")],
+            revision=data["revision"],
+        )
+    try:
+        ids, revision = _keys(request).revoked()
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
     return ClientKeyRevocations(ids=ids, revision=revision)
 
 
@@ -550,21 +617,24 @@ async def list_revoked_client_keys(request: Request) -> ClientKeyRevocations:
     dependencies=[Depends(require_operator_session)],
 )
 async def revoke_client_key(request: Request, key_id: str) -> None:
-    """Turn one key off. Repeating it is a 204, not an error.
-
-    The record stays, stamped, until the key's own expiry passes; a list
-    that forgets what was revoked cannot tell "never minted here" from
-    "turned off". The gateway learns within one of its routing refresh
-    intervals, which the contract says plainly rather than promising
-    instant.
-    """
-    record = _keys(request).revoke(key_id)
+    """Durably revoke at the authority; repeating a known revocation is a 204."""
+    owner = registry(request)
+    if owner.enrolled:
+        await owner.migrate()
+        await owner.forward(
+            "DELETE",
+            f"/v1/auth/client-keys/{key_id}",
+            authorization=request.headers.get("authorization"),
+        )
+        return
+    try:
+        record = _keys(request).revoke(key_id)
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
     if record is None:
         raise _problem(
             status.HTTP_404_NOT_FOUND,
             "No such key",
-            f"This agent has no client key with id {key_id!r}. Client-key records live on the "
-            "agent that minted them -- the one on the gateway's node -- so check you are asking "
-            "that machine.",
+            f"No client key with id {key_id!r} is registered on this standalone agent.",
         )
     log.info("revoked client key %r (id %s)", record.name, key_id)

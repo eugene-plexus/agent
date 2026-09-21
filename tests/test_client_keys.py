@@ -102,15 +102,15 @@ def test_revoke_is_idempotent_and_keeps_the_first_timestamp(tmp_path: Path) -> N
     assert second.revoked_at == 500.0, "a repeated revoke must not re-stamp when it happened"
 
 
-def test_revision_moves_on_a_revoke_and_not_on_a_mint(tmp_path: Path) -> None:
+def test_revision_moves_on_every_policy_change(tmp_path: Path) -> None:
     store = ClientKeyStore(tmp_path / client_keys.KEYS_FILE)
     _, before = store.revoked()
     store.add(_record("one"))
     _, after_mint = store.revoked()
-    assert after_mint == before, "the gateway cannot see a mint, so the revision must not move"
+    assert after_mint == before + 1
     store.revoke("one")
     _, after_revoke = store.revoked()
-    assert after_revoke == before + 1
+    assert after_revoke == before + 2
 
 
 def test_an_expired_key_leaves_the_revoked_set_and_the_list(tmp_path: Path) -> None:
@@ -128,7 +128,7 @@ def test_an_expired_key_leaves_the_revoked_set_and_the_list(tmp_path: Path) -> N
     assert [r.id for r in store.records(now=200.0)] == ["new"]
 
 
-def test_an_unreadable_record_is_dropped_and_the_rest_load(tmp_path: Path) -> None:
+def test_an_unreadable_record_makes_the_registry_unavailable(tmp_path: Path) -> None:
     """`degraded-mode-required`, applied to the agent's own files."""
     path = tmp_path / client_keys.KEYS_FILE
     path.write_text(
@@ -152,9 +152,11 @@ def test_an_unreadable_record_is_dropped_and_the_rest_load(tmp_path: Path) -> No
     )
     store = ClientKeyStore(path)
     store.load()
-    assert [r.id for r in store.records()] == ["good"]
-    _, revision = store.revoked()
-    assert revision == 3, "the revision survives a partial read; a reader must not see it go back"
+    with pytest.raises(OSError, match="unreadable"):
+        store.records()
+    with pytest.raises(OSError, match="unreadable"):
+        store.add(_record("replacement"))
+    assert '"bad"' in path.read_text()
 
 
 def test_a_corrupt_file_is_a_warning_not_a_crash(tmp_path: Path) -> None:
@@ -162,7 +164,8 @@ def test_a_corrupt_file_is_a_warning_not_a_crash(tmp_path: Path) -> None:
     path.write_text("this is not json", encoding="utf-8")
     store = ClientKeyStore(path)
     store.load()
-    assert store.records() == []
+    with pytest.raises(OSError, match="unreadable"):
+        store.records()
 
 
 def test_a_missing_file_writes_nothing(tmp_path: Path) -> None:
@@ -171,6 +174,47 @@ def test_a_missing_file_writes_nothing(tmp_path: Path) -> None:
     path = tmp_path / client_keys.KEYS_FILE
     ClientKeyStore(path).load()
     assert not path.exists()
+
+
+def test_failed_atomic_replacement_does_not_acknowledge_revocation(tmp_path, monkeypatch) -> None:
+    path = tmp_path / client_keys.KEYS_FILE
+    store = ClientKeyStore(path)
+    store.add(_record("one"))
+    before = path.read_bytes()
+
+    def fail(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(client_keys.os, "replace", fail)
+    with pytest.raises(OSError, match="disk full"):
+        store.revoke("one")
+    assert path.read_bytes() == before
+    assert store.revoked()[0] == []
+
+
+def test_unreadable_revocation_never_becomes_an_active_key(tmp_path) -> None:
+    path = tmp_path / client_keys.KEYS_FILE
+    raw = _record("one").to_json()
+    raw["revokedAt"] = "unreadable"
+    path.write_text(json.dumps({"keys": [raw], "revision": 1}))
+    store = ClientKeyStore(path)
+    store.load()
+    with pytest.raises(OSError):
+        store.revoked()
+
+
+def test_policy_includes_registered_ids_and_refuses_corrupt_storage(authed_client) -> None:
+    key = _mint(authed_client)
+    response = authed_client.get("/v1/auth/client-keys/policy")
+    assert response.status_code == 200
+    assert response.json()["keys"][0]["id"] == key["key"]["id"]
+    store = authed_client.app.state.client_keys
+    store.path.write_text("corrupt")
+    store.load()
+    assert authed_client.get("/v1/auth/client-keys/policy").status_code == 503
+    assert authed_client.get("/v1/auth/client-keys").status_code == 503
+    assert authed_client.post("/v1/auth/client-keys", json={"name": "new"}).status_code == 503
+    assert authed_client.delete("/v1/auth/client-keys/" + key["key"]["id"]).status_code == 503
 
 
 def test_new_key_ids_are_random(tmp_path: Path) -> None:
@@ -310,7 +354,7 @@ def test_revoking_twice_is_still_204(authed_client: TestClient) -> None:
 def test_revoking_an_unknown_id_says_where_records_live(authed_client: TestClient) -> None:
     resp = authed_client.delete("/v1/auth/client-keys/nope")
     assert resp.status_code == 404
-    assert "gateway" in resp.text, "the 404 must name where the records actually are"
+    assert "standalone agent" in resp.text
 
 
 def test_the_records_survive_a_restart(app: FastAPI, settings, tmp_path: Path) -> None:
