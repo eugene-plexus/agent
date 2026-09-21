@@ -55,12 +55,18 @@ class ClientKeyRegistry:
             return response.json() if response.content else None
         except httpx.HTTPStatusError as exc:
             # Preserve operator mistakes and refusals; outages have one actionable shape.
-            if exc.response.status_code in (400, 401, 403, 404, 409, 422):
+            if exc.response.status_code in (400, 401, 403, 404, 409, 422, 429):
                 try:
                     detail = exc.response.json()
                 except ValueError:
                     detail = "Control root refused this operation."
-                raise HTTPException(exc.response.status_code, detail=detail) from exc
+                raise HTTPException(
+                    exc.response.status_code,
+                    detail=detail,
+                    headers={"Retry-After": exc.response.headers["Retry-After"]}
+                    if "Retry-After" in exc.response.headers
+                    else None,
+                ) from exc
             raise self.unavailable() from exc
         except (httpx.HTTPError, ValueError, TimeoutError) as exc:
             raise self.unavailable() from exc

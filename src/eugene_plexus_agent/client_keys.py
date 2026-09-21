@@ -13,10 +13,12 @@ import os
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from .client_admission import AdmissionClock, decide, validate_ledger, validate_limits
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ class ClientKeyRecord:
     created_at: float
     expires_at: float
     revoked_at: float | None = None
+    limits: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -52,6 +55,8 @@ class ClientKeyRecord:
             "createdAt": self.created_at,
             "expiresAt": self.expires_at,
         }
+        if self.limits is not None:
+            out["limits"] = self.limits
         if self.revoked_at is not None:
             out["revokedAt"] = self.revoked_at
         return out
@@ -82,6 +87,10 @@ class ClientKeyRecord:
             return None
         if not key_id or not name or len(key_id) > 128 or len(name) > 64 or len(tail) > 6:
             return None
+        try:
+            limits = validate_limits(raw.get("limits"))
+        except ValueError:
+            return None
         return cls(
             id=key_id,
             name=name,
@@ -89,6 +98,7 @@ class ClientKeyRecord:
             created_at=created,
             expires_at=expires,
             revoked_at=revoked,
+            limits=limits,
         )
 
 
@@ -116,6 +126,8 @@ class ClientKeyStore:
         self._lock = threading.RLock()
         self._records: dict[str, ClientKeyRecord] = {}
         self._revision = 0
+        self._admission = validate_ledger(None)
+        self._admission_clock = AdmissionClock()
         self.error: str | None = None
 
     @property
@@ -141,6 +153,8 @@ class ClientKeyStore:
                     if record is None or record.id in records:
                         raise ValueError("invalid or duplicate record")
                     records[record.id] = record
+                self._admission = validate_ledger(raw.get("admission"))
+                self._admission_clock = AdmissionClock(self._admission["clock"])
                 self._records, self._revision, self.error = records, revision, None
             except FileNotFoundError:
                 self._records, self._revision, self.error = {}, 0, None
@@ -183,18 +197,41 @@ class ClientKeyStore:
             self._check()
             record = self._records.get(key_id)
             if record is not None and record.revoked_at is None:
-                record = ClientKeyRecord(
-                    record.id,
-                    record.name,
-                    record.tail,
-                    record.created_at,
-                    record.expires_at,
-                    time.time() if now is None else now,
-                )
+                record = replace(record, revoked_at=time.time() if now is None else now)
                 self._commit({**self._records, key_id: record})
             return record
 
-    def _commit(self, records: dict[str, ClientKeyRecord]) -> None:
+    def set_limits(self, key_id: str, limits: dict[str, Any]) -> ClientKeyRecord | None:
+        with self._lock:
+            self._check()
+            record = self._records.get(key_id)
+            if record is not None:
+                record = replace(record, limits=validate_limits(limits))
+                self._commit({**self._records, key_id: record})
+            return record
+
+    def admit(
+        self, *, key_id: str, action: str, request_id: str, model: str | None
+    ) -> dict[str, Any]:
+        with self._lock:
+            self._check()
+            key = self._records.get(key_id)
+            result, candidate = decide(
+                self._admission,
+                key.to_json() if key else None,
+                key_id=key_id,
+                action=action,
+                request_id=request_id,
+                model=model,
+                now=self._admission_clock.now(self._admission["clock"]),
+            )
+            if candidate is not None:
+                self._commit(self._records, admission=candidate)
+            return result
+
+    def _commit(
+        self, records: dict[str, ClientKeyRecord], *, admission: dict[str, Any] | None = None
+    ) -> None:
         # Commit to disk before making the new state visible or returning success.
         records = {key: value for key, value in records.items() if value.expires_at > time.time()}
         revision = self._revision + 1
@@ -204,9 +241,16 @@ class ClientKeyStore:
             os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8"
         ) as output:
             json.dump(
-                {"revision": revision, "keys": [r.to_json() for r in records.values()]}, output
+                {
+                    "revision": revision,
+                    "keys": [r.to_json() for r in records.values()],
+                    "admission": self._admission if admission is None else admission,
+                },
+                output,
             )
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, self._path)
         self._records, self._revision = records, revision
+        if admission is not None:
+            self._admission = admission

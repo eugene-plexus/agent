@@ -54,14 +54,19 @@ from .._generated.common_models import (
 )
 from .._generated.models import (
     AuthStatus,
+    ClientAdmissionRequest,
+    ClientAdmissionResult,
     ClientKey,
     ClientKeyCreated,
     ClientKeyCreateRequest,
+    ClientKeyLimits,
     ClientKeyList,
     ClientKeyPolicy,
     ClientKeyRevocations,
+    ClientKeyUpdateRequest,
 )
 from ..auth_state import AuthState
+from ..client_admission import AdmissionRefusal, validate_limits
 from ..client_key_registry import registry
 from ..client_keys import ClientKeyStore
 from ..dependencies import require_operator_or_gateway, require_operator_session
@@ -449,6 +454,7 @@ def _to_model(record: client_keys.ClientKeyRecord) -> ClientKey:
     return ClientKey(
         id=record.id,
         name=record.name,
+        limits=ClientKeyLimits.model_validate(record.limits) if record.limits is not None else None,
         tail=record.tail,
         createdAt=client_keys.as_datetime(record.created_at),
         expiresAt=client_keys.as_datetime(record.expires_at),
@@ -541,10 +547,15 @@ async def create_client_key(request: Request, body: ClientKeyCreateRequest) -> C
                 tail=client_keys.tail_of(token),
                 created_at=float(issued_at),
                 expires_at=float(expires_at),
+                limits=validate_limits(
+                    (body.limits or ClientKeyLimits()).model_dump(exclude_none=True)
+                ),
             )
         )
     except OSError as exc:
         raise owner.local_unavailable() from exc
+    except ValueError as exc:
+        raise _problem(422, "Invalid key limits", str(exc)) from exc
     log.info("minted client key %r (id %s), valid %d day(s)", name, key_id, ttl_days)
     return ClientKeyCreated(key=_to_model(record), token=token)
 
@@ -638,3 +649,70 @@ async def revoke_client_key(request: Request, key_id: str) -> None:
             f"No client key with id {key_id!r} is registered on this standalone agent.",
         )
     log.info("revoked client key %r (id %s)", record.name, key_id)
+
+
+@router.put(
+    "/v1/auth/client-keys/{key_id}/limits",
+    response_model=ClientKey,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator_session)],
+)
+async def set_client_key_limits(
+    request: Request, key_id: str, body: ClientKeyUpdateRequest
+) -> ClientKey:
+    owner = registry(request)
+    if owner.enrolled:
+        from urllib.parse import quote
+
+        return ClientKey.model_validate(
+            await owner.forward(
+                "PUT",
+                f"/v1/auth/client-keys/{quote(key_id, safe='')}/limits",
+                authorization=request.headers.get("authorization"),
+                body=body.model_dump(mode="json"),
+            )
+        )
+    try:
+        record = _keys(request).set_limits(key_id, body.limits.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise _problem(422, "Invalid limits", str(exc)) from exc
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
+    if record is None:
+        raise _problem(404, "No such key", "This key is not in the registry.")
+    return _to_model(record)
+
+
+@router.post(
+    "/v1/auth/client-keys/admission",
+    response_model=ClientAdmissionResult,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_operator_or_gateway)],
+)
+async def client_admission(request: Request, body: ClientAdmissionRequest) -> ClientAdmissionResult:
+    owner = registry(request)
+    if owner.enrolled:
+        return ClientAdmissionResult.model_validate(
+            await owner.forward(
+                "POST",
+                "/v1/auth/client-keys/admission",
+                body=body.model_dump(mode="json", exclude_none=True),
+            )
+        )
+    try:
+        return ClientAdmissionResult.model_validate(
+            _keys(request).admit(
+                key_id=body.keyId,
+                action=body.action.value,
+                request_id=body.requestId,
+                model=body.model,
+            )
+        )
+    except AdmissionRefusal as exc:
+        raise HTTPException(
+            exc.status,
+            detail=exc.detail,
+            headers={"Retry-After": str(exc.retry)} if exc.retry else None,
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise owner.local_unavailable() from exc
