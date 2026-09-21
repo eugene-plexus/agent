@@ -44,6 +44,7 @@ from . import node_identity
 from .app import create_app
 from .console_logging import install_console_capture
 from .onboarding import JoinRequest, ask, has_tty, is_fresh_boot, run_join
+from .recovery_guard import refuse_quarantined
 from .settings import Settings, load_settings
 from .state import AgentState
 
@@ -110,6 +111,7 @@ def main(argv: list[str] | None = None) -> None:
     settings = load_settings()
 
     if args.command == "join":
+        refuse_quarantined(settings.config_file)
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s", force=True)
         raise SystemExit(
             run_join(
@@ -147,6 +149,7 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # `--unattended` comes first because a TTY is not the same thing as
     # someone watching one: a Windows scheduled task has both handles as
     # a console and nobody in front of it. See this module's docstring.
+    refuse_quarantined(settings.config_file)
     if not unattended and is_fresh_boot(settings) and has_tty():
         request = ask(settings)
         if request is not None:

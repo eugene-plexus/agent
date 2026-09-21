@@ -64,6 +64,9 @@ log = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings: Settings = app.state.settings
+    from .recovery_guard import refuse_quarantined
+
+    refuse_quarantined(settings.config_file)
     state = AgentState(settings.config_file)
     if settings.safe_mode:
         log.warning(
