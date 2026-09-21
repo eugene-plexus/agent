@@ -251,6 +251,7 @@ async def test_health_ok_reports_ready_with_capabilities(
     assert outcome.capabilities.contextLength == 8192
     assert outcome.capabilities.parallelSlots == 4
     assert outcome.capabilities.multimodal is True
+    assert outcome.capabilities.vision is True
 
 
 async def test_ready_survives_an_unreadable_props(
@@ -505,3 +506,23 @@ def test_a_rejected_argument_is_explained_rather_than_left_as_an_exit_code(
     assert explained is not None
     assert "--no-mmap" in explained
     assert adapter.explain_exit(1, "ggml_cuda_init: failed\n") is None
+
+
+async def test_audio_projector_does_not_advertise_vision(adapter, monkeypatch):
+    def handler(request):
+        return httpx.Response(200, json={"modalities": {"vision": False, "audio": True}})
+
+    _patch_client(monkeypatch, handler)
+    outcome = await adapter.probe_readiness("http://127.0.0.1:8090")
+    assert outcome.capabilities.multimodal is True
+    assert outcome.capabilities.vision is False
+
+
+def test_projector_uses_curated_flags_with_spaces(adapter, binary):
+    argv = adapter.build_argv(
+        _spec(flags={"projectorPath": "/models/my vision/mmproj.gguf", "projectorOnCpu": True}),
+        binary,
+        port=8090,
+    )
+    assert argv[argv.index("--mmproj") + 1] == "/models/my vision/mmproj.gguf"
+    assert "--no-mmproj-offload" in argv

@@ -433,6 +433,7 @@ class LlamaCppAdapter(EngineAdapter):
             parallelSlots=int(slots) if isinstance(slots, int) and slots >= 1 else None,
             embeddings=None,
             multimodal=multimodal,
+            vision=modalities.get("vision") is True if isinstance(modalities, dict) else None,
         )
 
     # --- configuring ------------------------------------------------------
@@ -583,6 +584,8 @@ _CATEGORIES = {
 # the schema so the UI-facing key never has to look like a CLI flag, and
 # so an upstream rename touches one line.
 _FLAG_CLI_NAMES: dict[str, str] = {
+    "projectorPath": "--mmproj",
+    "projectorOnCpu": "--no-mmproj-offload",
     "contextSize": "--ctx-size",
     "gpuLayers": "--n-gpu-layers",
     "batchSize": "--batch-size",
@@ -596,6 +599,26 @@ _FLAG_CLI_NAMES: dict[str, str] = {
 }
 
 _FLAG_FIELDS: list[ConfigField] = [
+    ConfigField(
+        key="projectorPath",
+        label="Vision projector",
+        description=(
+            "Path on this node to the matching mmproj GGUF for this vision model. "
+            "Download it from the same model repository. Image input is available "
+            "only after the engine confirms that it loaded the projector."
+        ),
+        category="memory",
+        valueType=ConfigValueType.string,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="projectorOnCpu",
+        label="Run vision projector on CPU",
+        description="Keep image processing off the GPU. Slower, but uses less GPU memory.",
+        category="performance",
+        valueType=ConfigValueType.boolean,
+        requiresRestart=True,
+    ),
     ConfigField(
         key="contextSize",
         label="Context size",
