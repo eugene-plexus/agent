@@ -19,6 +19,7 @@ import json
 import time
 from pathlib import Path
 
+import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -243,19 +244,39 @@ def test_a_client_token_carries_the_audience_and_the_id() -> None:
     assert exp - payload.iat == 3600
 
 
-def test_an_operator_session_still_carries_no_jti() -> None:
+def test_an_operator_session_without_a_jti_still_decodes() -> None:
     """`jti` is not in the `require` list, and this is why.
 
     Every token minted before 2026-09-15 has none -- including the
     session the operator is holding while the agent is upgraded under
     them. Requiring it would log the whole install out.
+
+    Amended 2026-09-22: this asserted that a NEW session carries no
+    `jti`, which stopped being true when sessions gained a random one
+    (two logins in one second were byte-identical, so signing out and
+    back in handed back the revoked token). The property it exists for
+    is that an old, jti-less token is still accepted, so that is what it
+    builds now.
     """
     key = security.generate_signing_key()
-    token, _ = security.issue_operator_token(signing_key=key)
+    now = int(time.time())
+    legacy = jwt.encode(
+        {"sub": "operator", "aud": security.AUDIENCE_OPERATOR, "iat": now, "exp": now + 60},
+        key,
+        algorithm=security.signing_algorithm(key),
+    )
     payload = security.decode_token(
-        token=token, signing_key=key, expected_audience=security.AUDIENCE_OPERATOR
+        token=legacy, signing_key=key, expected_audience=security.AUDIENCE_OPERATOR
     )
     assert payload.jti is None
+
+
+def test_two_sessions_minted_in_one_second_are_different_tokens() -> None:
+    key = security.generate_signing_key()
+    now = int(time.time())
+    first, _ = security.issue_operator_token(signing_key=key, now=now)
+    second, _ = security.issue_operator_token(signing_key=key, now=now)
+    assert first != second
 
 
 # --------------------------------------------------------------------- #

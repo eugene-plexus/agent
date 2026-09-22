@@ -33,6 +33,15 @@ verbatim, every component behind it enforces its own auth, and the set
 of reachable addresses is exactly this agent's declared topology. It is
 the same trust boundary the Next server had, one process to the left.
 
+**With one refusal of its own: a session the operator signed out of.**
+Signing out is recorded here (`session_revocations`), and every
+component behind this proxy verifies tokens itself with the install's
+key and has never heard of that record -- so until 2026-09-22 a
+signed-out token went on working through this path, which is the path
+every browser uses, for the rest of its 14 days. Checked before the
+target is resolved, because resolving a remote target spends the
+caller's credential at the control root.
+
 **It streams.** `client.send(stream=True)` plus `StreamingResponse`,
 with `accept-encoding: identity` on the way up so no decoder sits in
 the path. Buffering here would silently undo M10 — the playground would
@@ -72,6 +81,8 @@ from fastapi.responses import StreamingResponse
 from .. import install_proxy, peer
 from .._generated.common_models import Problem
 from .._http import internal_client
+from ..auth_state import AuthState
+from ..dependencies import revoked_session_problem
 from ..node_identity import local_agent_url
 from ..settings import Settings
 from ..state import AgentState
@@ -360,6 +371,33 @@ def get_client(request: Request) -> httpx.AsyncClient:
     return client
 
 
+def presented_credentials(request: Request) -> list[str]:
+    """Every bearer this request carries, from either header a door reads.
+
+    Both, because the gateway's Anthropic door reads `x-api-key` before
+    `Authorization` and accepts an operator session in either; screening
+    one would leave the other as the way round a sign-out.
+    """
+    found: list[str] = []
+    header = request.headers.get("authorization")
+    if header:
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() == "bearer" and value.strip():
+            found.append(value.strip())
+    api_key = request.headers.get("x-api-key")
+    if api_key and api_key.strip():
+        found.append(api_key.strip())
+    return found
+
+
+def _refuse_signed_out(request: Request) -> None:
+    auth: AuthState | None = getattr(request.app.state, "auth_state", None)
+    if auth is None:
+        return
+    if any(auth.is_revoked(token) for token in presented_credentials(request)):
+        raise revoked_session_problem()
+
+
 def _upstream_url(base: str, path: str, query: str) -> httpx.URL:
     # Topology URLs arrive with a trailing slash (`http://127.0.0.1:8081/`).
     # Naive joining gives `http://127.0.0.1:8083//v1/config`, and FastAPI
@@ -418,6 +456,10 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
             "Invalid target",
             f"{target!r} is not a usable proxy target name.",
         )
+
+    # Before resolving: see the module docstring on why a remote target's
+    # lookup would already have spent the credential.
+    _refuse_signed_out(request)
 
     route = await resolve_target(request, target)
     url = _upstream_url(route.base, route.prefix + "/" + path.lstrip("/"), request.url.query)

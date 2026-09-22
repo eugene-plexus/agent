@@ -30,6 +30,7 @@ from fastapi.testclient import TestClient
 from eugene_plexus_agent import _private_files, client_keys
 from eugene_plexus_agent.client_keys import ClientKeyRecord, ClientKeyStore
 from eugene_plexus_agent.node_identity import NODE_FILE, NodeIdentityStore
+from eugene_plexus_agent.session_revocations import REVOKED_SESSIONS_FILE
 from eugene_plexus_agent.state import UNREADABLE_SUFFIX, AgentState
 
 from .conftest import TEST_PASSPHRASE
@@ -126,12 +127,24 @@ def _client_keys(_client: TestClient, tmp_path: Path) -> Path:
     return store.path
 
 
+def _revoked_sessions_via_sign_out(client: TestClient, tmp_path: Path) -> Path:
+    token = client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE}).json()[
+        "sessionToken"
+    ]
+    signed_out = client.delete(
+        "/v1/auth/sessions/current", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert signed_out.status_code == 204
+    return tmp_path / REVOKED_SESSIONS_FILE
+
+
 SITES: dict[str, Callable[[TestClient, Path], Path]] = {
     "agent.yaml": _agent_yaml_via_initialize,
     "companion config": _companion_config_via_launch,
     "node.yaml": _node_yaml,
     "agent.yaml.unreadable": _unreadable_copy,
     "client_keys.json": _client_keys,
+    "revoked_sessions.json": _revoked_sessions_via_sign_out,
 }
 
 

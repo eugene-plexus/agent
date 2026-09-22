@@ -271,12 +271,13 @@ class TokenPayload:
     iat: int
     exp: int
     jti: str | None = None
-    """The key's id, on a client key. Absent on every other token.
+    """The key's id, on a client key; a random session id on an operator
+    session minted since 2026-09-22 (see `issue_operator_token`); absent
+    on service tokens.
 
-    Not in the `require` list: operator sessions and service tokens have
-    never carried one, and demanding it would refuse every token minted
-    before 2026-09-15 -- including the one the caller is holding while
-    they read this.
+    Not in the `require` list: service tokens have never carried one,
+    and demanding it would refuse every token minted before 2026-09-15
+    -- including the one the caller is holding while they read this.
     """
 
 
@@ -301,6 +302,17 @@ def issue_operator_token(
     literal string `"operator"` — v0.2 is single-user, but the claim
     is structured so v0.3+ can add `sub: "operator:<id>"` for
     multi-user without re-shaping the token.
+
+    **The random `jti` is what makes a sign-out mean one session**
+    (2026-09-22). `iat` is whole seconds and an Ed25519 signature is
+    deterministic, so two logins in one second were byte-identical
+    tokens: signing out and straight back in handed the person the token
+    they had just revoked, refused everywhere -- and since sign-outs
+    became durable, refused after a restart too. The control root's
+    operator tokens have carried one for the same reason. Nothing
+    requires it and nothing keys on it: `session_revocations` hashes the
+    whole token, which also covers tokens minted before this and ones the
+    control root minted.
     """
     issued_at = now if now is not None else int(time.time())
     expires_at = issued_at + ttl_seconds
@@ -309,6 +321,7 @@ def issue_operator_token(
         "aud": AUDIENCE_OPERATOR,
         "iat": issued_at,
         "exp": expires_at,
+        "jti": secrets.token_urlsafe(12),
     }
     token = jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
     return token, expires_at

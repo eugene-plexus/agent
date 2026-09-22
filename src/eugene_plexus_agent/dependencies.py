@@ -53,6 +53,21 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     )
 
 
+def revoked_session_problem() -> HTTPException:
+    """The one refusal for a signed-out session, wherever it is presented.
+
+    Shared by this module's dependencies and the browser proxy, so a
+    token refused at the proxy reads exactly as it does on the agent's
+    own routes -- the UI's 401 handler already knows this shape and
+    sends the person to sign in.
+    """
+    return _problem(
+        status.HTTP_401_UNAUTHORIZED,
+        "Token revoked",
+        "Session was explicitly logged out. Login again to obtain a new token.",
+    )
+
+
 def require_initialized(request: Request) -> AgentState:
     """Returns the agent state, ONLY if the operator has set a
     passphrase. Otherwise short-circuits with 503 directing the
@@ -87,11 +102,7 @@ def require_operator_session(
     token = creds.credentials
     auth: AuthState = request.app.state.auth_state
     if auth.is_revoked(token):
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Token revoked",
-            "Session was explicitly logged out. Login again to obtain a new token.",
-        )
+        raise revoked_session_problem()
     try:
         payload = security.decode_token(
             token=token,
@@ -129,11 +140,7 @@ def require_operator_or_service(
     token = creds.credentials
     auth: AuthState = request.app.state.auth_state
     if auth.is_revoked(token):
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Token revoked",
-            "Session was explicitly logged out. Login again to obtain a new token.",
-        )
+        raise revoked_session_problem()
     try:
         payload = security.decode_token(
             token=token,

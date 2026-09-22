@@ -8,9 +8,14 @@ Holds runtime secrets the agent should never persist:
   * `master_key` — 32 bytes derived from the operator's passphrase
     via Argon2id. Encrypts apiKey-style fields on each child's disk.
     Threaded to spawned children via env var at startup.
-  * `revoked_tokens` — set of JWT IDs (or full token strings) the
-    operator has logged out. Cleared at restart along with the
-    signing key.
+
+And one thing that is not a secret and IS persisted:
+
+  * `revoked` — the sessions the operator signed out of, as hashes.
+    "Cleared at restart along with the signing key" was the design
+    until 2026-09-22, and it was wrong on an enrolled node, whose
+    signing key is NOT cleared at restart: every signed-out token came
+    back to life. See `session_revocations`.
 
 This state lives in `app.state.auth_state` after the lifespan
 initializes it. The supervisor reaches into it to read the master
@@ -26,11 +31,13 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
 from . import security
+from .session_revocations import RevokedSessions
 
 
 @dataclass
 class AuthState:
-    """Per-process auth state. NOT persisted; rebuilt at every startup."""
+    """Per-process auth state. Rebuilt at every startup; only `revoked`
+    is read back from disk, by the lifespan."""
 
     # Private signing material for all JWTs. New per restart on an agent that
     # has not enrolled; the INSTALL'S key, persisted in node.yaml and
@@ -44,9 +51,10 @@ class AuthState:
     # the OS keyring; the agent refuses to spawn children that need
     # encrypted secrets until it has one.
     master_key: bytes | None = None
-    # Revoked session tokens — set of full token strings. Logout
-    # appends; checked on every auth-protected request.
-    revoked_tokens: set[str] = field(default_factory=set)
+    # Signed-out sessions. Logout adds; checked on every auth-protected
+    # request AND by the browser proxy before it forwards anything. In
+    # memory until the lifespan binds it to its file beside agent.yaml.
+    revoked: RevokedSessions = field(default_factory=RevokedSessions)
     # Per-source-IP sliding-window log of failed login attempts. Kept
     # in AuthState (rather than module-global) so tests get a clean
     # rate-limit state with each fresh app fixture.
@@ -71,13 +79,12 @@ class AuthState:
         with self._lock:
             self.signing_key = key
 
-    def revoke(self, token: str) -> None:
-        with self._lock:
-            self.revoked_tokens.add(token)
+    def revoke(self, token: str, *, expires_at: int) -> None:
+        """Sign `token` out until it would have expired anyway."""
+        self.revoked.revoke(token, expires_at=expires_at)
 
     def is_revoked(self, token: str) -> bool:
-        with self._lock:
-            return token in self.revoked_tokens
+        return self.revoked.is_revoked(token)
 
     def record_login_failure(self, source: str, *, window_seconds: int, max_in_window: int) -> bool:
         """Append a failure for this source; return True iff the source

@@ -6,8 +6,11 @@ salt and every sealed share password), the copy of an `agent.yaml` that
 would not load (the same, verbatim), `node.yaml` (THE INSTALL'S signing
 key, in the clear on purpose -- see `node_identity`), and each companion
 driver's config (an `apiKey` an operator saved through the driver's own
-Config page rides along every time the agent rewrites the file). Until
-2026-09-22 only `client_keys.json` was created private. The rest took
+Config page rides along every time the agent rewrites the file). The
+sign-outs file, `revoked_sessions.json`, holds only hashes, and is
+written the same way so that nobody else on the host can edit a
+sign-out out of it. Until 2026-09-22 only `client_keys.json` was
+created private. The rest took
 the process umask -- 0644 on every stock Linux and macOS -- and
 `node.yaml` was chmodded to 0600 *after* its bytes were already on
 disk, which is a window, not a guarantee.

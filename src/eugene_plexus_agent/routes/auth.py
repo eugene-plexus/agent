@@ -421,10 +421,17 @@ async def _restart_supervised_children_if_present(request: Request) -> None:
 async def logout(
     request: Request,
 ) -> None:
-    """Add the current session token to the in-memory revocation set.
+    """Sign the current session out: here, through the proxy, and after a restart.
 
     Validates via the same dependency as protected routes so callers
     can't revoke arbitrary tokens — only the one they're holding.
+
+    Recorded in `session_revocations`, which is written beside
+    `agent.yaml` and which the browser proxy consults before forwarding;
+    until 2026-09-22 it was a set in memory that only this agent's own
+    routes read, so a signed-out token went on working against every
+    component behind the proxy, and against this agent too once an
+    enrolled node restarted.
     """
     creds: HTTPAuthorizationCredentials | None = await _bearer_scheme(request)
     if creds is None or not creds.credentials:
@@ -434,10 +441,11 @@ async def logout(
             "Provide the session token to revoke via Authorization: Bearer.",
         )
     # Validate before revoking so a bogus token doesn't grow the
-    # revocation set unboundedly.
-    _ = require_operator_session(request, creds)
+    # revocation set unboundedly -- and so its `exp` is known, which is
+    # how long the entry has to be kept.
+    payload = require_operator_session(request, creds)
     auth: AuthState = request.app.state.auth_state
-    auth.revoke(creds.credentials)
+    auth.revoke(creds.credentials, expires_at=payload.exp)
     log.info("session revoked")
 
 

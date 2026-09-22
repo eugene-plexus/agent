@@ -35,6 +35,7 @@ from . import (
     off_host,
     process_signals,
     security,
+    session_revocations,
     share_credentials,
     ui_assets,
 )
@@ -116,6 +117,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 identity.record.signing_key_id,
                 identity.record.name,
             )
+
+    # The sessions signed out before this start. Outside the `hasattr`
+    # above, and in safe mode too: a sign-out that was not read back is
+    # a live token on any node whose signing key survived the restart,
+    # which is every enrolled one -- and safe mode ignores `agent.yaml`,
+    # not the security state beside it.
+    app.state.auth_state.revoked.bind(
+        settings.config_file.resolve().parent / session_revocations.REVOKED_SESSIONS_FILE
+    )
 
     # OS keyring auto-unlock — only when the operator opted into it
     # AND a passphrase has been set (so we know which install's key
