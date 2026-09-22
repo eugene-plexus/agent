@@ -36,6 +36,7 @@ from typing import Any, Protocol
 import yaml
 
 from ._generated.models import ComponentEntry, ComponentKind, RuntimeSpec, SpawnConfig
+from ._private_files import write_private
 from .engines import adapter_for, default_model_alias
 from .state import AgentState
 
@@ -159,17 +160,19 @@ def _write_config(path: Path, managed: dict[str, Any]) -> bool:
     A knob that does not survive the next restart is not a knob, and
     `requestTimeoutSeconds` is precisely the one R2.5 exists to make
     worth turning.
+
+    **Written owner-only and atomically** (2026-09-22). Keeping the
+    operator's fields means keeping an `apiKey` they saved on the
+    driver's own Config page, so this file is exactly as secret as that
+    key; `write_text` created it at the umask's 0644 and truncated it
+    in place.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     document = _read_config(path) if path.exists() else {}
     changed = any(document.get(key) != value for key, value in managed.items())
     if not changed and path.exists():
         return False
     document.update(managed)
-    path.write_text(
-        yaml.safe_dump(document, sort_keys=True, default_flow_style=False),
-        encoding="utf-8",
-    )
+    write_private(path, yaml.safe_dump(document, sort_keys=True, default_flow_style=False))
     return changed
 
 

@@ -65,10 +65,7 @@ import binascii
 import ipaddress
 import json
 import logging
-import os
 import socket
-import stat
-import sys
 import threading
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -82,6 +79,7 @@ import nacl.signing
 import yaml
 
 from . import security
+from ._private_files import write_private
 
 log = logging.getLogger(__name__)
 
@@ -654,12 +652,12 @@ class NodeIdentityStore:
                 out[wire] = value
         rendered = yaml.safe_dump(out, sort_keys=True, default_flow_style=False)
         # Written to a sibling and renamed, so a crash mid-write leaves
-        # the previous identity rather than half of a new one.
-        tmp = self._path.with_suffix(".yaml.tmp")
-        tmp.write_text(rendered, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
-        os.replace(tmp, self._path)
+        # the previous identity rather than half of a new one. **Created
+        # 0600, not chmodded to it** (2026-09-22): `write_text` then
+        # `chmod` left the install's signing key on disk at the umask's
+        # mode for as long as the two calls took, and a leftover temp at
+        # that fixed name kept its mode through the next `write_text`.
+        write_private(self._path, rendered)
 
 
 __all__ = [

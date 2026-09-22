@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import os
 import secrets
 import threading
 import time
@@ -18,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ._private_files import write_private
 from .client_admission import AdmissionClock, decide, validate_ledger, validate_limits
 
 log = logging.getLogger(__name__)
@@ -235,22 +235,20 @@ class ClientKeyStore:
         # Commit to disk before making the new state visible or returning success.
         records = {key: value for key, value in records.items() if value.expires_at > time.time()}
         revision = self._revision + 1
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._path.with_suffix(".tmp")
-        with os.fdopen(
-            os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8"
-        ) as output:
-            json.dump(
+        # `write_private` rather than the `os.open(..., O_TRUNC, 0o600)`
+        # this used to spell out: a fixed `.tmp` name opened with
+        # `O_TRUNC` keeps the mode of a leftover from a crash, so one
+        # stray 0644 temp made every later registry 0644.
+        write_private(
+            self._path,
+            json.dumps(
                 {
                     "revision": revision,
                     "keys": [r.to_json() for r in records.values()],
                     "admission": self._admission if admission is None else admission,
-                },
-                output,
-            )
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, self._path)
+                }
+            ),
+        )
         self._records, self._revision = records, revision
         if admission is not None:
             self._admission = admission

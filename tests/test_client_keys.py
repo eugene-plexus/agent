@@ -23,7 +23,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import client_keys, security
+from eugene_plexus_agent import _private_files, client_keys, security
 from eugene_plexus_agent.auth_state import AuthState
 from eugene_plexus_agent.client_keys import ClientKeyRecord, ClientKeyStore
 
@@ -185,7 +185,8 @@ def test_failed_atomic_replacement_does_not_acknowledge_revocation(tmp_path, mon
     def fail(*_args):
         raise OSError("disk full")
 
-    monkeypatch.setattr(client_keys.os, "replace", fail)
+    # The replace lives in the shared private-file writer since 2026-09-22.
+    monkeypatch.setattr(_private_files.os, "replace", fail)
     with pytest.raises(OSError, match="disk full"):
         store.revoke("one")
     assert path.read_bytes() == before

@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from eugene_plexus_agent import client_keys
+from eugene_plexus_agent import _private_files
 from eugene_plexus_agent.client_admission import AdmissionRefusal
 from eugene_plexus_agent.client_keys import ClientKeyStore
 from tests.test_client_keys import _record
@@ -26,7 +26,8 @@ def test_standalone_restart_and_failed_writes(tmp_path, monkeypatch):
         def fail(*args):
             raise OSError("full")
 
-        patch.setattr(client_keys.os, "replace", fail)
+        # The replace lives in the shared private-file writer since 2026-09-22.
+        patch.setattr(_private_files.os, "replace", fail)
         with pytest.raises(OSError):
             store.admit(key_id="abc", action="release", request_id="one", model="m")
         assert path.read_bytes() == before

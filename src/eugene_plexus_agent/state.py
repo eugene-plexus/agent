@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 import re
 import threading
 from pathlib import Path
@@ -62,6 +61,7 @@ from ._generated.models import (
     ComponentStatus,
     RuntimeSpec,
 )
+from ._private_files import write_private
 
 # Port range the agent assigns engine runtimes from when the operator
 # doesn't pick one. Above the component ports (8079-8083) and clear of the
@@ -501,11 +501,13 @@ class AgentState:
         Best-effort and never raises: this runs while explaining a
         failure, and an exception here would turn one fault into two.
         A copy rather than a move, so an operator who fixes the original
-        by hand is not surprised to find it gone.
+        by hand is not surprised to find it gone. Owner-only like the
+        original: a file that would not parse still carries its `auth`
+        block verbatim, and a copy is only as private as its own mode.
         """
         target = self._path.with_suffix(self._path.suffix + UNREADABLE_SUFFIX)
         try:
-            target.write_bytes(self._path.read_bytes())
+            write_private(target, self._path.read_bytes())
         except OSError as exc:  # pragma: no cover - defensive
             log.warning("could not preserve %s as %s: %s", self._path, target, exc)
 
@@ -803,11 +805,13 @@ class AgentState:
         PATCH and every companion declaration rewrites this file, and
         M6 declares one companion per runtime.
 
-        `fsync` before the replace, not after: the ordering is what the
-        durability depends on, and skipping it would leave the metadata
-        rename ahead of the data on a crash.
+        **And owner-only from its first byte** (2026-09-22): the `auth`
+        block is the passphrase's hash and the master-key salt, which is
+        an offline guessing attack for anyone who can read the file, and
+        `tmp.open("w")` created it with the umask -- 0644 on a stock
+        Linux. `_private_files.write_private` is the same temp + `fsync`
+        + `os.replace`, with the mode given at creation.
         """
-        self._path.parent.mkdir(parents=True, exist_ok=True)
         out: dict[str, Any] = dict(self._config)
         out["components"] = [
             entry.model_dump(exclude_none=True, mode="json") for entry in self._components.values()
@@ -818,22 +822,9 @@ class AgentState:
         if self._auth:
             out["auth"] = dict(self._auth)
 
-        # Same directory, so `os.replace` is a rename within one volume.
-        # A temp file under the system temp dir would make it a copy,
-        # which is exactly the non-atomic thing being removed here.
-        tmp = self._path.with_suffix(self._path.suffix + f".tmp-{os.getpid()}")
-        try:
-            with tmp.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(out, f, sort_keys=True, default_flow_style=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self._path)
-        except BaseException:
-            # Including `KeyboardInterrupt`/`SystemExit`: a half-written
-            # temp file left behind is litter, and the reason this
-            # method exists is that interruptions happen mid-write.
-            tmp.unlink(missing_ok=True)
-            raise
+        # Rendered before anything is opened, so a failure to render
+        # (a value `safe_dump` refuses) touches no file at all.
+        write_private(self._path, yaml.safe_dump(out, sort_keys=True, default_flow_style=False))
 
 
 def _to_component(entry: ComponentEntry) -> Component:
