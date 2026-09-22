@@ -144,13 +144,18 @@ class KevAdapter(EngineAdapter):
 
     def describe(self, path: Path, origin: Origin) -> DiscoveredBinary:
         """Ask the interpreter whether it can actually serve Kev."""
-        probed = _probe_packages(str(path))
-        version = probed.get("kev") if probed else None
+        probed = _probe_packages(str(path)) or {}
+
+        def text(key: str) -> str | None:
+            value = probed.get(key)
+            return value if isinstance(value, str) else None
+
+        version = text("kev")
         python = PythonEngine(
             interpreter=str(path),
             pythonVersion=None,
             packageVersion=version,
-            torchVersion=probed.get("torch") if probed else None,
+            torchVersion=text("torch"),
             accelerator=None,
         )
         return DiscoveredBinary(path=path, origin=origin, version=version, python=python)
