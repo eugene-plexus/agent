@@ -152,6 +152,19 @@ _STRIPPED_RESPONSE_HEADERS = frozenset(
 
 _METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS", "HEAD"]
 
+MAX_PROXY_BODY_BYTES = 32 * 1024 * 1024
+"""The largest request body this proxy will hold and pass on.
+
+The body is buffered (see `proxy`), on a route that needs no sign-in,
+and until 2026-09-22 with no limit at all: anyone who could reach the
+port could make this process allocate whatever they cared to send.
+32 MiB is twice the gateway's own 16 MiB inference cap, so a chat
+request with images attached still reaches the gateway and is judged
+there -- in the gateway's words, which are the ones that name the
+model's limits -- rather than refused here in ours. Nothing else the
+browser sends comes near it.
+"""
+
 # No read timeout. A first token can be twenty seconds away behind an
 # engine that is still loading, and an SSE stream is idle between tokens
 # by definition; a read deadline here would cut a working generation off
@@ -390,6 +403,40 @@ def presented_credentials(request: Request) -> list[str]:
     return found
 
 
+def _too_large() -> HTTPException:
+    return _problem(
+        status.HTTP_413_CONTENT_TOO_LARGE,
+        "Request too large",
+        f"This request is larger than {MAX_PROXY_BODY_BYTES // (1024 * 1024)} MiB, the most "
+        "Eugene Plexus will pass on. Attach fewer or smaller files and try again.",
+    )
+
+
+async def read_capped_body(request: Request) -> bytes:
+    """The request body, refused once it passes `MAX_PROXY_BODY_BYTES`.
+
+    **Twice, because either alone leaves a hole.** A declared
+    `Content-Length` over the cap is refused before a byte is read; a
+    chunked upload declares nothing, so what arrives is counted and the
+    read stops at the first chunk past the cap -- the rest is never
+    asked for, let alone held. A `Content-Length` that lies is the
+    server's to enforce (uvicorn frames the body by it), so the count
+    is the backstop and not the other way round.
+    """
+    limit = MAX_PROXY_BODY_BYTES
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.strip().isdigit() and int(declared) > limit:
+        raise _too_large()
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            raise _too_large()
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _refuse_signed_out(request: Request) -> None:
     auth: AuthState | None = getattr(request.app.state, "auth_state", None)
     if auth is None:
@@ -461,13 +508,15 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
     # lookup would already have spent the credential.
     _refuse_signed_out(request)
 
-    route = await resolve_target(request, target)
-    url = _upstream_url(route.base, route.prefix + "/" + path.lstrip("/"), request.url.query)
-
     # The request body is buffered and the response is not, which is the
     # asymmetry that matters: uploads here are small JSON documents,
     # while the response can be a token stream that must not be held.
-    body = b"" if request.method in ("GET", "HEAD") else await request.body()
+    # Buffered under a cap, and read before resolving, so every refusal
+    # that depends only on the request comes before any network work.
+    body = b"" if request.method in ("GET", "HEAD") else await read_capped_body(request)
+
+    route = await resolve_target(request, target)
+    url = _upstream_url(route.base, route.prefix + "/" + path.lstrip("/"), request.url.query)
 
     client = get_client(request)
     upstream_request = client.build_request(
