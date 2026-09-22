@@ -96,6 +96,24 @@ _DEFAULT_CLIENT_TTL_SECONDS = 365 * 24 * 3600
 # --------------------------------------------------------------------------- #
 
 
+MIN_PASSPHRASE_LENGTH = 12
+"""The shortest passphrase `POST /v1/auth/initialize` will set, in characters.
+
+One character was enough until 2026-09-22. This is the one secret that
+stands between the network and every key the install holds -- the
+Argon2id hash in `agent.yaml` is an offline guessing target for anyone
+who ever reads that file -- and it cannot be recovered, so the only time
+to ask for a real one is when it is chosen. Twelve because a few
+ordinary words clear it without anyone reaching for symbols.
+
+**Enforced where a passphrase is chosen, never where one is used.**
+Login does not check it: an install set up before this existed has a
+shorter passphrase, and refusing it would lock its operator out of their
+own machine. The UI's wizard and the control root use the same number;
+if it moves, it moves in all three.
+"""
+
+
 _password_hasher = argon2.PasswordHasher(
     time_cost=_ARGON2_TIME_COST,
     memory_cost=_ARGON2_MEMORY_COST,

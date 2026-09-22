@@ -69,8 +69,40 @@ def test_initialize_refuses_when_already_initialized(client: TestClient) -> None
 
 def test_initialize_rejects_empty_passphrase(client: TestClient) -> None:
     response = client.post("/v1/auth/initialize", json={"passphrase": ""})
-    # FastAPI's pydantic min_length=1 returns 422.
     assert response.status_code == 422
+
+
+def test_initialize_refuses_a_passphrase_under_twelve_characters_in_plain_words(
+    client: TestClient,
+) -> None:
+    """The one secret between the network and every key on the install, and
+    it cannot be recovered. One character was enough until 2026-09-22."""
+    response = client.post("/v1/auth/initialize", json={"passphrase": "x" * 11})
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "at least 12 characters" in detail["detail"], detail
+    # Refused means nothing was set: the wizard can simply try again.
+    assert client.get("/v1/auth/status").json()["initialized"] is False
+
+
+def test_initialize_accepts_exactly_twelve_characters(client: TestClient) -> None:
+    assert client.post("/v1/auth/initialize", json={"passphrase": "x" * 12}).status_code == 200
+
+
+def test_login_still_accepts_a_short_passphrase_an_existing_install_set(
+    client: TestClient,
+) -> None:
+    """The minimum governs choosing a passphrase, never using one: an
+    install set up before it existed must not be locked out of itself."""
+    state = client.app.state.agent_state  # type: ignore[attr-defined]
+    state.set_passphrase(
+        passphrase_hash=security.hash_passphrase("pw"), master_salt_b64="c2FsdHNhbHRzYWx0"
+    )
+    assert client.post("/v1/auth/login", json={"passphrase": "pw"}).status_code == 200
+
+
+def test_the_minimum_is_the_number_the_ui_and_the_control_root_use() -> None:
+    assert security.MIN_PASSPHRASE_LENGTH == 12
 
 
 def test_initialize_persists_passphrase_for_subsequent_login(client: TestClient) -> None:

@@ -44,7 +44,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from .. import client_keys, keyring_store, peer, security
 from .._generated.common_models import (
@@ -146,9 +146,14 @@ async def auth_status(request: Request) -> AuthStatus:
 
 
 class _InitializeRequest(BaseModel):
-    """The wizard's payload for first-run passphrase setup."""
+    """The wizard's payload for first-run passphrase setup.
 
-    passphrase: str = Field(min_length=1)
+    No `min_length` here: the length is checked in the handler so that a
+    short passphrase -- including an empty one -- gets one sentence a
+    person can act on, not pydantic's validation list.
+    """
+
+    passphrase: str
 
 
 @router.post("/v1/auth/initialize", response_model=AuthLoginResponse)
@@ -198,6 +203,18 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
             "holds the passphrase is missing. Setting a new one would lock you out of "
             "everything the old one sealed, so it is refused. Restore the configuration "
             "file from a backup, or from the copy kept beside it, and start again.",
+        )
+
+    # After the two 409s, deliberately: on an install that is already set
+    # up, "too short" would be advice about a passphrase nobody can set.
+    if len(body.passphrase) < security.MIN_PASSPHRASE_LENGTH:
+        raise _problem(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Passphrase too short",
+            f"Choose a passphrase of at least {security.MIN_PASSPHRASE_LENGTH} characters "
+            f"(that one has {len(body.passphrase)}). It protects every key this install "
+            "holds and cannot be recovered if forgotten, so a few ordinary words strung "
+            "together are easier to remember and harder to guess than a short password.",
         )
 
     # Hash the passphrase (for verification on future logins) and

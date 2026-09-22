@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 import eugene_plexus_agent.admission as admission_module
 from eugene_plexus_agent import security
 
-from .conftest import StubRuntimeSupervisor, fake_devices
+from .conftest import TEST_PASSPHRASE, StubRuntimeSupervisor, fake_devices
 
 GIB = 1024**3
 
@@ -66,7 +66,7 @@ def test_the_dry_run_returns_the_decision_and_declares_nothing(
 
 
 def test_the_dry_run_is_readable_with_a_service_token(client: TestClient, tmp_path: Path) -> None:
-    client.post("/v1/auth/initialize", json={"passphrase": "pw"})
+    client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     response = client.post(
         "/v1/runtimes/admission",
         json=_runtime(_model(tmp_path, GIB)),
@@ -179,7 +179,7 @@ def test_the_declaration_mirrors_the_lifecycle_fields(
 
 
 def test_the_gateway_token_can_stop_and_start(client: TestClient, tmp_path: Path) -> None:
-    init = client.post("/v1/auth/initialize", json={"passphrase": "pw"})
+    init = client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     operator = {"Authorization": f"Bearer {init.json()['sessionToken']}"}
     client.post("/v1/runtimes", json=_runtime(_model(tmp_path, GIB)), headers=operator)
 
@@ -192,7 +192,7 @@ def test_the_gateway_token_can_stop_and_start(client: TestClient, tmp_path: Path
 
 
 def test_other_service_tokens_still_cannot(client: TestClient, tmp_path: Path) -> None:
-    init = client.post("/v1/auth/initialize", json={"passphrase": "pw"})
+    init = client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     operator = {"Authorization": f"Bearer {init.json()['sessionToken']}"}
     client.post("/v1/runtimes", json=_runtime(_model(tmp_path, GIB)), headers=operator)
 

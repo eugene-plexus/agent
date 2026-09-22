@@ -291,7 +291,7 @@ def test_the_clock_is_read_per_request_not_at_startup(authed_client: TestClient)
 
 
 def test_node_is_readable_with_a_service_token(client: TestClient) -> None:
-    client.post("/v1/auth/initialize", json={"passphrase": "pw"})
+    client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
     token = security.issue_service_token(signing_key=signing_key, kind="control")
     response = client.get("/v1/node", headers={"Authorization": f"Bearer {token}"})
@@ -299,7 +299,7 @@ def test_node_is_readable_with_a_service_token(client: TestClient) -> None:
 
 
 def test_node_requires_auth(client: TestClient) -> None:
-    client.post("/v1/auth/initialize", json={"passphrase": "pw"})
+    client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     assert client.get("/v1/node").status_code == 401
 
 
