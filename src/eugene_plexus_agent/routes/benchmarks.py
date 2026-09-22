@@ -13,6 +13,7 @@ from .._generated.models import (
     Benchmark,
     BenchmarkList,
     BenchmarkRequest,
+    EngineKind,
     RuntimeStatus,
 )
 from ..benchmarks import Benchmarks, benchmark_args
@@ -94,6 +95,19 @@ async def start_benchmark(body: BenchmarkRequest, request: Request) -> Benchmark
                 409, "Stop this node's runtimes before benchmarking: " + ", ".join(busy)
             )
         spec = body.runtime
+        if spec.engine is not EngineKind.llama_cpp:
+            # The instrument is llama-bench, which measures GGUF through
+            # llama.cpp and nothing else. Before this check, an MLX or
+            # vLLM spec fell into `prepare_binary`'s unconditional
+            # LlamaCppAdapter and the refusal read "no llama-server on
+            # PATH" — a true sentence about the wrong subject.
+            raise HTTPException(
+                422,
+                f"Benchmarking uses llama.cpp's own llama-bench and is only "
+                f"available for llama_cpp runtimes; this spec declares "
+                f"{spec.engine.value!r}. Measure a {spec.engine.value} model by "
+                f"running it and reading the gateway's per-request metrics.",
+            )
         # Reject incompatible settings and launch-policy violations BEFORE probing a binary.
         try:
             benchmark_args(body, Path("llama-bench"), spec.modelPath)

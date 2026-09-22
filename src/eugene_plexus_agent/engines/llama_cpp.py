@@ -368,7 +368,7 @@ class LlamaCppAdapter(EngineAdapter):
 
     # --- observing --------------------------------------------------------
 
-    async def probe_readiness(self, base_url: str) -> Readiness:
+    async def probe_readiness(self, base_url: str, *, established: bool = False) -> Readiness:
         """Read `llama-server`'s `/health`.
 
         Upstream's contract: 503 with `{"status": "loading model"}` while

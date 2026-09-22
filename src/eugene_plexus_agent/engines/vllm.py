@@ -289,7 +289,7 @@ class VllmAdapter(EngineAdapter):
 
     # --- observing --------------------------------------------------------
 
-    async def probe_readiness(self, base_url: str) -> Readiness:
+    async def probe_readiness(self, base_url: str, *, established: bool = False) -> Readiness:
         """Read vLLM's `/health`.
 
         Thinner than llama-server's (`serve/instrumentator/health.py`):

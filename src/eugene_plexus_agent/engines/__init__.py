@@ -20,11 +20,13 @@ from .base import (
     interpret_readiness,
 )
 from .llama_cpp import LlamaCppAdapter
+from .mlx import MlxAdapter
 from .vllm import VllmAdapter
 
 ADAPTERS: dict[EngineKind, EngineAdapter] = {
     EngineKind.llama_cpp: LlamaCppAdapter(),
     EngineKind.vllm: VllmAdapter(),
+    EngineKind.mlx: MlxAdapter(),
 }
 
 
@@ -45,6 +47,7 @@ __all__ = [
     "EngineUnavailableError",
     "LlamaCppAdapter",
     "Loading",
+    "MlxAdapter",
     "NotAnswering",
     "Readiness",
     "Ready",

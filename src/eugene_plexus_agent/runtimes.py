@@ -359,6 +359,14 @@ class RuntimeSupervisor:
         # process because it is an *observation*, not loop state — the
         # same reason component safe-mode observations live on Supervisor.
         self._readiness: dict[str, Loading | Ready | None] = {}
+        #: Which PROCESS proved residency: runtime name -> the
+        #: `last_restart` marker of the process that returned Ready.
+        #: Feeds `probe_readiness(established=...)`, so an expensive
+        #: first proof (MLX generates a token) is paid once per process
+        #: rather than once per poll. Keyed on the restart marker, not
+        #: the name, because a crash-and-respawn binds its port before
+        #: loading and would otherwise inherit the old proof.
+        self._proved_ready: dict[str, datetime] = {}
         # Why a stopped runtime is stopped — an observation, reported on
         # `Runtime.stopReason` and never persisted or replicated. Cleared
         # the moment the runtime is started.
@@ -599,6 +607,7 @@ class RuntimeSupervisor:
         sp = self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
+        self._proved_ready.pop(name, None)
         self._stop_reasons.pop(name, None)
         self._copy_notes.pop(name, None)
         self._load_progress.forget(name)
@@ -622,6 +631,7 @@ class RuntimeSupervisor:
             self.add_and_start(planner.spec.model_copy(update={"autoStart": True}))
             return True
         self._readiness.pop(name, None)
+        self._proved_ready.pop(name, None)
         await sp.restart()
         return True
 
@@ -642,6 +652,7 @@ class RuntimeSupervisor:
         sp = self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
+        self._proved_ready.pop(name, None)
         self._stop_reasons[name] = reason
         if sp is not None:
             await sp.stop()
@@ -662,6 +673,7 @@ class RuntimeSupervisor:
         self._processes.clear()
         self._planners.clear()
         self._readiness.clear()
+        self._proved_ready.clear()
         self._stop_reasons.clear()
 
     async def start_readiness_loop(self, get_specs: object) -> None:
@@ -894,13 +906,15 @@ class RuntimeSupervisor:
             return
         if sp.pid is None:
             self._readiness.pop(spec.name, None)
+            self._proved_ready.pop(spec.name, None)
             return
         adapter = adapter_for(spec.engine)
         if adapter is None:
             return
         started_at = sp.last_restart
         base = f"http://{spec.host or '127.0.0.1'}:{spec.port}"
-        outcome = await adapter.probe_readiness(base)
+        established = started_at is not None and self._proved_ready.get(spec.name) == started_at
+        outcome = await adapter.probe_readiness(base, established=established)
         if (
             self._processes.get(spec.name) is not sp
             or sp.last_restart != started_at
@@ -921,6 +935,8 @@ class RuntimeSupervisor:
             elapsed_seconds=elapsed,
         )
         sp.observe_readiness(isinstance(outcome, Ready))
+        if isinstance(outcome, Ready) and started_at is not None:
+            self._proved_ready[spec.name] = started_at
         if isinstance(outcome, Ready | Loading):
             self._readiness[spec.name] = outcome
         else:
@@ -1144,6 +1160,7 @@ def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescr
                     engine=kind,
                     available=False,
                     modelFormats=list(adapter.model_formats),
+                    experimental=adapter.experimental,
                     error=error,
                     flagSchema=adapter.flag_schema(),
                     managed=managed,
@@ -1156,6 +1173,7 @@ def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescr
                 engine=kind,
                 available=True,
                 modelFormats=list(adapter.model_formats),
+                experimental=adapter.experimental,
                 binaryPath=str(found.path),
                 version=found.version,
                 origin=found.origin,

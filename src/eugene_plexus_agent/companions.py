@@ -36,7 +36,7 @@ from typing import Any, Protocol
 import yaml
 
 from ._generated.models import ComponentEntry, ComponentKind, RuntimeSpec, SpawnConfig
-from .engines import default_model_alias
+from .engines import adapter_for, default_model_alias
 from .state import AgentState
 
 log = logging.getLogger(__name__)
@@ -80,8 +80,8 @@ def is_companion(entry: ComponentEntry, state: AgentState) -> bool:
         return False
 
 
-MANAGED_KEYS = ("provider", "runtimeName", "modelId")
-"""The three fields the agent owns in a companion's config file.
+MANAGED_KEYS = ("provider", "runtimeName", "modelId", "upstreamModelId")
+"""The four fields the agent owns in a companion's config file.
 
 **Everything else in that document belongs to the operator** (R2.5).
 The driver's own `PATCH /v1/config` writes into the same file -- that is
@@ -91,11 +91,20 @@ browser, not from us.
 """
 
 
-def render_config(*, runtime_name: str, alias: str) -> dict[str, Any]:
+def render_config(*, runtime_name: str, alias: str, upstream: str | None = None) -> dict[str, Any]:
+    """The managed document, `upstreamModelId` included even when null.
+
+    Rendered unconditionally rather than only for engines that need it,
+    because `_write_config` compares only the keys present in `managed`:
+    a key emitted conditionally would linger in the file after a runtime
+    changed engine, and the driver would keep translating for a backend
+    that no longer speaks the old sentinel.
+    """
     return {
         "provider": COMPANION_PROVIDER,
         "runtimeName": runtime_name,
         "modelId": alias,
+        "upstreamModelId": upstream,
     }
 
 
@@ -148,6 +157,20 @@ def resolved_alias(spec: RuntimeSpec) -> str:
     return spec.modelAlias or default_model_alias(spec.modelPath)
 
 
+def upstream_model_id(spec: RuntimeSpec) -> str | None:
+    """What the companion must send its backend, when that is not the alias.
+
+    Engine knowledge, so the adapter answers: `mlx_lm.server` has no flag
+    to serve a chosen name and resolves only upstream's `default_model`
+    sentinel, so its companion translates; every other engine is launched
+    WITH the alias (`--alias`, `--served-model-name`) and gets None.
+    """
+    adapter = adapter_for(spec.engine)
+    if adapter is None:
+        return None
+    return adapter.upstream_model_id(spec)
+
+
 async def ensure_companion(
     state: AgentState,
     supervisor: ComponentSupervisorLike | None,
@@ -170,7 +193,14 @@ async def ensure_companion(
         )
 
     path = companion_config_path(state, name)
-    changed = _write_config(path, render_config(runtime_name=spec.name, alias=resolved_alias(spec)))
+    changed = _write_config(
+        path,
+        render_config(
+            runtime_name=spec.name,
+            alias=resolved_alias(spec),
+            upstream=upstream_model_id(spec),
+        ),
+    )
 
     if existing is None:
         entry = ComponentEntry(

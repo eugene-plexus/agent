@@ -52,7 +52,10 @@ def test_declaring_a_runtime_declares_its_companion(
     assert companion["url"].startswith("http://127.0.0.1:")
     assert urlparse(companion["url"]).port != body["port"]
 
-    # Its config is three lines: follow the runtime by name, serve its alias.
+    # Its config is four lines: follow the runtime by name, serve its
+    # alias. `upstreamModelId` is null for llama.cpp — the runtime is
+    # launched WITH the alias — and rendered anyway, so a runtime that
+    # changes engine has the key cleared rather than left lingering.
     config_path = Path(companion["spawn"]["configFile"])
     assert config_path.parent == settings.config_file.parent / "drivers"
     document = yaml.safe_load(config_path.read_text(encoding="utf-8"))
@@ -60,6 +63,7 @@ def test_declaring_a_runtime_declares_its_companion(
         "provider": "openai_compat_custom",
         "runtimeName": "qwen3-a",
         "modelId": "Qwen3-1.7B-Q8_0",
+        "upstreamModelId": None,
     }
     # And it was handed to the component supervisor to spawn.
     assert ("add_and_start", "qwen3-a-driver") in stub_supervisor.calls

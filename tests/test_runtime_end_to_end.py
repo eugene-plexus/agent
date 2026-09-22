@@ -250,7 +250,7 @@ async def test_a_crash_during_load_is_not_automatically_retried(
     processes: list[_FakeProcess] = []
     original_sleep = asyncio.sleep
 
-    async def loading(_base: str) -> Loading:
+    async def loading(_base: str, *, established: bool = False) -> Loading:
         return Loading(detail="reading model from the share")
 
     async def create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
@@ -329,7 +329,7 @@ async def controlled_runtime(
         harness.spawned.put_nowait(process)
         return process
 
-    async def probe(_base: str) -> Loading | Ready | None:
+    async def probe(_base: str, *, established: bool = False) -> Loading | Ready | None:
         return harness.outcome
 
     async def backoff(seconds: float) -> None:
@@ -484,7 +484,7 @@ async def test_late_ready_probe_cannot_belong_to_a_replacement(
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def delayed(_base: str) -> Ready:
+    async def delayed(_base: str, *, established: bool = False) -> Ready:
         entered.set()
         await release.wait()
         return Ready()

@@ -593,7 +593,16 @@ async def check_admission(
     # stays the card's own reading, because reporting the reduced number
     # there would be a claim about the card that is not true.
     budget = max(0, free - reserved) if free is not None else None
-    ram_available = snapshot.ram_available_bytes if device.kind is not ComputeDeviceKind.cpu else 0
+    # `ram_bytes` means "system RAM a partial offload can spill into,
+    # BESIDE the device pool". On a discrete GPU that is real; on Apple
+    # unified memory the "VRAM" pool and host RAM are the same silicon,
+    # so passing both double-counts the machine — the exact "all host
+    # RAM read as free VRAM" defect the MLX slice exists to avoid. A
+    # metal device therefore gets no spillover term: its budget IS the
+    # unified pool (and today `memoryFreeBytes` is absent there, so the
+    # verdict is honestly `unknown` until a real Mac measures it).
+    spillover_device = device.kind not in (ComputeDeviceKind.cpu, ComputeDeviceKind.metal)
+    ram_available = snapshot.ram_available_bytes if spillover_device else 0
     blockers = _blockers(spec, targets, snapshot, running)
     full_offload = wants_full_offload(spec)
 
@@ -606,7 +615,7 @@ async def check_admission(
             spec.modelPath,
             context_length=context_length,
             vram_bytes=budget,
-            ram_bytes=ram_available if device.kind is not ComputeDeviceKind.cpu else None,
+            ram_bytes=ram_available if spillover_device else None,
         )
         if answer is not None:
             required = answer.required_bytes

@@ -34,6 +34,7 @@ from eugene_plexus_agent import _http
 from eugene_plexus_agent.admission import LibraryFitClient
 from eugene_plexus_agent.engines.base import probe_client
 from eugene_plexus_agent.engines.llama_cpp import LlamaCppAdapter
+from eugene_plexus_agent.engines.mlx import MlxAdapter
 from eugene_plexus_agent.engines.vllm import VllmAdapter
 
 
@@ -78,17 +79,23 @@ async def test_ten_readiness_probes_build_one_client(monkeypatch: pytest.MonkeyP
     assert built[0] == 0, f"{built[0]} clients built across ten probes"
 
 
-async def test_both_adapters_share_the_one_probe_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """llama.cpp and vLLM probe the same way and have no reason to hold
-    separate pools; a host running both would otherwise pay twice."""
+async def test_all_adapters_share_the_one_probe_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every adapter probes through the shared client; a host running
+    several engines would otherwise pay the construction cost per kind.
+    MLX matters most here: its readiness poll is the one that can issue
+    a completion, and a per-call client would put certifi's 104 ms parse
+    in front of every one of them."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={"choices": [{"message": {"content": "o"}}]})
         return httpx.Response(200, json={"status": "ok"})
 
     _mock(handler)
     built = _count_constructions(monkeypatch)
     await LlamaCppAdapter().probe_readiness("http://127.0.0.1:8090")
     await VllmAdapter().probe_readiness("http://127.0.0.1:8091")
+    await MlxAdapter().probe_readiness("http://127.0.0.1:8092")
     assert built[0] == 0
 
 

@@ -206,6 +206,14 @@ class EngineAdapter(abc.ABC):
     #: passes the value in as `configured`.
     configured_binary_key: str | None = None
 
+    #: True while this engine's integration has never been proved on the
+    #: hardware it targets — `mlx` until a physical Apple silicon run is
+    #: recorded. Reported on `EngineDescriptor.experimental` so the UI
+    #: can badge the option instead of hardcoding a list that goes stale
+    #: the day the evidence lands. A property of the *integration*, not
+    #: of this host.
+    experimental: bool = False
+
     # --- discovery --------------------------------------------------------
 
     def resolve_binary(
@@ -377,6 +385,20 @@ class EngineAdapter(abc.ABC):
         """
         return {}
 
+    def upstream_model_id(self, spec: RuntimeSpec) -> str | None:
+        """What a companion driver must send this engine, when that is
+        not the public alias — or None for an engine launched WITH the
+        alias, which is every engine that has a served-name flag.
+
+        Exists for `mlx_lm.server`'s shape of backend: no
+        `--served-model-name`, so the only ids it resolves are its own
+        `default_model` sentinel and the model's absolute path. The
+        companion advertises the public alias as `modelId` and carries
+        this value as `upstreamModelId`; the driver translates at the
+        backend boundary and nowhere else.
+        """
+        return None
+
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
         """A better `lastError` than "exited with code N", or None.
 
@@ -399,7 +421,7 @@ class EngineAdapter(abc.ABC):
     # --- observing --------------------------------------------------------
 
     @abc.abstractmethod
-    async def probe_readiness(self, base_url: str) -> Readiness:
+    async def probe_readiness(self, base_url: str, *, established: bool = False) -> Readiness:
         """Ask a running engine whether it is serving yet.
 
         A *network* observation only. It must not try to infer whether
@@ -408,6 +430,15 @@ class EngineAdapter(abc.ABC):
         long timeout into a slow poll, not a better answer. The
         supervisor combines this with what it knows about the process in
         `interpret_readiness`.
+
+        `established` is the supervisor saying *this same process has
+        already been proved ready once* — keyed on the process's own
+        restart marker, so a crash-and-respawn resets it. It exists for
+        an engine whose only proof of residency has a real cost (MLX
+        proves it by generating a token); such an adapter may downgrade
+        to a cheap liveness read once established, because a resident
+        model stays resident for the life of the process. Adapters whose
+        probes are already cheap ignore it.
         """
 
     # --- configuring ------------------------------------------------------
@@ -464,7 +495,27 @@ def interpret_readiness(
     Past the adapter's startup budget the answer is still `Loading`,
     flagged, with the elapsed time — the operator gets evidence, not a
     state machine that guesses "wedged" from a clock.
+
+    Since the MLX port, a budget also bounds a *narrated* load: an
+    adapter that returns `Loading` from its own probe and declares
+    `startup_budget_seconds` gets the same flag past the same clock.
+    Before that, the budget applied only to silent loads, so an engine
+    that says "loading" forever — which is exactly what a wedged
+    mlx_lm.server looks like, since nothing it serves can distinguish a
+    stall — could never be flagged at all.
     """
+    if isinstance(outcome, Loading) and not outcome.past_budget:
+        budget = adapter.startup_budget_seconds
+        if budget is not None and elapsed_seconds is not None and elapsed_seconds > budget:
+            base_detail = outcome.detail or "the engine reports it is loading"
+            return Loading(
+                detail=(
+                    f"{base_detail} — loading for {elapsed_seconds:.0f}s, past "
+                    f"{adapter.kind.value}'s {budget:.0f}s startup budget; check the "
+                    f"captured engine output for a stall."
+                ),
+                past_budget=True,
+            )
     if (
         not isinstance(outcome, NotAnswering)
         or outcome.reached
