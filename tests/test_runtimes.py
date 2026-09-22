@@ -54,7 +54,7 @@ def test_engines_lists_every_adapter_with_its_flag_schema(authed_client: TestCli
     response = authed_client.get("/v1/engines")
     assert response.status_code == 200
     engines = response.json()["engines"]
-    assert [e["engine"] for e in engines] == ["llama_cpp", "vllm", "mlx"]
+    assert [e["engine"] for e in engines] == ["llama_cpp", "vllm", "mlx", "kev"]
 
     for engine in engines:
         assert engine["flagSchema"]["component"] == f"engine:{engine['engine']}"
@@ -89,6 +89,11 @@ def test_engines_declare_which_model_formats_they_load(authed_client: TestClient
     # checks — see docs/design/mlx-engine.md in specs.
     assert by_kind["mlx"]["modelFormats"] == ["safetensors"]
     assert by_kind["mlx"]["experimental"] is True
+    # Kev loads its own checkpoint format and nothing else: the format
+    # is what keeps a decision model off every chat engine's launch
+    # button and every chat model off Kev's.
+    assert by_kind["kev"]["modelFormats"] == ["kev_checkpoint"]
+    assert by_kind["kev"]["experimental"] is True
 
 
 def test_model_formats_do_not_depend_on_availability(authed_client: TestClient) -> None:

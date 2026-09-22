@@ -18,6 +18,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "uiFontSize",
         "vllmBinary",
         "mlxBinary",
+        "kevPython",
         "engineBinaryRoots",
         "allowUnrestrictedEngineLaunch",
         "advertiseUrl",

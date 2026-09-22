@@ -385,6 +385,19 @@ class EngineAdapter(abc.ABC):
         """
         return {}
 
+    def companion_overrides(self, spec: RuntimeSpec) -> dict[str, object]:
+        """Managed companion-config keys this engine needs beyond the
+        defaults — a different `provider`, a concurrency ceiling.
+
+        Kev is why this exists: its companion speaks the System One
+        protocol (`provider: systemone_custom`) and must advertise
+        `decisionMaxConcurrent: 1`, because the pinned server holds one
+        request at a time. Keys returned here must be members of
+        `companions.MANAGED_KEYS`, or the merge would leave strays in an
+        operator's file.
+        """
+        return {}
+
     def upstream_model_id(self, spec: RuntimeSpec) -> str | None:
         """What a companion driver must send this engine, when that is
         not the public alias — or None for an engine launched WITH the

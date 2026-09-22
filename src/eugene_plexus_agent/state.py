@@ -216,6 +216,24 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.file_path,
     ),
     ConfigField(
+        key="kevPython",
+        label="Kev interpreter",
+        description=(
+            "Install-wide path to the Python interpreter inside the Kev "
+            "checkout's own virtual environment — for example "
+            "`/home/you/eugene-kev/.venv/bin/python`. Kev has no console "
+            "script: the launch is `python -m kev.serve`, so the engine is "
+            "an interpreter that can import it, which `uv sync --extra "
+            "serve` in the checkout arranges. Deliberately never found on "
+            "PATH — a bare `python` is not evidence of a Kev environment — "
+            "so without this (or `binary` on the runtime) the engine reads "
+            "as not installed. GET /v1/engines carries the pinned checkout "
+            "recipe. Read at the next spawn; no agent restart needed."
+        ),
+        category="engines",
+        valueType=ConfigValueType.file_path,
+    ),
+    ConfigField(
         key="advertiseUrl",
         label="Advertise address",
         description=(

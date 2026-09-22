@@ -144,6 +144,15 @@ class BackendKind(StrEnum):
     to the respective CLIs, which is how a subscription the operator
     already pays for becomes just another backend.
 
+    `systemone_http` speaks the TypeSafe System One decision
+    protocol (`POST /v1/systemone`: a state and named typed
+    questions, answered with structured probabilities rather than
+    text) — a supervised Kev runtime, another System One-compatible
+    server, or TypeSafe's own hosted endpoint, distinguished by
+    `DriverInfo.provider` exactly as the chat protocols are. A
+    driver on this protocol serves decisions and not chat; see
+    `Capabilities.chatCapable`.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -151,6 +160,7 @@ class BackendKind(StrEnum):
     claude_code_cli = 'claude_code_cli'
     codex_cli = 'codex_cli'
     openai_compat_http = 'openai_compat_http'
+    systemone_http = 'systemone_http'
 
 
 class ComputeDeviceKind(StrEnum):
@@ -184,6 +194,19 @@ class EngineKind(StrEnum):
     an engine is supported exactly when an adapter exists for it,
     and without an adapter there is nothing that knows how to start
     it or tell when it is ready.
+
+    `kev` drives upstream `python -m kev.serve` and loads Kev
+    decision checkpoints (`kev_checkpoint` format) — a decision
+    model, not a chat model: its server speaks the System One
+    protocol and its companion driver serves `POST /v1/decide`,
+    never completions. Like vLLM it loads the model *before*
+    binding its port (read off `kev/serve.py` at the pinned commit
+    and observed live 2026-09-22), so alive-and-refusing is
+    `loading`; unlike every other engine it handles one request at
+    a time, which its driver advertises as a concurrency limit.
+    Its bind is hardcoded to loopback upstream, which is the
+    posture Eugene wants: the gateway is the authenticated front
+    door.
 
     `llama_cpp` drives upstream `llama-server` and loads GGUF.
     `vllm` drives upstream `vllm serve` and loads safetensors.
@@ -222,14 +245,14 @@ class EngineKind(StrEnum):
     llama_cpp = 'llama_cpp'
     vllm = 'vllm'
     mlx = 'mlx'
+    kev = 'kev'
 
 
 class ModelFormat(StrEnum):
     """
     On-disk format of a model. A dimension of the data model rather
-    than an assumption (locked 2026-09-08): both are implemented at
-    v0.1, and the differences are load-bearing rather than
-    cosmetic.
+    than an assumption (locked 2026-09-08), and the differences are
+    load-bearing rather than cosmetic.
 
     * `gguf` — a single file, quantized, carrying its own metadata
       and tokenizer. Large models may be **split** into
@@ -241,6 +264,17 @@ class ModelFormat(StrEnum):
       weight files plus tokenizer files. Unquantized in practice,
       so **no quant tier** — a safetensors model is sized, not
       tiered, and the quant fields exist only on the GGUF side.
+    * `kev_checkpoint` — a directory holding a rank-limited LoRA
+      adapter (`adapter_config.json` + `adapter_model.safetensors`),
+      a pointer/decision head (`head.pt`), tokenizer files and
+      calibration/provenance artifacts (`provenance.json`), loaded
+      by Kev's own loader on top of a separately downloaded base
+      model named in the adapter config. Measured off the published
+      `jaredpalmer/kev-0.8b` checkpoint on 2026-09-22. **Not an
+      ordinary adapter**: a plain LoRA directory is skipped by the
+      scanner on purpose, and the decision head is what makes this
+      one a launchable model instead. Decision-only —
+      `ModelCapabilities.decision`, never `chat`.
 
     Shared because it appears on both sides of a join: a library
     entry declares what a model *is*, and
@@ -253,6 +287,7 @@ class ModelFormat(StrEnum):
 
     gguf = 'gguf'
     safetensors = 'safetensors'
+    kev_checkpoint = 'kev_checkpoint'
 
 
 class RetryDisposition(StrEnum):

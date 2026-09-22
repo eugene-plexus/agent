@@ -19,6 +19,7 @@ from .base import (
     default_model_alias,
     interpret_readiness,
 )
+from .kev import KevAdapter
 from .llama_cpp import LlamaCppAdapter
 from .mlx import MlxAdapter
 from .vllm import VllmAdapter
@@ -27,6 +28,7 @@ ADAPTERS: dict[EngineKind, EngineAdapter] = {
     EngineKind.llama_cpp: LlamaCppAdapter(),
     EngineKind.vllm: VllmAdapter(),
     EngineKind.mlx: MlxAdapter(),
+    EngineKind.kev: KevAdapter(),
 }
 
 
@@ -45,6 +47,7 @@ __all__ = [
     "DiscoveredBinary",
     "EngineAdapter",
     "EngineUnavailableError",
+    "KevAdapter",
     "LlamaCppAdapter",
     "Loading",
     "MlxAdapter",

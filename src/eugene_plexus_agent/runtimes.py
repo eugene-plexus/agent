@@ -1195,6 +1195,14 @@ def validate_spec(spec: RuntimeSpec, get_config: ConfigGetter | None = None) -> 
     adapter = adapter_for(spec.engine)
     if adapter is None:
         return f"no adapter for engine {spec.engine.value!r}"
+    if spec.engine is EngineKind.kev and spec.host not in (None, "127.0.0.1", "localhost"):
+        # Upstream hardcodes the bind to loopback (no --host flag at the
+        # pinned commit), so honouring this host is not in our power and
+        # accepting it would declare an address nothing listens on.
+        return (
+            f"kev.serve binds 127.0.0.1 only (upstream has no --host flag), so host "
+            f"{spec.host!r} cannot be honoured. Reach it through the gateway instead."
+        )
     if spec.flags:
         unknown = adapter.validate_flags(spec.flags)
         if unknown:

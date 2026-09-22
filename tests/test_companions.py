@@ -64,6 +64,7 @@ def test_declaring_a_runtime_declares_its_companion(
         "runtimeName": "qwen3-a",
         "modelId": "Qwen3-1.7B-Q8_0",
         "upstreamModelId": None,
+        "decisionMaxConcurrent": None,
     }
     # And it was handed to the component supervisor to spawn.
     assert ("add_and_start", "qwen3-a-driver") in stub_supervisor.calls
