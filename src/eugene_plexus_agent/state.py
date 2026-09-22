@@ -260,6 +260,26 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.url,
     ),
     ConfigField(
+        key="allowedHosts",
+        label="Allowed host names",
+        description=(
+            "Extra names this machine may be opened by in a browser. Leave it empty unless you "
+            "reach Eugene through a reverse proxy or your own domain -- then add that name, for "
+            "example `llm.example.com`. Already allowed without listing: any IP address, "
+            "`localhost`, a plain machine name such as `tower`, names ending `.local`, `.lan`, "
+            "`.home.arpa`, `.internal` or `.ts.net`, this computer's own name, and the host of "
+            "the advertise address above. Separate several names with commas; `*` allows any "
+            "name, which turns this protection off. Why it exists: a web page you visit can "
+            "point a name it controls at this machine's address (DNS rebinding) and then use "
+            "Eugene as if it were Eugene's own page -- read its settings, or set up a fresh "
+            "install before you do. Answering only to names it has been given stops that. "
+            "Takes effect on the next request; no restart."
+        ),
+        category="node",
+        valueType=ConfigValueType.string,
+        default="",
+    ),
+    ConfigField(
         key="pathMappings",
         label="Library folder overrides",
         description=(

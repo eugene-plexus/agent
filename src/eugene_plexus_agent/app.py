@@ -30,6 +30,7 @@ from . import (
     companions,
     default_topology,
     enrollment,
+    host_allowlist,
     keyring_store,
     node_identity,
     off_host,
@@ -68,6 +69,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     from .recovery_guard import refuse_quarantined
 
     refuse_quarantined(settings.config_file)
+    # This machine's FQDN, one of the names the Host allowlist answers to.
+    # A reverse lookup that can wait on DNS, so off the loop and not
+    # awaited; until it answers, the plain host name stands in.
+    host_allowlist.start_learning_fqdn()
     state = AgentState(settings.config_file)
     if settings.safe_mode:
         log.warning(
@@ -442,6 +447,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.settings = settings
+    # DNS rebinding: answer only to names this machine could really be
+    # opened by, on every route -- UI, API and proxy alike. Added before
+    # the witness below, so it sits INSIDE it: a phone that opened a
+    # name we refuse still reached this machine, which is what the
+    # witness records.
+    host_allowlist.install(app)
     # The only evidence about reach that comes from outside this machine:
     # somebody's phone, or another node, actually connected. Pure ASGI
     # and scope-only, so the streaming proxy below is untouched.
