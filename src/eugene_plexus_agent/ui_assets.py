@@ -182,6 +182,10 @@ _API_PREFIXES = ("/v1/", "/api/", "/healthz", "/openapi.json", "/docs", "/redoc"
 # this is the directive that needs no inventory. R5 or later can widen
 # it, and will be able to tell whether it broke anything because this
 # one already passes.
+#
+# `nosniff` and `no-referrer` are not here: they go on every response
+# this process sends, API and proxy included, so they are a middleware
+# (`response_headers.py`) rather than something only the UI carries.
 FRAME_HEADERS = {
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "frame-ancestors 'none'",

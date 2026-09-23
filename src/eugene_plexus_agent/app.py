@@ -35,6 +35,7 @@ from . import (
     node_identity,
     off_host,
     process_signals,
+    response_headers,
     security,
     session_revocations,
     share_credentials,
@@ -458,6 +459,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # and scope-only, so the streaming proxy below is untouched.
     app.state.off_host = off_host.OffHostWitness()
     off_host.install(app, app.state.off_host)
+    # `nosniff` and `no-referrer` on every response. Added last, so it is
+    # the outermost layer and covers the two above's own answers too --
+    # a refused host name is still a page a browser renders.
+    response_headers.install(app)
 
     # Public routes (no auth required).
     app.include_router(health_routes.router)
