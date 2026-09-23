@@ -51,6 +51,9 @@ def detect_host() -> HostAccelerator:
         arch=arch,
         accelerator=accelerator,
         acceleratorVersion=version,
+        computeCapability=(
+            _probe_compute_capability() if accelerator is Accelerator.cuda else None
+        ),
     )
 
 
@@ -134,7 +137,7 @@ class Probe(enum.Enum):
     FAILED = "failed"
 
 
-def _run(argv: list[str]) -> Probe | str:
+def _run(argv: list[str], *, detecting: bool = True) -> Probe | str:
     """Run a probe: its output, or which kind of nothing.
 
     **The resolved path, not the bare name.** `shutil.which` searches
@@ -146,6 +149,11 @@ def _run(argv: list[str]) -> Probe | str:
     PATH while `subprocess` ran the System32 copy, so this function's
     gate and its subject were two different programs. An operator who
     puts a newer tool earlier on PATH gets the one they chose now.
+
+    `detecting=False` is for a probe that asks a *working* tool one more
+    question, where a failure means "it would not say" rather than "that
+    accelerator is not here" -- the warning below would be a false
+    statement about the machine for it.
     """
     exe = shutil.which(argv[0])
     if exe is None:
@@ -162,6 +170,14 @@ def _run(argv: list[str]) -> Probe | str:
     except (OSError, subprocess.SubprocessError) as e:
         log.debug("probe %r failed: %s", argv[0], e)
         return Probe.FAILED
+    if proc.returncode != 0 and not detecting:
+        log.debug(
+            "%s exited %d: %s",
+            argv[0],
+            proc.returncode,
+            (proc.stderr or proc.stdout or "").strip()[:200],
+        )
+        return Probe.FAILED
     if proc.returncode != 0:
         log.warning(
             "%s is installed and exited %d: %s. Treating this machine as though that "
@@ -175,9 +191,9 @@ def _run(argv: list[str]) -> Probe | str:
     return (proc.stdout or "") + (proc.stderr or "")
 
 
-def _output(argv: list[str]) -> str | None:
+def _output(argv: list[str], *, detecting: bool = True) -> str | None:
     """`_run` for a caller that only needs output-or-nothing."""
-    result = _run(argv)
+    result = _run(argv, detecting=detecting)
     return None if isinstance(result, Probe) else result
 
 
@@ -188,6 +204,42 @@ def _probe_cuda() -> str | None:
         return None
     match = _CUDA_VERSION_RE.search(output)
     return match.group(1) if match else None
+
+
+# `6.1`, `8.6`, `12.0`. Anything else on a line (`[N/A]` for a MIG slice,
+# an error banner) is not a card we can reason about and is skipped.
+_COMPUTE_CAP_RE = re.compile(r"^\s*(\d+)\.(\d+)\s*$")
+
+
+def _probe_compute_capability() -> str | None:
+    """The LOWEST compute capability among this machine's NVIDIA cards.
+
+    **The driver's CUDA version cannot choose a build on its own.** From
+    CUDA 13 the toolkit no longer compiles for Maxwell, Pascal or Volta,
+    and the last driver branch those cards get (580) reports CUDA 13.0 --
+    so a Pascal card's driver asks for exactly the build that carries no
+    code for it (see `_cuda_variant`). The lowest card, because one
+    engine may use every visible card and its build has to carry code
+    for all of them.
+
+    `None` when the driver would not say. `compute_cap` arrived around
+    driver 510, and nothing older reports a CUDA version any published
+    build accepts, so a missing answer never changes the outcome.
+    """
+    output = _output(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], detecting=False
+    )
+    if not output:
+        return None
+    caps = [
+        (int(m.group(1)), int(m.group(2)))
+        for line in output.splitlines()
+        if (m := _COMPUTE_CAP_RE.match(line))
+    ]
+    if not caps:
+        return None
+    major, minor = min(caps)
+    return f"{major}.{minor}"
 
 
 def _has_nvidia() -> bool:

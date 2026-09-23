@@ -237,16 +237,23 @@ def test_cuda_takes_the_newer_minor_when_nothing_older_is_published() -> None:
     assert plan.variant == "win-cuda-12.4-x64"
 
 
-def test_cuda_never_crosses_a_major() -> None:
+def test_cuda_never_takes_a_newer_major() -> None:
     """An 11.8 driver cannot load a 12.x or 13.x build, and must be told
     to update rather than handed a binary that fails at load. The reason
-    names what the release does publish."""
+    names what the release does publish.
+
+    **Amended 2026-09-23, not added to.** This was
+    `test_cuda_never_crosses_a_major` and asserted the reason said *same
+    major* -- a sentence that was false in one direction, since a driver
+    runs builds from OLDER majors, and that locked in a refusal telling
+    a 13.x driver facing a 12.x-only release to update itself. The older
+    direction is `test_a_card_older_than_its_driver.py`."""
     plan = LlamaCppAdapter().plan_acquisition(
         _host(Os.windows, Arch.x64, Accelerator.cuda, "11.8"), _release()
     )
     assert isinstance(plan, Unavailable)
     assert "Update the NVIDIA driver" in plan.reason
-    assert "same major" in plan.reason
+    assert "at least as new as its own major" in plan.reason
     assert "12.4" in plan.reason and "13.3" in plan.reason
 
 

@@ -846,7 +846,18 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
 def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
     """The CUDA build this driver can load, from what the release publishes.
 
-    Two rules, in order, both NVIDIA's rather than ours:
+    Four rules, in order, all NVIDIA's rather than ours:
+
+    0. **Only builds that carry code for the card** (2026-09-23). From
+       CUDA 13 the toolkit no longer compiles for Maxwell, Pascal or
+       Volta, and upstream's `ggml-cuda/CMakeLists.txt` adds
+       `50-virtual 61-virtual 70-virtual` only below 13 -- so a card
+       below 7.5 cannot run a 13.x build, and the last driver branch
+       that supports one (580) reports CUDA 13.0. Before this rule a
+       Pascal card on that driver was handed exactly the build with no
+       kernels for it, which fails at model load naming nothing we did.
+       The LOWEST card decides (`host._probe_compute_capability`). An
+       unknown capability filters nothing, which is the old behaviour.
 
     1. **Prefer a build for the driver's own CUDA minor or an older one**
        within the same major -- the highest such minor. A 12.4 build on a
@@ -868,8 +879,16 @@ def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
        logged, because a build newer than the driver is a fact worth
        having in the log if the engine ever does fail to start.
 
-    **A different major is never crossed**, either way: a 13.x build
-    needs a 13.x driver, and the refusal says so and names the fix.
+    3. **Otherwise the newest build from an OLDER major.** NVIDIA's
+       drivers are backward compatible and the cudart companion ships
+       the build's own runtime, so a 12.x build loads on a 13.x driver.
+       This is how a Pascal card on a 580 driver gets the 12.8 build.
+       Until 2026-09-23 a different major was refused *either way*,
+       which also told the owner of a 13.x driver facing a 12.x-only
+       release to *update* a driver that was already newer.
+
+    **A NEWER major is never crossed**: a 13.x build needs a 13.x
+    driver, and the refusal says so and names the fix.
 
     The candidate minors come from **the release's asset names**, not a
     table. The table this replaced was written from b10867 and went stale
@@ -922,24 +941,77 @@ def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
     except ValueError:
         return Unavailable(reason=f"could not read the reported CUDA version {driver!r}.")
 
-    same_major = [t for t in published if t[0] == driver_major]
-    if not same_major:
-        offered = ", ".join(sorted({f"{mj}.{mn}" for mj, mn, _ in published}))
+    offered = ", ".join(sorted({f"{mj}.{mn}" for mj, mn, _ in published}))
+
+    # Rule 0, the card: drop every build that carries no code for it.
+    capability = _parse_capability(host.computeCapability)
+    runnable = [
+        t for t in published if capability is None or capability >= _lowest_capability(t[0])
+    ]
+    if not runnable:
+        assert capability is not None  # nothing is filtered without one
+        cc = host.computeCapability
+        if capability < _lowest_capability(12):
+            # Below 5.0 nothing any release publishes will ever run, so
+            # stepping back through older builds is pointless.
+            return Unavailable(
+                reason=(
+                    f"this machine's NVIDIA card has compute capability {cc}, and no "
+                    f"published llama.cpp CUDA build carries code for a card older than "
+                    f"5.0. Set `binary` on the runtime to a build compiled for this card."
+                ),
+            )
+        return Unavailable(
+            reason=(
+                f"this machine's NVIDIA card has compute capability {cc}, and release "
+                f"{release.version} publishes {platform_name} CUDA builds only for "
+                f"{offered}. CUDA 13 builds carry no code for a card below 7.5, and no "
+                f"CUDA 12 build is published. Set `binary` on the runtime to a build "
+                f"compiled for this card."
+            ),
+            release_bound=True,
+        )
+
+    same_major = [t for t in runnable if t[0] == driver_major]
+    if same_major:
+        fitting = [t for t in same_major if t[1] <= driver_minor]
+        if fitting:
+            return max(fitting, key=lambda t: (t[0], t[1]))[2]
+    else:
+        # Rule 3, an older major: NVIDIA's drivers are backward
+        # compatible, and the cudart companion ships the build's own
+        # runtime, so a 12.x build loads on a 13.x driver.
+        older = [t for t in runnable if t[0] < driver_major]
+        if older:
+            chosen = max(older, key=lambda t: (t[0], t[1]))
+            # The driver's major was published and filtered out, or never
+            # published: `runnable` holds none of it either way.
+            why = (
+                f"this card's compute capability {host.computeCapability} is below "
+                f"what CUDA {driver_major} builds carry code for"
+                if any(t[0] == driver_major for t in published)
+                else f"release {release.version} publishes no CUDA {driver_major} build"
+            )
+            log.info(
+                "llama.cpp: taking the CUDA %s.%s build on a driver that supports %s, "
+                "because %s. A driver runs builds from older CUDA majors.",
+                chosen[0],
+                chosen[1],
+                driver,
+                why,
+            )
+            return chosen[2]
         # Release-bound: a release whose 12.x asset has not been uploaded
         # yet looks, to a 12.x driver, like one that publishes 13.x only.
         return Unavailable(
             reason=(
                 f"this driver supports CUDA up to {driver}, and release {release.version} "
-                f"publishes {platform_name} CUDA builds only for {offered}. A CUDA build runs "
-                f"only on a driver of the same major version. Update the NVIDIA "
-                f"driver, or set `binary` on the runtime to a build you compiled."
+                f"publishes {platform_name} CUDA builds only for {offered}. A CUDA build "
+                f"needs a driver at least as new as its own major version. Update the "
+                f"NVIDIA driver, or set `binary` on the runtime to a build you compiled."
             ),
             release_bound=True,
         )
-
-    fitting = [t for t in same_major if t[1] <= driver_minor]
-    if fitting:
-        return max(fitting, key=lambda t: (t[0], t[1]))[2]
 
     newer = min(same_major, key=lambda t: (t[0], t[1]))
     log.info(
@@ -974,6 +1046,45 @@ def _published_cuda_variants(
             continue
         out.add((int(m.group("major")), int(m.group("minor")), variant))
     return sorted(out)
+
+
+# The oldest card a build from each CUDA toolkit major carries code for.
+# **A table, and deliberately one**: unlike upstream's asset names these
+# are NVIDIA's support decisions, made once per toolkit major and never
+# revised within it -- CUDA 12 dropped Kepler, CUDA 13 dropped Maxwell,
+# Pascal and Volta -- and upstream's `ggml-cuda/CMakeLists.txt` mirrors
+# them exactly (`50-virtual 61-virtual 70-virtual` only below 13,
+# `75-virtual` upward always). Checked 2026-09-23 against that file.
+_CUDA_LOWEST_CAPABILITY: dict[int, tuple[int, int]] = {12: (5, 0), 13: (7, 5)}
+
+
+def _lowest_capability(major: int) -> tuple[int, int]:
+    """The oldest compute capability a CUDA `major` build can run on.
+
+    **A major newer than the table assumes the newest floor we know**,
+    because a toolkit only ever drops architectures. That is a guess for
+    exactly one case -- a future CUDA 14 that also drops Turing -- and
+    the day upstream publishes a 14.x build is the day to re-read its
+    CMakeLists and add the row. An older major has no floor we need:
+    nothing older than 12 is published.
+    """
+    if major in _CUDA_LOWEST_CAPABILITY:
+        return _CUDA_LOWEST_CAPABILITY[major]
+    newest = max(_CUDA_LOWEST_CAPABILITY)
+    if major > newest:
+        return _CUDA_LOWEST_CAPABILITY[newest]
+    return (0, 0)
+
+
+def _parse_capability(value: str | None) -> tuple[int, int] | None:
+    """`"6.1"` -> `(6, 1)`, compared as a tuple so `12.0` sorts above `8.6`."""
+    if not value:
+        return None
+    major, _, minor = value.partition(".")
+    try:
+        return int(major), int(minor or 0)
+    except ValueError:
+        return None
 
 
 def _match_assets(release: Release, variant: str) -> tuple[ReleaseAsset, ...] | Unavailable:
