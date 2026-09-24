@@ -281,5 +281,5 @@ def test_config_schema_exposes_security_mode(authed_client: TestClient) -> None:
     schema = authed_client.get("/v1/config/schema").json()
     field = next(f for f in schema["fields"] if f["key"] == "securityMode")
     assert field["valueType"] == "enum"
-    assert set(field["enumValues"]) == {"prompt_on_startup", "os_keyring"}
+    assert set(field["enumValues"]) == {"prompt_on_startup", "os_keyring", "passphrase_file"}
     assert field["category"] == "security"

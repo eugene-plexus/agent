@@ -140,7 +140,12 @@ def test_status_reports_unlocked_and_keyring_availability(
     keyring_store.reset_probe_cache()
     fresh = client.get("/v1/auth/status")
     assert fresh.status_code == 200
-    assert fresh.json() == {"initialized": False, "unlocked": False, "keyringAvailable": True}
+    assert fresh.json() == {
+        "initialized": False,
+        "unlocked": False,
+        "keyringAvailable": True,
+        "passphraseFile": False,
+    }
 
     assert (
         client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE}).status_code == 200

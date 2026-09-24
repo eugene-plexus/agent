@@ -115,6 +115,23 @@ async def test_config(
                 "platform's keyring backend (Credential Manager on Windows, "
                 "Secret Service on Linux, Keychain on macOS)."
             )
+    elif effective_mode == "passphrase_file":
+        path = getattr(getattr(request.app.state, "settings", None), "passphrase_file", None)
+        if path is None:
+            problems.append(
+                "securityMode=passphrase_file needs EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE in "
+                "this agent's environment, which the Linux system install sets. Without it "
+                "there is nowhere to keep the passphrase and every restart leaves this agent "
+                "locked. Switch to prompt_on_startup, or set the variable where the service "
+                "is defined."
+            )
+        elif await asyncio.to_thread(path.is_file):
+            notes.append(f"The passphrase is kept in {path}; this agent unlocks itself on restart.")
+        else:
+            notes.append(
+                f"{path} does not exist yet. Signing in writes it; until then a restart "
+                "leaves this agent locked."
+            )
     else:
         notes.append(
             f"securityMode={effective_mode}; no external dependency to "

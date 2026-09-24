@@ -57,8 +57,15 @@ PRIVATE_MODE = 0o600
 _FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
 
 
-def write_private(path: Path, data: str | bytes, *, encoding: str = "utf-8") -> None:
+def write_private(
+    path: Path, data: str | bytes, *, encoding: str = "utf-8", mode: int = PRIVATE_MODE
+) -> None:
     """Replace `path` with `data`, created owner-only, atomically.
+
+    `mode` narrows it further, never wider: the passphrase file is 0400,
+    because nothing should ever write to it in place. Opening a file
+    created 0400 for writing is allowed at creation, and every later
+    write is a new temp file renamed over it, so 0400 costs nothing.
 
     Raises whatever the write raised, after removing the temp file: a
     half-written temp beside the config the supervisor reads is litter
@@ -72,7 +79,11 @@ def write_private(path: Path, data: str | bytes, *, encoding: str = "utf-8") -> 
     # temp under the system temp dir would make it a copy, which is the
     # non-atomic thing this exists to avoid.
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(4)}")
-    fd = os.open(tmp, _FLAGS, PRIVATE_MODE)
+    # POSIX only. On Windows a mode without the write bit sets the
+    # read-only attribute, and a read-only target refuses both the
+    # rename over it and deletion -- and the ACL is what protects the
+    # file there anyway.
+    fd = os.open(tmp, _FLAGS, (mode & PRIVATE_MODE) if os.name != "nt" else PRIVATE_MODE)
     try:
         try:
             out = os.fdopen(fd, "wb")

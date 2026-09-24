@@ -46,7 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
-from .. import client_keys, keyring_store, peer, security
+from .. import client_keys, keyring_store, passphrase_file, peer, security
 from .._generated.common_models import (
     AuthLoginRequest,
     AuthLoginResponse,
@@ -142,7 +142,37 @@ async def auth_status(request: Request) -> AuthStatus:
         initialized=state.has_passphrase(),
         unlocked=auth.has_master_key(),
         keyringAvailable=available,
+        passphraseFile=_unlocks_from_file(request, state),
     )
+
+
+def _passphrase_path(request: Request) -> Path | None:
+    settings = getattr(request.app.state, "settings", None)
+    return getattr(settings, "passphrase_file", None)
+
+
+def _unlocks_from_file(request: Request, state: AgentState) -> bool:
+    """Whether this agent keeps its passphrase in a file (the Linux
+    system install): the mode says so and there is somewhere to put it.
+    The wizard reads it to stop offering a keyring this account lacks."""
+    return (
+        state.get_config("securityMode") == "passphrase_file"
+        and _passphrase_path(request) is not None
+    )
+
+
+def _persist_passphrase_if_file_mode(request: Request, state: AgentState, passphrase: str) -> None:
+    """Keep the passphrase in its file when this install unlocks from one.
+
+    Initialize and sign-in are the only moments this process holds the
+    passphrase itself, so they are when the file is written: the first
+    one creates it, and any later one repairs a file that was deleted or
+    replaced. A changed mode (`PATCH securityMode`) takes effect at the
+    next sign-in for the same reason.
+    """
+    if state.get_config("securityMode") != "passphrase_file":
+        return
+    passphrase_file.store_passphrase(_passphrase_path(request), passphrase)
 
 
 class _InitializeRequest(BaseModel):
@@ -235,6 +265,7 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
     # If the operator chose OS-keyring mode, persist the master key
     # so the next restart auto-unlocks without re-prompting.
     _persist_master_key_if_keyring_mode(state, master_key)
+    _persist_passphrase_if_file_mode(request, state, body.passphrase)
 
     # If the supervisor was spawned before this initialize call (in
     # production it is — the lifespan builds it during app startup),
@@ -343,6 +374,7 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     # error. Useful when the operator switches `securityMode` from
     # prompt to keyring without re-initializing.
     _persist_master_key_if_keyring_mode(state, derived)
+    _persist_passphrase_if_file_mode(request, state, body.passphrase)
 
     # On the FIRST successful login of a process run, children that
     # the supervisor already launched are running without MASTER_KEY in

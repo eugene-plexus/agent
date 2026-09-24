@@ -123,13 +123,17 @@ CONFIG_FIELDS: list[ConfigField] = [
             "memory only (passphrase required every restart). "
             "'OS keyring' stores it in your OS Credential Manager / "
             "Keychain / Secret Service for auto-unlock; more "
-            "convenient, weaker boundary."
+            "convenient, weaker boundary. 'Passphrase file' is for an "
+            "agent running under its own account, which has no keyring: "
+            "the passphrase is kept in a file only that account can read "
+            "(EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE, which the Linux system "
+            "install sets), written when you set it or sign in."
         ),
         category="security",
         valueType=ConfigValueType.enum,
         default="prompt_on_startup",
-        enumValues=["prompt_on_startup", "os_keyring"],
-        enumLabels=["Prompt on startup", "OS keyring auto-unlock"],
+        enumValues=["prompt_on_startup", "os_keyring", "passphrase_file"],
+        enumLabels=["Prompt on startup", "OS keyring auto-unlock", "Passphrase file auto-unlock"],
         requiresRestart=True,
     ),
     ConfigField(

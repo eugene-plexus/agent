@@ -1164,6 +1164,10 @@ class AuthStatus(BaseModel):
         None,
         description="Whether this host's OS keyring (Windows Credential Manager,\nmacOS Keychain, a Linux Secret Service) accepted a write,\nread and delete of a probe entry from this process — measured\nonce per process run, not assumed from the platform. False on\na headless Linux box with no unlocked secret service, in a\ncontainer, or under a service account with no credential\nstore; true on the ordinary desktop. The wizard defaults\n`securityMode` to `os_keyring` on true and explains the\npassphrase prompt on false. Absent when the probe was not run\nor did not finish within its budget.\n",
     )
+    passphraseFile: bool | None = Field(
+        None,
+        description='True when this agent unlocks itself from a passphrase file:\n`securityMode` is `passphrase_file` and\n`EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE` names where the file\ngoes. The Linux system install, where the agent runs under\nits own account and has no keyring (2026-09-24). The wizard\nthen says the install unlocks itself after a restart, offers\nno keyring choice, and sets the control root to the same\nmode. Absent from an agent that predates the field, and false\neverywhere else.\n',
+    )
 
 
 class AllowedModel(RootModel[str]):

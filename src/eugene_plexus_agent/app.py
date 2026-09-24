@@ -19,6 +19,7 @@ spawned in this same lifespan get MASTER_KEY in their env immediately
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -37,6 +38,7 @@ from . import (
     keyring_store,
     node_identity,
     off_host,
+    passphrase_file,
     process_signals,
     response_headers,
     security,
@@ -170,6 +172,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "securityMode is os_keyring but no stored key was retrievable; "
                 "operator must log in via POST /v1/auth/login to populate it"
             )
+
+    # The keyring's sibling for an agent under its own account, which has
+    # no keyring: the Linux system install (2026-09-24). Here for the same
+    # reason the keyring is -- children spawned in this lifespan then start
+    # with the master key -- and off the loop, because it is two Argon2id
+    # runs (verify, then derive).
+    if (
+        state.has_passphrase()
+        and state.get_config("securityMode") == "passphrase_file"
+        and not app.state.auth_state.has_master_key()
+    ):
+        salt_b64 = state.get_master_salt_b64()
+        stored_hash = state.get_passphrase_hash()
+        if salt_b64 and stored_hash:
+            key = await asyncio.to_thread(
+                passphrase_file.unlock_key,
+                settings.passphrase_file,
+                passphrase_hash=stored_hash,
+                salt=base64.b64decode(salt_b64),
+            )
+            if key is not None:
+                app.state.auth_state.set_master_key(key)
+                log.info("master key recovered from the passphrase file; children will auto-unlock")
 
     # **Log in to the file servers before anything opens a model.** This
     # is the whole of R2.6's first measurement: an agent running as a

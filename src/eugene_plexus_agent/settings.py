@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     path when agent.yaml itself is malformed. PATCH /v1/config still
     writes to the on-disk file normally."""
 
+    passphrase_file: Path | None = None
+    """Where `securityMode: passphrase_file` keeps the passphrase.
+
+    Set by the Linux system install, where the agent runs as its own
+    account and has no keyring (see `passphrase_file`). Startup-only
+    bootstrap: the agent must know where to look before it is unlocked,
+    which is before any config it could read is open."""
+
     ui_dir: Path | None = None
     """Serve the web UI from this directory instead of the installed
     `eugene-plexus-ui` distribution.
