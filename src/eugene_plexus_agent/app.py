@@ -27,6 +27,7 @@ from fastapi import Depends, FastAPI
 
 from . import (
     __version__,
+    apps,
     companions,
     default_topology,
     enrollment,
@@ -47,6 +48,7 @@ from .client_key_registry import ClientKeyRegistry
 from .client_keys import KEYS_FILE, ClientKeyStore
 from .dependencies import require_operator_session
 from .library_folders import FOLDERS_FILE, LibraryFolderCache
+from .routes import apps as apps_routes
 from .routes import auth as auth_routes
 from .routes import benchmarks as benchmark_routes
 from .routes import components as components_routes
@@ -249,6 +251,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         identity.record.name if identity.record.enrolled else None
     )
 
+    # Optional apps (docs/design/apps-and-spokes.md). None in safe mode,
+    # which supervises nothing it was not asked to on the command line.
+    # `apps.yaml` degrades on its own: a file this build cannot read
+    # costs the apps, never the topology above.
+    if not hasattr(app.state, "apps"):
+        if settings.safe_mode:
+            app.state.apps = None
+        else:
+            app_store = apps.AppStore(settings.config_file.resolve().parent / apps.APPS_FILE)
+            app_store.load_or_degrade()
+            app.state.apps = apps.AppManager(
+                store=app_store,
+                catalogue=apps.load_catalogue(),
+                get_config=state.get_config,
+                bind_host=lambda: shared_child_env(settings, state, identity).get("BIND_HOST"),
+                advertise_host=lambda: _app_advertise_host(state, identity),
+                node_name=lambda: identity.record.name if identity.record.enrolled else None,
+                resolve_gateway=lambda: resolve_gateway_for_apps(app),
+            )
+    app_manager: apps.AppManager | None = app.state.apps
+
     # The topology every install has, on the one boot where there isn't
     # one yet. Before supervision starts, so the components below are
     # started by the same loop as any operator-declared entry rather
@@ -300,6 +323,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             runtime_supervisor.add_and_start(spec)
         await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
 
+    # Apps last, and in the background: each start resolves the gateway,
+    # which on a worker is a read from the control root, and a root that
+    # is down must not hold up supervision of the hub itself.
+    apps_task: asyncio.Task[None] | None = None
+    if app_manager is not None:
+        apps_task = asyncio.create_task(app_manager.start_enabled(), name="apps-boot")
+
     # **Where this host is, said out loud on every boot.** Before M9 the
     # address was announced once, at enrollment, so a host that rebooted
     # onto a new tailnet IP left the control root holding an address
@@ -317,6 +347,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Apps first: they are clients of everything below, and a spoke
+        # outliving the hub it talks to only produces errors in its log.
+        if apps_task is not None and not apps_task.done():
+            apps_task.cancel()
+            await asyncio.gather(apps_task, return_exceptions=True)
+        if app_manager is not None:
+            await app_manager.aclose()
         registry_task.cancel()
         await asyncio.gather(registry_task, return_exceptions=True)
         await registry.close()
@@ -413,6 +450,61 @@ async def _announce_address(
         log.warning("could not announce this node's address: %s", exc)
 
 
+def _app_advertise_host(state: AgentState, identity: node_identity.NodeIdentityStore) -> str | None:
+    """The host another device opens an app's UI on, or None for loopback."""
+    advertise = node_identity.effective_advertise_url(
+        state.get_config("advertiseUrl"), identity.record.advertise_url
+    )
+    host = node_identity.advertise_host(advertise)
+    if not host or node_identity.is_loopback_host(host):
+        return None
+    return host
+
+
+async def resolve_gateway_for_apps(app: FastAPI) -> tuple[str | None, str | None]:
+    """The gateway address an app on this node is handed, or why there is none.
+
+    **This node's own gateway when it runs one.** Otherwise the owning
+    node's agent proxy, `<agent>/api/proxy/gateway`: the same public path
+    a browser uses, reached at the address that node announced -- which
+    survives the container's port remap that a component's own URL does
+    not (see `install_proxy`). The app's client key rides through it
+    untouched and the gateway checks it; the proxy adds nothing.
+
+    The lookup spends this agent's own `service:agent` token, which the
+    control root accepts for reads. There is no operator at a boot.
+    """
+    from ._generated.models import ComponentKind
+
+    state: AgentState = app.state.agent_state
+    for entry in state.list_topology_entries():
+        if entry.kind == ComponentKind.gateway and entry.spawn is not None:
+            return str(entry.url).rstrip("/"), None
+    identity: node_identity.NodeIdentityStore = app.state.node_identity
+    if not identity.record.enrolled or not identity.record.control_url:
+        return None, (
+            "This machine runs no gateway and is not part of an install yet, so there was no "
+            "gateway address to give the app."
+        )
+    from . import install_proxy
+
+    token = security.issue_service_token(signing_key=app.state.auth_state.signing_key, kind="agent")
+    cache = getattr(app.state, "install_topology", None)
+    if cache is None:
+        cache = install_proxy.InstallTopology()
+        app.state.install_topology = cache
+    try:
+        owner = await cache.owner_of(
+            "gateway",
+            control_url=identity.record.control_url,
+            authorization=f"Bearer {token}",
+            transport=getattr(app.state, "control_transport", None),
+        )
+    except install_proxy.InstallLookupError as exc:
+        return None, f"The gateway could not be found, so the app was given none: {exc}"
+    return owner.agent_url.rstrip("/") + "/api/proxy/gateway", None
+
+
 def shared_child_env(
     settings: Settings, state: AgentState, identity: node_identity.NodeIdentityStore
 ) -> dict[str, str]:
@@ -487,6 +579,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # component that sees demand.
     app.include_router(runtimes_routes.router)
     app.include_router(benchmark_routes.router)
+    # Optional apps. Operator-only on every route; declared on the router.
+    app.include_router(apps_routes.router)
     # This host's identity and devices; reads only, operator or service.
     app.include_router(node_routes.router)
 

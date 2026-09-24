@@ -28,7 +28,14 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "modelCopyEnabled",
         "modelCopyDir",
         "modelCopyMinFreeGb",
+        "uvBinary",
+        "allowCustomApps",
     }
+    # Apps have their own category; running code that is not in the
+    # catalogue is an expert switch and off until someone turns it on.
+    custom = next(f for f in body["fields"] if f["key"] == "allowCustomApps")
+    assert custom["category"] == "apps" and custom["default"] is False
+    assert body["categories"]["apps"] == "Apps"
     # The copy trio is its own category, next to but not inside the
     # Library folder overrides: "where the share is mounted here" and
     # "does this machine keep its own copy" are different questions with

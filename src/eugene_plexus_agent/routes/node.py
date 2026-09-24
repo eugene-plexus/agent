@@ -516,6 +516,20 @@ def _listeners(request: Request) -> list[reach.Listener]:
         )
     ]
     state: AgentState = request.app.state.agent_state
+    # Apps listen too, on their own ports, and a phone opening a chat app
+    # needs the same three things a phone opening the console does.
+    manager = getattr(request.app.state, "apps", None)
+    if manager is not None:
+        for record in manager.store.installed():
+            if not manager.supervisor.is_running(record.id):
+                continue
+            out.append(
+                reach.Listener(
+                    process=f"app:{record.id}",
+                    port=record.port,
+                    bind_host=manager.supervisor.bind_host(record.id),
+                )
+            )
     supervisor = getattr(request.app.state, "supervisor", None)
     if supervisor is None:
         return out
@@ -682,6 +696,17 @@ async def set_node_reach(request: Request, body: NodeReachRequest) -> NodeReachR
             )
         except Exception as exc:  # pragma: no cover - defensive
             steps.append(ReachStep(step=Step.restart_components, ok=False, detail=str(exc)))
+
+    # 3b. the apps, for the same reason: they take their bind host from
+    #     their environment at spawn.
+    manager = getattr(request.app.state, "apps", None)
+    if manager is not None:
+        running = [r for r in manager.store.installed() if manager.supervisor.is_running(r.id)]
+        for record in running:
+            try:
+                await manager.restart(record)
+            except Exception:  # pragma: no cover - defensive
+                log.warning("could not restart app %s for reach", record.id, exc_info=True)
 
     # 4. the firewall.
     if body.allowFirewall:

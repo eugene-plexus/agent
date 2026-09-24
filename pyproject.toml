@@ -65,6 +65,8 @@ dev = [
     "mypy==1.20.2",
     "types-pyyaml>=6,<7",
     "datamodel-code-generator==0.57.0",
+    # The apps tests build a real environment with the tool installs use.
+    "uv==0.12.18",
 ]
 
 [project.scripts]

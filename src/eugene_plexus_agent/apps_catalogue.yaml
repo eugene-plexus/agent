@@ -1,0 +1,9 @@
+# The apps this agent release ships: a list of AppManifest entries
+# (specs openapi/agent.yaml). A new app in a later release is a new row
+# here -- the agent needs no new code for it. Each `source` is an archive
+# at a pinned commit and each `version` is that commit, the way the
+# installers pin the hub's own packages.
+#
+# Empty until the first app exists. See specs
+# docs/design/apps-and-spokes.md for the order they arrive in.
+[]

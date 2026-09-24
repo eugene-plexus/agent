@@ -55,6 +55,26 @@ async def healthz(request: Request) -> Health:
             },
         )
 
+    # `apps.yaml` degrades on its own (docs/design/apps-and-spokes.md),
+    # and says so here the same way: the topology is fine, the apps are
+    # not, and the copy that would not load is named.
+    apps = getattr(request.app.state, "apps", None)
+    if apps is not None and apps.store.degraded_reason:
+        apps_reason = apps.store.degraded_reason
+        return Health(
+            status=Status.degraded,
+            version=__version__,
+            component="agent",
+            safeMode=False,
+            details={
+                "appsError": apps_reason,
+                "appsFile": str(apps.store.path),
+                "appsFilePreserved": str(
+                    apps.store.path.with_suffix(apps.store.path.suffix + UNREADABLE_SUFFIX)
+                ),
+            },
+        )
+
     return Health(
         status=Status.ok,
         version=__version__,

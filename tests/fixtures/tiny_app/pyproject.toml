@@ -1,0 +1,12 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tiny-app"
+version = "0.0.1"
+requires-python = ">=3.12"
+description = "An app the agent's tests install for real: stdlib only, answers /healthz."
+
+[tool.hatch.build.targets.wheel]
+packages = ["tiny_app"]

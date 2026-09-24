@@ -531,13 +531,26 @@ async def create_client_key(request: Request, body: ClientKeyCreateRequest) -> C
     Forward the caller's operator credential; never upgrade a service token.
     The bearer is returned once and only metadata is durably stored.
     """
+    return await mint_client_key(request, body, authorization=request.headers.get("authorization"))
+
+
+async def mint_client_key(
+    request: Request, body: ClientKeyCreateRequest, *, authorization: str | None
+) -> ClientKeyCreated:
+    """The create route's body, callable by another route that must mint.
+
+    Installing an app mints its key here, with the installing request's
+    own credential -- the same rule as the route: a caller's operator
+    token is forwarded, and nothing is ever minted on a service token's
+    say-so.
+    """
     owner = registry(request)
     if owner.enrolled:
         return ClientKeyCreated.model_validate(
             await owner.forward(
                 "POST",
                 "/v1/auth/client-keys",
-                authorization=request.headers.get("authorization"),
+                authorization=authorization,
                 body=body.model_dump(mode="json"),
             )
         )
@@ -654,13 +667,24 @@ async def list_revoked_client_keys(request: Request) -> ClientKeyRevocations:
 )
 async def revoke_client_key(request: Request, key_id: str) -> None:
     """Durably revoke at the authority; repeating a known revocation is a 204."""
+    await revoke_client_key_at_authority(
+        request, key_id, authorization=request.headers.get("authorization")
+    )
+
+
+async def revoke_client_key_at_authority(
+    request: Request, key_id: str, *, authorization: str | None
+) -> None:
+    """The revoke route's body, for a route that must revoke as part of
+    something else -- uninstalling an app. Raises the route's own 404 for
+    a key the standalone registry does not know."""
     owner = registry(request)
     if owner.enrolled:
         await owner.migrate()
         await owner.forward(
             "DELETE",
             f"/v1/auth/client-keys/{key_id}",
-            authorization=request.headers.get("authorization"),
+            authorization=authorization,
         )
         return
     try:

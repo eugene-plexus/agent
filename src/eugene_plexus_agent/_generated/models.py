@@ -928,7 +928,7 @@ class Arch(StrEnum):
 class BoundAddress(BaseModel):
     process: str = Field(
         ...,
-        description='`agent`, or a `ComponentKind`. Engines are not listed: they\nare deliberately never widened.\n',
+        description='`agent`, a `ComponentKind`, or `app:<id>` for an installed\napp. Engines are not listed: they are deliberately never\nwidened.\n',
     )
     host: str = Field(
         ..., description='The interface bound — `127.0.0.1`, `0.0.0.0`, or one address.'
@@ -2097,6 +2097,136 @@ class FolderReachSource(StrEnum):
     override = 'override'
 
 
+class AppHubSurface(StrEnum):
+    """
+    A public hub surface an app's client key may be used on.
+
+    * `inference` — the gateway's client doors (`/v1/models`,
+      `/v1/chat/completions` and the rest), under A5's default
+      limits. The operator narrows or widens the key like any other.
+
+    One member today on purpose. A trainer depositing models into the
+    Library would add a second, together with the Library endpoint it
+    names, when a trainer exists to use it — not before.
+
+    """
+
+    inference = 'inference'
+
+
+class AppOrigin(StrEnum):
+    """
+    * `catalogue` — shipped with this agent release.
+    * `custom` — added by an operator on this node.
+
+    """
+
+    catalogue = 'catalogue'
+    custom = 'custom'
+
+
+class State1(StrEnum):
+    """
+    * `resolving` — reading the catalogue and minting the key.
+    * `creating` — building the environment with the manifest's
+      Python.
+    * `installing` — installing the package into it.
+    * `verifying` — importing `entry` with that interpreter.
+    * `done` / `failed` / `cancelled` — terminal, and retained
+      until the next install of this app starts.
+
+    """
+
+    resolving = 'resolving'
+    creating = 'creating'
+    installing = 'installing'
+    verifying = 'verifying'
+    done = 'done'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class AppInstall(BaseModel):
+    """
+    Progress of one install. Named phases, as for engines, because
+    they fail for different reasons: `creating` is the Python
+    download, `installing` is the package index and the network, and
+    `verifying` failing means the package installed and cannot start.
+
+    """
+
+    app: str
+    version: str | None = None
+    state: State1 = Field(
+        ...,
+        description="* `resolving` — reading the catalogue and minting the key.\n* `creating` — building the environment with the manifest's\n  Python.\n* `installing` — installing the package into it.\n* `verifying` — importing `entry` with that interpreter.\n* `done` / `failed` / `cancelled` — terminal, and retained\n  until the next install of this app starts.\n",
+    )
+    message: str | None = Field(
+        None, description='What is happening now, for a status line.'
+    )
+    error: str | None = Field(
+        None,
+        description='Populated when `state: failed`: the tail of the tool\'s own\noutput where there is one, because "install failed" is the\none message nobody can act on.\n',
+    )
+    startedAt: AwareDatetime | None = None
+    finishedAt: AwareDatetime | None = None
+
+
+class App(BaseModel):
+    """
+    One installed app: what was installed (persisted in `apps.yaml`
+    beside `agent.yaml`) and what the agent observes now.
+
+    `apps.yaml` is a separate file on purpose. An entry this agent
+    cannot read degrades the apps alone — the file is kept as
+    `apps.yaml.unreadable` and `/healthz` says why — and never takes
+    the topology, runtimes or passphrase with it.
+
+    """
+
+    id: str
+    name: str
+    version: str
+    previousVersion: str | None = Field(
+        None, description='The environment kept for rollback, when there is one.'
+    )
+    origin: AppOrigin
+    node: str | None = Field(None, description="This node's name, when it has one.")
+    enabled: bool = Field(
+        ...,
+        description='Whether the operator wants it running. Start and stop set it,\nand it survives the agent restarting.\n',
+    )
+    status: ComponentStatus
+    port: int = Field(
+        ...,
+        description='The port it binds, allocated from 8190-8289 and persisted so\nits address does not change between restarts.\n',
+    )
+    uiUrl: AnyUrl | None = Field(
+        None,
+        description="Where a browser opens its UI: this node's advertised host with\nthe app's port, or loopback on a node that advertises none.\nPresent only for an app with `ui: true`.\n",
+    )
+    gatewayUrl: AnyUrl | None = Field(
+        None,
+        description="The gateway address handed to the app at its last start — the\nlocal gateway when this node runs one, otherwise the owning\nnode's agent proxy (`<agent>/api/proxy/gateway`), which is the\nsame public path a browser uses and survives a port remap that\na component address does not. Absent when none could be found;\nan app we ship then says so and takes an address in its own\nconfig.\n",
+    )
+    ui: bool
+    configTrio: bool
+    uses: list[AppHubSurface]
+    keyId: str | None = Field(
+        None,
+        description='The client key minted for it. Revoking that key cuts the app\noff from the hub; uninstalling revokes it.\n',
+    )
+    keyName: str | None = None
+    installedAt: AwareDatetime | None = None
+    pid: int | None = None
+    lastRestart: AwareDatetime | None = None
+    lastError: str | None = None
+    detail: str | None = Field(
+        None,
+        description='Something the operator should know that is not an error — the\ngateway could not be found, say — in words they can act on.\n',
+    )
+
+
 class BenchmarkRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -2665,6 +2795,110 @@ class LibraryFolderStatus(BaseModel):
     )
 
 
+class AppManifest(BaseModel):
+    """
+    What an app is, how to install it, and what it needs from the hub.
+    The shipped catalogue is a list of these; so is a custom entry.
+
+    **Nothing here grants anything on the hub.** An app receives a
+    client key scoped by `uses` and the addresses it needs, and no
+    service token, signing key or master key — the same things a
+    third-party client could be given, which is the rule the design
+    calls *our spokes get no back doors*.
+
+    **What an app owes the agent** is small: bind the port in
+    `EUGENE_PLEXUS_APP_BIND_PORT` (on `EUGENE_PLEXUS_APP_BIND_HOST`
+    when set, loopback otherwise) and answer `GET /healthz` with a
+    2xx once it is serving — an app that never does reads `starting`
+    for as long as it runs. It finds its key in the file named by
+    `EUGENE_PLEXUS_APP_KEY_FILE`, the gateway at
+    `EUGENE_PLEXUS_APP_GATEWAY_URL` (absent when none could be
+    found), keeps its state under `EUGENE_PLEXUS_APP_DATA_DIR`, and —
+    with `configTrio` — requires `EUGENE_PLEXUS_APP_ADMIN_TOKEN` as
+    the bearer on its config trio.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="Stable identifier: a directory name under the node's `apps`\ndirectory, part of the key's name, and the path segment in\n`/v1/apps/{id}`. Lowercase so two spellings cannot be two apps.\n",
+        pattern='^[a-z][a-z0-9-]{1,39}$',
+    )
+    name: str = Field(
+        ..., description='What a person calls it.', max_length=80, min_length=1
+    )
+    summary: str | None = Field(
+        None, description='One or two sentences for the catalogue card.', max_length=400
+    )
+    homepage: AnyUrl | None = Field(
+        None, description='Where to read about it. Display only.'
+    )
+    source: str = Field(
+        ...,
+        description="What `uv pip install` is given, as `<package> @ <source>`: an\n`https://` archive URL — for a GitHub repo,\n`https://github.com/<owner>/<repo>/archive/<commit>.tar.gz` —\nor, for a custom entry, a directory on this node holding the\npackage (a developer's own checkout). The shipped catalogue\nuses archive URLs at pinned commits, the way the installers\npin the hub's own packages.\n",
+        min_length=1,
+    )
+    version: str = Field(
+        ...,
+        description="The label this install is recorded under and the name of its\nenvironment's directory — the commit, for a catalogue entry.\nUpdating an app is installing a different `version`.\n",
+        max_length=64,
+        min_length=1,
+        pattern='^[A-Za-z0-9._+-]+$',
+    )
+    package: str = Field(
+        ...,
+        description='The distribution name, e.g. `eugene-plexus-chat`.',
+        min_length=1,
+    )
+    entry: str = Field(
+        ...,
+        description="The module run as `python -m <entry>` with the app's own\ninterpreter. The install imports it once before it counts as\ninstalled, so a package that installs and cannot start is a\nfailed install rather than a crash loop later.\n",
+        pattern='^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$',
+    )
+    python: str | None = Field(
+        '3.12',
+        description="The Python the app's environment is built with.",
+        pattern='^3\\.[0-9]+$',
+    )
+    ui: bool | None = Field(
+        False,
+        description="Whether the app serves a browser UI on its port. A UI is\nopened on the app's own origin and never embedded in or\nproxied through the console: the console's origin holds the\noperator session and an unauthenticated proxy to every\ncomponent, and anything running there has operator authority.\n",
+    )
+    configTrio: bool | None = Field(
+        False,
+        description='Whether the app serves `GET /v1/config`, `GET\n/v1/config/schema` and `PATCH /v1/config`, requiring the admin\ntoken this agent hands it at each spawn. Required of apps we\nship; optional for a custom entry, whose page then shows\nstatus, logs and Open only.\n',
+    )
+    uses: list[AppHubSurface] | None = Field(
+        ['inference'], description="The hub surfaces the app's key is scoped to."
+    )
+
+
+class AppCatalogueEntry(BaseModel):
+    manifest: AppManifest
+    origin: AppOrigin
+    installedVersion: str | None = Field(
+        None,
+        description='The version installed on this node, when one is. Differs from\n`manifest.version` when an update is available.\n',
+    )
+
+
+class AppCatalogue(BaseModel):
+    apps: list[AppCatalogueEntry]
+    installable: bool = Field(
+        ..., description='Whether this node can install apps at all.'
+    )
+    reason: str | None = Field(
+        None, description='Why not, and what to do. Present when `installable: false`.'
+    )
+
+
+class AppList(BaseModel):
+    apps: list[App]
+
+
 class ComponentList(BaseModel):
     components: list[Component] = Field(
         ...,
@@ -2675,7 +2909,7 @@ class ComponentList(BaseModel):
 class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
     root: list[TextContentPart | ImageContentPart] = Field(
         ...,
-        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
         min_length=1,
     )
 
@@ -2867,7 +3101,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -2876,6 +3110,10 @@ class Message(BaseModel):
     toolCallId: str | None = Field(
         None,
         description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    reasoning: str | None = Field(
+        None,
+        description="On an **assistant** message: the reasoning the model produced\nfor that turn, as the backend reported it separately from\n`content` (`reasoning_content` on llama.cpp, `reasoning` on\nvLLM). Handed back so the next turn of a tool loop reaches\nthe model with its own earlier thinking.\n\n**Load-bearing rather than decorative, and measured:**\nllama.cpp b10948 renders a history turn's reasoning into the\nprompt for templates that preserve it (Qwen3, gpt-oss) --\nthe same tool-loop request was 172 prompt tokens without it\nand 184 with a twelve-token canary. Dropped here, a model\nresuming a tool loop has forgotten why it called the tool.\n\nAbsent on every other role, and an adapter whose backend\nhas no such channel (the agentic CLIs, a hosted OpenAI\nendpoint) omits it upstream rather than inventing one.\n",
     )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'

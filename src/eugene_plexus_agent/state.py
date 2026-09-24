@@ -195,6 +195,30 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.file_path,
     ),
     ConfigField(
+        key="uvBinary",
+        label="uv binary",
+        description=(
+            "The `uv` this agent builds apps' Python environments with. Leave empty to use "
+            "the copy the Eugene Plexus installer put beside this install, or `uv` on PATH. "
+            "Set it only on a developer install that has neither."
+        ),
+        category="apps",
+        valueType=ConfigValueType.file_path,
+    ),
+    ConfigField(
+        key="allowCustomApps",
+        label="Allow apps not in the catalogue",
+        description=(
+            "Expert override: allow adding an app by its source -- an archive URL or a folder "
+            "on this machine -- rather than only the apps this release ships. A custom app "
+            "runs its own code as this agent's OS user, holding the client key minted for it. "
+            "Hub credentials are still removed from its environment."
+        ),
+        category="apps",
+        valueType=ConfigValueType.boolean,
+        default=False,
+    ),
+    ConfigField(
         key="mlxBinary",
         label="MLX binary",
         description=(
@@ -377,6 +401,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "node": "Node",
     "storage": "Library",
     "modelStorage": "Model storage",
+    "apps": "Apps",
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}

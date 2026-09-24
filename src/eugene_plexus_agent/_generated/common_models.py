@@ -981,7 +981,7 @@ class DirectoryEntry(BaseModel):
 class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
     root: list[TextContentPart | ImageContentPart] = Field(
         ...,
-        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
         min_length=1,
     )
 
@@ -1034,7 +1034,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -1043,6 +1043,10 @@ class Message(BaseModel):
     toolCallId: str | None = Field(
         None,
         description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    reasoning: str | None = Field(
+        None,
+        description="On an **assistant** message: the reasoning the model produced\nfor that turn, as the backend reported it separately from\n`content` (`reasoning_content` on llama.cpp, `reasoning` on\nvLLM). Handed back so the next turn of a tool loop reaches\nthe model with its own earlier thinking.\n\n**Load-bearing rather than decorative, and measured:**\nllama.cpp b10948 renders a history turn's reasoning into the\nprompt for templates that preserve it (Qwen3, gpt-oss) --\nthe same tool-loop request was 172 prompt tokens without it\nand 184 with a twelve-token canary. Dropped here, a model\nresuming a tool loop has forgotten why it called the tool.\n\nAbsent on every other role, and an adapter whose backend\nhas no such channel (the agentic CLIs, a hosted OpenAI\nendpoint) omits it upstream rather than inventing one.\n",
     )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'
