@@ -148,6 +148,8 @@ module = [
     "win32api",
     "win32con",
     "win32gui",
+    # ...plus the one the install-permissions check reads ACLs with.
+    "win32security",
 ]
 ignore_missing_imports = true
 

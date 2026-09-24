@@ -26,6 +26,13 @@ async def healthz(request: Request) -> Health:
     `details` is a free-form object on `Health` and needs no contract
     change; the library already uses it for `unreadableRoots` and
     `scanError`, which is the same answer to the same question.
+
+    **`installPermissions`** rides on every answer, degraded or not:
+    one sentence per account outside this one, SYSTEM and Administrators
+    that can read `node.yaml` or add files to the install
+    (`install_permissions`). It does not degrade the status -- the
+    install works, and a status that flips for a permissions problem
+    would hide the next real outage behind a known one.
     """
     safe_mode = bool(getattr(request.app.state, "safe_mode", False))
     if safe_mode:
@@ -45,6 +52,7 @@ async def healthz(request: Request) -> Health:
             component="agent",
             safeMode=False,
             details={
+                **_permissions(request),
                 "configError": reason,
                 "configFile": str(state.path) if state is not None else None,
                 "configFilePreserved": (
@@ -67,6 +75,7 @@ async def healthz(request: Request) -> Health:
             component="agent",
             safeMode=False,
             details={
+                **_permissions(request),
                 "appsError": apps_reason,
                 "appsFile": str(apps.store.path),
                 "appsFilePreserved": str(
@@ -80,4 +89,10 @@ async def healthz(request: Request) -> Health:
         version=__version__,
         component="agent",
         safeMode=False,
+        details=_permissions(request) or None,
     )
+
+
+def _permissions(request: Request) -> dict[str, list[str]]:
+    sentences = list(getattr(request.app.state, "install_permissions", None) or [])
+    return {"installPermissions": sentences} if sentences else {}

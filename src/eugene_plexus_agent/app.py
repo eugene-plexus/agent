@@ -22,6 +22,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI
 
@@ -32,6 +33,7 @@ from . import (
     default_topology,
     enrollment,
     host_allowlist,
+    install_permissions,
     keyring_store,
     node_identity,
     off_host,
@@ -114,6 +116,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # comes up unenrolled and says why.
         log.error("node identity file could not be read (%s); running unenrolled", exc)
     app.state.node_identity = identity
+
+    # Whether another account on this machine can read node.yaml or add
+    # files to this install (Windows; see `install_permissions`). Off the
+    # loop and not awaited: naming a domain account can wait on a domain
+    # controller, and startup must not.
+    app.state.install_permissions = []
+    app.state.install_permissions_task = asyncio.create_task(
+        _check_install_permissions(app, settings.config_file.resolve().parent)
+    )
 
     # Tests can pre-populate auth state before the lifespan runs.
     if not hasattr(app.state, "auth_state"):
@@ -362,6 +373,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await benchmarks.close()
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
+        permissions_task = app.state.install_permissions_task
+        if not permissions_task.done():
+            permissions_task.cancel()
+            await asyncio.gather(permissions_task, return_exceptions=True)
         # The browser's upstream connections. Closed first because it is
         # the only thing here holding sockets to processes the next two
         # steps are about to stop.
@@ -385,6 +400,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # the way down, and closing a pool under an in-flight probe
         # turns an orderly shutdown into a traceback.
         await aclose_shared()
+
+
+async def _check_install_permissions(app: FastAPI, config_dir: Path) -> None:
+    """Say once, loudly, if another account can read this install's secrets.
+
+    The finding also rides on `/healthz` as `details.installPermissions`,
+    so it is visible without the log. Never fatal: a warning about the
+    install must not be what stops the install.
+    """
+    try:
+        grants = await asyncio.to_thread(install_permissions.check, config_dir)
+    except Exception:  # pragma: no cover - defensive
+        log.warning("could not check this install's permissions", exc_info=True)
+        return
+    app.state.install_permissions = [grant.sentence() for grant in grants]
+    for sentence in app.state.install_permissions:
+        log.warning(
+            "install permissions: %s. Another account on this machine could read this "
+            "install's signing key or add code that runs as this agent. Re-run the "
+            "installer to repair the folder's permissions.",
+            sentence,
+        )
 
 
 async def _connect_configured_shares(app: FastAPI) -> None:
