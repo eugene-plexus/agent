@@ -98,3 +98,54 @@ def test_the_recorded_epoch_fences_even_with_no_bundle_held(tmp_path: Path) -> N
     with pytest.raises(FencedError):
         trust.accept(root.bundle().jws)
     assert trust.bundle is None
+
+
+# --------------------------------------------------------------------------- #
+# How long since this node heard from the root
+# --------------------------------------------------------------------------- #
+
+
+def test_the_age_is_since_the_bundle_was_taken_not_since_it_was_signed(tmp_path: Path) -> None:
+    """A pull returns the same signed bundle until something changes, so
+    the bundle's own `iat` is days old on a quiet install that heard from
+    its root a minute ago. The age is when this node last took one."""
+    import os
+    import time
+
+    trust, root = _enrolled(tmp_path)
+    # Heard fifteen minutes ago, as far as the kept file says; taking a
+    # bundle now is what must bring the age back to zero.
+    then = time.time() - 900
+    os.utime(tmp_path / BUNDLE_FILE, (then, then))
+    trust.load()
+    assert (trust.heard_age_seconds() or 0) >= 895
+    old = tokens.build_bundle(
+        authority=root.identity,
+        version=root.version + 1,
+        epoch=root.epoch,
+        keys=[root.token.trust_key(["authority"]), *root.members.values()],
+        now=int(time.time()) - 5 * 86400,
+    )
+    trust.accept(old.jws)
+    age = trust.heard_age_seconds()
+    assert age is not None and age < 5
+    assert trust.heard_age_seconds(now=time.time() + 700) in (699, 700, 701)
+
+
+def test_the_age_survives_a_restart_from_the_kept_file(tmp_path: Path) -> None:
+    import os
+    import time
+
+    _enrolled(tmp_path)
+    kept = tmp_path / BUNDLE_FILE
+    then = time.time() - 900
+    os.utime(kept, (then, then))
+    again = NodeTrust(NodeIdentityStore(tmp_path / "node.yaml"), kept)
+    again._identity.load()
+    again.load()
+    age = again.heard_age_seconds()
+    assert age is not None and 895 <= age <= 905
+
+
+def test_a_standalone_node_has_no_root_to_hear_from(tmp_path: Path) -> None:
+    assert standalone_trust(tmp_path).heard_age_seconds() is None

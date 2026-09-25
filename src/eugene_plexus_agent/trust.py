@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 from . import tokens
@@ -56,6 +57,10 @@ class NodeTrust:
         self._path = bundle_path
         self._lock = threading.Lock()
         self._bundle: tokens.TrustBundle | None = None
+        # When this node last took the root's bundle. Not the bundle's
+        # `iat`: a pull returns the same signed bundle until something
+        # changes, so on a quiet install that grows without bound.
+        self._heard_at: float | None = None
 
     # ----- who this node is ----------------------------------------------
 
@@ -121,8 +126,15 @@ class NodeTrust:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             log.error("the kept trust bundle at %s was refused: %s", self._path, exc)
             return
+        try:
+            heard = self._path.stat().st_mtime
+        except OSError:
+            heard = None
         with self._lock:
             self._bundle = bundle
+            # The kept file is rewritten every time a bundle is taken, so
+            # its time is when this node last heard, across a restart.
+            self._heard_at = heard
         log.info(
             "trust bundle %d loaded (epoch %d, %d keys)",
             bundle.version,
@@ -162,6 +174,8 @@ class NodeTrust:
             raise BundleRollback(why)
         self._identity.accept_epoch(offered.epoch)
         self._install(offered)
+        with self._lock:
+            self._heard_at = time.time()
         return offered
 
     def _install(self, bundle: tokens.TrustBundle) -> None:
@@ -176,6 +190,16 @@ class NodeTrust:
         """Un-enrolled: drop the root's bundle; the caller becomes standalone."""
         with self._lock:
             self._bundle = None
+            self._heard_at = None
+
+    def heard_age_seconds(self, *, now: float | None = None) -> int | None:
+        """Seconds since this node last took the root's bundle; None if never,
+        or when it has joined nothing and has no root to hear from."""
+        with self._lock:
+            heard = self._heard_at
+        if heard is None or not self.enrolled:
+            return None
+        return max(0, int((time.time() if now is None else now) - heard))
 
     # ----- verifying ------------------------------------------------------
 

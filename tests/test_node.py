@@ -591,6 +591,32 @@ def test_a_lost_bundle_still_fences_a_lower_epoch(
     assert _auth(authed_client).trust.bundle is None
 
 
+def test_how_long_since_the_root_was_heard_is_on_node_and_healthz(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Both carry it once enrolled, and a standalone node carries neither,
+    because it has no root to hear from."""
+    assert "trustBundleAgeSeconds" not in (
+        authed_client.get("/healthz").json().get("details") or {}
+    )
+    assert authed_client.get("/v1/node").json().get("trustBundleAgeSeconds") is None
+    assert _enroll(authed_client, control).status_code == 200
+    # Signed five days ago and taken now: the age is since it was taken.
+    root = control.root
+    root.version += 1
+    signed_long_ago = tokens.build_bundle(
+        authority=root.identity,
+        version=root.version,
+        epoch=root.epoch,
+        keys=[root.token.trust_key(["authority"]), *root.members.values()],
+        now=int(time.time()) - 5 * 86400,
+    )
+    assert _push(authed_client, signed_long_ago).status_code == 200
+    node_age = authed_client.get("/v1/node").json()["trustBundleAgeSeconds"]
+    health_age = authed_client.get("/healthz").json()["details"]["trustBundleAgeSeconds"]
+    assert 0 <= node_age < 5 and 0 <= health_age < 5
+
+
 def test_an_unenrolled_agent_refuses_a_bundle(
     authed_client: TestClient, control: FakeControl
 ) -> None:

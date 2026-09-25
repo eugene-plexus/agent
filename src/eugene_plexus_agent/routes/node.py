@@ -144,7 +144,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         epoch=record.epoch if record.enrolled else None,
         advertiseUrl=advertise,  # type: ignore[arg-type]
         trustBundleVersion=bundle.version if bundle is not None else None,
-        trustBundleAgeSeconds=bundle.age_seconds() if bundle is not None else None,
+        trustBundleAgeSeconds=trust.heard_age_seconds() if record.enrolled else None,
         tokenPublicKey=token_public,
         controlPublicKey=record.control_public_key if record.enrolled else None,
         signingPublicKey=record.signing_public_key,

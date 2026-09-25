@@ -27,6 +27,11 @@ async def healthz(request: Request) -> Health:
     change; the library already uses it for `unreadableRoots` and
     `scanError`, which is the same answer to the same question.
 
+    **`trustBundleAgeSeconds`** rides on every answer from a node that
+    has joined an install: seconds since it last took the control root's
+    bundle, which it pulls every minute. Reported, never a status: a dead
+    root must not make every node look down.
+
     **`installPermissions`** rides on every answer, degraded or not:
     one sentence per account outside this one, SYSTEM and Administrators
     that can read `node.yaml` or add files to the install
@@ -53,6 +58,7 @@ async def healthz(request: Request) -> Health:
             safeMode=False,
             details={
                 **_permissions(request),
+                **_trust(request),
                 "configError": reason,
                 "configFile": str(state.path) if state is not None else None,
                 "configFilePreserved": (
@@ -76,6 +82,7 @@ async def healthz(request: Request) -> Health:
             safeMode=False,
             details={
                 **_permissions(request),
+                **_trust(request),
                 "appsError": apps_reason,
                 "appsFile": str(apps.store.path),
                 "appsFilePreserved": str(
@@ -89,10 +96,16 @@ async def healthz(request: Request) -> Health:
         version=__version__,
         component="agent",
         safeMode=False,
-        details=_permissions(request) or None,
+        details={**_permissions(request), **_trust(request)} or None,
     )
 
 
 def _permissions(request: Request) -> dict[str, list[str]]:
     sentences = list(getattr(request.app.state, "install_permissions", None) or [])
     return {"installPermissions": sentences} if sentences else {}
+
+
+def _trust(request: Request) -> dict[str, int]:
+    auth = getattr(request.app.state, "auth_state", None)
+    age = auth.trust.heard_age_seconds() if auth is not None else None
+    return {"trustBundleAgeSeconds": age} if age is not None else {}

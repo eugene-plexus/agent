@@ -3263,7 +3263,7 @@ class NodeIdentity(BaseModel):
     )
     trustBundleAgeSeconds: int | None = Field(
         None,
-        description='Seconds since the held bundle was signed. Reported, never\nenforced: a bundle keeps working while the root is dead, so\nits age is what tells an operator this node has not heard\nfrom the root.\n',
+        description="Seconds since this agent last took the control root's bundle\n-- a push, or the pull it makes every minute. Not the\nbundle's signing time: a quiet install's bundle can be days\nold and current. Reported, never enforced: a bundle keeps\nworking while the root is dead, so this is what tells an\noperator the node has not heard from the root. Past ten\nminutes the console lists it as an issue.\n",
     )
     tokenPublicKey: str | None = Field(
         None,
