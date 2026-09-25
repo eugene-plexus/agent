@@ -2,9 +2,9 @@
 
 Holds runtime secrets the agent should never persist:
 
-  * `signing_key` — Ed25519 private PEM, or the retained legacy HMAC
-    key until rotation. Enrolled agents restore the install's key from
-    node.yaml; only unenrolled agents generate a key at startup.
+  * `trust` — this node's token key, the authority it trusts, and the
+    trust bundle (`trust.NodeTrust`). The key is this node's own, from
+    `node.yaml`; no install-wide key exists any more (2026-09-25).
   * `master_key` — 32 bytes derived from the operator's passphrase
     via Argon2id. Encrypts apiKey-style fields on each child's disk.
     Threaded to spawned children via env var at startup.
@@ -13,9 +13,10 @@ And one thing that is not a secret and IS persisted:
 
   * `revoked` — the sessions the operator signed out of, as hashes.
     "Cleared at restart along with the signing key" was the design
-    until 2026-09-22, and it was wrong on an enrolled node, whose
-    signing key is NOT cleared at restart: every signed-out token came
-    back to life. See `session_revocations`.
+    until 2026-09-22, and it was wrong on an enrolled node, whose key
+    is NOT cleared at restart: every signed-out token came back to life.
+    See `session_revocations`. Enrolled, a sign-out is also replicated
+    by the control root and reaches every machine through the bundle.
 
 This state lives in `app.state.auth_state` after the lifespan
 initializes it. The supervisor reaches into it to read the master
@@ -30,8 +31,8 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
-from . import security
 from .session_revocations import RevokedSessions
+from .trust import NodeTrust
 
 
 @dataclass
@@ -39,13 +40,10 @@ class AuthState:
     """Per-process auth state. Rebuilt at every startup; only `revoked`
     is read back from disk, by the lifespan."""
 
-    # Private signing material for all JWTs. New per restart on an agent that
-    # has not enrolled; the INSTALL'S key, persisted in node.yaml and
-    # adopted at boot, on one that has (M7). Replaced in place by
-    # enrollment and by a signed re-key from the control root — the
+    # This node's token key and the bundle it verifies against. The
     # supervisor reads it at every spawn, so children restarted after
-    # either pick up the current one.
-    signing_key: bytes
+    # enrollment or un-enrollment pick up the current authority.
+    trust: NodeTrust
     # 32-byte master key derived from the operator's passphrase. None
     # until the passphrase has been verified (login) or recovered from
     # the OS keyring; the agent refuses to spawn children that need
@@ -69,15 +67,6 @@ class AuthState:
             raise ValueError("master key must be 32 bytes")
         with self._lock:
             self.master_key = key
-
-    def set_signing_key(self, key: bytes) -> None:
-        """Adopt the install's signing key — at enrollment, or when the
-        control root rotates it. Every token this agent minted under the
-        previous key stops verifying here, which is the point of a
-        rotation and the price of enrollment."""
-        security.validate_signing_key(key)
-        with self._lock:
-            self.signing_key = key
 
     def revoke(self, token: str, *, expires_at: int) -> None:
         """Sign `token` out until it would have expired anyway."""

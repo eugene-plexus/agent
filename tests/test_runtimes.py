@@ -16,7 +16,6 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import security
 from eugene_plexus_agent._generated.models import RuntimeSpec, RuntimeStatus
 from eugene_plexus_agent.engines import LlamaCppAdapter, VllmAdapter
 from eugene_plexus_agent.engines.base import Loading, Ready
@@ -24,7 +23,7 @@ from eugene_plexus_agent.runtimes import RuntimeSupervisor, _RuntimePlanner, des
 from eugene_plexus_agent.state import AgentState
 from eugene_plexus_agent.supervisor import ProcessState, SpawnPlan, SpawnPlanError
 
-from .conftest import StubRuntimeSupervisor
+from .conftest import StubRuntimeSupervisor, local_service_token
 
 
 def _runtime(**overrides: Any) -> dict[str, Any]:
@@ -38,8 +37,7 @@ def _runtime(**overrides: Any) -> dict[str, Any]:
 
 
 def _service_token(client: TestClient) -> str:
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    return security.issue_service_token(signing_key=signing_key, kind="gateway")
+    return local_service_token(client.app, "gateway")  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -433,8 +431,7 @@ def test_service_token_can_read_but_not_mutate(client: TestClient) -> None:
     # The gateway's token is authorized for stop — so an unknown runtime
     # is a 404, not a 401.
     assert client.post("/v1/runtimes/x/stop", headers=headers).status_code == 404
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    driver = security.issue_service_token(signing_key=signing_key, kind="inference-driver")
+    driver = local_service_token(client.app, "inference-driver")  # type: ignore[arg-type]
     assert (
         client.post(
             "/v1/runtimes/x/stop", headers={"Authorization": f"Bearer {driver}"}

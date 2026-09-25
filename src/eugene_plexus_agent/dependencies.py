@@ -1,29 +1,26 @@
-"""FastAPI dependencies for v0.2 auth.
+"""FastAPI dependencies for bearer auth, against this node's trust bundle.
 
-Two main dependencies:
+Every bearer is checked by `NodeTrust.verify`: the key found by `kid` in
+the bundle, the algorithm from the key, `typ`, `iss`, an `aud` naming
+this machine, the key's grants and the class's lifetime
+(`specs/docs/design/per-node-token-keys.md`, D2 and D5). The route levels:
 
-  * `require_initialized` — short-circuits with 503 when the operator
-    hasn't yet set a passphrase. Endpoints that are only meaningful
-    on a configured install (everything except /healthz and
-    /v1/auth/initialize) declare this.
+* `require_operator_session` — an operator session addressed to this
+  machine: one signed in here, or one another console exchanged for this
+  machine at the control root.
+* `require_operator_or_service` — the reads: a session, a service token
+  from this machine's own children, the control root's, or a `gateway`
+  token (this machine's gateway, or a node the bundle grants `gateway`).
+* `require_operator_or_gateway` — starting and stopping a runtime, and
+  the client-key policy: a session or a `gateway` token.
+* `require_operator_or_control` — declaring a runtime: a session or the
+  control root's own token.
+* `require_local_service` — a child of this agent speaking for itself,
+  and nothing else.
 
-  * `require_operator_session` — validates a `Authorization: Bearer ...`
-    token. Raises 401 on missing / malformed / expired / revoked.
-    Returns the decoded `TokenPayload` for downstream use.
-
-Service-token verification is a separate dependency
-(`require_service_token`) so endpoints can scope themselves correctly
-(e.g. POST /v1/identity/links/pending is service-only; PATCH
-/v1/identity/constitution is operator-only).
-
-  * `require_operator_or_service` — accepts an operator session token
-    OR *any* `service:*`-audience token. Used by the read-only topology
-    endpoints (`GET /v1/components`, `GET /v1/components/{name}`) so peer
-    components can auto-resolve each other's URLs with their service
-    token. Mutating topology routes stay operator-only. (v0.2.1: before
-    this, the whole `/v1/components` router was operator-only, so every
-    peer auto-resolve silently fell back to localhost defaults —
-    project_agent_components_auth_mismatch.)
+**No `service:*` wildcard anywhere** (2026-09-25). Until then a driver's
+token or the library's opened every read on every agent in the install,
+because a service token named a kind and every machine shared one key.
 """
 
 from __future__ import annotations
@@ -31,12 +28,15 @@ from __future__ import annotations
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from . import security
+from . import tokens
 from ._generated.common_models import Problem
 from .auth_state import AuthState
 from .state import AgentState
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+_SESSION = (tokens.TYP_SESSION,)
+_SESSION_OR_SERVICE = (tokens.TYP_SESSION, tokens.TYP_SERVICE)
 
 
 def _problem(status_code: int, title: str, detail: str) -> HTTPException:
@@ -84,164 +84,106 @@ def require_initialized(request: Request) -> AgentState:
     return state
 
 
-def require_operator_session(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Validate the bearer token and confirm it's an operator session.
-
-    Raises 401 for any auth failure; the response body is a Problem
-    JSON so the UI can surface a useful message.
-    """
-    if creds is None or not creds.credentials:
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Missing token",
-            "Provide a session token via the Authorization: Bearer header.",
-        )
-    token = creds.credentials
+def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> tokens.Claims:
+    """Verify one bearer addressed to this machine, or raise the 401 that says why."""
     auth: AuthState = request.app.state.auth_state
     if auth.is_revoked(token):
         raise revoked_session_problem()
     try:
-        payload = security.decode_token(
-            token=token,
-            signing_key=auth.signing_key,
-            expected_audience=security.AUDIENCE_OPERATOR,
-        )
-    except Exception as e:
+        return auth.trust.verify(token, classes=classes)
+    except tokens.TokenError as exc:
         raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Invalid token",
-            f"Session token rejected: {e}",
-        ) from e
-    return payload
+            status.HTTP_401_UNAUTHORIZED, "Invalid token", f"Bearer token rejected: {exc}"
+        ) from exc
 
 
-def require_operator_or_service(
-    request: Request,
-    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Accept an operator session token OR any service-audience token.
-
-    For read-only topology endpoints reachable from both the UI (operator
-    session) and peer components (service token). The signature + expiry
-    are verified the same way for both; only the `aud` claim differs.
-    Decoding with `expected_audience=None` skips PyJWT's audience check,
-    so we enforce the allowed audiences ourselves: `operator`, or any
-    `service:<kind>`. A revoked operator session is still rejected.
-    """
+def _bearer(creds: HTTPAuthorizationCredentials | None) -> str:
     if creds is None or not creds.credentials:
         raise _problem(
             status.HTTP_401_UNAUTHORIZED,
             "Missing token",
             "Provide a bearer token via the Authorization: Bearer header.",
         )
-    token = creds.credentials
-    auth: AuthState = request.app.state.auth_state
-    if auth.is_revoked(token):
-        raise revoked_session_problem()
-    try:
-        payload = security.decode_token(
-            token=token,
-            signing_key=auth.signing_key,
-            expected_audience=None,  # we validate the audience ourselves below
-        )
-    except Exception as e:
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Invalid token",
-            f"Bearer token rejected: {e}",
-        ) from e
-    is_operator = payload.aud == security.AUDIENCE_OPERATOR
-    is_service = payload.aud.startswith(security.SERVICE_AUDIENCE_PREFIX)
-    if not (is_operator or is_service):
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Wrong audience",
-            f"Token audience {payload.aud!r} is neither operator nor a service token.",
-        )
-    return payload
+    return creds.credentials
+
+
+def _refuse(claims: tokens.Claims, what: str) -> HTTPException:
+    return _problem(
+        status.HTTP_401_UNAUTHORIZED,
+        "Wrong audience",
+        f"A {claims.sub!r} service token from {claims.iss!r} may not {what}.",
+    )
+
+
+def _is_control(claims: tokens.Claims) -> bool:
+    return (
+        claims.is_service
+        and claims.iss == tokens.ISSUER_CONTROL
+        and claims.sub == tokens.SUB_CONTROL
+    )
+
+
+def require_operator_session(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """An operator session addressed to this machine."""
+    return verify_bearer(request, _bearer(creds), classes=_SESSION)
+
+
+def require_operator_or_service(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """The reads: a session, this machine's children, the root, or a gateway."""
+    claims = verify_bearer(request, _bearer(creds), classes=_SESSION_OR_SERVICE)
+    if claims.is_session:
+        return claims
+    recipient = request.app.state.auth_state.trust.recipient
+    if claims.is_local_service(recipient) or _is_control(claims):
+        return claims
+    if claims.sub == tokens.SUB_GATEWAY:
+        return claims
+    raise _refuse(claims, "read this agent")
 
 
 def require_operator_or_gateway(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Accept an operator session token OR the gateway's service token.
+) -> tokens.Claims:
+    """Start and stop a runtime, and the client-key policy (M6's lifecycle).
 
-    For the two lifecycle actions — stop and start a runtime — that M6
-    hands to the gateway, because the gateway is the one component that
-    sees demand. `service:gateway` exactly, not any service audience: a
-    leaked driver or library token still cannot stop a process holding a
-    GPU, which was the reason these were operator-only through M5.
+    `gateway` exactly: a driver's or the library's token still cannot
+    stop a process holding a GPU, which is why these were operator-only
+    through M5. A `gateway` token from another machine verified only if
+    the bundle grants that machine `gateway`.
     """
-    payload = require_operator_or_service(request, creds)
-    if payload.aud == security.AUDIENCE_OPERATOR:
-        return payload
-    if payload.aud == f"{security.SERVICE_AUDIENCE_PREFIX}gateway":
-        return payload
-    raise _problem(
-        status.HTTP_401_UNAUTHORIZED,
-        "Wrong audience",
-        f"Token audience {payload.aud!r} may not start or stop a runtime; only the operator "
-        "or the gateway (service:gateway) may.",
-    )
+    claims = verify_bearer(request, _bearer(creds), classes=_SESSION_OR_SERVICE)
+    if claims.is_session or claims.sub == tokens.SUB_GATEWAY:
+        return claims
+    raise _refuse(claims, "start or stop a runtime; only the operator or the gateway may")
 
 
 def require_operator_or_control(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Accept an operator session token OR the control root's service token.
+) -> tokens.Claims:
+    """Declare a runtime: a session, or the control root's own token.
 
-    For declaring a runtime. The control root forwards declarations to
-    the node that will run them (`control.yaml`, `POST /v1/runtimes`)
-    with `service:control`, and the trust root's token is what every
-    other credential in the install reduces to. Checked exactly: a
-    leaked driver or library token still cannot declare a runtime, which
-    was the reason this stayed operator-only through M6."""
-    payload = require_operator_or_service(request, creds)
-    if payload.aud == security.AUDIENCE_OPERATOR:
-        return payload
-    if payload.aud == f"{security.SERVICE_AUDIENCE_PREFIX}control":
-        return payload
-    raise _problem(
-        status.HTTP_401_UNAUTHORIZED,
-        "Wrong audience",
-        f"Token audience {payload.aud!r} may not declare a runtime; only the operator or "
-        "the control root (service:control) may.",
-    )
+    Signed by the root's key and addressed to this node, so no other
+    node can mint one: a leaked worker key cannot run anything here."""
+    claims = verify_bearer(request, _bearer(creds), classes=_SESSION_OR_SERVICE)
+    if claims.is_session or _is_control(claims):
+        return claims
+    raise _refuse(claims, "declare a runtime; only the operator or the control root may")
 
 
-def require_service_token(
+def require_local_service(
     request: Request,
-    expected_kind: str,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload:
-    """Validate a service-audience bearer token. Used by future
-    operator-internal endpoints. Not applied to any v0.2 agent
-    route yet — defined here so other components can mirror the
-    shape when they wire their own auth in."""
-    if creds is None or not creds.credentials:
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Missing token",
-            "Provide a service token via the Authorization: Bearer header.",
-        )
-    token = creds.credentials
-    auth: AuthState = request.app.state.auth_state
-    expected_audience = f"{security.SERVICE_AUDIENCE_PREFIX}{expected_kind}"
-    try:
-        payload = security.decode_token(
-            token=token,
-            signing_key=auth.signing_key,
-            expected_audience=expected_audience,
-        )
-    except Exception as e:
-        raise _problem(
-            status.HTTP_401_UNAUTHORIZED,
-            "Invalid service token",
-            f"Service token rejected: {e}",
-        ) from e
-    return payload
+) -> tokens.Claims:
+    """A child of this agent, with the token it was spawned with."""
+    claims = verify_bearer(request, _bearer(creds), classes=(tokens.TYP_SERVICE,))
+    if claims.is_local_service(request.app.state.auth_state.trust.recipient):
+        return claims
+    raise _refuse(claims, "ask this agent for a token; only its own children may")

@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import security
+from eugene_plexus_agent import security, tokens
 
-from .conftest import TEST_PASSPHRASE
+from .conftest import TEST_PASSPHRASE, local_service_token
 
 # --------------------------------------------------------------------------- #
 # Pre-init: only /healthz and /v1/auth/initialize work
@@ -192,10 +192,13 @@ def test_bogus_token_rejected(client: TestClient) -> None:
 
 
 def test_token_signed_with_wrong_key_rejected(client: TestClient) -> None:
-    """A JWT signed with a key different from the agent's
-    in-memory signing key must fail signature verification."""
+    """A session signed by a key the bundle does not list must fail,
+    even when it names this machine and claims the right issuer."""
     client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
-    bogus, _ = security.issue_operator_token(signing_key=b"\x00" * 32)
+    stranger = tokens.Signer(key=tokens.generate_private_key(), issuer="node:local")
+    bogus, _ = stranger.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=["node:local"], ttl_seconds=60
+    )
     client.headers["Authorization"] = f"Bearer {bogus}"
     assert client.get("/v1/config").status_code == 401
 
@@ -207,8 +210,7 @@ def test_service_token_rejected_for_operator_routes(client: TestClient) -> None:
     client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     # The signing key lives on the running app's auth_state — pull it
     # off so the forged token IS validly signed but audience-wrong.
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    svc = security.issue_service_token(signing_key=signing_key, kind="gateway")
+    svc = local_service_token(client.app, "gateway")  # type: ignore[arg-type]
     client.headers["Authorization"] = f"Bearer {svc}"
     assert client.get("/v1/config").status_code == 401
 

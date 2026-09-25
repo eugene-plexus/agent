@@ -29,12 +29,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import install_proxy
+from eugene_plexus_agent import install_proxy, tokens
 from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind
 
 # `httpx.Response(json=...)` reads itself eagerly, so a mock built that
 # way arrives already consumed and `aiter_raw()` refuses it. The proxy's
 # own suite hit this first and explains it at length.
+from .conftest import FakeRoot, enroll_app, local_service_token
 from .test_ui_proxy import byte_stream
 
 CONTROL_URL = "http://ctl.invalid:8083"
@@ -201,23 +202,201 @@ def test_a_local_component_is_never_looked_up(
 # --------------------------------------------------------------------------
 
 
-def test_the_lookup_spends_the_callers_own_token(
-    client: TestClient, upstream: Upstream, asked: list[httpx.Request]
+def test_the_lookup_spends_this_nodes_own_token_never_the_callers(
+    app: FastAPI, client: TestClient, upstream: Upstream, asked: list[httpx.Request]
 ) -> None:
-    """An enrolled node holds the install's signing key, so the browser's
-    token is one the root accepts. The proxy minting one of its own
-    would take back the property the port to the agent was built for."""
+    """Per-node token keys (2026-09-25): a caller's credential is
+    addressed to this machine and good nowhere else, so forwarding it to
+    the root would be refused -- and a proxy that forwarded whatever it
+    was handed is the confused deputy the per-node keys exist to remove.
+    The lookup is this agent's business, so it spends this agent's own
+    token, addressed to the root alone."""
     client.get("/api/proxy/gateway/v1/models", headers={"Authorization": "Bearer operators-token"})
 
     assert [str(r.url.path) for r in asked] == ["/v1/components", "/v1/nodes"]
-    assert {r.headers.get("authorization") for r in asked} == {"Bearer operators-token"}
+    trust = app.state.auth_state.trust
+    for r in asked:
+        _, _, token = r.headers["authorization"].partition(" ")
+        assert token != "operators-token"
+        claims = tokens.verify(
+            token, bundle=trust.bundle, recipient="control", classes=(tokens.TYP_SERVICE,)
+        )
+        assert claims.sub == "agent"
+        assert claims.aud == ("control",)
 
 
-def test_the_token_also_reaches_the_far_component(
+def test_a_credential_the_far_node_would_not_accept_is_stripped(
     client: TestClient, upstream: Upstream, asked: list[httpx.Request]
 ) -> None:
+    """Nothing this node cannot vouch for leaves the machine: a string it
+    cannot verify is not forwarded on the chance that someone else can."""
     client.get("/api/proxy/gateway/v1/models", headers={"Authorization": "Bearer operators-token"})
-    assert upstream.last.headers["authorization"] == "Bearer operators-token"
+    assert "authorization" not in upstream.last.headers
+
+
+@dataclass
+class Exchanges:
+    root: FakeRoot
+    requests: list[httpx.Request]
+
+
+@pytest.fixture
+def exchanges(app: FastAPI, client: TestClient) -> Exchanges:
+    """This node enrolled for real as `worker-1`, beside a node `root`
+    that runs the gateway, and a control root that answers lookups and
+    exchanges a session the way RFC 8693 says."""
+    root = FakeRoot()
+    root.register("root", tokens.generate_private_key().public_key())
+    root.register("other", tokens.generate_private_key().public_key())
+    enroll_app(app, root, "worker-1", control_url=CONTROL_URL)
+    asked: list[httpx.Request] = []
+    # The gateway on `root`, a driver on `other`: two far machines.
+    lookups = control_transport(
+        asked,
+        components=[
+            {"node": "root", "name": "gateway", "kind": "gateway"},
+            {"node": "other", "name": "llama-1", "kind": "inference-driver"},
+        ],
+        nodes=[
+            {"name": "root", "url": "http://root.invalid:8279/"},
+            {"name": "other", "url": "http://other.invalid:8079/"},
+        ],
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/v1/auth/token":
+            return lookups.handler(request)  # type: ignore[attr-defined, no-any-return]
+        asked.append(request)
+        body = json.loads(request.content)
+        exchanged = root.session(body["audience"], ttl=300, act={"sub": "node:worker-1"})
+        return httpx.Response(
+            200,
+            json={
+                "accessToken": exchanged,
+                "issuedTokenType": "urn:ietf:params:oauth:token-type:access_token",
+                "tokenType": "Bearer",
+                "expiresAt": "2099-01-01T00:00:00Z",
+            },
+        )
+
+    app.state.control_transport = httpx.MockTransport(handler)
+    return Exchanges(root=root, requests=asked)
+
+
+def test_a_session_for_this_console_is_exchanged_for_the_far_node(
+    app: FastAPI, client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    """The operator signed in here, so the session names this machine
+    and the root. The far node gets a short token the root issued for it
+    alone, and it is asked for once, not on every request."""
+    session = exchanges.root.session("node:worker-1", "control")
+
+    for _ in range(2):
+        response = client.get(
+            "/api/proxy/gateway/v1/models", headers={"Authorization": f"Bearer {session}"}
+        )
+        assert response.status_code == 200
+
+    exchanged = [r for r in exchanges.requests if r.url.path == "/v1/auth/token"]
+    assert len(exchanged) == 1
+    body = json.loads(exchanged[0].content)
+    assert body == {"subjectToken": session, "audience": "node:root"}
+    # The exchange is this agent acting, so it carries this agent's token.
+    _, _, actor = exchanged[0].headers["authorization"].partition(" ")
+    trust = app.state.auth_state.trust
+    assert (
+        tokens.verify(
+            actor, bundle=trust.bundle, recipient="control", classes=(tokens.TYP_SERVICE,)
+        ).sub
+        == "agent"
+    )
+    _, _, sent = upstream.last.headers["authorization"].partition(" ")
+    assert sent != session
+    claims = tokens.verify(
+        sent, bundle=trust.bundle, recipient="node:root", classes=(tokens.TYP_SESSION,)
+    )
+    assert claims.aud == ("node:root",)
+
+
+def test_one_session_is_exchanged_once_per_far_machine(
+    app: FastAPI, client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    """The cache is keyed by the session AND the destination: a token the
+    root issued for `root` must never be handed to `other`, which would
+    refuse it -- or, worse, to a machine that did not."""
+    session = exchanges.root.session("node:worker-1", "control")
+    headers = {"Authorization": f"Bearer {session}"}
+
+    assert client.get("/api/proxy/gateway/v1/models", headers=headers).status_code == 200
+    to_root = upstream.last.headers["authorization"]
+    assert client.get("/api/proxy/llama-1/v1/info", headers=headers).status_code == 200
+    to_other = upstream.last.headers["authorization"]
+
+    exchanged = [
+        json.loads(r.content)["audience"]
+        for r in exchanges.requests
+        if r.url.path == "/v1/auth/token"
+    ]
+    assert exchanged == ["node:root", "node:other"]
+    assert to_root != to_other
+    trust = app.state.auth_state.trust
+    for header, recipient in ((to_root, "node:root"), (to_other, "node:other")):
+        token = header.removeprefix("Bearer ")
+        assert tokens.verify(
+            token, bundle=trust.bundle, recipient=recipient, classes=(tokens.TYP_SESSION,)
+        ).aud == (recipient,)
+
+
+def test_an_api_key_header_is_translated_like_a_bearer(
+    app: FastAPI, client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    """Claude Code sends its credential as `x-api-key`. It leaves this
+    machine under the same rule as `Authorization`: exchanged when it is
+    this console's session, stripped when this node cannot vouch for it."""
+    session = exchanges.root.session("node:worker-1", "control")
+    client.get("/api/proxy/gateway/v1/models", headers={"x-api-key": session})
+    sent = upstream.last.headers["x-api-key"]
+    assert sent != session
+    trust = app.state.auth_state.trust
+    assert tokens.verify(
+        sent, bundle=trust.bundle, recipient="node:root", classes=(tokens.TYP_SESSION,)
+    ).aud == ("node:root",)
+
+    client.get("/api/proxy/gateway/v1/models", headers={"x-api-key": "not-a-token"})
+    assert "x-api-key" not in upstream.last.headers
+
+
+def test_a_token_already_addressed_to_the_far_node_passes_unchanged(
+    client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    already = exchanges.root.session("node:root")
+    client.get("/api/proxy/gateway/v1/models", headers={"Authorization": f"Bearer {already}"})
+    assert upstream.last.headers["authorization"] == f"Bearer {already}"
+    assert [r for r in exchanges.requests if r.url.path == "/v1/auth/token"] == []
+
+
+def test_a_local_service_token_is_reminted_only_within_this_nodes_grants(
+    app: FastAPI, client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    """A child's token is good on this machine alone. Leaving it, it is
+    re-minted by this node's key for the far node -- but only as far as
+    the root's grants for this node reach: a plain node speaks for its
+    agent across machines and for nothing else."""
+    driver = local_service_token(app, "inference-driver")
+    client.get("/api/proxy/gateway/v1/models", headers={"Authorization": f"Bearer {driver}"})
+    assert "authorization" not in upstream.last.headers
+
+    agent = local_service_token(app, "agent")
+    client.get("/api/proxy/gateway/v1/models", headers={"Authorization": f"Bearer {agent}"})
+    _, _, sent = upstream.last.headers["authorization"].partition(" ")
+    assert sent != agent
+    claims = tokens.verify(
+        sent,
+        bundle=app.state.auth_state.trust.bundle,
+        recipient="node:root",
+        classes=(tokens.TYP_SERVICE,),
+    )
+    assert (claims.iss, claims.sub, claims.aud) == ("node:worker-1", "agent", ("node:root",))
 
 
 # --------------------------------------------------------------------------
@@ -440,21 +619,19 @@ def test_a_node_that_did_not_answer_is_re_read_next_time(
     assert len(asked) == 4
 
 
-def test_a_refused_credential_is_not_remembered_for_the_next_caller(
+def test_a_refused_credential_is_not_remembered(
     app: FastAPI, client: TestClient, upstream: Upstream
 ) -> None:
-    """The proxy is unauthenticated by design -- it is the path the login
-    request itself travels -- so an anonymous request can reach this
-    lookup and be refused. Caching that refusal would answer the
-    signed-in operator with someone else's 401 for the whole negative
-    TTL."""
+    """The lookup spends this node's own token, so a 401 means the root
+    does not know this node's key yet -- an enrollment a moment old, or a
+    bundle the pull has not caught up with. Both mend themselves;
+    remembering the refusal would keep every console on this machine
+    broken for the whole negative TTL after the cause had gone."""
     asked: list[httpx.Request] = []
-    seen: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         asked.append(request)
-        seen.append(request.headers.get("authorization"))
-        if request.headers.get("authorization") is None:
+        if len(asked) <= 2:
             return httpx.Response(401, json={"detail": "Not authenticated"})
         body = (
             {"components": [{"node": "root", "name": "gateway", "kind": "gateway"}]}
@@ -467,8 +644,7 @@ def test_a_refused_credential_is_not_remembered_for_the_next_caller(
     enroll(app)
 
     assert client.get("/api/proxy/gateway/v1/models").status_code == 503
-    response = client.get("/api/proxy/gateway/v1/models", headers={"Authorization": "Bearer t"})
-    assert response.status_code == 200
+    assert client.get("/api/proxy/gateway/v1/models").status_code == 200
 
 
 def test_an_unreachable_upstream_names_the_node_and_not_just_a_url(

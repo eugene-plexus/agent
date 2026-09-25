@@ -17,7 +17,7 @@ only `EUGENE_PLEXUS_APP_*`.
 **Each app runs from its own Python environment**, built by `uv` into
 `<config dir>/apps/<id>/versions/<version>/venv`. A trainer brings
 torch and the Discord connector brings discord.py, and neither belongs
-in the process holding the install's signing key; on Windows the agent
+in the process holding this node's keys; on Windows the agent
 cannot upgrade packages in its own venv while it runs anyway, because
 its console-script `.exe` is locked. `watchdog-venv-is-runtime` is a
 rule about components and stays true of them.

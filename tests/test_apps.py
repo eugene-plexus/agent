@@ -23,6 +23,7 @@ import asyncio
 import json
 import shutil
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ from eugene_plexus_agent._generated.models import (
     ComponentStatus,
 )
 from eugene_plexus_agent.routes import apps as apps_routes
+
+from .conftest import standalone_auth
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_app"
 
@@ -689,10 +692,9 @@ class _Identity:
 def test_the_gateway_is_found_on_this_node_or_through_its_owners_agent(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
-    from eugene_plexus_agent import install_proxy, security
+    from eugene_plexus_agent import install_proxy
     from eugene_plexus_agent._generated.models import ComponentEntry
     from eugene_plexus_agent.app import resolve_gateway_for_apps
-    from eugene_plexus_agent.auth_state import AuthState
     from eugene_plexus_agent.state import AgentState
 
     state = AgentState(tmp_path / "agent.yaml")
@@ -709,7 +711,7 @@ def test_the_gateway_is_found_on_this_node_or_through_its_owners_agent(tmp_path:
         state=SimpleNamespace(
             agent_state=state,
             node_identity=_Identity(enrolled=False),
-            auth_state=AuthState(signing_key=security.generate_signing_key()),
+            auth_state=standalone_auth(Path(tempfile.mkdtemp())),
             install_topology=Topology(),
         )
     )

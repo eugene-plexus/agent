@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from eugene_plexus_agent import security
+from .conftest import local_service_token
 
 
 def request_body():
@@ -24,9 +24,7 @@ def request_body():
 
 def test_reads_and_writes_require_operator(client, app):
     assert client.get("/v1/benchmarks").status_code == 401
-    token = security.issue_service_token(
-        signing_key=app.state.auth_state.signing_key, kind="gateway"
-    )
+    token = local_service_token(app, "gateway")
     headers = {"Authorization": f"Bearer {token}"}
     assert client.get("/v1/benchmarks", headers=headers).status_code == 401
     assert client.post("/v1/benchmarks", json=request_body(), headers=headers).status_code == 401
@@ -147,9 +145,7 @@ def test_gateway_wake_cannot_bypass_benchmark(authed_client, app):
     spec = request_body()["runtime"] | {"autoStart": False}
     assert authed_client.post("/v1/runtimes", json=spec).status_code == 201
     app.state.benchmarks = SimpleNamespace(active=True)
-    token = security.issue_service_token(
-        signing_key=app.state.auth_state.signing_key, kind="gateway"
-    )
+    token = local_service_token(app, "gateway")
     try:
         response = authed_client.post(
             "/v1/runtimes/test/start", headers={"Authorization": f"Bearer {token}"}

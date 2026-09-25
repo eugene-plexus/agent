@@ -14,9 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import eugene_plexus_agent.admission as admission_module
-from eugene_plexus_agent import security
 
-from .conftest import TEST_PASSPHRASE, StubRuntimeSupervisor, fake_devices
+from .conftest import TEST_PASSPHRASE, StubRuntimeSupervisor, fake_devices, local_service_token
 
 GIB = 1024**3
 
@@ -42,8 +41,7 @@ def _model(tmp_path: Path, size: int) -> str:
 
 
 def _token(client: TestClient, kind: str) -> str:
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    return security.issue_service_token(signing_key=signing_key, kind=kind)
+    return local_service_token(client.app, kind)  # type: ignore[arg-type]
 
 
 # --- admission on the routes --------------------------------------------------
@@ -200,7 +198,7 @@ def test_other_service_tokens_still_cannot(client: TestClient, tmp_path: Path) -
         headers = {"Authorization": f"Bearer {_token(client, kind)}"}
         stop = client.post("/v1/runtimes/big/stop", headers=headers)
         assert stop.status_code == 401, kind
-        assert "service:gateway" in stop.json()["detail"]["detail"]
+        assert "only the operator or the gateway" in stop.json()["detail"]["detail"]
         assert client.post("/v1/runtimes/big/start", headers=headers).status_code == 401, kind
     # Declaring and deleting stay operator-only.
     gateway = {"Authorization": f"Bearer {_token(client, 'gateway')}"}

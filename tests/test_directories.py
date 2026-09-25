@@ -8,8 +8,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import security
 from eugene_plexus_agent.directory_listing import ListingError, list_directory, starting_points
+
+from .conftest import local_service_token
 
 
 def _tree(tmp_path: Path) -> Path:
@@ -130,7 +131,6 @@ def test_the_route_is_operator_only(client: TestClient, tmp_path: Path) -> None:
     assert init.status_code == 200
     anonymous = client.get("/v1/directories")
     assert anonymous.status_code == 401
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    service = security.issue_service_token(signing_key=signing_key, kind="gateway")
+    service = local_service_token(client.app, "gateway")  # type: ignore[arg-type]
     refused = client.get("/v1/directories", headers={"Authorization": f"Bearer {service}"})
     assert refused.status_code in (401, 403)

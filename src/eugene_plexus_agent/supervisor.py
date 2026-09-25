@@ -48,7 +48,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import orphan_kill, ports, process_signals, security
+from . import orphan_kill, ports, process_signals
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 from ._http import internal_client
 from .auth_state import AuthState
@@ -164,11 +164,11 @@ _COMPONENT_SPECS: dict[ComponentKind, _ComponentSpec] = {
     # second copy. One supervisor implementation, running on every host;
     # one control root, spawned by whichever agent's topology declares it.
     #
-    # It is the one component that receives no auth trio. It *is* the
-    # trust root — it mints the signing key and derives the master key
-    # from the operator's passphrase — so threading a key into it would
-    # be this process handing the trust root a key the trust root is
-    # supposed to own. See `_ComponentPlanner.plan`.
+    # It is the one component that receives no auth wiring. It *is* the
+    # trust root — it holds its own token key, signs the trust bundle and
+    # derives the master key from the operator's passphrase — so wiring
+    # this node's trust into it would be the node telling the root what
+    # to trust. See `_ComponentPlanner.plan`.
     ComponentKind.control: _ComponentSpec(
         module="eugene_plexus_control",
         env_prefix="EUGENE_PLEXUS_CONTROL",
@@ -343,8 +343,9 @@ class _ComponentPlanner:
         # advertises a non-loopback address. Read at every plan so a
         # config change reaches the next spawn.
         self._shared_child_env = shared_child_env
-        # auth_state is the source of the per-restart JWT signing key +
-        # (post-login) master key + service token issuance. Optional for
+        # auth_state is the source of this node's trust (the bundle, its
+        # authority, and local service tokens) and the (post-login)
+        # master key. Optional for
         # test ergonomics — tests that don't care about auth pass None
         # and get the env-var set without the auth trio.
         self._auth_state = auth_state
@@ -398,27 +399,26 @@ class _ComponentPlanner:
         degraded = bool(self.entry.safeMode) or self._auto_safe_mode_engaged
         env[f"{prefix}_SAFE_MODE"] = "1" if degraded else "0"
 
-        # Auth env vars. Children read these to (a) validate inbound
-        # bearer tokens against the shared signing key, (b) present a
-        # service token of their own on outbound calls, and (c) decrypt
-        # at-rest secrets like apiKey.
+        # Auth env vars (per-node token keys, 2026-09-25). Children read
+        # these to (a) verify inbound bearers against the trust bundle
+        # this agent keeps, checked against the authority it pinned,
+        # (b) know which recipient they are, and (c) present a token of
+        # their own that is addressed to this machine alone. No child
+        # gets a private token key: a driver's environment, leaked, is a
+        # token that works on this machine and nowhere else. Plus (d) the
+        # master key for at-rest secrets like apiKey.
         #
         # The control root gets none of them, and must not. It is the
-        # trust root: it derives the master key from the operator's
-        # passphrase and mints the install's signing key itself. Handing
-        # it ours would give it a key it did not choose, seal its secrets
-        # under a key that dies with this process, and quietly recreate
-        # the single-host trust model M5 exists to replace.
+        # trust root: it holds its own token key and signs the bundle
+        # every node trusts.
         if self._auth_state is not None and self.entry.kind not in _TRUST_ROOT_KINDS:
             kind_value = self.entry.kind.value  # "gateway", "inference-driver"
-            key = self._auth_state.signing_key
-            suffix = "AUTH_SIGNING_KEY" if len(key) == 32 else "AUTH_VERIFY_KEY"
-            env[f"{prefix}_{suffix}"] = base64.b64encode(security.verification_key(key)).decode(
-                "ascii"
-            )
-            env[f"{prefix}_SERVICE_TOKEN"] = security.issue_service_token(
-                signing_key=self._auth_state.signing_key,
-                kind=kind_value,
+            trust = self._auth_state.trust
+            env[f"{prefix}_TRUST_BUNDLE_FILE"] = str(trust.bundle_path)
+            env[f"{prefix}_TRUST_AUTHORITY"] = trust.authority
+            env[f"{prefix}_AUTH_RECIPIENT"] = trust.recipient
+            env[f"{prefix}_SERVICE_TOKEN"], _ = trust.mint_service(
+                sub=kind_value, audience=trust.recipient
             )
             if (
                 kind_value in {"library", "inference-driver"}

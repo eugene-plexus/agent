@@ -12,7 +12,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import HTTPException, Request
 
-from . import node_identity, security
+from . import node_identity
 from ._http import internal_client
 from .client_keys import as_datetime
 
@@ -40,9 +40,7 @@ class ClientKeyRegistry:
     ) -> Any:
         identity = self.app.state.node_identity.record
         if authorization is None:
-            authorization = "Bearer " + security.issue_service_token(
-                signing_key=self.app.state.auth_state.signing_key, kind="agent"
-            )
+            authorization = "Bearer " + self.app.state.auth_state.trust.agent_token("control")
         try:
             async with asyncio.timeout(3.0):
                 response = await self.client.request(

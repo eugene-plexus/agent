@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import security
+from .conftest import local_service_token
 
 
 def _service_token(client: TestClient) -> str:
@@ -20,8 +20,7 @@ def _service_token(client: TestClient) -> str:
     signing key so signature verification passes; only the audience marks
     it as a service rather than operator token.
     """
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    return security.issue_service_token(signing_key=signing_key, kind="gateway")
+    return local_service_token(client.app, "gateway")  # type: ignore[arg-type]
 
 
 def _gateway_entry() -> dict[str, object]:

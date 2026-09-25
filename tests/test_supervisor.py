@@ -23,7 +23,6 @@ from typing import Any
 
 import pytest
 
-from eugene_plexus_agent import security
 from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentKind,
@@ -79,6 +78,15 @@ class _FakeProcess:
     def _finish(self, returncode: int) -> None:
         self.returncode = returncode
         self._exit_event.set()
+
+
+def _auth() -> AuthState:
+    """A standalone node's auth state over a throwaway directory."""
+    import tempfile
+
+    from .conftest import standalone_auth
+
+    return standalone_auth(Path(tempfile.mkdtemp()))
 
 
 @pytest.fixture
@@ -284,9 +292,10 @@ async def test_remote_entry_does_not_spawn(monkeypatch: pytest.MonkeyPatch) -> N
 async def test_auth_state_threads_signing_key_and_service_token(
     driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """When an AuthState is wired in, every spawned child receives the
-    base64'd JWT signing key plus a freshly-issued service token bound
-    to the component's kind."""
+    """When an AuthState is wired in, every spawned child receives where
+    the trust bundle is, the authority that signs it, which recipient it
+    is, and a token of its own addressed to this machine alone -- and no
+    private key of any kind (per-node token keys, 2026-09-25)."""
     captured: dict[str, Any] = {}
 
     async def fake_create(*_args: Any, **kwargs: Any) -> _FakeProcess:
@@ -295,7 +304,7 @@ async def test_auth_state_threads_signing_key_and_service_token(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    auth = AuthState(signing_key=security.generate_signing_key())
+    auth = _auth()
     sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"), auth_state=auth)
     sp.start()
 
@@ -306,19 +315,20 @@ async def test_auth_state_threads_signing_key_and_service_token(
     await sp.stop()
 
     env = captured["env"]
-    # The child gets only the public verification half.
-    assert "EUGENE_PLEXUS_DRIVER_AUTH_SIGNING_KEY" not in env
-    assert base64.b64decode(
-        env["EUGENE_PLEXUS_DRIVER_AUTH_VERIFY_KEY"]
-    ) == security.verification_key(auth.signing_key)
-    # Service token must validate against the same signing key with the
-    # correct service audience.
-    payload = security.decode_token(
-        token=env["EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN"],
-        signing_key=auth.signing_key,
-        expected_audience="service:inference-driver",
-    )
-    assert payload.sub == "inference-driver"
+    trust = auth.trust
+    assert env["EUGENE_PLEXUS_DRIVER_TRUST_BUNDLE_FILE"] == str(trust.bundle_path)
+    assert env["EUGENE_PLEXUS_DRIVER_TRUST_AUTHORITY"] == trust.authority
+    assert env["EUGENE_PLEXUS_DRIVER_AUTH_RECIPIENT"] == trust.recipient
+    for gone in ("AUTH_SIGNING_KEY", "AUTH_VERIFY_KEY"):
+        assert f"EUGENE_PLEXUS_DRIVER_{gone}" not in env
+    # No private key of this node's is anywhere in the child's environment.
+    record = trust._identity.record
+    for private in (record.token_private_key, record.signing_private_key, record.private_key):
+        assert private and private not in env.values()
+    # The token verifies here, as this machine's own, and is good nowhere else.
+    claims = trust.verify(env["EUGENE_PLEXUS_DRIVER_SERVICE_TOKEN"], classes=("ep-service+jwt",))
+    assert claims.sub == "inference-driver"
+    assert claims.is_local_service(trust.recipient)
     # Master key absent because the operator hasn't logged in yet.
     assert "EUGENE_PLEXUS_DRIVER_MASTER_KEY" not in env
 
@@ -337,7 +347,7 @@ async def test_master_key_threaded_after_login(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    auth = AuthState(signing_key=security.generate_signing_key())
+    auth = _auth()
     auth.set_master_key(b"\x55" * 32)
 
     sp = SupervisedProcess.for_component(driver_entry, logging.getLogger("test"), auth_state=auth)
@@ -379,7 +389,7 @@ async def test_every_spawnable_kind_gets_its_own_prefix_and_audience(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    auth = AuthState(signing_key=security.generate_signing_key())
+    auth = _auth()
     procs: list[SupervisedProcess] = []
     for port, kind in enumerate(_COMPONENT_SPECS, start=9000):
         entry = ComponentEntry(
@@ -408,12 +418,11 @@ async def test_every_spawnable_kind_gets_its_own_prefix_and_audience(
         env = captured[kind.value]
         if kind in _TRUST_ROOT_KINDS:
             continue
-        payload = security.decode_token(
-            token=env[f"{spec.env_prefix}_SERVICE_TOKEN"],
-            signing_key=auth.signing_key,
-            expected_audience=f"service:{kind.value}",
+        claims = auth.trust.verify(
+            env[f"{spec.env_prefix}_SERVICE_TOKEN"], classes=("ep-service+jwt",)
         )
-        assert payload.sub == kind.value
+        assert claims.sub == kind.value
+        assert claims.aud == (auth.trust.recipient,)
 
 
 async def test_the_control_root_is_spawned_without_the_auth_trio(
@@ -439,7 +448,7 @@ async def test_the_control_root_is_spawned_without_the_auth_trio(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    auth = AuthState(signing_key=security.generate_signing_key())
+    auth = _auth()
     auth.set_master_key(b"m" * 32)
     entry = ComponentEntry(
         name="control",
@@ -462,11 +471,14 @@ async def test_the_control_root_is_spawned_without_the_auth_trio(
         "EUGENE_PLEXUS_CONTROL_AUTH_SIGNING_KEY",
         "EUGENE_PLEXUS_CONTROL_SERVICE_TOKEN",
         "EUGENE_PLEXUS_CONTROL_MASTER_KEY",
+        "EUGENE_PLEXUS_CONTROL_TRUST_BUNDLE_FILE",
+        "EUGENE_PLEXUS_CONTROL_TRUST_AUTHORITY",
+        "EUGENE_PLEXUS_CONTROL_AUTH_RECIPIENT",
     ):
         assert absent not in captured, (
-            f"{absent} was threaded into the control root. It is the trust root: it mints "
-            "the signing key and derives the master key from the operator's passphrase, "
-            "and being handed one by its supervisor is the single-host model returning."
+            f"{absent} was threaded into the control root. It is the trust root: it holds "
+            "its own token key, signs the bundle and derives the master key from the "
+            "operator's passphrase; being told what to trust by a node is backwards."
         )
 
 

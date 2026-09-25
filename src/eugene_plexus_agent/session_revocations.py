@@ -10,15 +10,16 @@ why this is a file and why the proxy reads it:
   there a restart turned every signed-out token back into a live one
   for the rest of its 14 days.
 * **Only this agent's own routes consulted the set.** The gateway, the
-  library, the drivers and the control root verify tokens themselves,
-  with the same install key, and have never heard of it. The browser
+  library, the drivers and the control root verify tokens themselves
+  and had never heard of it. (Since 2026-09-25 the control root also
+  replicates a sign-out and the trust bundle carries it everywhere.) The browser
   reaches all of them through this agent's `/api/proxy`, so "Sign out"
   signed out of the agent's pages and of nothing else. The proxy now
   refuses a revoked token before it forwards anything (`routes/proxy.py`).
 
 **Keyed by a SHA-256 of the token, never the token.** Not by `jti`:
 this agent's operator sessions gained a random one only on 2026-09-22
-(`security.issue_operator_token` says why), every session minted before
+(`tokens.Signer.mint` says why), every session minted before
 that has none and is valid for up to 14 days more, and an enrolled node
 also accepts the control root's sessions, which carry a `jti` of their
 own. The whole token identifies all three alike. And not the token
@@ -28,7 +29,7 @@ thing to leave lying around than the problem this solves; a token is
 about it to anyone who does not already hold it.
 
 **An entry is kept for the token's `exp` plus the clock-skew leeway**
-(`security.CLOCK_SKEW_LEEWAY_SECONDS`), because that is how long a
+(`tokens.LEEWAY_SECONDS`), because that is how long a
 decoder in this install would still accept it. After that the token is
 refused as expired wherever it goes, and the entry is only litter; so
 the file is bounded by the sign-outs of the last fortnight.
@@ -51,7 +52,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import security
+from . import tokens
 from ._private_files import write_private
 
 log = logging.getLogger(__name__)
@@ -112,7 +113,7 @@ class RevokedSessions:
         """
         stamp = time.time() if now is None else now
         with self._lock:
-            self._until[session_id(token)] = float(expires_at + security.CLOCK_SKEW_LEEWAY_SECONDS)
+            self._until[session_id(token)] = float(expires_at + tokens.LEEWAY_SECONDS)
             self._prune_locked(stamp)
             self._persist_locked()
 

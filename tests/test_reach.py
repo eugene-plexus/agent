@@ -630,12 +630,10 @@ def test_the_switch_will_not_stop_an_agent_nothing_would_start(
 
 
 def test_reach_is_operator_only(client: TestClient, app: FastAPI) -> None:
-    from eugene_plexus_agent import security
+    from .conftest import local_service_token
 
     client.post("/v1/auth/initialize", json={"passphrase": "correct horse battery staple"})
-    service = security.issue_service_token(
-        signing_key=app.state.auth_state.signing_key, kind="gateway", ttl_seconds=60
-    )
+    service = local_service_token(app, "gateway")
     response = client.post(
         "/v1/node/reach",
         json={"enabled": True},

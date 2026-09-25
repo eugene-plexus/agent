@@ -24,9 +24,8 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import security, session_revocations
+from eugene_plexus_agent import session_revocations, tokens
 from eugene_plexus_agent.app import create_app
-from eugene_plexus_agent.auth_state import AuthState
 from eugene_plexus_agent.session_revocations import REVOKED_SESSIONS_FILE, RevokedSessions
 from eugene_plexus_agent.settings import Settings
 
@@ -110,31 +109,26 @@ def test_a_different_token_is_still_forwarded(app: FastAPI, client: TestClient) 
 # -- a restart ---------------------------------------------------------------
 
 
-def _node_app(settings: Settings, signing_key: bytes) -> FastAPI:
-    """An agent whose signing key survives a restart, as an enrolled node's
-    does -- the case where a forgotten sign-out means a live token."""
+def _node_app(settings: Settings) -> FastAPI:
+    """An agent whose token key survives a restart -- every node's does,
+    since it lives in `node.yaml` -- which is the case where a forgotten
+    sign-out means a live token."""
     app = create_app(settings=settings)
     app.state.supervisor = StubSupervisor()
     app.state.runtime_supervisor = StubRuntimeSupervisor()
     app.state.device_detector = lambda: fake_devices()
     app.state.library_fit_client = None
     app.state.model_exists = lambda path: True
-    app.state.auth_state = AuthState(signing_key=signing_key)
     return app
 
 
 @pytest.fixture
-def install_key() -> bytes:
-    return security.generate_signing_key()
-
-
-@pytest.fixture
-def restarted(settings: Settings, install_key: bytes) -> Iterator[tuple[TestClient, str]]:
+def restarted(settings: Settings) -> Iterator[tuple[TestClient, str]]:
     """Sign in and out on one agent, then start a second over the same files."""
-    with TestClient(_node_app(settings, install_key)) as first:
+    with TestClient(_node_app(settings)) as first:
         token = _signed_in(first)
         _sign_out(first, token)
-    app = _node_app(settings, install_key)
+    app = _node_app(settings)
     with TestClient(app) as second:
         yield second, token
 
@@ -180,7 +174,7 @@ def test_an_entry_is_pruned_once_its_token_could_no_longer_verify(tmp_path: Path
     refused as expired and the entry is only litter."""
     path = tmp_path / REVOKED_SESSIONS_FILE
     now = time.time()
-    leeway = security.CLOCK_SKEW_LEEWAY_SECONDS
+    leeway = tokens.LEEWAY_SECONDS
     store = RevokedSessions()
     store.bind(path)
     store.revoke("long-gone", expires_at=int(now - leeway - 60))
@@ -221,13 +215,13 @@ def test_an_expired_entry_already_on_disk_is_pruned_when_the_file_is_read(tmp_pa
     assert on_disk == {live}
 
 
-def test_an_unreadable_file_does_not_stop_the_agent(settings: Settings, install_key: bytes) -> None:
+def test_an_unreadable_file_does_not_stop_the_agent(settings: Settings) -> None:
     """`degraded-mode-required`: a damaged list of sign-outs costs the
     sign-outs it held, and says so, and nothing else."""
     path = settings.config_file.parent / REVOKED_SESSIONS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{ not json", encoding="utf-8")
-    with TestClient(_node_app(settings, install_key)) as client:
+    with TestClient(_node_app(settings)) as client:
         assert client.get("/healthz").status_code == 200
         token = _signed_in(client)
         _sign_out(client, token)

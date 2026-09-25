@@ -1,7 +1,7 @@
-"""Token minter for the install: Ed25519 for new keys and rotations.
-Trusted agents/control retain private PEM; children receive public PEM.
-Existing 32-byte HS256 keys remain usable until an explicit rotation.
-The token-signing key is independent of the master encryption key.
+"""The agent's secrets: the passphrase, the master key, and at-rest envelopes.
+
+Tokens are minted and verified in `tokens` and `trust` (per-node token
+keys, 2026-09-25). The token key is independent of the master key.
 """
 
 from __future__ import annotations
@@ -9,18 +9,14 @@ from __future__ import annotations
 import base64
 import logging
 import secrets
-import time
 from dataclasses import dataclass
 from typing import Any
 
 import argon2
 import argon2.low_level
-import jwt
 import nacl.exceptions
 import nacl.secret
 import nacl.utils
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 log = logging.getLogger(__name__)
 
@@ -32,63 +28,6 @@ _ARGON2_TIME_COST = 3
 _ARGON2_MEMORY_COST = 65_536  # KiB
 _ARGON2_PARALLELISM = 4
 _ARGON2_HASH_LEN = 32  # bytes — drives the secretbox key length
-
-
-def validate_signing_key(key: bytes) -> None:
-    """Minters accept Ed25519 PKCS8 PEM or the existing legacy HMAC key."""
-    if len(key) == 32:
-        return
-    parsed = serialization.load_pem_private_key(key, password=None)
-    if not isinstance(parsed, Ed25519PrivateKey):
-        raise ValueError("token signing requires an Ed25519 private key")
-
-
-def signing_algorithm(key: bytes) -> str:
-    validate_signing_key(key)
-    return "HS256" if len(key) == 32 else "EdDSA"
-
-
-def verification_key(key: bytes) -> bytes:
-    """Validate public Ed25519 PEM, or an explicitly legacy 32-byte HMAC key."""
-    if len(key) == 32:
-        return key
-    if key.startswith(b"-----BEGIN PRIVATE KEY-----"):
-        parsed_private = serialization.load_pem_private_key(key, password=None)
-        if not isinstance(parsed_private, Ed25519PrivateKey):
-            raise ValueError("token signing requires an Ed25519 private key")
-        key = parsed_private.public_key().public_bytes(
-            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-    parsed = serialization.load_pem_public_key(key)
-    if not isinstance(parsed, Ed25519PublicKey):
-        raise ValueError("token verification requires an Ed25519 public key")
-    return key
-
-
-def verification_algorithm(key: bytes) -> str:
-    """Select from trusted key material, never an untrusted JWT header."""
-    return "HS256" if len(key) == 32 else "EdDSA"
-
-
-_DEFAULT_SESSION_TTL_SECONDS = 14 * 24 * 3600  # 14 days
-
-# Audience claim values.
-AUDIENCE_OPERATOR = "operator"
-SERVICE_AUDIENCE_PREFIX = "service:"
-
-AUDIENCE_CLIENT = "client"
-"""A long-lived key an app outside the install holds (S4, 2026-09-15).
-
-Deliberately neither `operator` nor a `service:` audience, because every
-check in every component tests for one of those two. So a client key is
-refused by this agent, by the control root, by the library and by the
-gateway's own config, admin and metrics paths **without any of them
-being taught about it** -- the narrowing comes from the shape of the
-claim, not from a list someone has to remember to update. Exactly one
-place opts in: the gateway's three OpenAI-compatible paths.
-"""
-
-_DEFAULT_CLIENT_TTL_SECONDS = 365 * 24 * 3600
 
 
 # --------------------------------------------------------------------------- #
@@ -255,234 +194,3 @@ def open_envelope(envelope: Envelope, master_key: bytes) -> str:
         return box.decrypt(ciphertext, nonce).decode("utf-8")
     except nacl.exceptions.CryptoError as e:
         raise ValueError(f"envelope decryption failed: {e}") from e
-
-
-# --------------------------------------------------------------------------- #
-# JWT session + service tokens
-# --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True)
-class TokenPayload:
-    """Decoded JWT claims. `iat` / `exp` are unix seconds."""
-
-    sub: str  # "operator" for operator sessions; component kind for service tokens
-    aud: str
-    iat: int
-    exp: int
-    jti: str | None = None
-    """The key's id, on a client key; a random session id on an operator
-    session minted since 2026-09-22 (see `issue_operator_token`); absent
-    on service tokens.
-
-    Not in the `require` list: service tokens have never carried one,
-    and demanding it would refuse every token minted before 2026-09-15
-    -- including the one the caller is holding while they read this.
-    """
-
-
-def generate_signing_key() -> bytes:
-    """New installs and explicit rotations use Ed25519, never a new HMAC key."""
-    return Ed25519PrivateKey.generate().private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    )
-
-
-def issue_operator_token(
-    *,
-    signing_key: bytes,
-    ttl_seconds: int = _DEFAULT_SESSION_TTL_SECONDS,
-    now: int | None = None,
-) -> tuple[str, int]:
-    """Issue a session token for the UI-authenticated operator.
-
-    Returns `(token, exp_unix_seconds)`. The operator's `sub` is the
-    literal string `"operator"` — v0.2 is single-user, but the claim
-    is structured so v0.3+ can add `sub: "operator:<id>"` for
-    multi-user without re-shaping the token.
-
-    **The random `jti` is what makes a sign-out mean one session**
-    (2026-09-22). `iat` is whole seconds and an Ed25519 signature is
-    deterministic, so two logins in one second were byte-identical
-    tokens: signing out and straight back in handed the person the token
-    they had just revoked, refused everywhere -- and since sign-outs
-    became durable, refused after a restart too. The control root's
-    operator tokens have carried one for the same reason. Nothing
-    requires it and nothing keys on it: `session_revocations` hashes the
-    whole token, which also covers tokens minted before this and ones the
-    control root minted.
-    """
-    issued_at = now if now is not None else int(time.time())
-    expires_at = issued_at + ttl_seconds
-    claims = {
-        "sub": "operator",
-        "aud": AUDIENCE_OPERATOR,
-        "iat": issued_at,
-        "exp": expires_at,
-        "jti": secrets.token_urlsafe(12),
-    }
-    token = jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
-    return token, expires_at
-
-
-def issue_service_token(
-    *,
-    signing_key: bytes,
-    kind: str,
-    ttl_seconds: int | None = None,
-    now: int | None = None,
-) -> str:
-    """Issue a long-lived service token for one supervised component.
-
-    Threaded via env var to spawned children. Lifetime defaults to
-    one year — long enough that a child can run without forced
-    re-auth, short enough that a leaked one expires. Agent
-    restart rotates the signing key anyway, so the effective
-    lifetime is bounded by agent uptime.
-
-    The `kind` is the component class (`gateway`, `inference-driver`).
-    Encoded as `aud: "service:<kind>"` so components can additionally
-    check the audience matches their own kind on inbound calls — a
-    leaked driver service token can't be used against the gateway.
-    """
-    issued_at = now if now is not None else int(time.time())
-    ttl = ttl_seconds if ttl_seconds is not None else 365 * 24 * 3600
-    expires_at = issued_at + ttl
-    claims = {
-        "sub": kind,
-        "aud": f"{SERVICE_AUDIENCE_PREFIX}{kind}",
-        "iat": issued_at,
-        "exp": expires_at,
-    }
-    return jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
-
-
-def issue_client_token(
-    *,
-    signing_key: bytes,
-    key_id: str,
-    name: str,
-    ttl_seconds: int = _DEFAULT_CLIENT_TTL_SECONDS,
-    now: int | None = None,
-) -> tuple[str, int]:
-    """Mint the bearer an OpenAI-compatible client outside the install holds.
-
-    Returns `(token, exp_unix_seconds)`. Signed with the same install
-    key as everything else, so no component needs a second key to verify
-    it; what makes it safe to hand out is the `aud`, which only the
-    gateway's front door accepts.
-
-    `sub` is the operator's name for the key, so a token decoded by hand
-    during a support conversation says what it is for. `jti` is the
-    record's id: the only claim the gateway needs in order to refuse a
-    revoked one.
-    """
-    if not key_id:
-        raise ValueError("key_id must not be empty")
-    if ttl_seconds <= 0:
-        raise ValueError("ttl_seconds must be positive")
-    issued_at = now if now is not None else int(time.time())
-    expires_at = issued_at + ttl_seconds
-    claims = {
-        "sub": name or "client",
-        "aud": AUDIENCE_CLIENT,
-        "iat": issued_at,
-        "exp": expires_at,
-        "jti": key_id,
-    }
-    token = jwt.encode(claims, signing_key, algorithm=signing_algorithm(signing_key))
-    return token, expires_at
-
-
-CLOCK_SKEW_LEEWAY_SECONDS = 300
-"""How far apart two hosts' clocks may drift before a token is refused.
-
-Five minutes: Kerberos's `MaxClockSkew`, and the window Entra and most
-OAuth validators apply to `iat`, `nbf` and `exp`. **It was zero until
-2026-09-15.** On the live two-machine install the control root's clock
-ran half a second ahead of a worker whose Windows Time service had
-stopped, and every token the root minted in the first half of each
-second was refused by that worker as "not yet valid (iat)" a few
-milliseconds later. Long-lived tokens (the gateway's, the operator's
-session) passed, every health check said ok, and the root listed the
-node `down` with no reason -- so it read as a key or enrollment fault
-and was neither. A skew large enough to matter for security is a
-broken clock; a broken clock is *reported* (`_note_clock_skew`), not
-enforced by refusing traffic between two healthy hosts.
-"""
-
-_SKEW_WARN_AFTER_SECONDS = 2.0
-_SKEW_WARN_INTERVAL_SECONDS = 60.0
-_last_skew_warning = 0.0
-
-
-def _note_clock_skew(iat: int, *, now: float | None = None) -> None:
-    """Warn, at most once a minute, when a token was issued in this host's future.
-
-    Accepted within `CLOCK_SKEW_LEEWAY_SECONDS`, so nothing breaks. Logged
-    so a wrong clock on either host is visible long before the skew grows
-    past the leeway and starts refusing traffic.
-    """
-    global _last_skew_warning
-    current = time.time() if now is None else now
-    ahead = iat - current
-    if ahead <= _SKEW_WARN_AFTER_SECONDS:
-        return
-    if current - _last_skew_warning < _SKEW_WARN_INTERVAL_SECONDS:
-        return
-    _last_skew_warning = current
-    log.warning(
-        "accepted a token issued %.1f s in this host's future: the issuer's clock or "
-        "this host's is wrong (tolerated up to %d s, then tokens are refused)",
-        ahead,
-        CLOCK_SKEW_LEEWAY_SECONDS,
-    )
-
-
-def decode_token(
-    *,
-    token: str,
-    signing_key: bytes,
-    expected_audience: str | None = None,
-    now: int | None = None,
-) -> TokenPayload:
-    """Verify a token's signature + expiry and return its claims.
-
-    Raises:
-      jwt.ExpiredSignatureError — token expired
-      jwt.InvalidAudienceError  — audience mismatch
-      jwt.InvalidTokenError     — signature failure or malformed claims
-    """
-    options: dict[str, Any] = {"require": ["sub", "aud", "iat", "exp"]}
-    decode_kwargs: dict[str, Any] = {
-        "key": verification_key(signing_key),
-        "algorithms": [verification_algorithm(signing_key)],
-        "options": options,
-    }
-    if expected_audience is not None:
-        decode_kwargs["audience"] = expected_audience
-    else:
-        # No expected audience to match against — the caller validates the
-        # `aud` claim itself (e.g. "operator OR any service:*"). PyJWT would
-        # otherwise raise InvalidAudienceError for a token that carries an
-        # `aud` claim when no `audience` is supplied, so disable its check.
-        # `aud` is still required-present via the `require` list above.
-        options["verify_aud"] = False
-    if now is not None:
-        # leeway is in seconds; we pass `now` via `leeway` is awkward —
-        # PyJWT validates against time.time() internally. Tests using
-        # the `now` parameter validate by setting the iat/exp explicitly.
-        pass
-    decode_kwargs["leeway"] = CLOCK_SKEW_LEEWAY_SECONDS
-    claims = jwt.decode(token, **decode_kwargs)
-    _note_clock_skew(int(claims["iat"]))
-    raw_jti = claims.get("jti")
-    return TokenPayload(
-        sub=str(claims["sub"]),
-        aud=str(claims["aud"]),
-        iat=int(claims["iat"]),
-        exp=int(claims["exp"]),
-        jti=str(raw_jti) if raw_jti is not None else None,
-    )

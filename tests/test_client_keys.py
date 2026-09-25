@@ -24,9 +24,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import _private_files, client_keys, security
+from eugene_plexus_agent import _private_files, client_keys, tokens
 from eugene_plexus_agent.auth_state import AuthState
 from eugene_plexus_agent.client_keys import ClientKeyRecord, ClientKeyStore
+
+from .conftest import local_service_token, standalone_trust
 
 # --------------------------------------------------------------------- #
 # The store
@@ -74,8 +76,8 @@ def test_the_file_never_contains_a_token(tmp_path: Path) -> None:
     """
     path = tmp_path / client_keys.KEYS_FILE
     store = ClientKeyStore(path)
-    key = security.generate_signing_key()
-    token, exp = security.issue_client_token(signing_key=key, key_id="one", name="Continue")
+    trust = standalone_trust(tmp_path / "node")
+    token, exp = trust.mint_local_client(key_id="one", name="Continue", ttl_seconds=3600)
     store.add(
         ClientKeyRecord(
             id="one",
@@ -230,52 +232,43 @@ def test_new_key_ids_are_random(tmp_path: Path) -> None:
 # --------------------------------------------------------------------- #
 
 
-def test_a_client_token_carries_the_audience_and_the_id() -> None:
-    key = security.generate_signing_key()
-    token, exp = security.issue_client_token(
-        signing_key=key, key_id="deadbeef", name="Open WebUI", ttl_seconds=3600
-    )
-    payload = security.decode_token(
-        token=token, signing_key=key, expected_audience=security.AUDIENCE_CLIENT
-    )
-    assert payload.aud == "client"
-    assert payload.jti == "deadbeef"
-    assert payload.sub == "Open WebUI"
-    assert exp - payload.iat == 3600
+def test_a_client_token_carries_its_class_its_recipient_and_the_id(tmp_path: Path) -> None:
+    trust = standalone_trust(tmp_path)
+    token, exp = trust.mint_local_client(key_id="deadbeef", name="Open WebUI", ttl_seconds=3600)
+    claims = trust.verify(token, classes=(tokens.TYP_CLIENT,))
+    assert claims.is_client
+    assert claims.aud == ("gateway",)
+    assert claims.jti == "deadbeef"
+    assert claims.sub == "Open WebUI"
+    assert exp - claims.iat == 3600
 
 
-def test_an_operator_session_without_a_jti_still_decodes() -> None:
-    """`jti` is not in the `require` list, and this is why.
-
-    Every token minted before 2026-09-15 has none -- including the
-    session the operator is holding while the agent is upgraded under
-    them. Requiring it would log the whole install out.
-
-    Amended 2026-09-22: this asserted that a NEW session carries no
-    `jti`, which stopped being true when sessions gained a random one
-    (two logins in one second were byte-identical, so signing out and
-    back in handed back the revoked token). The property it exists for
-    is that an old, jti-less token is still accepted, so that is what it
-    builds now.
-    """
-    key = security.generate_signing_key()
+def test_a_token_without_a_jti_is_refused(tmp_path: Path) -> None:
+    """No migration (2026-09-25), so `jti` is required of every token: it
+    is what a sign-out and a client-key revocation name."""
+    trust = standalone_trust(tmp_path)
+    signer = trust.signer()
     now = int(time.time())
-    legacy = jwt.encode(
-        {"sub": "operator", "aud": security.AUDIENCE_OPERATOR, "iat": now, "exp": now + 60},
-        key,
-        algorithm=security.signing_algorithm(key),
+    bare = jwt.encode(
+        {
+            "iss": signer.issuer,
+            "sub": "operator",
+            "aud": [trust.recipient],
+            "iat": now,
+            "exp": now + 60,
+        },
+        signer.key,
+        algorithm="EdDSA",
+        headers={"typ": tokens.TYP_SESSION, "kid": signer.kid},
     )
-    payload = security.decode_token(
-        token=legacy, signing_key=key, expected_audience=security.AUDIENCE_OPERATOR
-    )
-    assert payload.jti is None
+    with pytest.raises(tokens.TokenError):
+        trust.verify(bare, classes=(tokens.TYP_SESSION,))
 
 
-def test_two_sessions_minted_in_one_second_are_different_tokens() -> None:
-    key = security.generate_signing_key()
-    now = int(time.time())
-    first, _ = security.issue_operator_token(signing_key=key, now=now)
-    second, _ = security.issue_operator_token(signing_key=key, now=now)
+def test_two_sessions_minted_in_one_second_are_different_tokens(tmp_path: Path) -> None:
+    trust = standalone_trust(tmp_path)
+    first, _ = trust.mint_local_session()
+    second, _ = trust.mint_local_session()
     assert first != second
 
 
@@ -305,17 +298,11 @@ def test_mint_returns_the_token_once_and_the_list_never_does(authed_client: Test
     assert token not in listed.text
 
 
-def test_the_minted_token_verifies_with_the_installs_signing_key(
-    app: FastAPI, authed_client: TestClient
-) -> None:
+def test_the_minted_token_verifies_as_a_client_key(app: FastAPI, authed_client: TestClient) -> None:
     made = _mint(authed_client)
     auth: AuthState = app.state.auth_state
-    payload = security.decode_token(
-        token=made["token"],
-        signing_key=auth.signing_key,
-        expected_audience=security.AUDIENCE_CLIENT,
-    )
-    assert payload.jti == made["key"]["id"]
+    claims = auth.trust.verify(made["token"], classes=(tokens.TYP_CLIENT,))
+    assert claims.jti == made["key"]["id"]
 
 
 def test_the_default_life_is_a_year(authed_client: TestClient) -> None:
@@ -401,10 +388,8 @@ def test_the_records_survive_a_restart(app: FastAPI, settings, tmp_path: Path) -
 
 def _client_token(app: FastAPI) -> str:
     auth: AuthState = app.state.auth_state
-    token, _ = security.issue_client_token(
-        signing_key=auth.signing_key, key_id="probe", name="probe"
-    )
-    return token
+    token, _ = auth.trust.mint_local_client(key_id="probe", name="probe", ttl_seconds=3600)
+    return str(token)
 
 
 @pytest.mark.parametrize(
@@ -424,9 +409,8 @@ def test_a_client_key_opens_nothing_on_the_agent(
 ) -> None:
     """The whole point of a third audience.
 
-    `/v1/components` and `/v1/node` go through
-    `require_operator_or_service`, which accepts *any* `service:*` --
-    and `client` is deliberately not one, so these refuse without the
+    `/v1/components` and `/v1/node` accept sessions and service tokens,
+    and an `ep-client+jwt` is neither class, so these refuse without the
     dependency having been told about client keys at all.
     """
     token = _client_token(app)
@@ -448,8 +432,7 @@ def test_a_client_key_cannot_mint_another(app: FastAPI, authed_client: TestClien
 def test_the_gateways_service_token_may_read_the_revoked_set(
     app: FastAPI, authed_client: TestClient
 ) -> None:
-    auth: AuthState = app.state.auth_state
-    gateway = security.issue_service_token(signing_key=auth.signing_key, kind="gateway")
+    gateway = local_service_token(app, "gateway")
     resp = authed_client.get(
         "/v1/auth/client-keys/revoked", headers={"Authorization": f"Bearer {gateway}"}
     )
@@ -460,11 +443,10 @@ def test_the_gateways_service_token_may_read_the_revoked_set(
 def test_another_components_service_token_may_not(
     app: FastAPI, authed_client: TestClient, kind: str
 ) -> None:
-    """Narrowed to `service:gateway` exactly, the way starting and
-    stopping a runtime already is. A leaked driver token learns nothing
-    about which keys an operator turned off."""
-    auth: AuthState = app.state.auth_state
-    other = security.issue_service_token(signing_key=auth.signing_key, kind=kind)
+    """Narrowed to `gateway` exactly, the way starting and stopping a
+    runtime already is. A leaked driver token learns nothing about which
+    keys an operator turned off."""
+    other = local_service_token(app, kind)
     resp = authed_client.get(
         "/v1/auth/client-keys/revoked", headers={"Authorization": f"Bearer {other}"}
     )
@@ -472,7 +454,6 @@ def test_another_components_service_token_may_not(
 
 
 def test_a_service_token_may_not_list_the_keys(app: FastAPI, authed_client: TestClient) -> None:
-    auth: AuthState = app.state.auth_state
-    gateway = security.issue_service_token(signing_key=auth.signing_key, kind="gateway")
+    gateway = local_service_token(app, "gateway")
     resp = authed_client.get("/v1/auth/client-keys", headers={"Authorization": f"Bearer {gateway}"})
     assert resp.status_code == 401

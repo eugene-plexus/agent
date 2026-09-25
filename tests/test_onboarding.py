@@ -26,13 +26,15 @@ from typing import Any
 import httpx
 import pytest
 
-from eugene_plexus_agent import node_identity, onboarding
+from eugene_plexus_agent import node_identity, onboarding, tokens
 from eugene_plexus_agent._generated.common_models import ConfigUpdateRequest
 from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind, SpawnConfig
 from eugene_plexus_agent.default_topology import should_seed
 from eugene_plexus_agent.onboarding import JoinRequest
 from eugene_plexus_agent.settings import Settings
 from eugene_plexus_agent.state import AgentState
+
+from .conftest import FakeRoot as SigningRoot
 
 # A port nothing listens on, so the advertise-address derivation gets a
 # refusal in microseconds instead of a three-second timeout. Every test
@@ -49,13 +51,14 @@ def settings_for(tmp_path: Path, **over: Any) -> Settings:
 
 
 class FakeRoot:
-    """Enough control root to enroll against, and it records what it was
-    sent so the signing key's arrival is an assertion rather than a
-    hope."""
+    """Enough control root to enroll against: it records what it was sent
+    and answers with a real bundle, signed by a key of its own, listing
+    the token key the node sent."""
 
     def __init__(self, *, status: int = 201) -> None:
         self.status = status
         self.requests: list[dict[str, Any]] = []
+        self.root = SigningRoot()
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Patch `httpx.AsyncClient` so `run_join`, which builds its own
@@ -73,17 +76,15 @@ class FakeRoot:
             fake.requests.append(body)
             if fake.status != 201:
                 return httpx.Response(fake.status, json={"detail": "refused"})
+            fake.root.epoch = 4
+            fake.root.register(body["name"], tokens.load_public(body["tokenPublicKey"]))
             return httpx.Response(
                 201,
                 json={
                     "name": body["name"],
                     "epoch": 4,
-                    # Readable plaintext rather than key-shaped random
-                    # base64 beside a key-shaped name; gitleaks flags the
-                    # latter. Exactly 32 bytes, because the agent checks.
-                    "signingKey": _b64(b"not-a-real-signing-key-32-bytes!"),
-                    "signingKeyId": "2",
-                    "controlPublicKey": _b64(b"not-a-real-control-pubkey-32-byt"),
+                    "trustBundle": {"jws": fake.root.bundle().jws},
+                    "controlPublicKey": fake.root.public,
                 },
             )
 
@@ -142,9 +143,7 @@ def test_an_enrolled_node_is_not_a_fresh_boot(tmp_path: Path) -> None:
         name="gpu-box",
         control_url=ROOT_URL,
         epoch=1,
-        signing_key="a2V5",
-        signing_key_id="1",
-        control_public_key=None,
+        control_public_key=SigningRoot().public,
         recovery_public_key=None,
         advertise_url=None,
     )
@@ -190,8 +189,10 @@ def test_join_enrolls_and_the_next_boot_declares_nothing(
     assert code == 0
     assert root.requests[0]["name"] == "worker-1"
     # The signing public key goes with it, or this node could never tell
-    # the root it had moved.
+    # the root it had moved; and the token key, or nothing would trust it.
     assert root.requests[0]["signingPublicKey"]
+    assert root.requests[0]["tokenPublicKey"]
+    assert (tmp_path / "trust_bundle.json").exists()
 
     store = node_identity.NodeIdentityStore(tmp_path / node_identity.NODE_FILE)
     store.load()

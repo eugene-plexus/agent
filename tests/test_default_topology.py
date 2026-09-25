@@ -13,7 +13,6 @@ weight here.
 
 from __future__ import annotations
 
-import base64
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -25,10 +24,11 @@ from eugene_plexus_agent import default_topology
 from eugene_plexus_agent._generated.common_models import ConfigUpdateRequest
 from eugene_plexus_agent._generated.models import ComponentKind
 from eugene_plexus_agent.app import create_app
+from eugene_plexus_agent.node_identity import NodeIdentityStore
 from eugene_plexus_agent.settings import Settings
 from eugene_plexus_agent.state import AgentState
 
-from .conftest import TEST_PASSPHRASE, StubSupervisor
+from .conftest import TEST_PASSPHRASE, FakeRoot, StubSupervisor, enroll_store
 
 # Captured before any test patches the module attribute, so the one test that
 # checks the real implementation still gets it.
@@ -173,23 +173,17 @@ def test_an_existing_but_empty_topology_is_left_alone(tmp_path: Path) -> None:
 def test_an_enrolled_node_never_raises_a_rival_control_root(tmp_path: Path) -> None:
     """A node that has joined gets its topology from the install."""
     settings = _seeding_settings(tmp_path)
-    (tmp_path / "node.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "name": "node-b",
-                "controlUrl": "http://10.0.0.1:8083",
-                # enrolled == name and controlUrl and signingKey, and the
-                # key must decode to 32 bytes to be read at all.
-                "signingKey": base64.b64encode(b"k" * 32).decode(),
-                "signingKeyId": "1",
-                "epoch": 1,
-            }
-        ),
-        encoding="utf-8",
+    root = FakeRoot()
+    enroll_store(
+        NodeIdentityStore(tmp_path / "node.yaml"),
+        root,
+        "node-b",
+        control_url="http://10.0.0.1:8083",
     )
     client, _ = _boot(settings)
     with client:
-        _authenticate(client)
+        # An enrolled node's sessions come from its root, not from itself.
+        client.headers["Authorization"] = f"Bearer {root.session('node:node-b')}"
         assert "control" not in _names(client)
 
 

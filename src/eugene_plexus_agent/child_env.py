@@ -9,7 +9,19 @@ import os
 from collections.abc import Mapping
 
 _NAMESPACE = "EUGENE_PLEXUS_"
-_CREDENTIAL_SUFFIXES = ("_MASTER_KEY", "_AUTH_SIGNING_KEY", "_AUTH_VERIFY_KEY", "_SERVICE_TOKEN")
+# Everything the supervisor threads into a child for auth. The trust
+# bundle's path, its authority and the recipient name are not secret,
+# but a child must get them from this agent and nowhere else: an
+# inherited authority would be a child trusting keys this node does not.
+_CREDENTIAL_SUFFIXES = (
+    "_MASTER_KEY",
+    "_AUTH_SIGNING_KEY",
+    "_AUTH_VERIFY_KEY",
+    "_SERVICE_TOKEN",
+    "_TRUST_BUNDLE_FILE",
+    "_TRUST_AUTHORITY",
+    "_AUTH_RECIPIENT",
+)
 
 
 def reserved_override(

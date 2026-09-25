@@ -21,7 +21,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import install_proxy, library_folders, security
+from .. import install_proxy, library_folders
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import (
     Admission,
@@ -60,6 +60,7 @@ from ..dependencies import (
 )
 from ..engines.acquisition import AcquisitionError, Unavailable
 from ..engines.devices import detect_devices
+from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, rules_from_config
 from ..node_work import runtime_launch
 from ..reservations import ReservationLedger
@@ -172,18 +173,15 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
         return request.app.state.library_fit_client  # type: ignore[no-any-return]
     state: AgentState = request.app.state.agent_state
     auth = getattr(request.app.state, "auth_state", None)
-    token = (
-        security.issue_service_token(signing_key=auth.signing_key, kind="agent")
-        if auth is not None and auth.signing_key is not None
-        else None
-    )
+    trust = auth.trust if auth is not None else None
     transport = getattr(request.app.state, "library_transport", None)
 
     entry = next(
         (e for e in state.list_topology_entries() if e.kind is ComponentKind.library), None
     )
     if entry is not None:
-        return LibraryFitClient(str(entry.url), token, transport=transport)
+        local = trust.agent_token(trust.recipient) if trust is not None else None
+        return LibraryFitClient(str(entry.url), local, transport=transport)
 
     identity = getattr(request.app.state, "node_identity", None)
     record = identity.record if identity is not None else None
@@ -193,7 +191,7 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
         remote = await install_topology(request).owner_of(
             "library",
             control_url=str(record.control_url),
-            authorization=request.headers.get("authorization"),
+            authorization=lookup_authorization(request),
             transport=getattr(request.app.state, "control_transport", None),
         )
     except install_proxy.InstallLookupError as exc:
@@ -208,6 +206,10 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
         # none. A disagreement the console hop reports; here it means
         # there is nothing to ask.
         return None
+    # An `agent` token addressed to the library's machine: the owner's
+    # proxy forwards it to its local library unchanged, and it is good
+    # nowhere else (2026-09-25).
+    token = trust.agent_token(f"node:{remote.name}") if trust is not None else None
     return LibraryFitClient(
         f"{remote.agent_url.rstrip('/')}/api/proxy/library", token, transport=transport
     )
@@ -233,10 +235,9 @@ def effective_rules_for(request: Request) -> list[PathRule]:
 async def refresh_library_folders(request: Request) -> bool:
     """Read the library's folders into this node's copy, once per request.
 
-    Spends the request's own credential through `library_client_for`,
-    which is why there is no background loop: the install-wide lookup
-    carries the caller's token and nothing else. True when the library
-    answered on this request.
+    Once per request rather than in a background loop, which is why it
+    is cheap: the library is asked only when something here is about to
+    use its answer. True when the library answered on this request.
     """
     done = getattr(request.state, "library_folders_refreshed", None)
     if done is not None:

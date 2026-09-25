@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,7 +28,6 @@ from eugene_plexus_agent._generated.models import (
     ComponentKind,
     SpawnConfig,
 )
-from eugene_plexus_agent.auth_state import AuthState
 from eugene_plexus_agent.supervisor import Supervisor
 from tests.conftest import TEST_PASSPHRASE, StubSupervisor
 
@@ -270,9 +270,11 @@ async def test_respawn_after_master_key_set_includes_master_key_env_var(
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
 
-    from eugene_plexus_agent import security
+    import tempfile
 
-    auth = AuthState(signing_key=security.generate_signing_key())
+    from .conftest import standalone_auth
+
+    auth = standalone_auth(Path(tempfile.mkdtemp()))
     sup = Supervisor(log=logging.getLogger("test"), auth_state=auth)
 
     entry = ComponentEntry(

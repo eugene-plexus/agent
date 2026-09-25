@@ -25,6 +25,14 @@ from one person emptied for everybody. `peer.peer_of` reads the address
 the proxy saw. See `peer.py` for why that header is believable and
 `X-Forwarded-For` was not.
 
+**Sessions are minted by the control root once this node is enrolled**
+(per-node token keys, 2026-09-25). Login here checks this node's own
+passphrase when it has one, then forwards the sign-in to the root with
+this agent's own token as proof of which machine is asking, and returns
+the root's session, addressed to this machine and to the root. A worker
+with no passphrase of its own is a console now too. Standalone, this
+agent verifies and mints as it always did.
+
 **Client keys (S4, 2026-09-15)** live at the bottom of this file. A
 different kind of credential: not a session, not a component's service
 token, but a long-lived named bearer an operator hands to an app
@@ -42,11 +50,12 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
-from .. import client_keys, keyring_store, passphrase_file, peer, security
+from .. import client_keys, keyring_store, passphrase_file, peer, security, tokens
 from .._generated.common_models import (
     AuthLoginRequest,
     AuthLoginResponse,
@@ -64,13 +73,21 @@ from .._generated.models import (
     ClientKeyPolicy,
     ClientKeyRevocations,
     ClientKeyUpdateRequest,
+    ServiceTokenRequest,
+    ServiceTokenResponse,
 )
+from .._http import internal_client
 from ..auth_state import AuthState
 from ..client_admission import AdmissionRefusal, validate_limits
 from ..client_key_registry import registry
 from ..client_keys import ClientKeyStore
-from ..dependencies import require_operator_or_gateway, require_operator_session
+from ..dependencies import (
+    require_local_service,
+    require_operator_or_gateway,
+    require_operator_session,
+)
 from ..state import AgentState
+from ..trust import MintRefused
 from .config import connect_shares
 
 log = logging.getLogger(__name__)
@@ -275,7 +292,11 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
     # is configured), so the operator sees no spurious churn.
     await _restart_supervised_children_if_present(request)
 
-    token, exp = security.issue_operator_token(signing_key=auth.signing_key)
+    if auth.trust.enrolled:
+        # An enrolled node's sessions come from the root, whatever set
+        # the passphrase here.
+        return await _forward_login(request, body.passphrase)
+    token, exp = auth.trust.mint_local_session()
     log.info("first-run passphrase set; operator session issued")
     return AuthLoginResponse(
         sessionToken=token,
@@ -298,26 +319,8 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
         or "unknown"
     )
 
-    if not state.has_passphrase():
-        # **An enrolled node is a different situation and needs different
-        # advice.** A worker onboarded with `eugene-plexus-agent join` has
-        # no passphrase of its own and never will: it verifies tokens with
-        # the install's signing key, so an operator session minted at the
-        # control root already works here. Telling it to run first-run
-        # setup would be telling an operator to raise a second install on
-        # a machine that is already part of one. Found by M9's acceptance
-        # run, which was the first thing to log in at a joined node.
-        identity = getattr(request.app.state, "node_identity", None)
-        record = identity.record if identity is not None else None
-        if record is not None and record.enrolled:
-            raise _problem(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "No local passphrase",
-                f"This node is enrolled in the install at {record.control_url} and has no "
-                f"passphrase of its own. Log in at the control root instead; the session "
-                f"token it issues is accepted here, because the whole install shares one "
-                f"signing key. Do not run first-run setup on a node that has joined.",
-            )
+    enrolled = auth.trust.enrolled
+    if not state.has_passphrase() and not enrolled:
         raise _problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Setup required",
@@ -335,6 +338,14 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
             f"Too many failed logins from {remote}. Wait "
             f"{_RATE_LIMIT_WINDOW_SECONDS} seconds and try again.",
         )
+
+    if not state.has_passphrase():
+        # **A worker with no passphrase of its own** (joined with
+        # `eugene-plexus-agent join`) is a console too: the root checks
+        # the passphrase and mints the session. Until 2026-09-25 this
+        # answered "log in at the control root instead", because the
+        # root's session was accepted here only by sharing its key.
+        return await _forward_login(request, body.passphrase, remote=remote)
 
     stored = state.get_passphrase_hash()
     if stored is None or not security.verify_passphrase(body.passphrase, stored):
@@ -392,13 +403,76 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
         # children go looking for models.
         await connect_shares(request)
 
-    token, exp = security.issue_operator_token(signing_key=auth.signing_key)
+    if enrolled:
+        return await _forward_login(request, body.passphrase, remote=remote)
+    token, exp = auth.trust.mint_local_session()
     log.info("operator login from %s", remote)
     return AuthLoginResponse(
         sessionToken=token,
         expiresAt=_dt_from_unix(exp),
         operatorName=None,
     )
+
+
+# How long a forwarded sign-in waits for the control root. Argon2id there
+# takes a fraction of a second; anything slower is the root being down.
+_FORWARD_TIMEOUT_SECONDS = 15.0
+
+
+async def _forward_login(
+    request: Request, passphrase: str, *, remote: str | None = None
+) -> AuthLoginResponse:
+    """Ask the control root for a session addressed to this machine.
+
+    This agent's own `agent` token is the actor, so the root addresses
+    the session to `node:<this machine>` and to itself. A refusal counts
+    as a failed login here too, so the rate limit holds per browser even
+    though every forwarded attempt reaches the root from this one agent.
+    """
+    auth: AuthState = request.app.state.auth_state
+    identity = request.app.state.node_identity.record
+    control_url = str(identity.control_url).rstrip("/")
+    actor = auth.trust.agent_token(tokens.RECIPIENT_CONTROL)
+    transport = getattr(request.app.state, "control_transport", None)
+    try:
+        async with internal_client(timeout=_FORWARD_TIMEOUT_SECONDS, transport=transport) as client:
+            response = await client.post(
+                f"{control_url}/v1/auth/login",
+                json={"passphrase": passphrase},
+                headers={"Authorization": f"Bearer {actor}"},
+            )
+    except httpx.HTTPError as exc:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Control root unreachable",
+            f"Signing in needs the control root at {control_url}, and it did not answer "
+            f"({str(exc) or type(exc).__name__}). Sessions already signed in keep working, and "
+            "so does everything the install is serving.",
+        ) from exc
+    if response.status_code == 401:
+        if remote is not None:
+            auth.record_login_failure(
+                remote,
+                window_seconds=_RATE_LIMIT_WINDOW_SECONDS,
+                max_in_window=_RATE_LIMIT_MAX_FAILURES,
+            )
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Wrong passphrase",
+            "The control root did not accept that passphrase. Repeated failures from one "
+            "source are rate-limited.",
+        )
+    if response.status_code != 200:
+        raise _problem(
+            status.HTTP_502_BAD_GATEWAY,
+            "Control root refused the sign-in",
+            f"The control root at {control_url} answered {response.status_code}: "
+            f"{response.text[:300]}",
+        )
+    if remote is not None:
+        auth.clear_login_failures(remote)
+    log.info("operator signed in through the control root%s", f" from {remote}" if remote else "")
+    return AuthLoginResponse.model_validate(response.json())
 
 
 def _persist_master_key_if_keyring_mode(state: AgentState, master_key: bytes) -> None:
@@ -479,6 +553,42 @@ async def logout(
     auth: AuthState = request.app.state.auth_state
     auth.revoke(creds.credentials, expires_at=payload.exp)
     log.info("session revoked")
+    # **Enrolled, the sign-out is the install's** (2026-09-25): the root
+    # replicates it and the bundle carries it to every machine. Best
+    # effort; the local list above covers a root that is down now.
+    if auth.trust.enrolled and tokens.RECIPIENT_CONTROL in payload.aud:
+        identity = request.app.state.node_identity.record
+        transport = getattr(request.app.state, "control_transport", None)
+        try:
+            async with internal_client(
+                timeout=_FORWARD_TIMEOUT_SECONDS, transport=transport
+            ) as client:
+                await client.delete(
+                    f"{str(identity.control_url).rstrip('/')}/v1/auth/sessions/current",
+                    headers={"Authorization": f"Bearer {creds.credentials}"},
+                )
+        except httpx.HTTPError as exc:
+            log.warning("could not tell the control root about the sign-out: %s", exc)
+
+
+@router.post("/v1/auth/service-token", response_model=ServiceTokenResponse)
+async def mint_service_token(request: Request, body: ServiceTokenRequest) -> ServiceTokenResponse:
+    """A 15-minute token for one of this agent's children to present elsewhere.
+
+    How the gateway reaches every node's drivers and agents with no key of
+    its own (design D8). The caller proves it is a child of this agent
+    with the local token it was spawned with, and gets a token under its
+    own `sub`, addressed to one recipient, signed by this node's key. Only
+    what this node's bundle entry grants is minted: `gateway` to another
+    machine needs the operator's gateway grant, and nothing else leaves.
+    """
+    caller = require_local_service(request, await _bearer_scheme(request))
+    auth: AuthState = request.app.state.auth_state
+    try:
+        token, expires = auth.trust.mint_service(sub=caller.sub, audience=body.audience)
+    except MintRefused as exc:
+        raise _problem(status.HTTP_403_FORBIDDEN, "Not granted", str(exc)) from exc
+    return ServiceTokenResponse(token=token, expiresAt=_dt_from_unix(expires))
 
 
 def _dt_from_unix(unix_seconds: int) -> datetime:
@@ -602,12 +712,13 @@ async def mint_client_key(
     # before the token and make "valid a year" read as 364 days in any
     # arithmetic a client does on the two fields.
     issued_at = int(time.time())
-    token, expires_at = security.issue_client_token(
-        signing_key=auth.signing_key,
-        key_id=key_id,
-        name=name,
+    token, expires_at = auth.trust.signer().mint(
+        typ=tokens.TYP_CLIENT,
+        sub=name,
+        aud=[tokens.RECIPIENT_GATEWAY],
         ttl_seconds=int(ttl_days) * 24 * 3600,
         now=issued_at,
+        jti=key_id,
     )
     try:
         record = _keys(request).add(

@@ -1,42 +1,42 @@
-"""This host's identity in an install: its keypair, its enrollment, the
-install's signing key, and where other hosts reach it.
+"""This host's identity in an install: its keys, its enrollment, and
+where other hosts reach it.
 
-M5 contracted the exchange and built the control root's half; the agent
-never had a half. This is it. One file, `node.yaml`, beside `agent.yaml`:
+One file, `node.yaml`, beside `agent.yaml`:
 
     name: gpu-box
     privateKey: <base64 X25519>        never leaves this host
     publicKey: <base64 X25519>
     signingPrivateKey: <base64 Ed25519 seed>   signs address announcements
     signingPublicKey: <base64 Ed25519>
+    tokenPrivateKey: <base64 Ed25519 seed>     signs this node's tokens
     advertiseSequence: 3               strictly increasing, mirrored at the root
     controlUrl: http://100.64.0.1:8083
-    controlPublicKey: <base64 Ed25519>  the root's identity, checked on every re-key
+    controlPublicKey: <base64 Ed25519>  the root's identity: signs every trust bundle
     recoveryPublicKey: <base64 X25519>  the second recipient of anything sealed here
-    signingKey: <base64>                THE INSTALL'S service-token signing key
-    signingKeyId: "1"
     epoch: 1                            highest control-root epoch accepted
     advertiseUrl: http://100.64.0.7:8079
     enrolledAt: 2026-09-10T22:14:03+00:00
 
-**The signing key is stored in the clear, mode 0600, on purpose.** The
-agent hands it to every component it spawns in their environment, so a
-process compromise on this host already yields it; sealing it on disk
-would protect it from nothing that matters while making a headless GPU
-box unable to spawn a verifiable companion at boot until someone typed a
-passphrase *at that host*. The node's private key lives here for the
-same reason — what it protects is secrets sealed *to this node*, whose
-plaintext also rides in children's environments. This file is therefore
-exactly as sensitive as the agent's process environment, and the mesh VPN
-remains the network boundary. Separate from `agent.yaml` because that
-file is topology an operator edits (and has already leaked once via
-`git add -A`); identity is never edited by hand.
+**Every private key here was generated here and has never been anywhere
+else** (per-node token keys, 2026-09-25;
+`specs/docs/design/per-node-token-keys.md`). Until then this file also
+held the install's signing key, sent by the control root at enrollment,
+which made every node's copy of this file the whole install. The token
+key here signs tokens for this machine and `agent` tokens for reads
+elsewhere, and the trust bundle is what says so to everyone else. So
+this file, leaked, costs this machine.
 
-**Epoch fencing lives here.** `accept_rekey` refuses an epoch below the
-highest recorded, and an equal epoch with a lower key generation — a
-superseded control root, or a replayed rotation, is refused on this host
-alone, with no election and no agreement with any other agent. That is
-the whole of M5 §6's mechanism, on the side that does the fencing.
+It is stored in the clear, mode 0600 (plus the installer's protections),
+because a headless GPU box has to mint its children's tokens at boot
+with nobody there to type a passphrase. Separate from `agent.yaml`
+because that file is topology an operator edits (and has already leaked
+once via `git add -A`); identity is never edited by hand.
+
+**Epoch fencing lives here.** `accept_epoch` refuses an epoch below the
+highest recorded, so a superseded control root is refused on this host
+alone, with no election and no agreement with any other agent. The
+epoch arrives on the trust bundle, and the bundle's own version refuses
+a rollback (`trust.py`).
 
 **The node signs too, and for the mirror-image reason.** An address
 announcement (`PATCH /v1/nodes/{name}` at the root) is signed with this
@@ -49,19 +49,14 @@ minted so secrets can be sealed *to* this node, and X25519 does not sign;
 the derivation between them only runs Ed25519 to X25519, which is the
 direction we do not have.
 
-**The re-key's credential is a signature, not a bearer.** A rotation
-invalidates every service token in the install, and a re-run of an
-interrupted one cannot know which key each node still holds; the control
-root's identity key does not rotate, which is what makes it the one
-credential that survives the operation. The canonical message is three
-fields through one serializer, stated in `agent.yaml`'s `RekeyRequest`
-so both sides implement it from the same sentence.
+**The bundle's credential is a signature, not a bearer.** The root
+signs it with its identity key, which does not rotate, and this node
+checks it against the key it pinned at enrollment.
 """
 
 from __future__ import annotations
 
 import base64
-import binascii
 import ipaddress
 import json
 import logging
@@ -78,7 +73,6 @@ import nacl.public
 import nacl.signing
 import yaml
 
-from . import security
 from ._private_files import write_private
 
 log = logging.getLogger(__name__)
@@ -93,8 +87,8 @@ _DERIVE_TIMEOUT_SECONDS = 3.0
 
 
 class FencedError(Exception):
-    """A re-key was refused because it would move the epoch backwards, or
-    replay a superseded key generation. The caller answers 409."""
+    """A trust bundle was refused because it would move the epoch
+    backwards. The caller answers 409."""
 
 
 # --------------------------------------------------------------------------- #
@@ -102,30 +96,15 @@ class FencedError(Exception):
 # --------------------------------------------------------------------------- #
 
 
-def rekey_message(*, signing_key: str, signing_key_id: str, epoch: int) -> bytes:
-    """The canonical bytes both sides sign and verify.
-
-    Exactly the form `RekeyRequest.signature` describes: the JSON object
-    with keys sorted and no whitespace. Three fields, one serializer — a
-    fourth field or a space anywhere and every rotation in the install
-    fails to verify.
-    """
-    return json.dumps(
-        {"epoch": epoch, "signingKey": signing_key, "signingKeyId": signing_key_id},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-
 def address_message(*, name: str, sequence: int, url: str) -> bytes:
     """The canonical bytes an address announcement is signed over —
     `NodeAddressAnnouncement.signature` in `control.yaml`, byte for byte.
 
-    The mirror of `rekey_message`: three fields, keys sorted, no
-    whitespace. `url` goes in **exactly as it will be sent**, before any
-    normalization, because the root verifies against the raw request body
-    for precisely this reason. Sign a parsed URL and every announcement
-    fails with what looks like a crypto error.
+    Three fields, keys sorted, no whitespace. `url` goes in **exactly as
+    it will be sent**, before any normalization, because the root
+    verifies against the raw request body for precisely this reason. Sign
+    a parsed URL and every announcement fails with what looks like a
+    crypto error.
     """
     return json.dumps(
         {"name": name, "sequence": sequence, "url": url},
@@ -138,31 +117,6 @@ def sign_address(*, signing_private_key: str, message: bytes) -> str:
     """Detached Ed25519 signature by this node's identity signing key."""
     seed = base64.b64decode(signing_private_key, validate=True)
     return base64.b64encode(nacl.signing.SigningKey(seed).sign(message).signature).decode("ascii")
-
-
-def verify_rekey_signature(*, control_public_key: str, message: bytes, signature: str) -> bool:
-    """True iff `signature` is the control identity's detached Ed25519
-    signature over `message`. Every malformed input is simply False —
-    the caller has one answer for "not from a root I recognise"."""
-    try:
-        verify_key = nacl.signing.VerifyKey(base64.b64decode(control_public_key, validate=True))
-        verify_key.verify(message, base64.b64decode(signature, validate=True))
-    except (nacl.exceptions.CryptoError, binascii.Error, ValueError, TypeError):
-        return False
-    return True
-
-
-def sign_rekey_message(*, control_private_key: str, message: bytes) -> str:
-    """The control root's side of the exchange.
-
-    Here as well as in `control` because the agent's tests need to forge
-    messages with a key they generated, and because "components share
-    schemas, not code" means the two implementations are checked against
-    each other by the acceptance run rather than by an import.
-    """
-    seed = base64.b64decode(control_private_key, validate=True)
-    signed = nacl.signing.SigningKey(seed).sign(message)
-    return base64.b64encode(signed.signature).decode("ascii")
 
 
 def generate_control_identity_for_tests() -> tuple[str, str]:
@@ -357,33 +311,18 @@ class IdentityRecord:
     public_key: str | None = None
     signing_private_key: str | None = None
     signing_public_key: str | None = None
+    token_private_key: str | None = None
     advertise_sequence: int = 0
     control_url: str | None = None
     control_public_key: str | None = None
     recovery_public_key: str | None = None
-    signing_key: str | None = None
-    signing_key_id: str | None = None
     epoch: int | None = None
     advertise_url: str | None = None
     enrolled_at: str | None = None
 
     @property
     def enrolled(self) -> bool:
-        return bool(self.name and self.control_url and self.signing_key)
-
-    @property
-    def signing_key_bytes(self) -> bytes | None:
-        if not self.signing_key:
-            return None
-        try:
-            raw = base64.b64decode(self.signing_key, validate=True)
-        except (binascii.Error, ValueError):
-            return None
-        try:
-            security.validate_signing_key(raw)
-        except (ValueError, TypeError):
-            return None
-        return raw
+        return bool(self.name and self.control_url and self.control_public_key)
 
 
 _FIELDS: tuple[tuple[str, str], ...] = (
@@ -392,25 +331,15 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("publicKey", "public_key"),
     ("signingPrivateKey", "signing_private_key"),
     ("signingPublicKey", "signing_public_key"),
+    ("tokenPrivateKey", "token_private_key"),
     ("advertiseSequence", "advertise_sequence"),
     ("controlUrl", "control_url"),
     ("controlPublicKey", "control_public_key"),
     ("recoveryPublicKey", "recovery_public_key"),
-    ("signingKey", "signing_key"),
-    ("signingKeyId", "signing_key_id"),
     ("epoch", "epoch"),
     ("advertiseUrl", "advertise_url"),
     ("enrolledAt", "enrolled_at"),
 )
-
-
-def _key_id_order(value: str | None) -> int | None:
-    """Key generations are compared as integers when both are digit
-    strings, which is what the control root mints. Anything else is not
-    ordered, and an unordered pair is never called a replay."""
-    if value is None or not value.isdigit():
-        return None
-    return int(value)
 
 
 class NodeIdentityStore:
@@ -454,27 +383,24 @@ class NodeIdentityStore:
             self._record = IdentityRecord(**values)
             if self._record.enrolled:
                 log.info(
-                    "node identity loaded: enrolled as %r with %s at epoch %s, "
-                    "signing key generation %s",
+                    "node identity loaded: enrolled as %r with %s at epoch %s",
                     self._record.name,
                     self._record.control_url,
                     self._record.epoch,
-                    self._record.signing_key_id,
                 )
 
     # ----- mutations --------------------------------------------------
 
     def ensure_keypair(self) -> IdentityRecord:
-        """Generate this node's two keypairs if they are missing. Both
-        private halves are written here and read by nothing but this
-        process.
+        """Generate this node's three keys if they are missing. Every
+        private half is written here and read by nothing but this process.
 
-        **Two, not one, and they are not interchangeable.** The X25519
-        pair exists so the control root can seal secrets *to* this node;
-        the Ed25519 pair exists so this node can sign an address
-        announcement. One key cannot do both jobs — sealing is
-        Diffie-Hellman, signing is Ed25519 — and a key that did both
-        would be a key whose compromise costs twice.
+        **Three, and they are not interchangeable.** The X25519 pair
+        exists so the control root can seal secrets *to* this node; the
+        Ed25519 identity pair signs an address announcement; the Ed25519
+        token key signs this node's tokens (2026-09-25). One key per
+        job, because a key that did two would be a key whose compromise
+        costs twice (NIST SP 800-57 §5.2).
 
         Each is filled in independently, so a node that enrolled before
         the signing key existed grows one on its next start. That alone
@@ -501,6 +427,14 @@ class NodeIdentityStore:
                 )
                 changed = True
                 log.info("generated this node's signing keypair")
+            if not self._record.token_private_key:
+                token = nacl.signing.SigningKey.generate()
+                self._record = replace(
+                    self._record,
+                    token_private_key=base64.b64encode(bytes(token)).decode("ascii"),
+                )
+                changed = True
+                log.info("generated this node's token key")
             if changed:
                 self._write_locked()
             return self._record
@@ -511,9 +445,7 @@ class NodeIdentityStore:
         name: str,
         control_url: str,
         epoch: int,
-        signing_key: str,
-        signing_key_id: str | None,
-        control_public_key: str | None,
+        control_public_key: str,
         recovery_public_key: str | None,
         advertise_url: str | None,
     ) -> IdentityRecord:
@@ -523,8 +455,6 @@ class NodeIdentityStore:
                 name=name,
                 control_url=control_url.rstrip("/"),
                 epoch=epoch,
-                signing_key=signing_key,
-                signing_key_id=signing_key_id,
                 control_public_key=control_public_key,
                 recovery_public_key=recovery_public_key,
                 advertise_url=advertise_url,
@@ -568,8 +498,8 @@ class NodeIdentityStore:
             return claimed
 
     def unenroll(self) -> IdentityRecord:
-        """Leave the install: discard its signing key, epoch, root URL and
-        root identity, and return this node to its own.
+        """Leave the install: discard its epoch, root URL and root
+        identity, and return this node to its own.
 
         **The node's own keypairs are kept.** They are this host's
         identity, not the install's — the same node re-joining anywhere
@@ -588,8 +518,6 @@ class NodeIdentityStore:
                 control_url=None,
                 control_public_key=None,
                 recovery_public_key=None,
-                signing_key=None,
-                signing_key_id=None,
                 epoch=None,
                 advertise_url=None,
                 advertise_sequence=0,
@@ -598,12 +526,11 @@ class NodeIdentityStore:
             self._write_locked()
             return self._record
 
-    def accept_rekey(self, *, signing_key: str, signing_key_id: str, epoch: int) -> bool:
-        """Record a re-key or an epoch announcement. Returns True iff the
-        signing key changed — the caller restarts children only then.
+    def accept_epoch(self, epoch: int) -> None:
+        """Record a newer control-root epoch. Raises `FencedError` on a lower one.
 
-        Raises `FencedError` on a lower epoch, or an equal epoch with a
-        lower key generation. Never moves the recorded epoch backwards.
+        Never moves the recorded epoch backwards: a superseded root is
+        refused on this host alone, with no election.
         """
         with self._lock:
             held_epoch = self._record.epoch or 0
@@ -613,33 +540,9 @@ class NodeIdentityStore:
                     f"{held_epoch}. A control root presenting a lower epoch is a superseded "
                     f"root, and this node fences it without an election."
                 )
-            held_generation = _key_id_order(self._record.signing_key_id)
-            offered_generation = _key_id_order(signing_key_id)
-            if (
-                epoch == held_epoch
-                and held_generation is not None
-                and offered_generation is not None
-                and offered_generation < held_generation
-            ):
-                raise FencedError(
-                    f"refusing signing key generation {signing_key_id!r} at epoch {epoch}: this "
-                    f"node holds generation {self._record.signing_key_id!r}. A lower generation at "
-                    f"the same epoch is a replayed rotation."
-                )
-            held_key = self._record.signing_key_bytes
-            offered_key = base64.b64decode(signing_key, validate=True)
-            security.validate_signing_key(offered_key)
-            if held_key is not None and len(held_key) != 32 and len(offered_key) == 32:
-                raise FencedError("refusing an HS256 downgrade after this node adopted Ed25519")
-            changed = signing_key != self._record.signing_key
-            self._record = replace(
-                self._record,
-                signing_key=signing_key,
-                signing_key_id=signing_key_id,
-                epoch=epoch,
-            )
-            self._write_locked()
-            return changed
+            if epoch != held_epoch:
+                self._record = replace(self._record, epoch=epoch)
+                self._write_locked()
 
     # ----- internals --------------------------------------------------
 
@@ -657,6 +560,8 @@ class NodeIdentityStore:
         # `chmod` left the install's signing key on disk at the umask's
         # mode for as long as the two calls took, and a leftover temp at
         # that fixed name kept its mode through the next `write_text`.
+        # (The install's signing key is no longer here; the node's own
+        # three private keys are.)
         write_private(self._path, rendered)
 
 
@@ -674,8 +579,5 @@ __all__ = [
     "is_loopback_host",
     "local_agent_url",
     "not_a_node_address",
-    "rekey_message",
     "sign_address",
-    "sign_rekey_message",
-    "verify_rekey_signature",
 ]

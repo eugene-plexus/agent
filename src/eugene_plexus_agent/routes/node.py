@@ -1,24 +1,20 @@
 """This host in an install: `GET /v1/node`, `POST /v1/node/enroll`,
-`POST /v1/node/rekey`.
+`POST /v1/node/trust-bundle`.
 
-The agent's half of M5's exchange, built at M7. The control root's half
-has existed since the `control` repo did; its 85 tests ran against fake
-agents that did all of this, and no real agent did any of it.
+The agent's half of M5's exchange, built at M7, and since 2026-09-25 an
+exchange of public keys only (`specs/docs/design/per-node-token-keys.md`).
 
-**Enroll** (operator-only): generate the node keypair if there is none,
+**Enroll** (operator-only): generate the node's keys if there are none,
 work out where other hosts reach this agent, present the join token and
-the *public* key to the control root, and take back a name, the epoch,
-the install's signing key and the root's identity. Then adopt that key
-for this agent's own token verification and restart every supervised
-component so they pick it up — from that moment a token minted anywhere
-in the install verifies here, which is the property M5 §1 named as the
-whole problem.
+the *public* keys to the control root, and take back a name, the epoch,
+the root's identity and a trust bundle that already lists this node's
+token key. Then restart every supervised component so they verify
+against the install's bundle instead of this node's own.
 
-**Re-key** (no bearer; the credential is a signature): the control root
-rotates the install key, or announces a new epoch after a promotion, by
-sending a message signed with the identity this node recorded at
-enrollment. A lower epoch is refused — that refusal *is* epoch fencing —
-and so is a replayed key generation.
+**Trust bundle** (no bearer; the credential is the signature): the
+control root pushes a newer bundle whenever one changes, and this agent
+pulls it every minute too. A lower epoch or version is refused — that
+refusal *is* epoch fencing and rollback protection.
 
 Device detection shells out to a vendor tool, so it runs in a worker
 thread rather than on the event loop. Tests inject a detector on
@@ -29,8 +25,6 @@ thread rather than on the event loop. Tests inject a detector on
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import logging
 import platform
 import sys
@@ -40,8 +34,8 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from .. import __version__, default_topology, reach, security
-from .._generated.common_models import ConfigUpdateRequest, Problem
+from .. import __version__, default_topology, reach, tokens
+from .._generated.common_models import ConfigUpdateRequest, Problem, SignedTrustBundle
 from .._generated.models import (
     Arch,
     EnrollRequest,
@@ -51,7 +45,6 @@ from .._generated.models import (
     NodeReachResult,
     Os,
     ReachStep,
-    RekeyRequest,
     Step,
     UnenrollRequest,
     UnenrollResult,
@@ -74,10 +67,9 @@ from ..node_identity import (
     advertise_host,
     effective_advertise_url,
     is_loopback_host,
-    rekey_message,
-    verify_rekey_signature,
 )
 from ..state import AgentState
+from ..trust import BundleRollback
 
 log = logging.getLogger(__name__)
 
@@ -86,10 +78,10 @@ router = APIRouter(tags=["node"])
 _read_auth = [Depends(require_operator_or_service)]
 _write_auth = [Depends(require_operator_session)]
 
-# Revoking at the root rotates the install's signing key across every
-# remaining node, so it is slower than a read and worth waiting for —
-# but not worth blocking a detach on, which is why exceeding it still
-# leaves this node un-enrolled with `controlNotified: false`.
+# Revoking at the root is one log entry and a bundle push, but it is a
+# write on another host and worth waiting for — not worth blocking a
+# detach on, which is why exceeding it still leaves this node
+# un-enrolled with `controlNotified: false`.
 _REVOKE_TIMEOUT_SECONDS = 20.0
 
 
@@ -141,6 +133,9 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
     record = _store(request).record
     state: AgentState = request.app.state.agent_state
     advertise = effective_advertise_url(state.get_config("advertiseUrl"), record.advertise_url)
+    trust = request.app.state.auth_state.trust
+    bundle = trust.bundle if record.enrolled else None
+    token_public = tokens.public_b64(trust.signer().key) if record.token_private_key else None
     return NodeIdentity(
         enrolled=record.enrolled,
         name=record.name if record.enrolled else None,
@@ -148,7 +143,9 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         controlUrl=record.control_url if record.enrolled else None,  # type: ignore[arg-type]
         epoch=record.epoch if record.enrolled else None,
         advertiseUrl=advertise,  # type: ignore[arg-type]
-        signingKeyId=record.signing_key_id if record.enrolled else None,
+        trustBundleVersion=bundle.version if bundle is not None else None,
+        trustBundleAgeSeconds=bundle.age_seconds() if bundle is not None else None,
+        tokenPublicKey=token_public,
         controlPublicKey=record.control_public_key if record.enrolled else None,
         signingPublicKey=record.signing_public_key,
         advertiseSequence=record.advertise_sequence,
@@ -159,16 +156,18 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         # Read at the moment of answering, not cached and not derived
         # from anything: the point of the field is that a console can
         # compare two hosts and see a drift neither host can see about
-        # itself. `_note_clock_skew` in security.py observes the same
-        # quantity precisely and can only write it to a log.
+        # itself. `tokens.note_clock_skew` observes the same quantity
+        # precisely and can only write it to a log.
         time=datetime.now(UTC),
     )
 
 
 async def _restart_children(request: Request, *, why: str) -> None:
-    """Every supervised component reads the signing key from its
-    environment at spawn, so a key this agent just adopted reaches them
-    only through a respawn. Engines are not touched: they have no auth."""
+    """Every supervised component reads the bundle's path and the pinned
+    authority from its environment at spawn, so a change of authority
+    reaches them only through a respawn. A newer bundle from the same
+    authority does not need one: they reload the file. Engines are not
+    touched: they have no auth."""
     supervisor = getattr(request.app.state, "supervisor", None)
     if supervisor is None:
         return
@@ -179,23 +178,11 @@ async def _restart_children(request: Request, *, why: str) -> None:
         return
     if restarted:
         log.info(
-            "%s; restarting %d supervised component(s) so they pick up the signing key: %s",
+            "%s; restarting %d supervised component(s) so they trust the new authority: %s",
             why,
             len(restarted),
             ", ".join(restarted),
         )
-
-
-def _decode_signing_key(value: str) -> bytes | None:
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    try:
-        security.validate_signing_key(raw)
-    except (ValueError, TypeError):
-        return None
-    return raw
 
 
 # --------------------------------------------------------------------------- #
@@ -213,7 +200,7 @@ async def get_node(request: Request) -> NodeIdentity:
     """This host, its devices, and whether anything else can get to it.
 
     `reach` is assembled here rather than on the identity helper because
-    the other three callers of `_identity` -- enroll, unenroll, rekey --
+    the other three callers of `_identity` -- enroll, unenroll, trust-bundle --
     are each in the middle of a trust operation and none of them wants a
     firewall read on the way out. It goes in a thread: the firewall read
     is a COM enumeration on Windows and two subprocesses on POSIX, and
@@ -238,10 +225,9 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
     """Join an install. See the module docstring for the order and why.
 
     **The operator's own session on this agent stops verifying the moment
-    this succeeds**, because the key it was signed with has been replaced
-    by the install's. Log in again - here or at the control root; both
-    now mint tokens this agent accepts. The same price a rotation charges
-    at the control root, for the same reason.
+    this succeeds**, because this agent now trusts the install's bundle
+    and not its own. Sign in again: the sign-in forwards to the control
+    root, which is the only thing that mints sessions in an install.
 
     The advertise URL is the `advertiseUrl` config field when the
     operator set one; otherwise it is derived from the local end of a TCP
@@ -287,21 +273,21 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
     except EnrollmentError as exc:
         raise _from_enrollment_error(exc) from exc
 
-    auth.set_signing_key(outcome.signing_key)
+    auth.trust.load()
     # Joining answers the one onboarding question, so nothing is left
     # for the wizard to do. Set here rather than only at the next boot
     # because enrolling does not restart this process -- without it the
     # operator who just enrolled gets sent to first-run setup.
     default_topology.mark_onboarded(state)
     log.info(
-        "enrolled as %r with the control root at %s at epoch %d; adopted the install's signing "
-        "key (generation %s)",
+        "enrolled as %r with the control root at %s at epoch %d; trust bundle %d lists %d keys",
         outcome.name,
         control_url,
         outcome.epoch,
-        outcome.signing_key_id,
+        outcome.bundle.version,
+        len(outcome.bundle.keys),
     )
-    await _restart_children(request, why="enrolled and adopted the install's signing key")
+    await _restart_children(request, why="enrolled and now trusts the install's bundle")
     return _identity(request, snapshot)
 
 
@@ -314,26 +300,23 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
 async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -> UnenrollResult:
     """Leave an install - the exact inverse of enrolling.
 
-    **Why this is safe to allow from the node**, which is the only part
-    that needs an argument: revocation exists because a node that still
-    *holds* the signing key can still authenticate, so removing a registry
-    entry alone does nothing. Un-enrolling **discards** that key. A node
+    **Why this is safe to allow from the node**: the install stops
+    trusting this node when the root drops its key from the bundle.
+    Un-enrolling only makes this node stop trusting the install. A node
     cannot escape revocation this way; it can only disarm itself.
 
     **It proceeds when the root is unreachable.** An operator detaching a
     node from a dead install is precisely the case where refusing is
     useless - `degraded-mode-required`, applied to a trust operation.
     `controlNotified` is how the caller learns the install still lists
-    this node and still trusts the key it just threw away.
+    this node and still trusts its key.
 
-    The root is told first, forwarding the caller's own bearer: one
-    install, one signing key, so the operator session that authorized
-    this call is an operator session at the root too. Revoking there
-    rotates the key for every remaining node, which is the entire point
-    of revoking rather than deleting.
+    The root is told first, forwarding the caller's own session, which is
+    addressed to the root as well as to this machine. Revoking there drops
+    this node's key from the bundle every other machine holds.
 
     Like enrollment, this logs out every session on this node, because
-    the key they were signed with is gone.
+    this node no longer trusts the authority that signed them.
     """
     store = _store(request)
     auth: AuthState = request.app.state.auth_state
@@ -356,8 +339,8 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
     if not notify:
         detail = (
             "notifyControl was false, so the control root was not told. It still lists this "
-            f"node as {previous_name!r} and still trusts the signing key this node just "
-            f"discarded; revoke it there (DELETE /v1/nodes/{previous_name}) when you can."
+            f"node as {previous_name!r} and still trusts this node's key; revoke it there "
+            f"(DELETE /v1/nodes/{previous_name}) when you can."
         )
     else:
         notified, detail = await _revoke_at_root(
@@ -365,14 +348,15 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
         )
 
     store.unenroll()
-    auth.set_signing_key(security.generate_signing_key())
+    auth.trust.forget()
+    auth.trust.become_standalone()
     log.warning(
-        "left the install at %s (was %r); discarded its signing key and minted a local one%s",
+        "left the install at %s (was %r); this node is its own authority again%s",
         previous_control_url,
         previous_name,
         "" if notified else "; THE CONTROL ROOT WAS NOT TOLD",
     )
-    await _restart_children(request, why="left the install and returned to a local signing key")
+    await _restart_children(request, why="left the install and became its own authority")
 
     return UnenrollResult(
         identity=_identity(request, await _devices(request)),
@@ -406,8 +390,7 @@ async def _revoke_at_root(
     except httpx.HTTPError as exc:
         return False, (
             f"Could not reach the control root at {control_url}: {exc}. This node has left "
-            f"anyway; revoke it there (DELETE /v1/nodes/{name}) so the install rotates its "
-            f"signing key."
+            f"anyway; revoke it there (DELETE /v1/nodes/{name}) so the install drops its key."
         )
     if response.status_code == 404:
         # Already gone from the registry. Nothing is owed, and reporting
@@ -423,72 +406,41 @@ async def _revoke_at_root(
 
 
 @router.post(
-    "/v1/node/rekey",
+    "/v1/node/trust-bundle",
     response_model=NodeIdentity,
     response_model_exclude_none=True,
 )
-async def rekey_node(request: Request, body: RekeyRequest) -> NodeIdentity:
-    """Take a new signing key, or a new epoch, from the control root.
+async def take_trust_bundle(request: Request, body: SignedTrustBundle) -> NodeIdentity:
+    """Take a newer trust bundle, or a new epoch, from the control root.
 
     No bearer dependency, deliberately: the credential is the signature,
-    verified against the `controlPublicKey` recorded at enrollment. See
-    `agent.yaml` for why a bearer cannot do this job.
+    checked against the `controlPublicKey` pinned at enrollment. A newer
+    bundle from the same authority restarts nothing; children reload the
+    file.
     """
-    store = _store(request)
     auth: AuthState = request.app.state.auth_state
-    record = store.record
-
-    if not record.enrolled or not record.control_public_key:
+    if not _store(request).record.enrolled:
         raise _problem(
             status.HTTP_401_UNAUTHORIZED,
             "not-enrolled",
             "Not enrolled",
             "This agent has not enrolled with a control root, so it has no root identity to "
-            "verify a re-key against.",
+            "check a trust bundle against.",
         )
-
-    message = rekey_message(
-        signing_key=body.signingKey, signing_key_id=body.signingKeyId, epoch=int(body.epoch)
-    )
-    if not verify_rekey_signature(
-        control_public_key=record.control_public_key, message=message, signature=body.signature
-    ):
-        log.warning("refused a re-key whose signature did not verify against the control root")
+    try:
+        bundle = auth.trust.accept(body.jws)
+    except tokens.BundleError as exc:
+        log.warning("refused a trust bundle: %s", exc)
         raise _problem(
             status.HTTP_401_UNAUTHORIZED,
             "signature-rejected",
             "Signature rejected",
-            "The re-key is not signed by the control root this agent enrolled with.",
-        )
-
-    signing_key = _decode_signing_key(body.signingKey)
-    if signing_key is None:
-        raise _problem(
-            status.HTTP_400_BAD_REQUEST,
-            "malformed-signing-key",
-            "Malformed signing key",
-            "`signingKey` must be base64 Ed25519 private PEM or a legacy 32-byte key.",
-        )
-
-    try:
-        changed = store.accept_rekey(
-            signing_key=body.signingKey, signing_key_id=body.signingKeyId, epoch=int(body.epoch)
-        )
-    except FencedError as exc:
-        log.warning("fenced a re-key: %s", exc)
+            f"The trust bundle is not signed by the control root this agent enrolled with: {exc}",
+        ) from exc
+    except (FencedError, BundleRollback) as exc:
+        log.warning("fenced a trust bundle: %s", exc)
         raise _problem(status.HTTP_409_CONFLICT, "fenced", "Fenced", str(exc)) from exc
-
-    if changed:
-        auth.set_signing_key(signing_key)
-        log.warning(
-            "signing key rotated to generation %s at epoch %d", body.signingKeyId, body.epoch
-        )
-        await _restart_children(
-            request, why=f"the install's signing key rotated to generation {body.signingKeyId}"
-        )
-    else:
-        log.info("epoch %d acknowledged; signing key unchanged", body.epoch)
-
+    log.info("took trust bundle %d at epoch %d", bundle.version, bundle.epoch)
     return _identity(request, await _devices(request))
 
 

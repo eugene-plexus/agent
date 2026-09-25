@@ -1,7 +1,7 @@
 """Whether another account on this machine can read this install's secrets
 or plant files in it (Windows).
 
-`node.yaml` holds the install's signing key in the clear (`node_identity`),
+`node.yaml` holds this node's private keys in the clear (`node_identity`),
 and `_private_files` makes it owner-only on POSIX from its first byte. On
 Windows the mode bits mean nothing and a file takes the ACL its directory
 hands down -- which `_private_files` calls "the installer's business" and

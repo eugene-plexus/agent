@@ -1,12 +1,13 @@
-"""This host in an install: identity, enrollment, the signed re-key, and
+"""This host in an install: identity, enrollment, the trust bundle, and
 what each of them changes about the rest of the agent.
 
 The control root is a fake behind an httpx `MockTransport`, and a real
 listening socket, because the advertise address is derived from the
 local end of a TCP connection to it and a fake that skipped that step
-would agree with whatever the code guessed. What is under test is the
-agent's half of an exchange the control repo's suite has exercised from
-its side against fake agents since M5.
+would agree with whatever the code guessed. The fake signs real bundles
+and real sessions with keys of its own (`FakeRoot`), so every token that
+verifies here verified against a bundle, the way it will in production
+(per-node token keys, 2026-09-25).
 """
 
 from __future__ import annotations
@@ -22,54 +23,65 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import nacl.exceptions
+import nacl.signing
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import enrollment, node_identity, security
+from eugene_plexus_agent import enrollment, node_identity, tokens
 from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind, SpawnConfig
 from eugene_plexus_agent.app import create_app, shared_child_env
-from eugene_plexus_agent.node_identity import (
-    NodeIdentityStore,
-    generate_control_identity_for_tests,
-    rekey_message,
-    sign_rekey_message,
-)
+from eugene_plexus_agent.node_identity import NodeIdentityStore
 from eugene_plexus_agent.settings import Settings
 from eugene_plexus_agent.supervisor import _ComponentPlanner
 
-from .conftest import TEST_PASSPHRASE, StubRuntimeSupervisor, StubSupervisor, fake_devices
+from .conftest import (
+    TEST_PASSPHRASE,
+    FakeRoot,
+    StubRuntimeSupervisor,
+    StubSupervisor,
+    fake_devices,
+    local_service_token,
+)
 
 JOIN_TOKEN = "join-token-minted-for-this-test"
 
 
-class FakeControl:
-    """A control root: one enrollment endpoint behind a MockTransport, and
-    a real listening socket so the agent's advertise-host derivation has
-    something to connect to.
+def _verify_ed25519(public: str, message: bytes, signature: str) -> bool:
+    try:
+        nacl.signing.VerifyKey(base64.b64decode(public, validate=True)).verify(
+            message, base64.b64decode(signature, validate=True)
+        )
+    except (nacl.exceptions.CryptoError, ValueError):
+        return False
+    return True
 
-    Holds a real Ed25519 identity so tests can sign re-keys the way the
-    control root does, and an install signing key to hand out.
+
+class FakeControl:
+    """A control root behind a MockTransport, and a real listening socket
+    so the agent's advertise-host derivation has something to connect to.
+
+    It keeps a registry of each node's token key and grants and signs
+    trust bundles over it exactly as the real root does, so what this
+    agent accepts is what a real bundle would have let it accept.
     """
 
     def __init__(self) -> None:
-        self.private, self.public = generate_control_identity_for_tests()
-        self.signing_key = security.generate_signing_key()
+        self.root = FakeRoot()
         # Readable plaintext, not key-shaped base64 next to a key-shaped
         # name — gitleaks flags the latter.
         self.recovery_public = base64.b64encode(
             b"recovery-recipient-public-key-32".ljust(32, b"0")[:32]
         ).decode()
-        self.epoch = 1
-        self.signing_key_id = "1"
         self.refuse: tuple[int, dict[str, Any]] | None = None
+        self.corrupt: str | None = None
         self.enroll_requests: list[dict[str, Any]] = []
-        # The node registry, as far as a fake needs one: the signing
-        # public key it was given, and the address/sequence high-water
-        # mark it enforces exactly as the real root does.
         self.nodes: dict[str, dict[str, Any]] = {}
         self.address_requests: list[dict[str, Any]] = []
         self.revoked: list[str] = []
         self.refuse_revoke: int | None = None
+        self.logins: list[dict[str, Any]] = []
+        self.sign_outs: list[str] = []
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
@@ -79,8 +91,8 @@ class FakeControl:
         return f"http://127.0.0.1:{self._listener.getsockname()[1]}"
 
     @property
-    def signing_key_b64(self) -> str:
-        return base64.b64encode(self.signing_key).decode("ascii")
+    def public(self) -> str:
+        return self.root.public
 
     def close(self) -> None:
         self._listener.close()
@@ -90,6 +102,13 @@ class FakeControl:
             path = request.url.path
             if path == "/v1/nodes/enroll":
                 return self._enroll(request)
+            if path == "/v1/auth/login":
+                return self._login(request)
+            if path == "/v1/auth/sessions/current":
+                self.sign_outs.append(request.headers.get("authorization", ""))
+                return httpx.Response(204)
+            if path == "/v1/trust/bundle":
+                return httpx.Response(200, json={"jws": self.root.bundle().jws})
             if path.startswith("/v1/nodes/") and request.method == "PATCH":
                 return self._announce(path.rsplit("/", 1)[-1], request)
             if path.startswith("/v1/nodes/") and request.method == "DELETE":
@@ -104,33 +123,63 @@ class FakeControl:
         if self.refuse is not None:
             code, payload = self.refuse
             return httpx.Response(code, json={"detail": payload})
-        # Enrolling replaces the record, sequence included — the real
-        # root's `enrollNode` does, and a rebuilt host whose counter
-        # restarted could never re-advertise otherwise.
-        self.nodes[body["name"]] = {
+        name = body["name"]
+        self.nodes[name] = {
             "url": body.get("url"),
             "signingPublicKey": body.get("signingPublicKey"),
             "advertiseSequence": 0,
         }
+        self.root.register(name, tokens.load_public(body["tokenPublicKey"]))
+        bundle = self.root.bundle()
+        payload: dict[str, Any] = {
+            "name": name,
+            "epoch": self.root.epoch,
+            "trustBundle": {"jws": bundle.jws},
+            "controlPublicKey": self.public,
+            "recoveryPublicKey": self.recovery_public,
+        }
+        if self.corrupt == "no-bundle":
+            payload.pop("trustBundle")
+        if self.corrupt == "foreign-bundle":
+            payload["trustBundle"] = {"jws": FakeRoot().bundle().jws}
+        if self.corrupt == "not-listed":
+            self.root.members.pop(name)
+            payload["trustBundle"] = {"jws": self.root.bundle().jws}
+        if self.corrupt == "misnamed":
+            # This node's own key, listed as some other machine: trusting
+            # it would let this node's tokens speak as that one.
+            key = self.root.members.pop(name).public
+            self.root.register("someone-else", key)
+            payload["trustBundle"] = {"jws": self.root.bundle().jws}
+        return httpx.Response(201, json=payload)
+
+    def _login(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        header = request.headers.get("authorization", "")
+        self.logins.append({"passphrase": body.get("passphrase"), "authorization": header})
+        if body.get("passphrase") != TEST_PASSPHRASE:
+            return httpx.Response(401, json={"detail": {"title": "Wrong passphrase"}})
+        aud = ["control"]
+        try:
+            actor = tokens.verify(
+                header.removeprefix("Bearer "),
+                bundle=self.root.bundle(),
+                recipient="control",
+                classes=[tokens.TYP_SERVICE],
+            )
+            if actor.sub == "agent" and actor.issuer_node:
+                aud = [f"node:{actor.issuer_node}", "control"]
+        except tokens.TokenError:
+            pass
+        token = self.root.session(*aud)
         return httpx.Response(
-            201,
-            json={
-                "name": body["name"],
-                "epoch": self.epoch,
-                "signingKey": self.signing_key_b64,
-                "signingKeyId": self.signing_key_id,
-                "controlPublicKey": self.public,
-                "recoveryPublicKey": self.recovery_public,
-            },
+            200,
+            json={"sessionToken": token, "expiresAt": "2099-01-01T00:00:00+00:00"},
         )
 
     def _announce(self, name: str, request: httpx.Request) -> httpx.Response:
-        """The real verification, not a rubber stamp.
-
-        Signature checked against the key enrollment recorded, over the
-        **raw body's** url — which is the whole trap: verify a parsed URL
-        and every announcement 401s on a trailing slash.
-        """
+        """The real verification: the key enrollment recorded, over the
+        **raw body's** url."""
         body = json.loads(request.content)
         self.address_requests.append({"name": name, **body})
         record = self.nodes.get(name)
@@ -142,9 +191,7 @@ class FakeControl:
         message = node_identity.address_message(
             name=name, sequence=int(body["sequence"]), url=body["url"]
         )
-        if not node_identity.verify_rekey_signature(
-            control_public_key=public, message=message, signature=body["signature"]
-        ):
+        if not _verify_ed25519(public, message, body["signature"]):
             return httpx.Response(401, json={"detail": "signature rejected"})
         if body["url"] == record["url"]:
             return httpx.Response(
@@ -178,28 +225,9 @@ class FakeControl:
         if name not in self.nodes:
             return httpx.Response(404, json={"detail": "no such node"})
         self.nodes.pop(name)
+        self.root.members.pop(name, None)
         self.revoked.append(name)
-        return httpx.Response(202, json={"reason": "revocation", "signingKeyId": "2"})
-
-    def rekey(
-        self,
-        *,
-        signing_key: bytes,
-        key_id: str,
-        epoch: int,
-        sign_with: str | None = None,
-    ) -> dict[str, Any]:
-        """A re-key body as the control root would send it."""
-        key_b64 = base64.b64encode(signing_key).decode("ascii")
-        message = rekey_message(signing_key=key_b64, signing_key_id=key_id, epoch=epoch)
-        return {
-            "signingKey": key_b64,
-            "signingKeyId": key_id,
-            "epoch": epoch,
-            "signature": sign_rekey_message(
-                control_private_key=sign_with or self.private, message=message
-            ),
-        }
+        return httpx.Response(202, json={"reason": "revocation", "version": self.root.version})
 
 
 @pytest.fixture
@@ -210,20 +238,26 @@ def control() -> Iterator[FakeControl]:
 
 
 def _enroll(client: TestClient, control: FakeControl, **body: Any) -> httpx.Response:
-    """Enroll, and on success re-authenticate the client with a token
-    minted from THE INSTALL'S key — the way the control root would mint
-    one. The operator session that requested the enrollment was signed
-    with this agent's old random key and stops verifying the moment the
-    install key is adopted; that is the designed price of enrollment, the
-    same one a rotation charges, and every test past this point is also
-    an assertion that a control-minted token verifies here."""
+    """Enroll, and on success sign in again, through the root.
+
+    The session that asked for the enrollment was signed by this agent as
+    its own authority and stops verifying the moment it trusts the
+    install's bundle instead; that is the designed price of enrollment.
+    Signing in again forwards to the fake root, so every test past this
+    point is also an assertion that a root-minted session verifies here.
+    """
     client.app.state.control_transport = control.transport()  # type: ignore[attr-defined]
     payload: dict[str, Any] = {"controlUrl": control.url, "token": JOIN_TOKEN, "name": "gpu-box"}
     payload.update(body)
     response = client.post("/v1/node/enroll", json=payload)
     if response.status_code == 200:
-        token, _ = security.issue_operator_token(signing_key=control.signing_key)
-        client.headers["Authorization"] = f"Bearer {token}"
+        signed_in = client.post(
+            "/v1/auth/login",
+            json={"passphrase": TEST_PASSPHRASE},
+            headers={"Authorization": ""},
+        )
+        assert signed_in.status_code == 200, signed_in.text
+        client.headers["Authorization"] = f"Bearer {signed_in.json()['sessionToken']}"
     return response
 
 
@@ -240,7 +274,7 @@ def _restarts(client: TestClient) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# GET /v1/node, unenrolled — unchanged from M6
+# GET /v1/node, unenrolled
 # --------------------------------------------------------------------------- #
 
 
@@ -249,8 +283,9 @@ def test_node_reports_devices_and_unenrolled(authed_client: TestClient) -> None:
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["enrolled"] is False
-    for absent in ("controlUrl", "name", "epoch", "signingKeyId", "controlPublicKey"):
+    for absent in ("controlUrl", "name", "epoch", "trustBundleVersion", "controlPublicKey"):
         assert absent not in body
+    assert body["tokenPublicKey"], "a standalone node has a token key of its own"
     assert body["os"] in ("windows", "linux", "macos")
     assert body["arch"] in ("x64", "arm64")
     kinds = [d["kind"] for d in body["devices"]]
@@ -260,20 +295,12 @@ def test_node_reports_devices_and_unenrolled(authed_client: TestClient) -> None:
 
 
 def test_node_carries_this_hosts_own_clock(authed_client: TestClient) -> None:
-    """The one fact a console cannot get any other way.
-
-    Bracketed the way a caller is told to bracket it: the answer must
-    sit inside the window the request occupied, or it is not this
-    host's clock at the moment it answered.
-    """
+    """Bracketed the way a caller is told to bracket it."""
     before = datetime.now(UTC)
     response = authed_client.get("/v1/node")
     after = datetime.now(UTC)
     assert response.status_code == 200, response.text
-
     reported = response.json()["time"]
-    # Offset-aware on the wire, or a consumer in another zone reads it
-    # as local time and computes a skew of whole hours.
     assert reported.endswith("Z") or "+" in reported[10:] or reported[10:].count("-") > 0
     parsed = datetime.fromisoformat(reported)
     assert parsed.tzinfo is not None
@@ -281,19 +308,15 @@ def test_node_carries_this_hosts_own_clock(authed_client: TestClient) -> None:
 
 
 def test_the_clock_is_read_per_request_not_at_startup(authed_client: TestClient) -> None:
-    """A cached value would report a fixed lie rather than a live clock,
-    and a drift that grew after boot would be invisible -- which is the
-    failure the field exists to make visible."""
     first = datetime.fromisoformat(authed_client.get("/v1/node").json()["time"])
     time.sleep(0.01)
     second = datetime.fromisoformat(authed_client.get("/v1/node").json()["time"])
     assert second > first
 
 
-def test_node_is_readable_with_a_service_token(client: TestClient) -> None:
+def test_node_is_readable_with_a_childs_local_token(client: TestClient) -> None:
     client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
-    token = security.issue_service_token(signing_key=signing_key, kind="control")
+    token = local_service_token(client.app, "gateway")  # type: ignore[arg-type]
     response = client.get("/v1/node", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
 
@@ -308,18 +331,15 @@ def test_node_requires_auth(client: TestClient) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_enrollment_presents_the_public_key_and_url_and_adopts_the_install_key(
+def test_enrollment_sends_public_keys_only_and_keeps_the_bundle(
     authed_client: TestClient, control: FakeControl, settings: Settings
 ) -> None:
     """The whole exchange, from the agent's side.
 
-    The request carries the *public* key only, the inventory, and where
-    other hosts reach this agent — derived, here, from the real socket to
-    the fake control. The response is recorded, the install's signing key
-    replaces this agent's random one, and every supervised component is
-    restarted so it picks the key up.
+    Public keys go out — sealing, identity and the token key — and a
+    bundle that lists this node's token key comes back and is kept. No
+    private key crosses the wire in either direction (2026-09-25).
     """
-    before = _auth(authed_client).signing_key
     response = _enroll(authed_client, control)
     assert response.status_code == 200, response.text
     body = response.json()
@@ -327,8 +347,8 @@ def test_enrollment_presents_the_public_key_and_url_and_adopts_the_install_key(
     assert body["enrolled"] is True
     assert body["name"] == "gpu-box"
     assert body["epoch"] == 1
-    assert body["signingKeyId"] == "1"
     assert body["controlPublicKey"] == control.public
+    assert body["trustBundleVersion"] >= 1
     assert urlparse(body["controlUrl"]).port == urlparse(control.url).port
     advertised = urlparse(body["advertiseUrl"])
     assert (advertised.hostname, advertised.port) == ("127.0.0.1", settings.bind_port)
@@ -337,38 +357,45 @@ def test_enrollment_presents_the_public_key_and_url_and_adopts_the_install_key(
     sent = control.enroll_requests[-1]
     assert sent["token"] == JOIN_TOKEN
     assert sent["name"] == "gpu-box"
-    assert len(base64.b64decode(sent["publicKey"], validate=True)) == 32
+    for key in ("publicKey", "signingPublicKey", "tokenPublicKey"):
+        assert len(base64.b64decode(sent[key], validate=True)) == 32
+    assert sent["tokenPublicKey"] == body["tokenPublicKey"]
     assert sent["url"] == f"http://127.0.0.1:{settings.bind_port}"
     assert [d["kind"] for d in sent["devices"]] == ["cuda", "cpu"]
-    assert sent["os"] and sent["arch"] and sent["agentVersion"]
-    assert "privateKey" not in sent
-
-    after = _auth(authed_client).signing_key
-    assert after == control.signing_key and after != before
+    assert "rivate" not in json.dumps(sent), "no private key goes to the root"
     assert _restarts(authed_client) == 1
 
-    # On disk, beside agent.yaml, with the private half — and without the
-    # join token, which is spent.
     node_file = settings.config_file.parent / "node.yaml"
-    assert node_file.exists()
     text = node_file.read_text(encoding="utf-8")
-    assert "privateKey:" in text and control.signing_key_b64 in text
+    assert "tokenPrivateKey:" in text and "signingKey:" not in text
     assert JOIN_TOKEN not in text
+    kept = json.loads((settings.config_file.parent / "trust_bundle.json").read_text("utf-8"))
+    assert tokens.parse_bundle(kept["jws"], authority=control.public).version >= 1
+
+
+def test_a_root_minted_session_verifies_and_a_self_minted_one_no_longer_does(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Enrolling changes the authority: the session this agent minted as
+    its own authority is dead, and the root's is good."""
+    stale = dict(authed_client.headers)
+    assert _enroll(authed_client, control).status_code == 200
+    assert authed_client.get("/v1/node", headers=stale).status_code == 401
+    assert authed_client.get("/v1/node").status_code == 200
+    # And a session the root addressed to some other console is not ours.
+    elsewhere = control.root.session("node:laptop", "control")
+    assert (
+        authed_client.get("/v1/node", headers={"Authorization": f"Bearer {elsewhere}"}).status_code
+        == 401
+    )
 
 
 def test_enrolling_twice_is_a_409_that_names_the_way_out(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    stale = dict(authed_client.headers)
     assert _enroll(authed_client, control).status_code == 200
-    # The session that asked for the enrollment is dead: the key it was
-    # signed with is gone. Designed, documented, and the same price a
-    # rotation charges at the control root.
-    assert authed_client.get("/v1/node", headers=stale).status_code == 401
     again = _enroll(authed_client, control)
     assert again.status_code == 409
-    # The way out is an operation now, not a filesystem instruction. Before
-    # M9 this message told the operator to delete node.yaml by hand.
     assert "gpu-box" in again.text and "/v1/node/unenroll" in again.text
     assert len(control.enroll_requests) == 1, "a second enrollment must not reach the root"
 
@@ -376,14 +403,33 @@ def test_enrolling_twice_is_a_409_that_names_the_way_out(
 def test_a_root_that_refuses_the_token_is_a_502_and_nothing_is_recorded(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    before = _auth(authed_client).signing_key
     control.refuse = (401, {"title": "Join token rejected", "detail": "join token is unknown"})
     response = _enroll(authed_client, control)
     assert response.status_code == 502
     assert "401" in response.text and "join token is unknown" in response.text
     assert authed_client.get("/v1/node").json()["enrolled"] is False
-    assert _auth(authed_client).signing_key == before
     assert _restarts(authed_client) == 0
+
+
+@pytest.mark.parametrize(
+    ("corruption", "words"),
+    [
+        ("no-bundle", "trustBundle"),
+        ("foreign-bundle", "does not verify"),
+        ("not-listed", "does not list this node"),
+        ("misnamed", "as node:gpu-box"),
+    ],
+)
+def test_an_enrollment_whose_bundle_cannot_be_trusted_records_nothing(
+    authed_client: TestClient, control: FakeControl, corruption: str, words: str
+) -> None:
+    """A root whose bundle is missing, signed by someone else, or silent
+    about this node would leave an enrolled node that trusts nothing."""
+    control.corrupt = corruption
+    response = _enroll(authed_client, control)
+    assert response.status_code == 502, response.text
+    assert words in response.text
+    assert authed_client.get("/v1/node").json()["enrolled"] is False
 
 
 def test_an_unreachable_root_is_a_502(authed_client: TestClient) -> None:
@@ -403,8 +449,6 @@ def test_a_configured_advertise_url_wins_over_derivation(
 ) -> None:
     patched = authed_client.patch("/v1/config", json={"advertiseUrl": "http://100.64.0.7:8079"})
     assert patched.status_code == 200, patched.text
-    assert patched.json()["applied"] == ["advertiseUrl"]
-
     assert _enroll(authed_client, control).status_code == 200
     assert control.enroll_requests[-1]["url"] == "http://100.64.0.7:8079"
     assert authed_client.get("/v1/node").json()["advertiseUrl"].rstrip("/") == (
@@ -419,30 +463,13 @@ def test_the_name_defaults_to_the_hostname(authed_client: TestClient, control: F
     assert response.json()["name"] == socket.gethostname()
 
 
-def test_a_malformed_enrollment_is_a_502_and_nothing_is_recorded(
-    authed_client: TestClient, control: FakeControl
-) -> None:
-    def handle(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(201, json={"name": "gpu-box", "epoch": 1, "signingKey": "short"})
-
-    authed_client.app.state.control_transport = httpx.MockTransport(handle)  # type: ignore[attr-defined]
-    response = authed_client.post(
-        "/v1/node/enroll", json={"controlUrl": control.url, "token": JOIN_TOKEN, "name": "gpu-box"}
-    )
-    assert response.status_code == 502
-    assert "signingKey" in response.text
-    assert authed_client.get("/v1/node").json()["enrolled"] is False
-
-
-def test_identity_and_the_install_key_survive_a_restart(
+def test_identity_and_the_bundle_survive_a_restart(
     authed_client: TestClient,
     control: FakeControl,
     settings: Settings,
 ) -> None:
-    """The property M5 §8 asked for — a restart is not a re-key — on the
-    agent's side. A second process over the same directory comes up
-    enrolled, verifying tokens with the install's key from its first
-    request, which is what a token minted at the control root needs."""
+    """A second process over the same directory comes up enrolled,
+    trusting the kept bundle from its first request."""
     assert _enroll(authed_client, control).status_code == 200
 
     reborn = create_app(settings=settings)
@@ -451,24 +478,18 @@ def test_identity_and_the_install_key_survive_a_restart(
     reborn.state.device_detector = lambda: fake_devices()
     reborn.state.library_fit_client = None
     with TestClient(reborn) as client:
-        assert reborn.state.auth_state.signing_key == control.signing_key
-        # A token the control root would mint — signed with the install key
-        # this agent never generated — verifies here.
-        token, _ = security.issue_operator_token(signing_key=control.signing_key)
-        response = client.get("/v1/node", headers={"Authorization": f"Bearer {token}"})
+        session = control.root.session("node:gpu-box", "control")
+        response = client.get("/v1/node", headers={"Authorization": f"Bearer {session}"})
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["enrolled"] is True
         assert body["name"] == "gpu-box"
-        assert body["epoch"] == 1
         assert body["controlPublicKey"] == control.public
 
 
 def test_runtimes_report_the_node_once_enrolled(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    """`Runtime.node` is filled from the agent's identity, never declared,
-    and absent until there is an identity to fill it from."""
     spec = {
         "name": "qwen",
         "engine": "llama_cpp",
@@ -478,183 +499,205 @@ def test_runtimes_report_the_node_once_enrolled(
     created = authed_client.post("/v1/runtimes", json=spec)
     assert created.status_code == 201, created.text
     assert created.json()["node"] is None
-
     assert _enroll(authed_client, control).status_code == 200
     listed = authed_client.get("/v1/runtimes").json()["runtimes"]
     assert [r["node"] for r in listed] == ["gpu-box"]
 
 
 # --------------------------------------------------------------------------- #
-# Re-key and epoch fencing
+# The trust bundle: push, pull, fencing
 # --------------------------------------------------------------------------- #
 
 
-def test_a_signed_rekey_is_adopted_and_children_restart(
+def _push(client: TestClient, bundle: tokens.TrustBundle) -> httpx.Response:
+    return client.post(
+        "/v1/node/trust-bundle", json={"jws": bundle.jws}, headers={"Authorization": ""}
+    )
+
+
+def test_a_newer_bundle_is_taken_and_nothing_restarts(
     authed_client: TestClient, control: FakeControl, settings: Settings
 ) -> None:
+    """A revocation elsewhere in the install is a new bundle here, and it
+    takes effect without a restart: children reload the file."""
     assert _enroll(authed_client, control).status_code == 200
-    new_key = security.generate_signing_key()
-
-    # No bearer on the request: the signature is the credential.
-    response = authed_client.post(
-        "/v1/node/rekey",
-        json=control.rekey(signing_key=new_key, key_id="2", epoch=1),
-        headers={"Authorization": ""},
-    )
+    control.root.register("attic", tokens.generate_private_key().public_key())
+    newer = control.root.bundle()
+    response = _push(authed_client, newer)
     assert response.status_code == 200, response.text
-    assert response.json()["signingKeyId"] == "2"
-    assert _auth(authed_client).signing_key == new_key
-    assert _restarts(authed_client) == 2, "enrollment and the re-key each restart the children"
-    text = (settings.config_file.parent / "node.yaml").read_text(encoding="utf-8")
-    assert base64.b64encode(new_key).decode() in text
-    assert control.signing_key_b64 not in text
+    assert response.json()["trustBundleVersion"] == newer.version
+    assert _restarts(authed_client) == 1, "only enrollment restarted anything"
+    kept = json.loads((settings.config_file.parent / "trust_bundle.json").read_text("utf-8"))
+    assert kept["jws"] == newer.jws
 
 
-def test_rekey_cannot_downgrade_an_asymmetric_node(authed_client, control):
-    assert _enroll(authed_client, control).status_code == 200
-    held = _auth(authed_client).signing_key
-    response = authed_client.post(
-        "/v1/node/rekey", json=control.rekey(signing_key=b"L" * 32, key_id="99", epoch=99)
-    )
-    assert response.status_code == 409
-    assert "HS256" in response.text
-    assert _auth(authed_client).signing_key == held
-    assert _restarts(authed_client) == 1
-
-
-def test_a_rekey_with_a_bad_signature_is_401_and_changes_nothing(
+def test_a_bundle_signed_by_another_root_is_401_and_changes_nothing(
     authed_client: TestClient, control: FakeControl
 ) -> None:
     assert _enroll(authed_client, control).status_code == 200
-    impostor_private, _ = generate_control_identity_for_tests()
-    new_key = security.generate_signing_key()
-
-    forged = control.rekey(signing_key=new_key, key_id="2", epoch=1, sign_with=impostor_private)
-    response = authed_client.post("/v1/node/rekey", json=forged)
+    held = _auth(authed_client).trust.bundle
+    response = _push(authed_client, FakeRoot().bundle())
     assert response.status_code == 401
     assert "not signed by the control root" in response.text
-    assert _auth(authed_client).signing_key == control.signing_key
+    assert _auth(authed_client).trust.bundle == held
 
-    garbage = dict(forged, signature="bm90LWEtc2lnbmF0dXJl")
-    assert authed_client.post("/v1/node/rekey", json=garbage).status_code == 401
-    assert _restarts(authed_client) == 1
+
+def test_an_older_bundle_is_refused_as_a_rollback(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """A captured bundle replayed after a revocation would bring a revoked
+    key back; the version refuses it."""
+    assert _enroll(authed_client, control).status_code == 200
+    old = control.root.bundle()
+    newer = control.root.bundle()
+    assert _push(authed_client, newer).status_code == 200
+    stale = _push(authed_client, old)
+    assert stale.status_code == 409
+    assert "below" in stale.text
+    assert authed_client.get("/v1/node").json()["trustBundleVersion"] == newer.version
 
 
 def test_a_lower_epoch_is_fenced_with_409(authed_client: TestClient, control: FakeControl) -> None:
-    """M5 §6, on the side that does the fencing: a superseded root
-    presenting a lower epoch is refused by this node alone, with no
-    election and no agreement with any other agent."""
+    """M5 §6, on the side that does the fencing: a superseded root is
+    refused by this node alone, with no election."""
     assert _enroll(authed_client, control).status_code == 200
-    key = control.signing_key
-
-    # An announcement: same key, higher epoch. Recorded, nothing restarted.
-    announced = authed_client.post(
-        "/v1/node/rekey", json=control.rekey(signing_key=key, key_id="1", epoch=3)
-    )
+    control.root.epoch = 3
+    announced = _push(authed_client, control.root.bundle())
     assert announced.status_code == 200, announced.text
     assert announced.json()["epoch"] == 3
-    assert _restarts(authed_client) == 1
 
-    # The old root, back at epoch 2 with a genuine signature: fenced.
-    stale = authed_client.post(
-        "/v1/node/rekey", json=control.rekey(signing_key=key, key_id="1", epoch=2)
-    )
+    control.root.epoch = 2
+    stale = _push(authed_client, control.root.bundle())
     assert stale.status_code == 409
-    assert "already acknowledged epoch 3" in stale.text
+    assert "epoch" in stale.text
     assert authed_client.get("/v1/node").json()["epoch"] == 3
 
-    # And a rotation it tries to push from there is fenced too, key or no key.
-    stale_key = authed_client.post(
-        "/v1/node/rekey",
-        json=control.rekey(signing_key=security.generate_signing_key(), key_id="9", epoch=0),
-    )
-    assert stale_key.status_code == 409
-    assert _auth(authed_client).signing_key == key
 
-
-def test_a_replayed_generation_at_the_same_epoch_is_409(
-    authed_client: TestClient, control: FakeControl
+def test_a_lost_bundle_still_fences_a_lower_epoch(
+    authed_client: TestClient, control: FakeControl, settings: Settings
 ) -> None:
+    """The kept bundle is the usual fence; the epoch in `node.yaml` is the
+    one that survives losing it. A superseded root cannot re-seat itself
+    on a node that deleted, or never wrote, its bundle file."""
     assert _enroll(authed_client, control).status_code == 200
-    second = security.generate_signing_key()
-    assert (
-        authed_client.post(
-            "/v1/node/rekey", json=control.rekey(signing_key=second, key_id="2", epoch=1)
-        ).status_code
-        == 200
-    )
-    replay = authed_client.post(
-        "/v1/node/rekey", json=control.rekey(signing_key=control.signing_key, key_id="1", epoch=1)
-    )
-    assert replay.status_code == 409
-    assert "replayed rotation" in replay.text
-    assert _auth(authed_client).signing_key == second
+    control.root.epoch = 3
+    assert _push(authed_client, control.root.bundle()).status_code == 200
+    (settings.config_file.parent / "trust_bundle.json").unlink()
+    _auth(authed_client).trust.forget()
 
-    # Re-sending the current generation is idempotent, not a replay.
-    again = authed_client.post(
-        "/v1/node/rekey", json=control.rekey(signing_key=second, key_id="2", epoch=1)
-    )
-    assert again.status_code == 200
-    assert _restarts(authed_client) == 2
+    control.root.epoch = 2
+    stale = _push(authed_client, control.root.bundle())
+    assert stale.status_code == 409, stale.text
+    assert _auth(authed_client).trust.bundle is None
 
 
-def test_an_unenrolled_agent_refuses_a_rekey(
+def test_an_unenrolled_agent_refuses_a_bundle(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    response = authed_client.post(
-        "/v1/node/rekey",
-        json=control.rekey(signing_key=security.generate_signing_key(), key_id="2", epoch=1),
-    )
+    response = _push(authed_client, control.root.bundle())
     assert response.status_code == 401
     assert "not enrolled" in response.text.lower()
 
 
-def test_the_canonical_message_is_the_contracted_form() -> None:
-    """Three fields, sorted keys, no whitespace — the sentence in
-    `RekeyRequest.signature`, byte for byte. A fourth field or a space
-    anywhere and every rotation in the install fails to verify."""
-    message = rekey_message(signing_key="a2V5", signing_key_id="7", epoch=42)
-    assert message == b'{"epoch":42,"signingKey":"a2V5","signingKeyId":"7"}'
-    private, public = generate_control_identity_for_tests()
-    signature = sign_rekey_message(control_private_key=private, message=message)
-    assert node_identity.verify_rekey_signature(
-        control_public_key=public, message=message, signature=signature
+def test_revoking_a_key_in_the_bundle_ends_its_tokens_here(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """A gateway on another machine, granted and then revoked: its token
+    works until this node takes the bundle without it, and not after."""
+    assert _enroll(authed_client, control).status_code == 200
+    nas = tokens.Signer(key=tokens.generate_private_key(), issuer="node:nas")
+    control.root.register("nas", nas.key.public_key(), ("gateway",))
+    assert _push(authed_client, control.root.bundle()).status_code == 200
+    token, _ = nas.mint(
+        typ=tokens.TYP_SERVICE, sub="gateway", aud=["node:gpu-box"], ttl_seconds=600
     )
-    assert not node_identity.verify_rekey_signature(
-        control_public_key=public, message=message + b" ", signature=signature
+    headers = {"Authorization": f"Bearer {token}"}
+    assert authed_client.get("/v1/runtimes", headers=headers).status_code == 200
+
+    control.root.members.pop("nas")
+    assert _push(authed_client, control.root.bundle()).status_code == 200
+    assert authed_client.get("/v1/runtimes", headers=headers).status_code == 401
+
+
+def test_another_machines_agent_reads_nothing_here(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """D5: this agent's reads take its own children, the root, and a
+    gateway -- not another machine's agent. A leaked worker key signs
+    `sub: agent` for every machine in the install, and buys none of them."""
+    assert _enroll(authed_client, control).status_code == 200
+    attic = tokens.Signer(key=tokens.generate_private_key(), issuer="node:attic")
+    control.root.register("attic", attic.key.public_key())
+    assert _push(authed_client, control.root.bundle()).status_code == 200
+    token, _ = attic.mint(
+        typ=tokens.TYP_SERVICE, sub="agent", aud=["node:gpu-box"], ttl_seconds=600
     )
-    assert not node_identity.verify_rekey_signature(
-        control_public_key=public, message=message, signature="not base64!!"
+    headers = {"Authorization": f"Bearer {token}"}
+    for path in ("/v1/runtimes", "/v1/components", "/v1/node"):
+        assert authed_client.get(path, headers=headers).status_code == 401, path
+
+
+def test_only_this_agents_children_may_ask_it_for_a_token(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """`POST /v1/auth/service-token` signs with this node's key, so it is
+    for this machine's own components: not another machine's agent, not
+    a granted gateway elsewhere, not even the operator."""
+    assert _enroll(authed_client, control).status_code == 200
+    nas = tokens.Signer(key=tokens.generate_private_key(), issuer="node:nas")
+    control.root.register("nas", nas.key.public_key(), ("gateway",))
+    assert _push(authed_client, control.root.bundle()).status_code == 200
+    body = {"audience": "node:nas"}
+    for sub in ("agent", "gateway"):
+        remote, _ = nas.mint(typ=tokens.TYP_SERVICE, sub=sub, aud=["node:gpu-box"], ttl_seconds=600)
+        refused = authed_client.post(
+            "/v1/auth/service-token", json=body, headers={"Authorization": f"Bearer {remote}"}
+        )
+        assert refused.status_code == 401, (sub, refused.text)
+    assert authed_client.post("/v1/auth/service-token", json=body).status_code == 401
+    child = local_service_token(authed_client.app, "agent")  # type: ignore[arg-type]
+    granted = authed_client.post(
+        "/v1/auth/service-token", json=body, headers={"Authorization": f"Bearer {child}"}
     )
+    assert granted.status_code == 200, granted.text
 
 
 # --------------------------------------------------------------------------- #
-# service:control may declare a runtime
+# Who may declare a runtime
 # --------------------------------------------------------------------------- #
 
 
-def test_the_control_roots_service_token_may_declare_a_runtime(client: TestClient) -> None:
-    """The control root forwards declarations to the node that will run
-    them with `service:control`; through M6 the agent refused. Checked
-    exactly — a library's token still cannot."""
-    client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
-    signing_key = client.app.state.auth_state.signing_key  # type: ignore[attr-defined]
+def test_only_the_control_roots_own_token_may_declare_a_runtime(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The root forwards declarations with a token signed by its own key
+    and addressed to this node. A child's local token cannot declare, and
+    neither can a gateway's: a leaked worker key runs nothing here."""
+    assert _enroll(authed_client, control).status_code == 200
     spec = {"name": "qwen", "engine": "llama_cpp", "modelPath": "/m.gguf", "autoStart": False}
 
-    library = security.issue_service_token(signing_key=signing_key, kind="library")
-    refused = client.post("/v1/runtimes", json=spec, headers={"Authorization": f"Bearer {library}"})
-    assert refused.status_code == 401
-    assert "service:control" in refused.text
+    for refused_token in (
+        local_service_token(authed_client.app, "library"),  # type: ignore[arg-type]
+        local_service_token(authed_client.app, "gateway"),  # type: ignore[arg-type]
+        # This node's own key can sign `sub: control`; only the root's
+        # key is the control root. A stolen node key declares nothing.
+        local_service_token(authed_client.app, "control"),  # type: ignore[arg-type]
+        control.root.service("node:attic"),
+    ):
+        refused = authed_client.post(
+            "/v1/runtimes", json=spec, headers={"Authorization": f"Bearer {refused_token}"}
+        )
+        assert refused.status_code == 401, refused.text
 
-    control = security.issue_service_token(signing_key=signing_key, kind="control")
-    accepted = client.post(
-        "/v1/runtimes", json=spec, headers={"Authorization": f"Bearer {control}"}
+    root_token = control.root.service("node:gpu-box")
+    accepted = authed_client.post(
+        "/v1/runtimes", json=spec, headers={"Authorization": f"Bearer {root_token}"}
     )
     assert accepted.status_code == 201, accepted.text
-
-    # Deleting it is still the operator's.
-    denied = client.delete("/v1/runtimes/qwen", headers={"Authorization": f"Bearer {control}"})
-    assert denied.status_code == 401
+    denied = authed_client.delete(
+        "/v1/runtimes/qwen", headers={"Authorization": f"Bearer {root_token}"}
+    )
+    assert denied.status_code == 401, "deleting it is still the operator's"
 
 
 # --------------------------------------------------------------------------- #
@@ -767,7 +810,7 @@ def test_the_planner_prefixes_shared_env_per_kind_and_the_operator_wins() -> Non
     plan = _ComponentPlanner(control, logging.getLogger("t"), None, lambda: shared).plan()
     assert plan is not None
     assert plan.env["EUGENE_PLEXUS_CONTROL_BIND_HOST"] == "0.0.0.0"
-    assert "EUGENE_PLEXUS_CONTROL_AUTH_SIGNING_KEY" not in plan.env
+    assert not any("TRUST" in k or "SERVICE_TOKEN" in k for k in plan.env)
 
     # An explicit per-component value from the operator wins.
     pinned = ComponentEntry(
@@ -811,19 +854,13 @@ def test_address_helpers() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_unenroll_discards_the_installs_key_and_tells_the_root(
+def test_unenroll_stops_trusting_the_install_and_tells_the_root(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    """The inverse of enrolling, and the reason it is safe to run here.
-
-    Revocation exists because a node that still *holds* the signing key
-    can still authenticate. Un-enrolling discards it - the opposite
-    direction - so a node cannot escape revocation this way, only disarm
-    itself. The assertion that matters is the last one: the install's key
-    no longer verifies here.
-    """
+    """The inverse of enrolling. The assertion that matters is the last
+    one: a session the root signs no longer verifies here."""
     assert _enroll(authed_client, control).status_code == 200
-    assert _auth(authed_client).signing_key == control.signing_key
+    session = control.root.session("node:gpu-box", "control")
 
     response = authed_client.post("/v1/node/unenroll")
     assert response.status_code == 200, response.text
@@ -832,7 +869,25 @@ def test_unenroll_discards_the_installs_key_and_tells_the_root(
     assert body["previousName"] == "gpu-box"
     assert body["identity"]["enrolled"] is False
     assert control.revoked == ["gpu-box"]
-    assert _auth(authed_client).signing_key != control.signing_key
+    assert (
+        authed_client.get("/v1/node", headers={"Authorization": f"Bearer {session}"}).status_code
+        == 401
+    )
+    # Its own authority again, not the old root's: a token the old root
+    # signs for a standalone machine is refused, and a sign-in here works.
+    as_standalone = control.root.session("node:local")
+    assert (
+        authed_client.get(
+            "/v1/node", headers={"Authorization": f"Bearer {as_standalone}"}
+        ).status_code
+        == 401
+    )
+    signed_in = authed_client.post(
+        "/v1/auth/login", json={"passphrase": TEST_PASSPHRASE}, headers={"Authorization": ""}
+    )
+    assert signed_in.status_code == 200, signed_in.text
+    own = {"Authorization": f"Bearer {signed_in.json()['sessionToken']}"}
+    assert authed_client.get("/v1/node", headers=own).status_code == 200
 
 
 def test_unenroll_keeps_this_nodes_own_keypairs(
@@ -843,15 +898,17 @@ def test_unenroll_keeps_this_nodes_own_keypairs(
     holding only public halves can read nothing with them."""
     _enroll(authed_client, control)
     store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
-    before = (store.record.public_key, store.record.signing_public_key)
+    before = (
+        store.record.public_key,
+        store.record.signing_public_key,
+        store.record.token_private_key,
+    )
     assert all(before)
 
     authed_client.post("/v1/node/unenroll")
     after = store.record
-    assert (after.public_key, after.signing_public_key) == before
+    assert (after.public_key, after.signing_public_key, after.token_private_key) == before
     # And everything that belonged to the install is gone.
-    assert after.signing_key is None
-    assert after.signing_key_id is None
     assert after.epoch is None
     assert after.control_url is None
     assert after.control_public_key is None
@@ -895,9 +952,9 @@ def test_unenroll_can_skip_telling_the_root(
 def test_unenroll_restarts_children_and_is_409_when_not_enrolled(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    """Children hold the install's signing key in their environment, so a
-    key this agent just threw away reaches them only through a respawn -
-    the same reason enrollment restarts them."""
+    """Children read the authority they trust from their environment, so
+    a change of authority reaches them only through a respawn - the same
+    reason enrollment restarts them."""
     assert authed_client.post("/v1/node/unenroll").status_code == 409
 
     _enroll(authed_client, control)
@@ -1053,30 +1110,73 @@ async def test_a_persisted_address_is_the_fallback_when_the_root_is_unreachable(
     assert resolved == "http://192.0.2.99:8079"
 
 
-def test_a_joined_node_is_told_to_log_in_at_the_control_root(
+def test_a_joined_node_with_no_passphrase_signs_in_through_the_root(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    """A worker has no passphrase of its own and never will.
-
-    It verifies tokens with the install's signing key, so an operator
-    session minted at the control root already works there. The default
-    message told it to run `POST /v1/auth/initialize`, which on a machine
-    that has joined an install is advice to raise a second one. Found by
-    M9's acceptance run -- the first thing that ever tried to log in at a
-    joined node.
-    """
+    """A worker has no passphrase of its own, and since 2026-09-25 it is a
+    console anyway: the sign-in forwards to the root, with this agent's
+    own token as the actor, and comes back addressed to this machine.
+    Until then it answered "log in at the control root instead"."""
     _enroll(authed_client, control)
-    # A node onboarded by `eugene-plexus-agent join` has an identity and
-    # no passphrase; simulate that half by clearing the passphrase the
-    # fixture set.
     state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
     state._auth.pop("passphraseHash", None)
 
-    response = authed_client.post("/v1/auth/login", json={"passphrase": "anything"})
+    wrong = authed_client.post("/v1/auth/login", json={"passphrase": "not the passphrase"})
+    assert wrong.status_code == 401, wrong.text
+
+    response = authed_client.post("/v1/auth/login", json={"passphrase": TEST_PASSPHRASE})
+    assert response.status_code == 200, response.text
+    session = response.json()["sessionToken"]
+    claims = _auth(authed_client).trust.verify(session, classes=(tokens.TYP_SESSION,))
+    assert claims.aud == ("node:gpu-box", "control")
+    actor = control.logins[-1]["authorization"].removeprefix("Bearer ")
+    actor_claims = tokens.verify(
+        actor, bundle=control.root.bundle(), recipient="control", classes=[tokens.TYP_SERVICE]
+    )
+    assert (actor_claims.sub, actor_claims.iss) == ("agent", "node:gpu-box")
+
+
+def test_a_forwarded_sign_in_that_fails_counts_against_the_limit(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Every forwarded attempt reaches the root from this one agent, so
+    the root cannot tell browsers apart: the limit is kept here, per
+    source, or it is not kept at all."""
+    _enroll(authed_client, control)
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    state._auth.pop("passphraseHash", None)
+    for _ in range(5):
+        wrong = authed_client.post("/v1/auth/login", json={"passphrase": "not the passphrase"})
+        assert wrong.status_code == 401, wrong.text
+    limited = authed_client.post("/v1/auth/login", json={"passphrase": TEST_PASSPHRASE})
+    assert limited.status_code == 429, limited.text
+
+
+def test_a_sign_in_while_the_root_is_down_says_so(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    _enroll(authed_client, control)
+
+    def dead(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("control root is gone")
+
+    authed_client.app.state.control_transport = httpx.MockTransport(dead)  # type: ignore[attr-defined]
+    response = authed_client.post("/v1/auth/login", json={"passphrase": TEST_PASSPHRASE})
     assert response.status_code == 503, response.text
-    detail = response.json()["detail"]["detail"]
-    assert "control root" in detail
-    assert "first-run setup" in detail or "setup" in detail
+    assert "control root" in response.json()["detail"]["detail"]
+    # The session already held keeps working: nothing here needed the root.
+    assert authed_client.get("/v1/node").status_code == 200
+
+
+def test_a_sign_out_is_forwarded_to_the_root(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Install-wide sign-out: the root replicates it into the bundle."""
+    _enroll(authed_client, control)
+    session = authed_client.headers["Authorization"]
+    assert authed_client.delete("/v1/auth/sessions/current").status_code == 204
+    assert control.sign_outs == [session]
+    assert authed_client.get("/v1/node").status_code == 401
 
 
 # --------------------------------------------------------------------------- #

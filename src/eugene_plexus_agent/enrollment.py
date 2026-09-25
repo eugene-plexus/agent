@@ -11,7 +11,9 @@ browser arrives after the thing it would configure.
 Three operations, and the middle one is the M9 defect:
 
 **enroll** — present a join token and this node's *public* keys, take back
-a name, the epoch, the install's signing key and the root's identity.
+a name, the epoch, the root's identity and a trust bundle that already
+lists this node's token key. **No private key arrives** (2026-09-25):
+until then the answer carried the install's signing key in plaintext.
 
 **announce** — tell the root this node's address, on every start and on
 every change. Before M9 the address was sent exactly once, at enrollment,
@@ -21,21 +23,19 @@ because the only address it had was the stale one. Which is also why this
 is a push and not the root asking.
 
 **The announcement is signed, not bearer-authenticated**, mirroring the
-signed re-key in the other direction. A service token names a *kind* and
-not a host, so any agent could re-address any node; and every other write
-on the control root is operator-only on purpose, while the case that
-matters here is a host that rebooted at 3am with nobody watching.
+signed trust bundle in the other direction: every other write on the
+control root is operator-only on purpose, while the case that matters
+here is a host that rebooted at 3am with nobody watching.
 
-Nothing in this module touches `AuthState` or the supervisor. Adopting the
-key and restarting children are consequences the caller owns, because the
-CLI has no children to restart and no sessions to invalidate.
+Nothing in this module touches `AuthState` or the supervisor. Loading the
+bundle and restarting children are consequences the caller owns, because
+the CLI has no children to restart and no sessions to invalidate. The
+bundle file is written here, verified, so both callers get it.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import logging
 import platform
 import socket
@@ -45,7 +45,7 @@ from typing import Any
 
 import httpx
 
-from . import __version__, security
+from . import __version__, tokens
 from ._http import internal_client
 from .node_identity import (
     NodeIdentityStore,
@@ -85,9 +85,8 @@ class EnrollmentError(Exception):
 class EnrollmentOutcome:
     name: str
     epoch: int
-    signing_key: bytes
-    """Decoded, so the caller does not repeat the validation."""
-    signing_key_id: str | None
+    bundle: tokens.TrustBundle
+    """Verified against the root's key, and already kept on disk."""
     advertise_url: str | None
 
 
@@ -120,18 +119,6 @@ def host_arch() -> str | None:
     if machine in ("arm64", "aarch64"):
         return "arm64"
     return None
-
-
-def decode_signing_key(value: str) -> bytes | None:
-    try:
-        raw = base64.b64decode(value, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    try:
-        security.validate_signing_key(raw)
-    except (ValueError, TypeError):
-        return None
-    return raw
 
 
 async def resolve_advertise_url(
@@ -182,18 +169,22 @@ async def perform_enrollment(
             "Already enrolled",
             f"This agent is enrolled as {held.name!r} with the control root at "
             f"{held.control_url}. Leaving is a deliberate act: POST /v1/node/unenroll here "
-            f"(or revoke it there first, which rotates the install's signing key).",
+            f"(or revoke it there first, which drops its key from that install).",
         )
 
     record = store.ensure_keypair()
     control_url = control_url.rstrip("/")
     node_name = (name or "").strip() or socket.gethostname()
+    if not record.token_private_key:  # pragma: no cover - ensure_keypair makes one
+        raise EnrollmentError("no-token-key", "No token key", "This node has no token key.")
+    token_key = tokens.load_private(record.token_private_key)
 
     payload: dict[str, Any] = {
         "token": token,
         "name": node_name,
         "publicKey": record.public_key,
         "signingPublicKey": record.signing_public_key,
+        "tokenPublicKey": tokens.public_b64(token_key),
         "agentVersion": __version__,
         "os": host_os(),
         "arch": host_arch(),
@@ -230,33 +221,44 @@ async def perform_enrollment(
 
     granted_name = body.get("name")
     epoch = body.get("epoch")
-    signing_key_b64 = body.get("signingKey")
+    control_public_key = _str_or_none(body.get("controlPublicKey"))
     if not isinstance(granted_name, str) or not granted_name:
         raise _malformed(control_url, "`name` is missing")
     if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
         raise _malformed(control_url, f"`epoch` is {epoch!r}")
-    signing_key = decode_signing_key(signing_key_b64) if isinstance(signing_key_b64, str) else None
-    if signing_key is None:
+    if control_public_key is None:
+        raise _malformed(control_url, "`controlPublicKey` is missing")
+    raw_bundle = body.get("trustBundle")
+    jws = raw_bundle.get("jws") if isinstance(raw_bundle, dict) else None
+    if not isinstance(jws, str):
+        raise _malformed(control_url, "`trustBundle` is missing")
+    try:
+        bundle = tokens.parse_bundle(jws, authority=control_public_key)
+    except tokens.BundleError as exc:
+        raise _malformed(control_url, f"its trust bundle does not verify ({exc})") from exc
+    own = bundle.keys.get(tokens.thumbprint(token_key))
+    if own is None or own.issuer != tokens.node_recipient(granted_name):
         raise _malformed(
-            control_url, "`signingKey` must be base64 Ed25519 private PEM or a legacy 32-byte key"
+            control_url,
+            f"its trust bundle does not list this node's token key as node:{granted_name}",
         )
 
+    # The bundle is kept before the record says enrolled: a crash between
+    # the two leaves an unenrolled node with a stray file, never an
+    # enrolled one that trusts nothing.
+    from .trust import BUNDLE_FILE
+
+    tokens.write_bundle_file(store.path.parent / BUNDLE_FILE, bundle)
     store.record_enrollment(
         name=granted_name,
         control_url=control_url,
         epoch=epoch,
-        signing_key=str(signing_key_b64),
-        signing_key_id=_str_or_none(body.get("signingKeyId")),
-        control_public_key=_str_or_none(body.get("controlPublicKey")),
+        control_public_key=control_public_key,
         recovery_public_key=_str_or_none(body.get("recoveryPublicKey")),
         advertise_url=advertise_url,
     )
     return EnrollmentOutcome(
-        name=granted_name,
-        epoch=epoch,
-        signing_key=signing_key,
-        signing_key_id=_str_or_none(body.get("signingKeyId")),
-        advertise_url=advertise_url,
+        name=granted_name, epoch=epoch, bundle=bundle, advertise_url=advertise_url
     )
 
 
@@ -354,7 +356,6 @@ __all__ = [
     "EnrollmentError",
     "EnrollmentOutcome",
     "announce_address",
-    "decode_signing_key",
     "host_arch",
     "host_os",
     "perform_enrollment",

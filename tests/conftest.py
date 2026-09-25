@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from eugene_plexus_agent import tokens
 from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentStatus,
@@ -35,9 +38,12 @@ from eugene_plexus_agent._generated.models import (
     RuntimeStatus,
 )
 from eugene_plexus_agent.app import create_app
+from eugene_plexus_agent.auth_state import AuthState
 from eugene_plexus_agent.engines.devices import DeviceSnapshot
+from eugene_plexus_agent.node_identity import NodeIdentityStore
 from eugene_plexus_agent.runtimes import RuntimeSupervisor
 from eugene_plexus_agent.settings import Settings
+from eugene_plexus_agent.trust import BUNDLE_FILE, NodeTrust
 
 TEST_PASSPHRASE = "correct horse battery staple"
 
@@ -211,6 +217,112 @@ def fake_devices(
         ram_available_bytes=40 * 1024**3,
         detected_at=datetime.now(UTC),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Trust: this node's keys, a standalone authority, and a fake control root
+# (per-node token keys, 2026-09-25)
+# --------------------------------------------------------------------------- #
+
+
+def standalone_trust(directory: Path) -> NodeTrust:
+    """A node that has joined nothing: its own authority, as `node:local`."""
+    directory.mkdir(parents=True, exist_ok=True)
+    store = NodeIdentityStore(directory / "node.yaml")
+    store.ensure_keypair()
+    trust = NodeTrust(store, directory / BUNDLE_FILE)
+    trust.load()
+    return trust
+
+
+def standalone_auth(directory: Path, *, master_key: bytes | None = None) -> AuthState:
+    return AuthState(trust=standalone_trust(directory), master_key=master_key)
+
+
+@dataclass
+class FakeRoot:
+    """A control root, as far as one agent can tell: an identity key that
+    signs bundles, and a token key that signs sessions and its own tokens."""
+
+    identity: Ed25519PrivateKey = field(default_factory=tokens.generate_private_key)
+    token: tokens.Signer = field(
+        default_factory=lambda: tokens.Signer(key=tokens.generate_private_key(), issuer="control")
+    )
+    members: dict[str, tokens.TrustKey] = field(default_factory=dict)
+    version: int = 1
+    epoch: int = 1
+
+    @property
+    def public(self) -> str:
+        return tokens.public_b64(self.identity)
+
+    def register(self, name: str, key: Ed25519PublicKey, grants: tuple[str, ...] = ()) -> None:
+        self.members[name] = tokens.TrustKey(
+            kid=tokens.thumbprint(key),
+            issuer=f"node:{name}",
+            public=key,
+            grants=frozenset({"node", *grants}),
+        )
+
+    def bundle(self, *, revoked: tuple[tuple[str, int], ...] = ()) -> tokens.TrustBundle:
+        self.version += 1
+        return tokens.build_bundle(
+            authority=self.identity,
+            version=self.version,
+            epoch=self.epoch,
+            keys=[self.token.trust_key(["authority"]), *self.members.values()],
+            revoked_sessions=revoked,
+        )
+
+    def session(self, *aud: str, ttl: int = 3600, **extra: Any) -> str:
+        token, _ = self.token.mint(
+            typ=tokens.TYP_SESSION, sub="operator", aud=list(aud), ttl_seconds=ttl, extra=extra
+        )
+        return token
+
+    def service(self, aud: str, *, sub: str = "control", ttl: int = 300) -> str:
+        token, _ = self.token.mint(typ=tokens.TYP_SERVICE, sub=sub, aud=[aud], ttl_seconds=ttl)
+        return token
+
+
+def enroll_store(
+    store: NodeIdentityStore,
+    root: FakeRoot,
+    name: str,
+    *,
+    control_url: str = "http://control.invalid:8083",
+    grants: tuple[str, ...] = (),
+) -> tokens.TrustBundle:
+    """Make `store` enrolled with `root`, and keep the bundle beside it."""
+    record = store.ensure_keypair()
+    assert record.token_private_key is not None
+    key = tokens.load_private(record.token_private_key).public_key()
+    root.register(name, key, grants)
+    bundle = root.bundle()
+    tokens.write_bundle_file(store.path.parent / BUNDLE_FILE, bundle)
+    store.record_enrollment(
+        name=name,
+        control_url=control_url,
+        epoch=root.epoch,
+        control_public_key=root.public,
+        recovery_public_key=None,
+        advertise_url=None,
+    )
+    return bundle
+
+
+def enroll_app(app: FastAPI, root: FakeRoot, name: str, **kwargs: Any) -> tokens.TrustBundle:
+    """Enroll a running test app's node with `root` and reload its trust."""
+    bundle = enroll_store(app.state.node_identity, root, name, **kwargs)
+    app.state.auth_state.trust.load()
+    return bundle
+
+
+def local_service_token(app: FastAPI, sub: str) -> str:
+    """What this agent would hand a child of kind `sub` at spawn."""
+    trust = app.state.auth_state.trust
+    token, _ = trust.mint_service(sub=sub, audience=trust.recipient)
+    return str(token)
 
 
 @pytest.fixture

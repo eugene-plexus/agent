@@ -28,19 +28,37 @@ not deprecated here; it is not implemented here.
 
 **Unauthenticated, deliberately.** This is the path the login request
 itself travels, so a dependency on a session token would make logging
-in impossible. It confers no authority: `Authorization` is forwarded
-verbatim, every component behind it enforces its own auth, and the set
-of reachable addresses is exactly this agent's declared topology. It is
-the same trust boundary the Next server had, one process to the left.
+in impossible. It confers no authority: every component behind it
+enforces its own auth, and the set of reachable addresses is exactly
+this agent's declared topology plus the nodes the install names.
+
+**And the one place a credential leaves this machine** (per-node token
+keys, 2026-09-25; D7 in `specs/docs/design/per-node-token-keys.md`).
+A request to a component on this machine carries its credential
+unchanged. A request that goes anywhere else has each bearer translated
+by `_translate`:
+
+* one already addressed to the destination passes unchanged — a
+  session carries `control`, so a worker console reaching the root is
+  not an exchange, and a client key is addressed to any gateway;
+* **this machine's operator session is exchanged** at the control root
+  for a 5-minute token addressed to that one machine, and cached until a
+  minute before it expires;
+* a token this machine's own child presents is re-minted for the
+  destination under the same `sub`, if this node's grants allow it;
+* anything else is stripped.
+
+So another machine never receives the operator's session. A worker that
+is compromised sees 5-minute tokens addressed to itself, which it
+cannot spend anywhere else. Until 2026-09-25 this forwarded the session
+verbatim to every node on every poll.
 
 **With one refusal of its own: a session the operator signed out of.**
-Signing out is recorded here (`session_revocations`), and every
-component behind this proxy verifies tokens itself with the install's
-key and has never heard of that record -- so until 2026-09-22 a
+Signing out is recorded here (`session_revocations`) as well as at the
+control root, and a component behind this proxy learns of the root's
+record only when its bundle catches up -- so until 2026-09-22 a
 signed-out token went on working through this path, which is the path
-every browser uses, for the rest of its 14 days. Checked before the
-target is resolved, because resolving a remote target spends the
-caller's credential at the control root.
+every browser uses, for the rest of its 14 days. Checked first.
 
 **It streams.** `client.send(stream=True)` plus `StreamingResponse`,
 with `accept-encoding: identity` on the way up so no decoder sits in
@@ -78,7 +96,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
-from .. import install_proxy, peer
+from .. import install_proxy, peer, tokens
 from .._generated.common_models import Problem
 from .._http import internal_client
 from ..auth_state import AuthState
@@ -210,6 +228,10 @@ class Route:
     base: str
     prefix: str = ""
     node: str | None = None
+    recipient: str | None = None
+    """Who the request is addressed to, for credential translation:
+    `control` for the control root, `node:<name>` for a component on
+    another machine, None for a component on this one."""
 
 
 def resolve_local(request: Request, target: str) -> str | None:
@@ -296,7 +318,7 @@ async def resolve_target(request: Request, target: str) -> Route:
         remote = await install_topology(request).owner_of(
             target,
             control_url=str(record.control_url),
-            authorization=request.headers.get("authorization"),
+            authorization=install_proxy.lookup_authorization(request),
             transport=getattr(request.app.state, "control_transport", None),
         )
     except install_proxy.InstallLookupError as exc:
@@ -317,7 +339,15 @@ async def resolve_target(request: Request, target: str) -> Route:
             "running.",
         )
 
-    return Route(base=remote.agent_url, prefix=f"{PROXY_PREFIX}/{target}", node=remote.name)
+    recipient = (
+        tokens.RECIPIENT_CONTROL if target == "control" else tokens.node_recipient(remote.name)
+    )
+    return Route(
+        base=remote.agent_url,
+        prefix=f"{PROXY_PREFIX}/{target}",
+        node=remote.name,
+        recipient=recipient,
+    )
 
 
 async def _resolve_node(request: Request, name: str) -> Route:
@@ -357,12 +387,12 @@ async def _resolve_node(request: Request, name: str) -> Route:
         url = await install_topology(request).agent_url_of(
             name,
             control_url=str(record.control_url),
-            authorization=request.headers.get("authorization"),
+            authorization=install_proxy.lookup_authorization(request),
             transport=getattr(request.app.state, "control_transport", None),
         )
     except install_proxy.InstallLookupError as exc:
         raise _problem(status.HTTP_503_SERVICE_UNAVAILABLE, "Node unreachable", str(exc)) from exc
-    return Route(base=url, node=name)
+    return Route(base=url, node=name, recipient=tokens.node_recipient(name))
 
 
 def get_client(request: Request) -> httpx.AsyncClient:
@@ -445,6 +475,118 @@ def _refuse_signed_out(request: Request) -> None:
         raise revoked_session_problem()
 
 
+# --------------------------------------------------------------------- #
+# Credential translation (D7)
+# --------------------------------------------------------------------- #
+
+_ANY_CLASS = (tokens.TYP_SESSION, tokens.TYP_SERVICE, tokens.TYP_CLIENT)
+
+# How long before an exchanged token's expiry it is replaced rather than
+# reused: enough that a request started now finishes before it lapses.
+_EXCHANGE_MARGIN_SECONDS = 60
+
+
+async def _exchange(request: Request, session: tokens.Claims, token: str, audience: str) -> str:
+    """This machine's session, exchanged at the root for `audience` (RFC 8693)."""
+    import time
+
+    cache: dict[tuple[str, str], tuple[str, int]] = (
+        getattr(request.app.state, "exchanged_tokens", None) or {}
+    )
+    request.app.state.exchanged_tokens = cache
+    key = (session.jti, audience)
+    held = cache.get(key)
+    now = int(time.time())
+    if held is not None and held[1] - _EXCHANGE_MARGIN_SECONDS > now:
+        return held[0]
+
+    auth: AuthState = request.app.state.auth_state
+    record = request.app.state.node_identity.record
+    control_url = str(record.control_url).rstrip("/")
+    transport = getattr(request.app.state, "control_transport", None)
+    try:
+        async with internal_client(timeout=10.0, transport=transport) as client:
+            response = await client.post(
+                f"{control_url}/v1/auth/token",
+                json={"subjectToken": token, "audience": audience},
+                headers={"Authorization": "Bearer " + auth.trust.agent_token("control")},
+            )
+    except httpx.HTTPError as exc:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Control root unreachable",
+            f"Acting on {audience} from this console needs the control root at {control_url}, "
+            f"and it did not answer ({str(exc) or type(exc).__name__}). This machine, and "
+            "everything the install is serving, keep working.",
+        ) from exc
+    if response.status_code != 200:
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED if response.status_code == 401 else 502,
+            "Exchange refused",
+            f"The control root would not exchange this session for {audience} "
+            f"({response.status_code}): {response.text[:300]}",
+        )
+    body = response.json()
+    exchanged = str(body["accessToken"])
+    from datetime import datetime
+
+    expires = int(datetime.fromisoformat(str(body["expiresAt"]).replace("Z", "+00:00")).timestamp())
+    for stale in [k for k, (_, exp) in cache.items() if exp <= now]:
+        cache.pop(stale, None)
+    cache[key] = (exchanged, expires)
+    return exchanged
+
+
+async def _translate(request: Request, token: str, destination: str) -> str | None:
+    """The credential to send to `destination` in place of `token`, or None to strip it."""
+    auth: AuthState = request.app.state.auth_state
+    trust = auth.trust
+    bundle = trust.bundle
+    if bundle is None:
+        return None
+    try:
+        tokens.verify(token, bundle=bundle, recipient=destination, classes=_ANY_CLASS)
+        return token
+    except tokens.TokenError:
+        pass
+    try:
+        claims = trust.verify(token, classes=_ANY_CLASS)
+    except tokens.TokenError:
+        return None
+    if claims.is_session and claims.act is None and trust.enrolled:
+        return await _exchange(request, claims, token, destination)
+    if claims.is_local_service(trust.recipient):
+        from ..trust import MintRefused
+
+        try:
+            minted, _ = trust.mint_service(sub=claims.sub, audience=destination)
+        except MintRefused:
+            return None
+        return minted
+    return None
+
+
+async def _credential_headers(request: Request, route: Route) -> dict[str, str | None]:
+    """Header replacements for a request leaving this machine; empty when it does not."""
+    if route.recipient is None:
+        return {}
+    changes: dict[str, str | None] = {}
+    header = request.headers.get("authorization")
+    if header:
+        scheme, _, value = header.partition(" ")
+        translated = (
+            await _translate(request, value.strip(), route.recipient)
+            if scheme.lower() == "bearer" and value.strip()
+            else None
+        )
+        changes["authorization"] = f"Bearer {translated}" if translated else None
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        translated = await _translate(request, api_key.strip(), route.recipient)
+        changes["x-api-key"] = translated
+    return changes
+
+
 def _upstream_url(base: str, path: str, query: str) -> httpx.URL:
     # Topology URLs arrive with a trailing slash (`http://127.0.0.1:8081/`).
     # Naive joining gives `http://127.0.0.1:8083//v1/config`, and FastAPI
@@ -504,8 +646,7 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
             f"{target!r} is not a usable proxy target name.",
         )
 
-    # Before resolving: see the module docstring on why a remote target's
-    # lookup would already have spent the credential.
+    # First: a signed-out session goes nowhere, here or elsewhere.
     _refuse_signed_out(request)
 
     # The request body is buffered and the response is not, which is the
@@ -518,10 +659,15 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
     route = await resolve_target(request, target)
     url = _upstream_url(route.base, route.prefix + "/" + path.lstrip("/"), request.url.query)
 
+    headers = _request_headers(request, route)
+    for name, value in (await _credential_headers(request, route)).items():
+        headers.pop(name, None)
+        headers.pop(name.title(), None)
+        if value is not None:
+            headers[name] = value
+
     client = get_client(request)
-    upstream_request = client.build_request(
-        request.method, url, headers=_request_headers(request, route), content=body
-    )
+    upstream_request = client.build_request(request.method, url, headers=headers, content=body)
     try:
         upstream = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:

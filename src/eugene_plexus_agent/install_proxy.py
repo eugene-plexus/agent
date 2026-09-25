@@ -35,14 +35,14 @@ machine.
 
 ## Three properties, each deliberate
 
-**It spends the caller's credential, not one of its own.** The lookup
-carries the request's own `Authorization` header to the control root.
-An enrolled node holds the install's signing key, so the operator token
-the browser got from *this* agent is one the root accepts -- that is
-what makes a worker's console a console for the install. Keeping the
-proxy credential-free is the property `routes/proxy.py` was rebuilt to
-have; spending a minted service token here would have quietly taken it
-back.
+**It spends this node's own `agent` token, and only on topology.**
+Until 2026-09-25 the lookup carried the caller's `Authorization`, which
+worked because every node shared one key, and which meant the operator's
+session travelled to the root on every lookup and the cache served one
+caller's answer to the next. Where components and nodes are is not
+secret; a read-only `agent` token addressed to `control` is the whole
+of what this needs (`lookup_authorization`). The caller's credential is
+translated separately, per hop, in `routes/proxy.py`.
 
 **One hop, never two.** The resolved node is where the component is, so
 a second hop can only be a resolution loop. `HOP_HEADER` marks a request
@@ -119,10 +119,9 @@ class _Snapshot:
     owners: dict[str, str] = field(default_factory=dict)
     node_urls: dict[str, str] = field(default_factory=dict)
     error: str | None = None
-    # A refusal of the *caller's* credential says nothing about the
-    # install, so it must not be remembered on anyone else's behalf: an
-    # unauthenticated probe would otherwise poison the answer for the
-    # signed-in operator for the whole negative TTL.
+    # A refusal of this node's own token means the root does not know its
+    # key yet -- an enrollment a moment old, a bundle not yet caught up.
+    # Both mend themselves, so it is not remembered for the negative TTL.
     cacheable: bool = True
 
 
@@ -262,6 +261,14 @@ class InstallTopology:
         )
 
 
+def lookup_authorization(request: Any) -> str | None:
+    """The credential a lookup spends: this node's own `agent` token."""
+    auth = getattr(request.app.state, "auth_state", None)
+    if auth is None:
+        return None
+    return "Bearer " + str(auth.trust.agent_token("control"))
+
+
 def _reachable_url(snapshot: _Snapshot, node: str, subject: str) -> str:
     """A node's agent URL, or the reason nothing here can reach it.
 
@@ -281,9 +288,9 @@ def _reachable_url(snapshot: _Snapshot, node: str, subject: str) -> str:
         )
     unusable = not_a_node_address(url)
     if unusable is not None:
-        # R2.4: this hop spends the **caller's own** bearer, which is the
-        # right design and is exactly why the base URL cannot be
-        # anything a node felt like naming. The control root refuses to
+        # R2.4: a hop to this address carries a credential addressed to
+        # it, which is exactly why the base URL cannot be anything a node
+        # felt like naming. The control root refuses to
         # record these now; a registry written before that fix still
         # holds them, and this is the process that would dial one.
         raise InstallLookupError(

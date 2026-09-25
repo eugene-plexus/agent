@@ -41,7 +41,6 @@ from . import (
     passphrase_file,
     process_signals,
     response_headers,
-    security,
     session_revocations,
     share_credentials,
     ui_assets,
@@ -66,6 +65,7 @@ from .runtimes import RuntimeSupervisor, close_installers
 from .settings import Settings, load_settings
 from .state import AgentState
 from .supervisor import Supervisor
+from .trust import BUNDLE_FILE, NodeTrust
 
 log = logging.getLogger(__name__)
 
@@ -103,11 +103,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.config_error = config_error
 
     # This host's identity in the install (M7): node.yaml beside
-    # agent.yaml. Loaded before auth state, because an enrolled agent
-    # verifies tokens with THE INSTALL'S signing key from the first
-    # request and hands that key to every child it spawns — a restart
-    # is not a re-key. An agent that has not enrolled mints a random
-    # per-restart key, which is the single-host behaviour unchanged.
+    # agent.yaml. Loaded before auth state, because this node signs with
+    # its own token key from `node.yaml` and verifies against the trust
+    # bundle kept beside it from the first request (2026-09-25). An agent
+    # that has not enrolled is its own authority, with the same key.
     identity = node_identity.NodeIdentityStore(
         settings.config_file.resolve().parent / node_identity.NODE_FILE
     )
@@ -117,6 +116,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Degraded, not dead: supervision needs no identity. The agent
         # comes up unenrolled and says why.
         log.error("node identity file could not be read (%s); running unenrolled", exc)
+    try:
+        # The three keys, made once and kept: an unenrolled node needs its
+        # token key and identity key as much as an enrolled one does.
+        identity.ensure_keypair()
+    except OSError as exc:
+        log.error("could not write this node's keys to %s: %s", identity.path, exc)
     app.state.node_identity = identity
 
     # Whether another account on this machine can read node.yaml or add
@@ -130,14 +135,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Tests can pre-populate auth state before the lifespan runs.
     if not hasattr(app.state, "auth_state"):
-        install_key = identity.record.signing_key_bytes
-        app.state.auth_state = AuthState(signing_key=install_key or security.generate_signing_key())
-        if install_key is not None:
-            log.info(
-                "verifying tokens with the install's signing key (generation %s) as node %r",
-                identity.record.signing_key_id,
-                identity.record.name,
-            )
+        trust = NodeTrust(identity, settings.config_file.resolve().parent / BUNDLE_FILE)
+        try:
+            trust.load()
+        except (OSError, RuntimeError) as exc:
+            log.error("could not load this node's trust: %s", exc)
+        app.state.auth_state = AuthState(trust=trust)
+        log.info(
+            "signing as %s; trusting %s",
+            trust.recipient,
+            "the control root's bundle" if trust.enrolled else "this node alone",
+        )
 
     # The sessions signed out before this start. Outside the `hasattr`
     # above, and in safe mode too: a sign-out that was not read back is
@@ -380,9 +388,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     registry = ClientKeyRegistry(app)
     app.state.client_key_registry = registry
     registry_task = asyncio.create_task(registry.run())
+    # The trust bundle, pulled every minute: how a node that was down
+    # during a revocation, a sign-out or a root-key rotation catches up by
+    # itself. The push is the fast path; this is the one that cannot miss.
+    bundle_task = asyncio.create_task(_pull_trust_bundle(app), name="trust-bundle-pull")
     try:
         yield
     finally:
+        bundle_task.cancel()
+        await asyncio.gather(bundle_task, return_exceptions=True)
         # Apps first: they are clients of everything below, and a spoke
         # outliving the hub it talks to only produces errors in its log.
         if apps_task is not None and not apps_task.done():
@@ -427,6 +441,45 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await aclose_shared()
 
 
+TRUST_PULL_INTERVAL_SECONDS = 60.0
+
+
+async def _pull_trust_bundle(app: FastAPI) -> None:
+    """Ask the control root for its bundle every minute, while enrolled.
+
+    Never raises and never stops: a root that is down is a normal state,
+    and the bundle this node holds keeps working meanwhile (it has no
+    hard expiry, by design; its age is on `GET /v1/node`).
+    """
+    from . import tokens
+    from ._http import internal_client
+    from .node_identity import FencedError
+    from .trust import BundleRollback
+
+    transport = getattr(app.state, "control_transport", None)
+    async with internal_client(timeout=10.0, transport=transport) as client:
+        while True:
+            trust = app.state.auth_state.trust
+            record = app.state.node_identity.record
+            if trust.enrolled and record.control_url:
+                try:
+                    response = await client.get(
+                        f"{str(record.control_url).rstrip('/')}/v1/trust/bundle"
+                    )
+                    if response.status_code == 200:
+                        held = trust.bundle
+                        taken = trust.accept(str(response.json()["jws"]))
+                        if held is None or taken.version != held.version:
+                            log.info("pulled trust bundle %d", taken.version)
+                except BundleRollback:
+                    pass
+                except (tokens.BundleError, FencedError) as exc:
+                    log.warning("refused the control root's trust bundle: %s", exc)
+                except Exception as exc:
+                    log.debug("could not pull the trust bundle: %s", exc)
+            await asyncio.sleep(TRUST_PULL_INTERVAL_SECONDS)
+
+
 async def _check_install_permissions(app: FastAPI, config_dir: Path) -> None:
     """Say once, loudly, if another account can read this install's secrets.
 
@@ -443,7 +496,7 @@ async def _check_install_permissions(app: FastAPI, config_dir: Path) -> None:
     for sentence in app.state.install_permissions:
         log.warning(
             "install permissions: %s. Another account on this machine could read this "
-            "install's signing key or add code that runs as this agent. Re-run the "
+            "node's own keys or add code that runs as this agent. Re-run the "
             "installer to repair the folder's permissions.",
             sentence,
         )
@@ -550,7 +603,7 @@ async def resolve_gateway_for_apps(app: FastAPI) -> tuple[str | None, str | None
         )
     from . import install_proxy
 
-    token = security.issue_service_token(signing_key=app.state.auth_state.signing_key, kind="agent")
+    token = app.state.auth_state.trust.agent_token("control")
     cache = getattr(app.state, "install_topology", None)
     if cache is None:
         cache = install_proxy.InstallTopology()

@@ -7,16 +7,17 @@ import json
 import logging
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
-from eugene_plexus_agent import security
 from eugene_plexus_agent._generated.models import ComponentEntry, RuntimeSpec
-from eugene_plexus_agent.auth_state import AuthState
 from eugene_plexus_agent.engines.llama_cpp import LlamaCppAdapter
 from eugene_plexus_agent.runtimes import _RuntimePlanner, validate_spec
 from eugene_plexus_agent.supervisor import SpawnPlanError, _ComponentPlanner
+
+from .conftest import standalone_auth
 
 SECRET_ENV = {
     "EUGENE_PLEXUS_AGENT_MASTER_KEY": "parent-master",
@@ -56,7 +57,7 @@ def _component(kind: str, env: dict[str, str] | None = None) -> ComponentEntry:
 )
 def test_component_receives_only_its_deliberate_credentials(kind, prefix, monkeypatch):
     _ambient(monkeypatch)
-    auth = AuthState(signing_key=security.generate_signing_key(), master_key=b"m" * 32)
+    auth = standalone_auth(Path(tempfile.mkdtemp()), master_key=b"m" * 32)
     plan = _ComponentPlanner(_component(kind), logging.getLogger("test"), auth).plan()
     assert plan is not None
     for key, value in SECRET_ENV.items():
