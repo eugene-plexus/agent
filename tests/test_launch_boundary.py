@@ -21,7 +21,7 @@ from .conftest import standalone_auth
 
 SECRET_ENV = {
     "EUGENE_PLEXUS_AGENT_MASTER_KEY": "parent-master",
-    "EUGENE_PLEXUS_CONTROL_AUTH_SIGNING_KEY": "root-signing",
+    "EUGENE_PLEXUS_CONTROL_TRUST_AUTHORITY": "an-inherited-authority",
     "EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN": "old-service",
     "eugene_plexus_driver_master_key": "lowercase-secret",
     "EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE": "/private/root-password",
@@ -102,7 +102,7 @@ def test_engine_inherits_no_plexus_credentials(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "key", ["EUGENE_PLEXUS_DRIVER_MASTER_KEY", "eugene_plexus_driver_auth_signing_key"]
+    "key", ["EUGENE_PLEXUS_DRIVER_MASTER_KEY", "eugene_plexus_driver_trust_bundle_file"]
 )
 def test_component_override_cannot_replace_credential_wiring(key):
     with pytest.raises(SpawnPlanError, match="reserved"):

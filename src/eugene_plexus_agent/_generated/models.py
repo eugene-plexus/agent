@@ -1327,14 +1327,9 @@ class ClientKey(BaseModel):
     lastUsedAt: AwareDatetime | None = Field(
         None, description='Reserved; not currently measured.'
     )
-    originNode: str | None = None
     limits: ClientKeyLimits | None = Field(
         None,
         description='Absent on legacy keys (all models, no per-key limits); new keys receive bounded defaults.',
-    )
-    migrated: bool | None = Field(
-        None,
-        description='True for a record imported from a pre-A3 node-local registry.',
     )
 
 
@@ -1343,19 +1338,11 @@ class Scope1(StrEnum):
     standalone = 'standalone'
 
 
-class Migration(StrEnum):
-    complete = 'complete'
-    pending = 'pending'
-    error = 'error'
-    standalone = 'standalone'
-
-
 class ClientKeyList(BaseModel):
     keys: list[ClientKey]
     authority: str | None = None
     revision: int | None = Field(None, ge=0)
     scope: Scope1 | None = None
-    migration: Migration | None = None
     detail: str | None = None
 
 
@@ -1438,17 +1425,6 @@ class ClientKeyPolicy(BaseModel):
         description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
     )
     keys: list[ClientKeyPolicyEntry]
-
-
-class ClientKeyImport(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    keys: list[ClientKey] = Field(..., max_length=10000)
-    signature: str = Field(
-        ...,
-        description='Base64 Ed25519 signature by the enrolled node over UTF-8\n\'eugene-plexus/client-keys/import/v1\\n\' followed by canonical JSON\n{"node":name,"keys":keys}, sorted keys, compact separators, ensure_ascii=false.\nIdempotent; imported revocations cannot be cleared by replay.\n',
-    )
 
 
 class ClientKeyRevocations(BaseModel):

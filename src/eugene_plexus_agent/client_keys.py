@@ -1,4 +1,4 @@
-"""Atomic standalone registry and source records for install-wide migration.
+"""The standalone registry: a machine that has joined no install keeps its keys here.
 
 Only metadata is stored; bearer tokens are returned once at creation. A corrupt
 or unwritable registry is unavailable, never silently replaced with an empty one.

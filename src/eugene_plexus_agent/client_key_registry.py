@@ -1,34 +1,26 @@
-"""Enrolled agents relay key management and migrate their legacy metadata."""
+"""Enrolled agents relay key management to the control root.
+
+Keys made on a machine before it joined an install are signed by that
+machine alone and are not carried over (per-node token keys,
+2026-09-25): their tokens could not verify anywhere in the install, so a
+record of them there would only look like a key that works.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
-import time
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException, Request
 
-from . import node_identity
 from ._http import internal_client
-from .client_keys import as_datetime
-
-IMPORT_DOMAIN = b"eugene-plexus/client-keys/import/v1\n"
 
 
 class ClientKeyRegistry:
     def __init__(self, app: Any) -> None:
         self.app = app
         self.client = internal_client(timeout=3.0)
-        self.migration = "pending"
-        self.detail = "Existing keys are waiting to be registered with the control root."
-        self._digest: str | None = None
-        self._next_attempt = 0.0
-        self._failures = 0
-        self._migration_task: asyncio.Task[None] | None = None
 
     @property
     def enrolled(self) -> bool:
@@ -92,63 +84,7 @@ class ClientKeyRegistry:
             },
         )
 
-    async def migrate(self) -> None:
-        if not self.enrolled:
-            return
-        if self._migration_task is not None and not self._migration_task.done():
-            await asyncio.shield(self._migration_task)
-        elif time.perf_counter() >= self._next_attempt:
-            self._migration_task = asyncio.create_task(self._import())
-            await asyncio.shield(self._migration_task)
-
-    async def _import(self) -> None:
-        try:
-            identity = self.app.state.node_identity.record
-            records = []
-            for record in self.app.state.client_keys.records():
-                raw = record.to_json()
-                for field in ("createdAt", "expiresAt", "revokedAt"):
-                    if field in raw:
-                        raw[field] = as_datetime(raw[field]).isoformat()
-                records.append(raw)
-            payload = {"node": identity.name, "keys": records}
-            canonical = json.dumps(
-                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-            ).encode()
-            digest = hashlib.sha256(canonical + identity.control_url.encode()).hexdigest()
-            if digest == self._digest:
-                return
-            signature = node_identity.sign_address(
-                signing_private_key=identity.signing_private_key, message=IMPORT_DOMAIN + canonical
-            )
-            await self.forward(
-                "POST",
-                f"/v1/nodes/{quote(identity.name, safe='')}/client-keys/import",
-                body={"keys": records, "signature": signature},
-            )
-            self._digest = digest
-            self.migration = "complete"
-            self.detail = "Existing keys are registered install-wide. Their tokens are unchanged."
-            self._failures = 0
-        except (HTTPException, OSError, ValueError, TypeError):
-            self._failures += 1
-            self.migration = "error"
-            self.detail = (
-                "Existing keys could not be registered. Restore the control connection "
-                "or the local client_keys.json backup; unregistered keys are refused."
-            )
-        finally:
-            self._next_attempt = time.perf_counter() + min(15, 2 ** min(self._failures, 4))
-
-    async def run(self) -> None:
-        while True:
-            await self.migrate()
-            await asyncio.sleep(15)
-
     async def close(self) -> None:
-        if self._migration_task is not None:
-            self._migration_task.cancel()
-            await asyncio.gather(self._migration_task, return_exceptions=True)
         await self.client.aclose()
 
 

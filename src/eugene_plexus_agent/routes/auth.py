@@ -641,18 +641,15 @@ async def list_client_keys(request: Request) -> ClientKeyList:
     """The records, newest first. Never the tokens -- see `client_keys`."""
     owner = registry(request)
     if owner.enrolled:
-        await owner.migrate()
         data = await owner.forward(
             "GET", "/v1/auth/client-keys", authorization=request.headers.get("authorization")
         )
-        data.update(migration=owner.migration, detail=owner.detail)
         return ClientKeyList.model_validate(data)
     try:
         return ClientKeyList.model_validate(
             dict(
                 keys=[_to_model(r) for r in _keys(request).records()],
                 scope="standalone",
-                migration="standalone",
                 revision=_keys(request).revision,
             )
         )
@@ -823,7 +820,6 @@ async def revoke_client_key_at_authority(
     a key the standalone registry does not know."""
     owner = registry(request)
     if owner.enrolled:
-        await owner.migrate()
         await owner.forward(
             "DELETE",
             f"/v1/auth/client-keys/{key_id}",

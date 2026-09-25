@@ -387,7 +387,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     registry = ClientKeyRegistry(app)
     app.state.client_key_registry = registry
-    registry_task = asyncio.create_task(registry.run())
     # The trust bundle, pulled every minute: how a node that was down
     # during a revocation, a sign-out or a root-key rotation catches up by
     # itself. The push is the fast path; this is the one that cannot miss.
@@ -404,8 +403,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await asyncio.gather(apps_task, return_exceptions=True)
         if app_manager is not None:
             await app_manager.aclose()
-        registry_task.cancel()
-        await asyncio.gather(registry_task, return_exceptions=True)
         await registry.close()
         benchmarks = getattr(app.state, "benchmarks", None)
         if benchmarks is not None:

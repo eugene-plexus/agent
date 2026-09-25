@@ -15,8 +15,6 @@ _NAMESPACE = "EUGENE_PLEXUS_"
 # inherited authority would be a child trusting keys this node does not.
 _CREDENTIAL_SUFFIXES = (
     "_MASTER_KEY",
-    "_AUTH_SIGNING_KEY",
-    "_AUTH_VERIFY_KEY",
     "_SERVICE_TOKEN",
     "_TRUST_BUNDLE_FILE",
     "_TRUST_AUTHORITY",
