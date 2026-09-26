@@ -191,10 +191,12 @@ def run_join(request: JoinRequest, settings: Settings) -> int:
     if declared and not request.force:
         kept_because = _why_components_are_kept(state, identity, declared)
         if kept_because is not None:
+            # Short lines: a console wraps at its own width, mid-word, and
+            # "it has a pas / sphrase" is how the first version read.
             print(
-                "error: this machine already runs an install of its own ("
-                + ", ".join(declared)
-                + f"), and {kept_because}.",
+                "error: this machine already runs an install of its own\n"
+                f"       ({', '.join(declared)}).\n"
+                f"       {kept_because}",
                 file=sys.stderr,
             )
             print(
@@ -244,6 +246,19 @@ def run_join(request: JoinRequest, settings: Settings) -> int:
 _SEEDED = frozenset(component.name for component in DEFAULTS)
 
 
+def _is_loopback_url(url: str | None) -> bool:
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    host = urlsplit(url or "").hostname or ""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _why_components_are_kept(
     state: AgentState,
     identity: node_identity.NodeIdentityStore,
@@ -264,15 +279,21 @@ def _why_components_are_kept(
     install already), a component the seed never declares, or a model
     declared to run.
     """
+    # Enrollment first: it says the most. A machine joined to a control
+    # root on loopback is the control host of an install of its own,
+    # which is what the setup wizard makes (Amish_Station, 2026-09-26).
+    record = identity.record
+    if record.enrolled:
+        if _is_loopback_url(record.control_url):
+            return "It is that install's control host, with a trust root of its own."
+        return f"It is already joined to {record.control_url}."
     if state.has_passphrase():
-        return "it has been set up (it has a passphrase)"
-    if identity.record.enrolled:
-        return f"it is already joined to {identity.record.control_url}"
+        return "It has been set up: a passphrase was chosen on it."
     extra = sorted(set(declared) - _SEEDED)
     if extra:
-        return "it declares " + ", ".join(extra) + ", which only a person adds"
+        return "It declares " + ", ".join(extra) + ", which only a person adds."
     if state.list_runtime_specs():
-        return "it has models declared to run"
+        return "It has models declared to run."
     return None
 
 

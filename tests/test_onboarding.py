@@ -284,9 +284,9 @@ def test_a_refused_join_discards_nothing(
 @pytest.mark.parametrize(
     ("setup", "reason"),
     [
-        ("passphrase", "it has been set up (it has a passphrase)"),
-        ("extra-component", "it declares ollama, which only a person adds"),
-        ("runtime", "it has models declared to run"),
+        ("passphrase", "a passphrase was chosen on it"),
+        ("extra-component", "It declares ollama, which only a person adds."),
+        ("runtime", "It has models declared to run."),
     ],
 )
 def test_join_refuses_to_discard_an_install_someone_set_up(
@@ -336,6 +336,9 @@ def test_join_refuses_to_discard_an_install_someone_set_up(
     assert _declared(settings) == before
     err = capsys.readouterr().err
     assert reason in err
+    # Short enough for any console: one that wraps mid-word read
+    # "it has a pas / sphrase" on 2026-09-26.
+    assert max(len(line) for line in err.splitlines()) <= 80, err
     assert "-Uninstall" in err and "--uninstall" in err
     assert "DELETE /v1/components" not in err
     assert "agent.yaml" not in err
@@ -444,3 +447,48 @@ def _raises(exc: type[BaseException]) -> Any:
         raise exc()
 
     return _input
+
+
+@pytest.mark.parametrize(
+    ("control_url", "reason"),
+    [
+        ("http://127.0.0.1:8083", "It is that install's control host"),
+        ("http://192.168.16.252:8283", "It is already joined to http://192.168.16.252:8283."),
+    ],
+)
+def test_an_enrolled_machine_is_named_by_what_it_is(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_devices: None,
+    capsys: pytest.CaptureFixture[str],
+    control_url: str,
+    reason: str,
+) -> None:
+    """Enrollment says more than the passphrase does, so it is the reason
+    given. A machine joined to a root on loopback is the control host of
+    an install of its own -- what the setup wizard makes, and what
+    Amish_Station turned out to be (2026-09-26), where the join said only
+    "it has a passphrase"."""
+    settings = settings_for(tmp_path)
+    state = AgentState(settings.config_file)
+    state.load()
+    _seed_control_plane(state, tmp_path)
+    state.set_passphrase(passphrase_hash="$argon2id$h", master_salt_b64="c2FsdA==")
+    store = node_identity.NodeIdentityStore(tmp_path / node_identity.NODE_FILE)
+    store.ensure_keypair()
+    store.record_enrollment(
+        name="Amish_Station",
+        control_url=control_url,
+        epoch=1,
+        control_public_key=SigningRoot().public,
+        recovery_public_key=None,
+        advertise_url=None,
+    )
+    root = FakeRoot()
+    root.install(monkeypatch)
+
+    assert onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="t"), settings) == 2
+    assert root.requests == []
+    err = capsys.readouterr().err
+    assert reason in err
+    assert max(len(line) for line in err.splitlines()) <= 80, err
