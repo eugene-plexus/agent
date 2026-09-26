@@ -50,6 +50,7 @@ from pathlib import Path
 from . import node_identity
 from .default_topology import DEFAULTS, should_seed
 from .enrollment import (
+    TOKEN_REFUSED,
     EnrollmentError,
     EnrollmentOutcome,
     perform_enrollment,
@@ -59,6 +60,12 @@ from .settings import Settings
 from .state import AgentState
 
 log = logging.getLogger(__name__)
+
+#: `join`'s exit code when the control root refused the token itself —
+#: unknown, expired, withdrawn or already used. The installers read it:
+#: every other failure can be retried with the same command, this one
+#: needs a new token.
+EXIT_TOKEN_REFUSED = 3
 
 
 @dataclass(frozen=True)
@@ -216,6 +223,19 @@ def run_join(request: JoinRequest, settings: Settings) -> int:
     try:
         outcome = asyncio.run(_join(request, settings, state, identity))
     except EnrollmentError as exc:
+        if exc.slug == TOKEN_REFUSED:
+            # Its own exit code, because it is the one failure where running
+            # the same command again cannot work: the installer reads it
+            # and says to make a new token, never to retry (2026-09-26).
+            print(
+                "error: the control root did not accept this join token\n"
+                f"       ({exc.detail}).\n"
+                "       A join token works once, and expires. Make a new one on the\n"
+                "       control root's Nodes page (Add a node) and run the command it\n"
+                "       gives you. Nothing on this machine changed.",
+                file=sys.stderr,
+            )
+            return EXIT_TOKEN_REFUSED
         print(f"error: {exc.title.lower()}: {exc.detail}", file=sys.stderr)
         return 1
 
@@ -332,6 +352,7 @@ def config_dir(settings: Settings) -> Path:
 
 
 __all__ = [
+    "EXIT_TOKEN_REFUSED",
     "JoinRequest",
     "ask",
     "config_dir",

@@ -277,7 +277,10 @@ def test_a_refused_join_discards_nothing(
     _seed_control_plane(state, tmp_path)
     FakeRoot(status=401).install(monkeypatch)
 
-    assert onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="expired"), settings) == 1
+    assert (
+        onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="expired"), settings)
+        == onboarding.EXIT_TOKEN_REFUSED
+    )
     assert _declared(settings) == ["control", "gateway", "library"]
 
 
@@ -359,10 +362,50 @@ def test_join_reports_a_refusal_without_recording_anything(
     settings = settings_for(tmp_path)
     FakeRoot(status=401).install(monkeypatch)
 
-    assert onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="expired"), settings) == 1
+    assert (
+        onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="expired"), settings)
+        == onboarding.EXIT_TOKEN_REFUSED
+    )
     store = node_identity.NodeIdentityStore(tmp_path / node_identity.NODE_FILE)
     store.load()
     assert store.record.enrolled is False
+
+
+@pytest.mark.parametrize("status", [401, 409])
+def test_a_refused_token_has_its_own_exit_code_and_says_make_a_new_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    no_devices: None,
+    status: int,
+) -> None:
+    """401 is a token the root does not know or that expired, 409 one
+    already used. Running the same command again cannot work for either,
+    so the installers need to tell this apart from every other failure,
+    and the words must send the person to make a new token."""
+    settings = settings_for(tmp_path)
+    FakeRoot(status=status).install(monkeypatch)
+
+    code = onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="t"), settings)
+
+    assert code == onboarding.EXIT_TOKEN_REFUSED
+    said = capsys.readouterr().err
+    assert "did not accept this join token" in said
+    assert "Make a new one" in said
+    assert "Nodes page" in said
+    assert "again" not in said
+    assert all(len(line) <= 80 for line in said.splitlines())
+
+
+def test_a_root_that_cannot_answer_is_not_a_refused_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_devices: None
+) -> None:
+    """A locked or failing root did not look at the token; the same
+    command works once it is up, so this must not say "make a new one"."""
+    settings = settings_for(tmp_path)
+    FakeRoot(status=503).install(monkeypatch)
+
+    assert onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="t"), settings) == 1
 
 
 def test_an_explicit_advertise_address_is_used_verbatim(

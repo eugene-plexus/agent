@@ -69,6 +69,10 @@ ENROLL_TIMEOUT_SECONDS = 15.0
 ANNOUNCE_TIMEOUT_SECONDS = 8.0
 
 
+#: The slug for a join token the control root refused (401 or 409).
+TOKEN_REFUSED = "join-token-refused"
+
+
 class EnrollmentError(Exception):
     """Something in the exchange failed. `slug` and `title` exist so an
     HTTP caller can render a Problem without re-deriving them, and the CLI
@@ -204,6 +208,16 @@ async def perform_enrollment(
             f"this agent is still unenrolled.",
         ) from exc
 
+    if response.status_code in (401, 409):
+        # The root answers 401 for a token it does not know or that has
+        # expired, and 409 for one already used. Neither changes by trying
+        # again, which is why this has a slug of its own.
+        raise EnrollmentError(
+            TOKEN_REFUSED,
+            "Join token refused",
+            f"the control root at {control_url} answered {response.status_code}: "
+            f"{problem_detail(response)}",
+        )
     if response.status_code != 201:
         raise EnrollmentError(
             "control-root-refused",
@@ -352,6 +366,7 @@ def _str_or_none(value: Any) -> str | None:
 __all__ = [
     "ANNOUNCE_TIMEOUT_SECONDS",
     "ENROLL_TIMEOUT_SECONDS",
+    "TOKEN_REFUSED",
     "AnnounceOutcome",
     "EnrollmentError",
     "EnrollmentOutcome",
