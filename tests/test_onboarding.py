@@ -55,8 +55,9 @@ class FakeRoot:
     and answers with a real bundle, signed by a key of its own, listing
     the token key the node sent."""
 
-    def __init__(self, *, status: int = 201) -> None:
+    def __init__(self, *, status: int = 201, detail: object = "refused") -> None:
         self.status = status
+        self.detail = detail
         self.requests: list[dict[str, Any]] = []
         self.root = SigningRoot()
 
@@ -75,7 +76,7 @@ class FakeRoot:
             body = json.loads(request.content)
             fake.requests.append(body)
             if fake.status != 201:
-                return httpx.Response(fake.status, json={"detail": "refused"})
+                return httpx.Response(fake.status, json={"detail": fake.detail})
             fake.root.epoch = 4
             fake.root.register(body["name"], tokens.load_public(body["tokenPublicKey"]))
             return httpx.Response(
@@ -384,13 +385,19 @@ def test_a_refused_token_has_its_own_exit_code_and_says_make_a_new_one(
     so the installers need to tell this apart from every other failure,
     and the words must send the person to make a new token."""
     settings = settings_for(tmp_path)
-    FakeRoot(status=status).install(monkeypatch)
+    # The real root's words, as `problem()` sends them: long enough, with
+    # the URL beside them, to run past a console's width unwrapped.
+    FakeRoot(
+        status=status,
+        detail={"title": "Join token rejected", "detail": "join token is unknown or has expired"},
+    ).install(monkeypatch)
 
     code = onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="t"), settings)
 
     assert code == onboarding.EXIT_TOKEN_REFUSED
     said = capsys.readouterr().err
     assert "did not accept this join token" in said
+    assert "join token is unknown or has expired" in " ".join(said.split())
     assert "Make a new one" in said
     assert "Nodes page" in said
     assert "again" not in said

@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -227,9 +228,14 @@ def run_join(request: JoinRequest, settings: Settings) -> int:
             # Its own exit code, because it is the one failure where running
             # the same command again cannot work: the installer reads it
             # and says to make a new token, never to retry (2026-09-26).
+            # The root's own words, wrapped: a URL and a reason on one line
+            # ran past 80 columns and a console broke it mid-word.
+            said = textwrap.fill(
+                f"({exc.detail}).", width=80, initial_indent=" " * 7, subsequent_indent=" " * 8
+            )
             print(
                 "error: the control root did not accept this join token\n"
-                f"       ({exc.detail}).\n"
+                f"{said}\n"
                 "       A join token works once, and expires. Make a new one on the\n"
                 "       control root's Nodes page (Add a node) and run the command it\n"
                 "       gives you. Nothing on this machine changed.",
