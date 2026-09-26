@@ -206,37 +206,146 @@ def test_join_enrolls_and_the_next_boot_declares_nothing(
     assert should_seed(state, enrolled=store.record.enrolled) is False
 
 
-def test_join_refuses_when_a_control_plane_is_already_declared(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_devices: None
+def _seed_control_plane(state: AgentState, tmp_path: Path) -> None:
+    """What a machine that started once without being told to join holds:
+    the three components the first boot declares, and nothing else."""
+    for name, kind, port in (
+        ("control", ComponentKind.control, 8083),
+        ("gateway", ComponentKind.gateway, 8080),
+        ("library", ComponentKind.library, 8082),
+    ):
+        state.add_topology_entry(
+            ComponentEntry(
+                name=name,
+                kind=kind,
+                url=f"http://127.0.0.1:{port}",  # type: ignore[arg-type]
+                spawn=SpawnConfig(configFile=str(tmp_path / f"{name}.yaml")),
+            )
+        )
+
+
+def _declared(settings: Settings) -> list[str]:
+    state = AgentState(settings.config_file)
+    state.load()
+    return sorted(e.name for e in state.list_topology_entries())
+
+
+def test_join_discards_a_control_plane_nobody_set_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_devices: None,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The one this would otherwise get wrong: an operator who started the
-    agent once (seeding control/gateway/library) and then decided the
-    machine should be a worker. Joining anyway leaves two control roots
-    in one install, which is the exact thing the seeding rule exists to
-    prevent."""
+    """Amended 2026-09-26. This test used to assert a refusal here, and
+    that refusal is what stranded a real Windows worker: its service had
+    started once before the join, seeded control/gateway/library, and the
+    join then told the person to DELETE components over the API or edit
+    agent.yaml by hand.
+
+    Nobody can have put anything into a control plane that has no
+    passphrase, because the console asks for one before any page opens.
+    So the join removes it, and says so. Troy: "Someone running a join
+    cmd with a valid token should be assumed to know what they're doing."
+    """
     settings = settings_for(tmp_path)
     state = AgentState(settings.config_file)
     state.load()
-    state.add_topology_entry(
-        ComponentEntry(
-            name="control",
-            kind=ComponentKind.control,
-            url="http://127.0.0.1:8083",  # type: ignore[arg-type]
-            spawn=SpawnConfig(configFile=str(tmp_path / "control.yaml")),
-        )
-    )
+    _seed_control_plane(state, tmp_path)
     root = FakeRoot()
     root.install(monkeypatch)
 
-    request = JoinRequest(control_url=ROOT_URL, token="t")
-    assert onboarding.run_join(request, settings) == 2
-    assert root.requests == []
+    assert onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="t"), settings) == 0
+    assert len(root.requests) == 1
+    assert _declared(settings) == []
+    out = capsys.readouterr().out
+    assert "removed the control plane this machine had started on its own" in out
+    assert "control, gateway, library" in out
 
-    # ...and the expert override goes through, per the standing rule that
-    # a refusal must always leave a way past it.
+    # And the next boot neither re-seeds nor asks.
+    assert onboarding.is_fresh_boot(settings) is False
+
+
+def test_a_refused_join_discards_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_devices: None
+) -> None:
+    """The discard waits for the enrollment. A bad or expired token must
+    leave the machine exactly as it was, not with its install removed and
+    no other to belong to."""
+    settings = settings_for(tmp_path)
+    state = AgentState(settings.config_file)
+    state.load()
+    _seed_control_plane(state, tmp_path)
+    FakeRoot(status=401).install(monkeypatch)
+
+    assert onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="expired"), settings) == 1
+    assert _declared(settings) == ["control", "gateway", "library"]
+
+
+@pytest.mark.parametrize(
+    ("setup", "reason"),
+    [
+        ("passphrase", "it has been set up (it has a passphrase)"),
+        ("extra-component", "it declares ollama, which only a person adds"),
+        ("runtime", "it has models declared to run"),
+    ],
+)
+def test_join_refuses_to_discard_an_install_someone_set_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_devices: None,
+    capsys: pytest.CaptureFixture[str],
+    setup: str,
+    reason: str,
+) -> None:
+    """Anything a person could have made is kept: joining over it would
+    leave two control roots in one install, which is what the seeding
+    rule exists to prevent. The refusal names the installer's uninstall,
+    never an API call or a file to edit."""
+    from eugene_plexus_agent._generated.models import EngineKind, RuntimeSpec
+
+    settings = settings_for(tmp_path)
+    state = AgentState(settings.config_file)
+    state.load()
+    _seed_control_plane(state, tmp_path)
+    if setup == "passphrase":
+        state.set_passphrase(passphrase_hash="$argon2id$h", master_salt_b64="c2FsdA==")
+    elif setup == "extra-component":
+        state.add_topology_entry(
+            ComponentEntry(
+                name="ollama",
+                kind=ComponentKind.inference_driver,
+                url="http://127.0.0.1:8081",  # type: ignore[arg-type]
+                spawn=SpawnConfig(configFile=str(tmp_path / "ollama.yaml")),
+            )
+        )
+    else:
+        state.add_runtime(
+            RuntimeSpec(
+                name="qwen",
+                engine=EngineKind.llama_cpp,
+                modelPath=str(tmp_path / "qwen.gguf"),
+                port=8090,
+            )
+        )
+    before = _declared(settings)
+    root = FakeRoot()
+    root.install(monkeypatch)
+
+    assert onboarding.run_join(JoinRequest(control_url=ROOT_URL, token="t"), settings) == 2
+    assert root.requests == []
+    assert _declared(settings) == before
+    err = capsys.readouterr().err
+    assert reason in err
+    assert "-Uninstall" in err and "--uninstall" in err
+    assert "DELETE /v1/components" not in err
+    assert "agent.yaml" not in err
+
+    # ...and the expert override still goes through, keeping everything,
+    # per the standing rule that a refusal must always leave a way past it.
     forced = JoinRequest(control_url=ROOT_URL, token="t", force=True)
     assert onboarding.run_join(forced, settings) == 0
     assert len(root.requests) == 1
+    assert _declared(settings) == before
 
 
 def test_join_reports_a_refusal_without_recording_anything(

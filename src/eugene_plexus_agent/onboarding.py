@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import node_identity
-from .default_topology import should_seed
+from .default_topology import DEFAULTS, should_seed
 from .enrollment import (
     EnrollmentError,
     EnrollmentOutcome,
@@ -177,21 +177,6 @@ def run_join(request: JoinRequest, settings: Settings) -> int:
         print(f"error: could not read {settings.config_file}: {exc}", file=sys.stderr)
         return 2
 
-    declared = [e.name for e in state.list_topology_entries()]
-    if declared and not request.force:
-        print(
-            "error: this machine already has components declared: " + ", ".join(sorted(declared)),
-            file=sys.stderr,
-        )
-        print(
-            "       Joining an install as a worker would leave a rival control plane\n"
-            "       running here. Remove them first (DELETE /v1/components/<name>, or\n"
-            f"       edit {settings.config_file}), or pass --force if you know they\n"
-            "       belong to the install you are joining.",
-            file=sys.stderr,
-        )
-        return 2
-
     identity = node_identity.NodeIdentityStore(
         settings.config_file.resolve().parent / node_identity.NODE_FILE
     )
@@ -201,11 +186,45 @@ def run_join(request: JoinRequest, settings: Settings) -> int:
         print(f"error: could not read the node identity file: {exc}", file=sys.stderr)
         return 2
 
+    declared = sorted(e.name for e in state.list_topology_entries())
+    discard: list[str] = []
+    if declared and not request.force:
+        kept_because = _why_components_are_kept(state, identity, declared)
+        if kept_because is not None:
+            print(
+                "error: this machine already runs an install of its own ("
+                + ", ".join(declared)
+                + f"), and {kept_because}.",
+                file=sys.stderr,
+            )
+            print(
+                "       Joining would leave that install's control root running beside the\n"
+                "       one you are joining. Uninstall it first with the installer\n"
+                "       (-Uninstall on Windows, --uninstall on Linux and macOS), then join\n"
+                "       again. Pass --force only if these components belong to the install\n"
+                "       you are joining.",
+                file=sys.stderr,
+            )
+            return 2
+        # Nobody ever set this one up, so it holds nothing a person put
+        # there. Discarded only after the enrollment succeeds, so a bad
+        # token leaves the machine exactly as it was.
+        discard = declared
+
     try:
         outcome = asyncio.run(_join(request, settings, state, identity))
     except EnrollmentError as exc:
         print(f"error: {exc.title.lower()}: {exc.detail}", file=sys.stderr)
         return 1
+
+    for name in discard:
+        state.remove_topology_entry(name)
+    if discard:
+        print(
+            "removed the control plane this machine had started on its own ("
+            + ", ".join(discard)
+            + "): nobody had set it up, so it held nothing."
+        )
 
     print(f"joined {request.control_url} as node {outcome.name!r} at epoch {outcome.epoch}.")
     print(f"identity written to {identity.path}.")
@@ -220,6 +239,41 @@ def run_join(request: JoinRequest, settings: Settings) -> int:
         )
     print("start the agent normally; it will not declare a control plane of its own.")
     return 0
+
+
+_SEEDED = frozenset(component.name for component in DEFAULTS)
+
+
+def _why_components_are_kept(
+    state: AgentState,
+    identity: node_identity.NodeIdentityStore,
+    declared: list[str],
+) -> str | None:
+    """Why the components declared here must survive a join, or None.
+
+    **A machine that started once without being told to join** (a plain
+    install, or the service coming up before anyone ran the join) seeds a
+    control plane of its own. Nobody can have put anything into it: the
+    console asks for a passphrase before any other page opens, and the
+    passphrase is what this reads. So a join discards it instead of
+    refusing. Troy, 2026-09-26: "Someone running a join cmd with a valid
+    token should be assumed to know what they're doing."
+
+    Anything a person could have made is kept, and the join refuses:
+    a passphrase (the wizard ran), an enrollment (this is a node of some
+    install already), a component the seed never declares, or a model
+    declared to run.
+    """
+    if state.has_passphrase():
+        return "it has been set up (it has a passphrase)"
+    if identity.record.enrolled:
+        return f"it is already joined to {identity.record.control_url}"
+    extra = sorted(set(declared) - _SEEDED)
+    if extra:
+        return "it declares " + ", ".join(extra) + ", which only a person adds"
+    if state.list_runtime_specs():
+        return "it has models declared to run"
+    return None
 
 
 async def _join(
