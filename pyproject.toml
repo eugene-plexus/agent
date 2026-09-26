@@ -38,6 +38,12 @@ dependencies = [
     # it was already here under [dev] because the test client needs it,
     # and a proxy that streams needs `client.send(stream=True)`.
     "httpx>=0.27,<1",
+    # Egress verifies certificates the way the OS does (`_http.py`,
+    # `egress_ssl_context`). On Windows that is the only verifier that
+    # fetches a root Windows has not downloaded yet: GitHub's chain ends at
+    # one, and on a fresh machine OpenSSL's read of the store failed it
+    # (2026-09-26).
+    "truststore>=0.10,<1",
 ]
 
 [project.optional-dependencies]

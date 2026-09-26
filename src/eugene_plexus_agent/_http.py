@@ -43,6 +43,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+import truststore
 
 # **Reentrant, and that is not decoration.** `shared_internal_client`
 # holds this lock while it builds a client, and building one calls
@@ -53,6 +54,7 @@ import httpx
 # is a hang that a full test run hides and a cold start reproduces.
 _LOCK = threading.RLock()
 _CONTEXT: ssl.SSLContext | None = None
+_EGRESS_CONTEXT: ssl.SSLContext | None = None
 
 
 def ssl_context() -> ssl.SSLContext:
@@ -68,6 +70,32 @@ def ssl_context() -> ssl.SSLContext:
             if _CONTEXT is None:
                 _CONTEXT = httpx.create_ssl_context()
     return _CONTEXT
+
+
+def egress_ssl_context() -> ssl.SSLContext:
+    """The context for the public internet: the OS verifies the certificate.
+
+    **Not certifi, and not OpenSSL's read of the Windows store.** Windows
+    ships only some of the roots it trusts and downloads the rest the
+    first time its own verifier needs one. GitHub's chain ends at such a
+    root (USERTrust ECC), so on a fresh machine Python's OpenSSL, which
+    reads the store and never triggers the download, failed the
+    certificate while PowerShell and every browser on the same machine
+    passed it. Found on a friend's first install, 2026-09-26: *"could not
+    reach the upstream release list"* on a machine that was online.
+
+    `truststore` hands the chain to the OS verifier (CertGetCertificateChain
+    on Windows, Security.framework on macOS, the system store on Linux),
+    which fetches a missing root, and trusts the roots an antivirus or a
+    company proxy installed, exactly as the browser does. Built once, for
+    the same reason as `ssl_context`.
+    """
+    global _EGRESS_CONTEXT
+    if _EGRESS_CONTEXT is None:
+        with _LOCK:
+            if _EGRESS_CONTEXT is None:
+                _EGRESS_CONTEXT = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return _EGRESS_CONTEXT
 
 
 def is_internal(url: str) -> bool:
@@ -104,22 +132,24 @@ def internal_client(**kwargs: Any) -> httpx.AsyncClient:
 def egress_client(**kwargs: Any) -> httpx.AsyncClient:
     """A client for the public internet. Honours the user's proxy
     environment, because that is how those users reach it at all."""
-    kwargs.setdefault("verify", ssl_context())
+    kwargs.setdefault("verify", egress_ssl_context())
     kwargs.setdefault("trust_env", True)
     return httpx.AsyncClient(**kwargs)
 
 
 def client_for(url: str, **kwargs: Any) -> httpx.AsyncClient:
     """Whichever of the two `url` calls for."""
-    kwargs.setdefault("trust_env", not is_internal(url))
-    kwargs.setdefault("verify", ssl_context())
+    internal = is_internal(url)
+    kwargs.setdefault("trust_env", not internal)
+    kwargs.setdefault("verify", ssl_context() if internal else egress_ssl_context())
     return httpx.AsyncClient(**kwargs)
 
 
 def sync_client_for(url: str, **kwargs: Any) -> httpx.Client:
     """`client_for`, for the few synchronous call sites."""
-    kwargs.setdefault("trust_env", not is_internal(url))
-    kwargs.setdefault("verify", ssl_context())
+    internal = is_internal(url)
+    kwargs.setdefault("trust_env", not internal)
+    kwargs.setdefault("verify", ssl_context() if internal else egress_ssl_context())
     return httpx.Client(**kwargs)
 
 
@@ -188,6 +218,7 @@ __all__ = [
     "aclose_shared",
     "client_for",
     "egress_client",
+    "egress_ssl_context",
     "internal_client",
     "is_internal",
     "reset_shared",

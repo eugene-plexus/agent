@@ -31,6 +31,9 @@ import json
 import logging
 import os
 import shutil
+import socket
+import ssl
+import sys
 import tarfile
 import time
 import urllib.error
@@ -39,8 +42,10 @@ import zipfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .._generated.models import EngineInstall, EngineKind, State
+from .._http import egress_ssl_context
 
 log = logging.getLogger(__name__)
 
@@ -157,6 +162,231 @@ class Unavailable:
 
 
 # --------------------------------------------------------------------------- #
+# Why upstream did not answer
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class FetchFailure:
+    """Why a request to upstream produced no answer, in words a person acts on.
+
+    **The cause is what was observed, never a guess.** Until 2026-09-26
+    every failure here — a 403 rate limit, a certificate an antivirus had
+    replaced, a DNS failure, a timeout — became *"could not reach the
+    upstream release list. Check network access"*, and the exception was
+    logged at DEBUG. A friend's first install said that on a machine whose
+    network, and whose copy of our own Python, both reached GitHub fine,
+    and nothing anywhere recorded what had actually happened.
+    """
+
+    #: What happened, as a clause: "api.github.com did not answer within 10 seconds".
+    cause: str
+    #: What to do about it, as whole sentences.
+    next_step: str
+    #: The exception as Python spelled it, for the log and nobody else.
+    detail: str
+
+    def sentence(self) -> str:
+        return f"{self.cause}. {self.next_step}"
+
+
+def _python_that_connects() -> str:
+    """The interpreter a firewall or antivirus sees making the connection.
+
+    On Windows a virtualenv's `python.exe` is a launcher that starts the
+    base interpreter as a child, so a program rule has to name the base
+    one — `sys.executable` names the launcher.
+    """
+    return getattr(sys, "_base_executable", None) or sys.executable
+
+
+def _github_message(error: urllib.error.HTTPError) -> str | None:
+    """GitHub's own words from an error body, when it sent JSON with a message."""
+    try:
+        body = error.read(4096)
+        message = json.loads(body.decode("utf-8", "replace")).get("message")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return message.strip() if isinstance(message, str) and message.strip() else None
+
+
+def _rate_limit_failure(error: urllib.error.HTTPError) -> FetchFailure | None:
+    """GitHub's anonymous limit is per network ADDRESS, not per machine.
+
+    A person who has made no requests at all can meet it, because a
+    provider that puts many customers behind one address (Starlink, mobile
+    data, carrier-grade NAT) shares the sixty between all of them.
+    """
+    headers = error.headers
+    remaining = headers.get("X-RateLimit-Remaining") if headers is not None else None
+    retry_after = headers.get("Retry-After") if headers is not None else None
+    detail = f"HTTPError {error.code}: {error.reason}"
+
+    if remaining == "0":
+        limit = headers.get("X-RateLimit-Limit") or "60"
+        when = "within the hour"
+        reset = headers.get("X-RateLimit-Reset")
+        if reset and reset.isdigit():
+            at = datetime.fromtimestamp(int(reset))
+            minutes = max(1, -(-(int(reset) - int(time.time())) // 60))
+            when = f"at {at:%H:%M} (in {minutes} minute{'s' if minutes != 1 else ''})"
+        return FetchFailure(
+            cause=(
+                f"GitHub's limit of {limit} requests an hour for this network's address is used up"
+            ),
+            next_step=(
+                f"It resets {when}. An address shared by many customers, as on "
+                f"Starlink or mobile data, can run out without this machine asking."
+            ),
+            detail=detail,
+        )
+    if error.code in (403, 429) and retry_after and retry_after.isdigit():
+        seconds = int(retry_after)
+        wait = f"{-(-seconds // 60)} minute(s)" if seconds >= 60 else f"{seconds} seconds"
+        return FetchFailure(
+            cause="GitHub is limiting requests from this network's address",
+            next_step=f"Try again in {wait}.",
+            detail=detail,
+        )
+    return None
+
+
+def _certificate_failure(
+    error: ssl.SSLCertVerificationError, *, host: str, detail: str
+) -> FetchFailure:
+    """A certificate this machine's own verifier refused, by why it refused.
+
+    Egress is verified by the OS (`_http.egress_ssl_context`), so the words
+    arrive in the OS's vocabulary: Windows says *"not within its validity
+    period"* where OpenSSL says *"certificate has expired"*, and both are
+    matched. Each reason sends a person somewhere different, so they are
+    not merged: a wrong clock is fixed on this machine, a wrong name means
+    something else answered, and an untrusted root means something replaced
+    the certificate or the OS was not allowed to fetch the root.
+    """
+    why = (error.verify_message or str(error)).strip().rstrip(".")
+    said = why.lower()
+    cause = f"this machine could not verify the security certificate {host} presented ({why})"
+    if "expired" in said or "not yet valid" in said or "validity period" in said:
+        next_step = (
+            "Check this machine's date and time. A clock that is far off makes "
+            "every certificate look invalid."
+        )
+    elif "match" in said or "mismatch" in said:
+        next_step = (
+            "The certificate belongs to a different name, so something else is "
+            "answering in GitHub's place, such as a sign-in page or a proxy."
+        )
+    else:
+        next_step = (
+            "Something between this machine and GitHub may be replacing its "
+            "certificate, such as a proxy or an antivirus's web protection whose "
+            "own certificate is not installed."
+        )
+        if sys.platform == "win32":
+            # The one machine-side cause of an untrusted root on Windows once
+            # the OS is the verifier: a hardened image that may not fetch one.
+            next_step += (
+                " Or Windows is not allowed to download root certificates (the "
+                'Group Policy setting "Turn off Automatic Root Certificates Update").'
+            )
+    return FetchFailure(cause=cause, next_step=next_step, detail=detail)
+
+
+def describe_fetch_failure(error: BaseException, *, url: str, timeout: float) -> FetchFailure:
+    """Classify a failed upstream request by what actually went wrong.
+
+    Order matters: `HTTPError` is a `URLError`, and a `URLError` wraps the
+    real cause in `.reason`, which may itself be an exception or a string.
+    """
+    host = urlparse(url).hostname or url
+    exe = _python_that_connects()
+    detail = f"{type(error).__name__}: {error}"
+
+    if isinstance(error, urllib.error.HTTPError):
+        limited = _rate_limit_failure(error)
+        if limited is not None:
+            return limited
+        said = _github_message(error)
+        status = f"HTTP {error.code} {error.reason}".strip()
+        if said and said.lower() != str(error.reason).lower():
+            status = f"{status}: {said}"
+        if error.code >= 500:
+            return FetchFailure(
+                cause=f"{host} answered with an error ({status})",
+                next_step="GitHub may be having trouble. Try again in a few minutes.",
+                detail=detail,
+            )
+        return FetchFailure(
+            cause=f"{host} turned the request down ({status})",
+            next_step="Try again later.",
+            detail=detail,
+        )
+
+    cause: BaseException | str = error
+    if isinstance(error, urllib.error.URLError):
+        cause = error.reason
+        if isinstance(cause, BaseException):
+            # `<urlopen error certificate verify failed>` hides the class
+            # that says which kind of failure it was.
+            detail = f"URLError({type(cause).__name__}): {cause}"
+
+    if isinstance(cause, ssl.SSLCertVerificationError):
+        return _certificate_failure(cause, host=host, detail=detail)
+    if isinstance(cause, ssl.SSLError):
+        return FetchFailure(
+            cause=f"the secure connection to {host} failed ({cause.reason or cause})",
+            next_step=(
+                "Something on this machine or network may be interfering with "
+                "secure connections, such as an antivirus's web protection or a "
+                f"proxy. Allow Eugene's Python through it: {exe}"
+            ),
+            detail=detail,
+        )
+    if isinstance(cause, socket.gaierror):
+        return FetchFailure(
+            cause=f"this machine could not look up the address of {host}",
+            next_step="Check the network connection and its DNS settings.",
+            detail=detail,
+        )
+    if isinstance(cause, TimeoutError):
+        return FetchFailure(
+            cause=f"{host} did not answer within {timeout:g} seconds",
+            next_step=(
+                "Check the network connection. A firewall that silently drops "
+                f"Eugene's traffic looks like this too; its Python is {exe}"
+            ),
+            detail=detail,
+        )
+    if isinstance(cause, ConnectionRefusedError):
+        return FetchFailure(
+            cause=f"the connection to {host} was refused",
+            next_step=f"A firewall or proxy may be blocking Eugene's Python: {exe}",
+            detail=detail,
+        )
+    if isinstance(cause, (ConnectionResetError, ConnectionAbortedError)):
+        return FetchFailure(
+            cause=f"the connection to {host} was cut off",
+            next_step=f"A firewall or antivirus may be blocking Eugene's Python: {exe}",
+            detail=detail,
+        )
+    if isinstance(cause, ValueError):
+        return FetchFailure(
+            cause=f"the answer from {host} was not GitHub's release list",
+            next_step=(
+                "A sign-in page or a proxy may be answering in GitHub's place. "
+                "Open any web page on this machine to check."
+            ),
+            detail=detail,
+        )
+    return FetchFailure(
+        cause=f"the request to {host} failed ({cause})",
+        next_step="Check the network connection.",
+        detail=detail,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # GitHub releases
 # --------------------------------------------------------------------------- #
 
@@ -185,6 +415,17 @@ class GitHubReleases:
         # Monotonic, like `_cached_at` and for the same reason: this one
         # gates a retry rather than being shown to anybody.
         self._failed_at: float | None = None
+        self._last_failure: FetchFailure | None = None
+
+    @property
+    def last_failure(self) -> FetchFailure | None:
+        """Why the most recent check produced no answer; `None` once one does.
+
+        An empty `list_releases()` alone cannot say whether upstream was
+        unreachable or answered with nothing usable. This is the half that
+        says which, and why.
+        """
+        return self._last_failure
 
     @property
     def checked_at(self) -> datetime | None:
@@ -227,16 +468,24 @@ class GitHubReleases:
         ):
             return self._cached or []
 
+        url = f"https://api.github.com/repos/{self._repo}/releases?per_page=30"
         try:
-            raw = self._fetch(f"https://api.github.com/repos/{self._repo}/releases?per_page=30")
+            raw = self._fetch(url)
         except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
             self._failed_at = now
-            log.debug(
-                "could not list releases for %s: %s; not asking again for %.0fs",
+            failure = describe_fetch_failure(e, url=url, timeout=_METADATA_TIMEOUT_SECONDS)
+            # A WARNING, because a person may be looking at the result — but
+            # once per distinct cause, not every five minutes all day.
+            repeated = self._last_failure is not None and self._last_failure.cause == failure.cause
+            log.log(
+                logging.DEBUG if repeated else logging.WARNING,
+                "could not list releases for %s: %s [%s]; asking again in %.0fs",
                 self._repo,
-                e,
+                failure.sentence(),
+                failure.detail,
                 self._failure_backoff_seconds,
             )
+            self._last_failure = failure
             return self._cached or []
 
         releases: list[Release] = []
@@ -264,9 +513,12 @@ class GitHubReleases:
                 )
             )
 
+        if self._last_failure is not None:
+            log.info("listed releases for %s again after: %s", self._repo, self._last_failure.cause)
         self._cached = releases
         self._cached_at = now
         self._failed_at = None
+        self._last_failure = None
         self._checked_at = datetime.now(UTC)
         return releases
 
@@ -279,7 +531,9 @@ class GitHubReleases:
                 "User-Agent": "eugene-plexus-agent",
             },
         )
-        with urllib.request.urlopen(request, timeout=_METADATA_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(
+            request, timeout=_METADATA_TIMEOUT_SECONDS, context=egress_ssl_context()
+        ) as response:
             return json.loads(response.read().decode("utf-8"))
 
 
@@ -566,7 +820,9 @@ def _download(asset: ReleaseAsset, target: Path, progress: _Progress) -> None:
     request = urllib.request.Request(asset.url, headers={"User-Agent": "eugene-plexus-agent"})
     try:
         with (
-            urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response,
+            urllib.request.urlopen(
+                request, timeout=_DOWNLOAD_TIMEOUT_SECONDS, context=egress_ssl_context()
+            ) as response,
             target.open("wb") as out,
         ):
             while True:
@@ -576,7 +832,11 @@ def _download(asset: ReleaseAsset, target: Path, progress: _Progress) -> None:
                 out.write(chunk)
                 progress.bytes_downloaded += len(chunk)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
-        raise AcquisitionError(f"downloading {asset.name} failed: {e}") from e
+        failure = describe_fetch_failure(e, url=asset.url, timeout=_DOWNLOAD_TIMEOUT_SECONDS)
+        log.warning(
+            "downloading %s failed: %s [%s]", asset.name, failure.sentence(), failure.detail
+        )
+        raise AcquisitionError(f"downloading {asset.name} failed: {failure.sentence()}") from e
 
 
 def _verify(asset: ReleaseAsset, archive: Path) -> None:

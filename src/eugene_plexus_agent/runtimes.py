@@ -1022,10 +1022,12 @@ def plan_for(
         # 2026-09-15 is not always the newest build with assets: a release
         # mid-upload has some and not ours.
         return adapter.plan_latest(detected)
-    release = next(
-        (r for r in adapter.releases.list_releases() if r.version == version),
-        None,
-    )
+    listed = adapter.releases.list_releases()
+    if not listed:
+        # Not "that build is not recent": nothing is listed at all, and
+        # the reason is the one the empty list carries.
+        return Unavailable(reason=adapter.no_release_list_reason())
+    release = next((r for r in listed if r.version == version), None)
     if release is None:
         return Unavailable(
             reason=(

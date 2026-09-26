@@ -195,6 +195,27 @@ class LlamaCppAdapter(EngineAdapter):
         builds = self.builds(force=force)
         return builds[0] if builds else None
 
+    def no_release_list_reason(self) -> str:
+        """Why there is no build to offer, when the list itself came back empty.
+
+        Two different situations, told apart by `last_failure`: GitHub never
+        answered (and here is what happened instead), or it answered and
+        none of the builds it listed carries a download. Until 2026-09-26
+        both read *"could not reach the upstream release list. Check network
+        access"*, which sent a person to a network that was working.
+        """
+        failure = self.releases.last_failure
+        fallback = "Or set `binary` on the runtime to a llama.cpp build you already have."
+        if failure is not None:
+            return (
+                f"could not get the list of llama.cpp builds from GitHub: "
+                f"{failure.sentence()} {fallback}"
+            )
+        return (
+            "GitHub's list of llama.cpp builds has no build with downloads in it "
+            f"right now. Try again in an hour. {fallback}"
+        )
+
     def plan_latest(
         self, host: HostAccelerator, *, force: bool = False
     ) -> AcquisitionPlan | Unavailable:
@@ -223,12 +244,7 @@ class LlamaCppAdapter(EngineAdapter):
         """
         builds = self.builds(force=force)
         if not builds:
-            return Unavailable(
-                reason=(
-                    "could not reach the upstream release list. Check network access, or "
-                    "set `binary` on the runtime to a build you already have."
-                )
-            )
+            return Unavailable(reason=self.no_release_list_reason())
         first: Unavailable | None = None
         for release in builds[:FALLBACK_BUILDS]:
             plan = self.plan_acquisition(host, release)
