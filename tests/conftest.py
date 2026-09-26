@@ -389,6 +389,18 @@ def _pin_host_environment_probes(app: FastAPI) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_port_held_elsewhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Allocate runtime and companion ports as if nothing else held any.
+
+    Whether 8090 is free depends on the machine: a developer's box running
+    a live install holds it, CI does not. Tests about holding override this.
+    """
+    from eugene_plexus_agent import state as state_module
+
+    monkeypatch.setattr(state_module, "_held_elsewhere", lambda port: False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:
         monkeypatch.delenv(key, raising=False)

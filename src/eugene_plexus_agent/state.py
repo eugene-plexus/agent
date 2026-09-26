@@ -44,7 +44,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from . import model_copies, model_paths, share_credentials
+from . import model_copies, model_paths, ports, share_credentials
 from ._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -415,6 +415,15 @@ def _config_defaults() -> dict[str, Any]:
     return {f.key: f.default for f in CONFIG_FIELDS if f.default is not None}
 
 
+def _held_elsewhere(port: int) -> bool:
+    """Something outside this install's records holds `port` on this machine now.
+
+    A seam as well as a probe: tests pin it, because whether 8090 is free
+    depends on the machine the suite happens to run on.
+    """
+    return not ports.is_free(port)
+
+
 class AgentState:
     """Threadsafe owner of `agent.yaml`. Single lock, single file write.
 
@@ -753,13 +762,14 @@ class AgentState:
     def allocate_component_port(self) -> int:
         """A free port for a component the agent declares itself — the
         companion driver. Same range as runtimes, checked against both,
-        so a companion never lands on a port a later runtime gets."""
+        so a companion never lands on a port a later runtime gets, and
+        against the machine, so it never lands on one something else holds."""
         with self._lock:
             taken = self._component_ports_locked() | {
                 other.port for other in self._runtimes.values() if other.port is not None
             }
             for candidate in range(_RUNTIME_PORT_BASE, _RUNTIME_PORT_BASE + _RUNTIME_PORT_SPAN):
-                if candidate not in taken:
+                if candidate not in taken and not _held_elsewhere(candidate):
                     return candidate
         raise ValueError(
             f"no free port in {_RUNTIME_PORT_BASE}-{_RUNTIME_PORT_BASE + _RUNTIME_PORT_SPAN - 1} "
@@ -776,6 +786,14 @@ class AgentState:
         useless there. With N runtimes nobody should be handing out port
         numbers by hand. Component URL ports count as taken too, since
         companion drivers are allocated from the same range.
+
+        **And so does a port something else on the machine holds.** The
+        install's own records say nothing about another Eugene install, a
+        second agent, or the operator's own llama-server on 8090 -- and on
+        Windows a second bind can share a port rather than fail. The same
+        socket probe first-boot seeding uses (`ports.is_free`). A port the
+        operator picks is kept even when held: an explicit value wins, and
+        the engine's own failure then says what holds it.
         """
         taken = {
             other.port
@@ -788,7 +806,7 @@ class AgentState:
             return spec
 
         for candidate in range(_RUNTIME_PORT_BASE, _RUNTIME_PORT_BASE + _RUNTIME_PORT_SPAN):
-            if candidate not in taken:
+            if candidate not in taken and not _held_elsewhere(candidate):
                 return spec.model_copy(update={"port": candidate})
         raise ValueError(
             f"no free port in {_RUNTIME_PORT_BASE}-"
