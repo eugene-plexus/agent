@@ -301,9 +301,9 @@ def _reachable_url(snapshot: _Snapshot, node: str, subject: str) -> str:
     if is_loopback_host(advertise_host(url)):
         raise InstallLookupError(
             f"{subject} on node {node!r}, which advertises {url} -- a loopback address, "
-            "reachable only from that host. Set `advertiseUrl` in that node's agent config "
-            "to the address other hosts use for it (the same one you type in the browser); "
-            "it re-announces itself immediately."
+            "reachable only from that host. Set that node's Advertise address (Config -> "
+            f"Agent @ {node}, `advertiseUrl`) to the address other hosts use for it, the same "
+            "one you type in the browser, port included; it re-announces itself immediately."
         )
     return url
 

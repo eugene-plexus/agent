@@ -187,6 +187,9 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
     identity = getattr(request.app.state, "node_identity", None)
     record = identity.record if identity is not None else None
     if record is None or not record.enrolled or not record.control_url:
+        request.state.library_unavailable = (
+            "This machine runs no Library and has not joined an install that has one."
+        )
         return None
     try:
         remote = await install_topology(request).owner_of(
@@ -196,7 +199,10 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
             transport=getattr(request.app.state, "control_transport", None),
         )
     except install_proxy.InstallLookupError as exc:
-        log.info(
+        # Kept for the Folders page and the refusal: this is the whole
+        # reason no folder's mount applies on this machine (2026-09-27).
+        request.state.library_unavailable = f"The install's Library could not be found: {exc}"
+        log.warning(
             "no library on this node, and the install's could not be found (%s); "
             "admission measures by file size",
             exc,
@@ -206,6 +212,10 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
         # The registry says the library is here and this topology has
         # none. A disagreement the console hop reports; here it means
         # there is nothing to ask.
+        request.state.library_unavailable = (
+            f"The install's registry says the Library runs on this machine "
+            f"({record.name}), and this machine runs none."
+        )
         return None
     # An `agent` token addressed to the library's machine: the owner's
     # proxy forwards it to its local library unchanged, and it is good
@@ -246,7 +256,10 @@ async def refresh_library_folders(request: Request) -> bool:
     cache = folder_cache_for(request)
     answered = False
     if cache is not None:
-        answered = await library_folders.refresh(cache, await library_client_for(request))
+        library = await library_client_for(request)
+        answered = await library_folders.refresh(
+            cache, library, unavailable=getattr(request.state, "library_unavailable", None)
+        )
     request.state.library_folders_refreshed = answered
     return answered
 
@@ -315,7 +328,9 @@ def _reserve(request: Request, spec: RuntimeSpec, admission: Admission | None) -
 async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
-    await refresh_library_folders(request)
+    consulted = await refresh_library_folders(request)
+    cache = folder_cache_for(request)
+    folders_unread = None if consulted or cache is None else cache.failure
     detector = getattr(request.app.state, "device_detector", None) or detect_devices
     snapshot = await asyncio.to_thread(detector)
     observed = [(other, _compose(other, supervisor).status) for other in state.list_runtime_specs()]
@@ -343,6 +358,7 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
         size_of=getattr(request.app.state, "model_size_of", None),
         mappings=effective_rules_for(request),
         node_name=node_name,
+        folders_unread=folders_unread,
         exists=getattr(request.app.state, "model_exists", None),
         # So admission asks about the file a launch would actually open,
         # including this node's own copy when it holds one.
@@ -754,6 +770,9 @@ async def restart_runtime(request: Request, name: str) -> RestartResult:
     spec = state.get_runtime_spec(name)
     if spec is None:
         raise _not_found(name)
+    # A restart is a launch: it opens the model through the Library's
+    # folders as they are now, which is usually why someone pressed it.
+    await refresh_library_folders(request)
     supervisor = _supervisor(request)
     if supervisor is not None and not await supervisor.restart(name):
         # Nothing was supervised under that name — it is stopped or was

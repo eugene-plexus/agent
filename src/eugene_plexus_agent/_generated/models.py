@@ -2915,6 +2915,10 @@ class Runtime(BaseModel):
         description="Where **this host** opens the model: `modelPath` resolved\nthrough the Library folder's `mounts` for this OS and this\nnode's `pathMappings` overrides, or `modelPath` itself when\nno rule applies (M11; the folder half 2026-09-14). Observed,\nnever declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n\n**A local copy is resolved one step ahead of all of that**\n(`docs/design/node-local-model-copy.md`): where this node\nkeeps a valid copy of the file, `localPath` is the copy and\n`localPathSource` says `copy`. Turning the copy off reverts\nthis by itself, because nothing is stored — the answer is\nrecomputed on every read.\n",
     )
     localPathSource: RuntimeLocalPathSource | None = None
+    openedPath: str | None = Field(
+        None,
+        description="The model file the **running** process was started with,\nresolved exactly as `localPath` is, at that start. Null when\nno process is running (`stopped`, `exited`, `crashed`,\n`copying`).\n\n`localPath` is recomputed on every read, so the two differ\nexactly when the rules changed after this process started — a\nLibrary folder's mount, this node's overrides, or its local\ncopy. The process keeps the file it opened; a restart opens\n`localPath` instead. (2026-09-27: a folder change on ten nodes\nshould say which models still run from the old path, not ask\nanyone to reboot the nodes.)\n",
+    )
     localPathNote: str | None = Field(
         None,
         description='Why this node is **not** opening a local copy, when it is\nnot and the operator asked for one: not enough free space to\nleave the configured headroom, the copy failed, the source\ncould not be read. Absent when the copy was used, and absent\nwhen copying is switched off — a node that was never asked\nhas nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
@@ -3490,6 +3494,10 @@ class LibraryFolderReach(BaseModel):
     )
     libraryUrl: str | None = Field(
         None, description='Where the library was, or was looked for.'
+    )
+    libraryError: str | None = Field(
+        None,
+        description='Why the library could not be read on this call, when\n`libraryConsulted` is false, in the words of what failed: the\ninstall lookup (for instance a control host registered at a\nloopback address), the library\'s own refusal, or the\nconnection. Absent when the library answered.\n\nOn the wire because the failure is otherwise silent where it\nmatters: a worker that cannot read the folders applies no\nfolder\'s mount, and its launch is refused as "nothing exists\nat" the Library\'s own path — the mount the operator already\nset is never mentioned (2026-09-27, the live install).\n',
     )
     folders: list[LibraryFolderStatus]
 

@@ -291,6 +291,24 @@ def test_a_model_under_a_library_folder_is_declared_and_opens_at_the_inherited_m
     assert cache.path.exists()
 
 
+def test_a_restart_reads_the_folders_as_they_are_now(authed_client: TestClient) -> None:
+    """A restart is a launch; after a folder's mount moves on the root it is
+    the button that applies it, so it must not open the old copy's rule."""
+    cache = authed_client.app.state.library_folders  # type: ignore[attr-defined]
+    cache._windows = False
+    _install_library(authed_client, [{"path": "/models", "mounts": ["/mnt/models"]}])
+    assert (
+        authed_client.post("/v1/runtimes", json=_spec("/models/q.gguf", "kept")).status_code == 201
+    )
+    library = _install_library(authed_client, [{"path": "/models", "mounts": ["/mnt/nas"]}])
+
+    response = authed_client.post("/v1/runtimes/kept/restart")
+
+    assert response.status_code == 202, response.text
+    assert library.asked == 1
+    assert cache.folders[0].mounts == ("/mnt/nas",)
+
+
 def test_an_update_to_a_path_outside_the_library_is_refused_too(authed_client: TestClient) -> None:
     _install_library(authed_client, [{"path": "/models", "mounts": []}])
     assert (

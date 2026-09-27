@@ -97,7 +97,7 @@ def supervisor_for(
     # thing about Clear.
     def fake_spawn(spec: RuntimeSpec, adapter: Any) -> None:
         seen.append(spec.name)
-        sup._planners[spec.name] = SimpleNamespace(spec=spec, binary=None)
+        sup._planners[spec.name] = SimpleNamespace(spec=spec, binary=None, opened_path=None)
 
         async def stop() -> None:
             return None

@@ -447,6 +447,63 @@ def test_the_test_button_walks_the_installs_library_too(
     assert "sizes match" in body["summary"]
 
 
+def _worker_whose_library_node_is_on_loopback(app: FastAPI) -> None:
+    """The live install, 2026-09-27: the container's own agent registered
+    itself at 127.0.0.1, so a worker's lookup of the Library refuses it."""
+    del app.state.library_fit_client
+    enroll(app, name="Amish_Station")
+    app.state.control_transport = control_transport(
+        [],
+        components=[{"node": "NAS", "name": "library", "kind": "library"}],
+        nodes=[
+            {"name": "NAS", "url": "http://127.0.0.1:8079/"},
+            {"name": "Amish_Station", "url": "http://192.168.16.75:8079/"},
+        ],
+    )
+
+
+def test_a_worker_that_cannot_read_the_folders_says_why_on_the_folders_page(
+    authed_client: TestClient,
+) -> None:
+    _worker_whose_library_node_is_on_loopback(authed_client.app)  # type: ignore[arg-type]
+
+    body = authed_client.post("/v1/library/folders/check", json={}).json()
+
+    assert body["libraryConsulted"] is False
+    assert "127.0.0.1:8079" in body["libraryError"]
+    assert "loopback" in body["libraryError"]
+    assert "advertiseUrl" in body["libraryError"]
+
+
+def test_a_refusal_with_no_folder_mount_applied_names_the_unread_folders(
+    authed_client: TestClient,
+) -> None:
+    """The live install's refusal said "nothing exists at /models/..." and
+    told the operator to set the mount they had already set."""
+    _worker_whose_library_node_is_on_loopback(authed_client.app)  # type: ignore[arg-type]
+    authed_client.app.state.model_exists = lambda p: False  # type: ignore[attr-defined]
+
+    body = authed_client.post(
+        "/v1/runtimes/admission",
+        json={"name": "m", "engine": "llama_cpp", "modelPath": "/models/q.gguf"},
+    ).json()
+
+    assert body["decision"] == "refuse"
+    reason = body["reason"]
+    assert "could not read the Library's folders" in reason
+    assert "127.0.0.1:8079" in reason
+    assert "mount that share here" not in reason
+
+
+def test_a_worker_that_reads_the_folders_again_forgets_the_old_failure(tmp_path: Path) -> None:
+    from eugene_plexus_agent.library_folders import LibraryFolderCache, parse_folders
+
+    cache = LibraryFolderCache(tmp_path / "library_folders.json", windows=True)
+    cache.note_failure("control host on loopback")
+    cache.update(parse_folders([{"path": "/models", "mounts": []}]), library_url=None)
+    assert cache.failure is None
+
+
 def test_an_unreachable_control_root_falls_back_to_file_size(
     authed_client: TestClient, tmp_path: Path
 ) -> None:

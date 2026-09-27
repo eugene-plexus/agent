@@ -77,6 +77,7 @@ from ._generated.models import (
 )
 from ._http import internal_client, shared_internal_client
 from .engines.devices import DeviceSnapshot
+from .enrollment import problem_detail
 from .model_paths import PathRule, resolve_model_path
 from .reservations import Reservation, held_bytes
 
@@ -202,6 +203,9 @@ class LibraryFitClient:
         # socket; production leaves it None.
         self._transport = transport
         self._own_client: httpx.AsyncClient | None = None
+        self.last_error: str | None = None
+        """Why the last folder read returned None, for the node's copy to
+        keep and the Folders page to show."""
 
     def _client(self) -> httpx.AsyncClient:
         """The client these three reads share.
@@ -246,16 +250,28 @@ class LibraryFitClient:
         """The library's folders with their mounts, raw -- what this node
         inherits its path rules from (2026-09-14). None when it could not
         answer, and the node keeps its last copy."""
+        self.last_error = None
         try:
             client = self._client()
             response = await client.get(f"{self._base}/v1/folders", headers=self._headers)
             if response.status_code >= 400:
-                log.info("library folder list returned %d", response.status_code)
+                self.last_error = (
+                    f"The Library at {self._base} answered {response.status_code}: "
+                    f"{problem_detail(response)}"
+                )
+                log.warning("library folder list: %s", self.last_error)
                 return None
             folders = response.json().get("folders")
-            return folders if isinstance(folders, list) else None
+            if isinstance(folders, list):
+                return folders
+            self.last_error = f"The Library at {self._base} answered without a folder list."
+            return None
         except (httpx.HTTPError, ValueError) as e:
-            log.info("library unreachable for its folder list (%s)", e)
+            # A timeout's text is the empty string; its type is the reason.
+            self.last_error = (
+                f"The Library at {self._base} could not be reached: {e or type(e).__name__}"
+            )
+            log.warning("library folder list: %s", self.last_error)
             return None
 
     async def fit(
@@ -857,6 +873,7 @@ async def check_admission(
     node_name: str | None = None,
     exists: Callable[[str], bool] | None = None,
     copy_settings: model_copies.CopySettings | None = None,
+    folders_unread: str | None = None,
 ) -> Admission:
     """Measure `spec` against the device it targets, right now.
 
@@ -865,7 +882,9 @@ async def check_admission(
     `exists` is its sibling for the file being there at all. `mappings`
     are this node's `pathMappings`, applied to `modelPath` before
     anything on disk is asked about it (M11); `node_name` is for the
-    refusal's prose.
+    refusal's prose. `folders_unread` is why this node could not read the
+    Library's folders on this request, when it could not: then no folder's
+    mount may have applied, and the refusal has to say so.
     """
     sizer = size_of or model_size_bytes
     is_there = exists or path_exists
@@ -884,7 +903,12 @@ async def check_admission(
     location = await asyncio.to_thread(_locate, spec, mappings, is_there, sizer, copy_settings)
     if not location.exists:
         return _refuse_missing(
-            spec, location, node_name=node_name, context_length=context_length, warnings=warnings
+            spec,
+            location,
+            node_name=node_name,
+            context_length=context_length,
+            warnings=warnings,
+            folders_unread=folders_unread,
         )
 
     if not targets:
@@ -1210,11 +1234,22 @@ def _refuse_missing(
     node_name: str | None,
     context_length: int | None,
     warnings: list[str],
+    folders_unread: str | None = None,
 ) -> Admission:
     """The one launch failure the dry run can predict with certainty."""
     where = f"on {node_name}" if node_name else "on this host"
     tab = f"Library -> {node_name or 'this machine'} -> Folders"
-    if location.mapping is None:
+    if location.mapping is None and folders_unread:
+        # Not "set a mount": the operator may well have set one. This node
+        # could not read the folders, so none of their mounts applied and
+        # the Library's own spelling was tried (2026-09-27, the live
+        # install, whose control host was registered at 127.0.0.1).
+        fix = (
+            f"Nothing exists at {location.localPath}, and no Library folder's mount was "
+            f"applied, because {node_name or 'this machine'} could not read the Library's "
+            f"folders. {folders_unread}"
+        )
+    elif location.mapping is None:
         fix = (
             f"Nothing exists at {location.localPath}. If these files live on another machine "
             f"-- the Library's own folder, say -- mount that share here and say where: on the "

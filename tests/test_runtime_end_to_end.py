@@ -240,6 +240,57 @@ async def test_stop_releases_the_process(fake_engine: Path) -> None:
         runtimes_module.ADAPTERS.update(original)
 
 
+async def test_a_running_engine_says_which_file_it_opened_after_the_rules_move(
+    fake_engine: Path,
+) -> None:
+    """`openedPath` is what the running process was handed; `localPath` is
+    what the next start would open (2026-09-27).
+
+    A Library folder's mount changed on the root: the page must be able to
+    name the models still running from the old path, and a restart must
+    move them to the new one.
+    """
+    port = 8396
+    spec = _spec(port)
+    config: dict[str, Any] = {"pathMappings": [{"from": "/models", "to": "Y:\\models"}]}
+    supervisor = RuntimeSupervisor(log=logging.getLogger("test"), get_config=config.get)
+    adapter = _FakeEngineAdapter(fake_engine, ready_after=0.0)
+
+    from eugene_plexus_agent import runtimes as runtimes_module
+
+    original = runtimes_module.ADAPTERS.copy()
+    runtimes_module.ADAPTERS[spec.engine] = adapter
+    old = "Y:\\models\\Qwen3-30B-A3B-Q4_K_M.gguf"
+    new = "\\\\NAS\\models\\Qwen3-30B-A3B-Q4_K_M.gguf"
+    try:
+        # Declared but not started: nothing is open.
+        assert supervisor.compose(spec).openedPath is None
+
+        supervisor.add_and_start(spec)
+        await supervisor.start_readiness_loop(lambda: [spec])
+        assert await _await_status(supervisor, spec, RuntimeStatus.ready) == RuntimeStatus.ready
+        runtime = supervisor.compose(spec)
+        assert runtime.openedPath == old
+        assert runtime.localPath == old
+
+        # The mount moves under the running process.
+        config["pathMappings"] = [{"from": "/models", "to": "\\\\NAS\\models"}]
+        runtime = supervisor.compose(spec)
+        assert runtime.localPath == new
+        assert runtime.openedPath == old
+
+        assert await supervisor.restart(spec.name)
+        assert await _await_status(supervisor, spec, RuntimeStatus.ready) == RuntimeStatus.ready
+        assert supervisor.compose(spec).openedPath == new
+
+        await supervisor.stop_one(spec.name)
+        assert supervisor.compose(spec).openedPath is None
+    finally:
+        await supervisor.stop_all()
+        runtimes_module.ADAPTERS.clear()
+        runtimes_module.ADAPTERS.update(original)
+
+
 async def test_a_crash_during_load_is_not_automatically_retried(
     fake_engine: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -285,6 +336,9 @@ async def test_a_crash_during_load_is_not_automatically_retried(
         assert "restart" in runtime.lastError
         assert "retry" in runtime.lastError
         assert runtime.pid is None
+        # Nothing holds the file any more: a crashed runtime is not listed as
+        # "still on the old path" after a folder's mount moves.
+        assert runtime.openedPath is None
     finally:
         await supervisor.stop_all()
 

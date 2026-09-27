@@ -84,6 +84,9 @@ log = logging.getLogger(__name__)
 # heavier answer than `/healthz`.
 _READINESS_POLL_SECONDS = 2.0
 
+# The statuses in which a process holds the file its plan opened.
+_PROCESS_RUNNING = frozenset({RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.ready})
+
 # `key -> value` over the agent's own config. What an adapter's
 # `configured_binary_key` is read through: config lives in `AgentState`,
 # adapters are stateless singletons, and the two meet here.
@@ -165,6 +168,10 @@ class _RuntimePlanner:
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
         so the operator sees the build that is actually running rather than
         whatever is on PATH now."""
+        self.opened_path: str | None = None
+        """The model path the last plan handed the engine. Read for
+        `Runtime.openedPath`, because `localPath` is recomputed on every
+        read and a folder's mount can change under a running process."""
 
     @property
     def name(self) -> str:
@@ -204,6 +211,7 @@ class _RuntimePlanner:
         # the adapter carries the resolved local path, and that is the
         # only place the two differ.
         launch_spec = self._launch_spec()
+        self.opened_path = launch_spec.modelPath
         argv = self._adapter.build_argv(launch_spec, binary, port)
 
         # Engines inherit the ambient environment, then the adapter's own
@@ -786,6 +794,11 @@ class RuntimeSupervisor:
             # a stopped runtime shows what its next start would open.
             localPath=local_path,
             localPathSource=RuntimeLocalPathSource(resolved.source),
+            # What the process that is running now was handed. Differs
+            # from localPath exactly when the rules moved since it started.
+            openedPath=(
+                planner.opened_path if planner is not None and status in _PROCESS_RUNNING else None
+            ),
             # Only when a copy was asked for and is not being used --
             # otherwise there is nothing to explain, and a note on every
             # runtime would train the operator to ignore the one that

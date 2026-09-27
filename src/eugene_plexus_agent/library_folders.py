@@ -119,8 +119,21 @@ class LibraryFolderCache:
         self._fetched_at: float | None = None
         self._library_url: str | None = None
         self._windows = host_is_windows() if windows is None else windows
+        self._failure: str | None = None
 
     # --- state -------------------------------------------------------------
+
+    @property
+    def failure(self) -> str | None:
+        """Why the last read did not happen, in the words of what failed;
+        None once one succeeds (2026-09-27). The live install's worker spent
+        a day refusing launches as "nothing exists at /models/..." because
+        this lived only in an INFO log: its control host was registered at
+        127.0.0.1, so no folder's mount was ever applied."""
+        return self._failure
+
+    def note_failure(self, reason: str) -> None:
+        self._failure = reason
 
     @property
     def path(self) -> Path:
@@ -172,6 +185,7 @@ class LibraryFolderCache:
         now: float | None = None,
     ) -> None:
         """A fresh answer from the library: hold it and write it down."""
+        self._failure = None
         self._folders = list(folders)
         self._fetched_at = time.time() if now is None else now
         self._library_url = library_url
@@ -232,17 +246,29 @@ class FolderSource(Protocol):
     async def folders(self) -> list[dict[str, Any]] | None: ...
 
 
-async def refresh(cache: LibraryFolderCache, library: object | None) -> bool:
+async def refresh(
+    cache: LibraryFolderCache, library: object | None, *, unavailable: str | None = None
+) -> bool:
     """Ask `library` for its folders and hold the answer. False when there
-    was no library to ask or it did not answer; the copy stands."""
+    was no library to ask or it did not answer; the copy stands, and the
+    cache keeps why -- `unavailable` when there was nothing to ask, else
+    what the library's client said."""
     if library is None or not hasattr(library, "folders"):
+        # Every production path that finds no library says why; nothing
+        # known is nothing to report.
+        if unavailable:
+            cache.note_failure(unavailable)
         return False
     try:
         answer = await library.folders()
     except Exception as exc:  # a management-plane call must not fail a launch
-        log.info("library folders could not be read (%s); keeping the last copy", exc)
+        log.warning("library folders could not be read (%s); keeping the last copy", exc)
+        cache.note_failure(f"Reading the Library's folders failed: {exc}")
         return False
     if answer is None:
+        cache.note_failure(
+            getattr(library, "last_error", None) or "The Library did not answer with its folders."
+        )
         return False
     cache.update(parse_folders(answer), library_url=getattr(library, "base_url", None))
     return True
@@ -332,6 +358,7 @@ def check_reach(
         libraryConsulted=library_consulted,
         folderListAgeSeconds=0 if library_consulted else cache.age_seconds(now=now),
         libraryUrl=cache.library_url,
+        libraryError=None if library_consulted else cache.failure,
         folders=rows,
     )
 
