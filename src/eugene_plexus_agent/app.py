@@ -59,6 +59,7 @@ from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import directories as directories_routes
 from .routes import health as health_routes
+from .routes import logs as logs_routes
 from .routes import node as node_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
@@ -710,6 +711,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(node_routes.router)
     # Checking for and installing a newer version; operator-only.
     app.include_router(update_routes.router)
+    app.include_router(logs_routes.router)
 
     # The browser surface, registered LAST and in this order. The proxy
     # is deliberately unauthenticated — it is the path the login request

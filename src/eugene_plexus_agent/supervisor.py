@@ -578,6 +578,15 @@ class SupervisedProcess:
     def name(self) -> str:
         return self._planner.name
 
+    @property
+    def supervising(self) -> bool:
+        """Whether the supervision loop is still running -- through back-off
+        and respawns included. False once it has given up (the crash limit,
+        or a model load that failed) or before it was started: the record
+        is kept so its last error can still be read, and nothing is on its
+        way up."""
+        return self._task is not None and not self._task.done()
+
     # --- public lifecycle --------------------------------------------------
 
     def start(self) -> None:

@@ -1155,6 +1155,30 @@ class UpdateOutcome(StrEnum):
     failed = 'failed'
 
 
+class LogLine(BaseModel):
+    time: AwareDatetime | None = Field(
+        ...,
+        description="When the agent received the line, UTC. Null for a line written\nbefore lines were stamped that carries no time of its own, and\nfor the updater's log.\n",
+    )
+    source: str = Field(
+        ...,
+        description='`agent`, or the supervised child the line came from as the\nsupervisor names it (`gateway`, `library`, `control`,\n`engine: qwen`, a companion driver), or `update`.\n',
+    )
+    text: str = Field(..., description='The line, with tokens and API keys masked.')
+
+
+class LogPage(BaseModel):
+    lines: list[LogLine] = Field(
+        ..., description='Oldest first; the last is the newest that matched.'
+    )
+    sources: list[str] = Field(
+        ..., description='Every source seen in the part of the log read, for a picker.'
+    )
+    truncated: bool = Field(
+        ..., description='Older matching lines exist beyond `tail`.'
+    )
+
+
 class UpdateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',

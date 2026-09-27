@@ -20,6 +20,9 @@ Defaults are hardcoded and require no operator action:
   - Path: `<config_file dir>/logs/agent.log`
     (i.e. next to `agent.yaml`, wherever the operator chose to put it)
   - 10 MB per file, 5 backups (50 MB max disk per stream)
+  - Each line stamped at receipt in UTC and tagged with its source
+    (`logs.stamp`), and published for anyone following (`logs.BUS`);
+    `GET /v1/logs` reads it back (2026-09-27)
 
 Tuning these would mean adding fields to the config_store + UI controls
 — deferred to v0.3 along with the rest of the logging-config UX.
@@ -37,6 +40,8 @@ import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TextIO
+
+from . import logs
 
 # SGR (Select Graphic Rendition) escapes — the `\x1b[<n>;<n>m` family
 # used by `supervisor._colorize_alerts` for red/yellow inline coloring.
@@ -74,7 +79,12 @@ class _TeeStream(io.TextIOBase):
                     break
                 line = self._buf[:nl]
                 self._buf = self._buf[nl + 1 :]
-                self._capture.info(_ANSI_SGR_RE.sub("", line))
+                # Stamped at receipt and tagged with its source, so the
+                # Logs page can put an engine's lines on a timeline and
+                # interleave machines (2026-09-27; `logs.stamp`).
+                stamped = logs.stamp(_ANSI_SGR_RE.sub("", line.rstrip("\r")))
+                self._capture.info(stamped)
+                logs.BUS.publish(stamped)
         return len(data)
 
     def flush(self) -> None:

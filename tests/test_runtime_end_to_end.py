@@ -339,6 +339,16 @@ async def test_a_crash_during_load_is_not_automatically_retried(
         # Nothing holds the file any more: a crashed runtime is not listed as
         # "still on the old path" after a folder's mount moves.
         assert runtime.openedPath is None
+
+        # Start is a new attempt, not "already running; nothing to do": the
+        # record of the failed load is kept to be read, not to block
+        # (2026-09-27, the live install).
+        assert supervisor.is_running(spec.name) is False
+        supervisor.add_and_start(spec)
+        async with asyncio.timeout(2):
+            while len(processes) < 2:
+                await original_sleep(0)
+        assert len(processes) == 2
     finally:
         await supervisor.stop_all()
 

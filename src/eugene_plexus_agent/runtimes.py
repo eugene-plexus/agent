@@ -412,8 +412,16 @@ class RuntimeSupervisor:
         """Begin supervising a runtime. Declared-but-not-started when
         `autoStart` is false — that is how a rarely-used large model stays
         configured without holding VRAM."""
-        if spec.name in self._processes:
-            return
+        existing = self._processes.get(spec.name)
+        if existing is not None:
+            if existing.supervising:
+                return
+            # A loop that gave up -- a load that failed, or the crash limit
+            # -- keeps its record so the error stays readable. Start means
+            # try again, from a fresh plan; answering "already running"
+            # made Start a silent no-op on exactly the runtime that needed
+            # it (2026-09-27, the live install).
+            self._forget_ended(spec.name)
         if spec.autoStart is False:
             self._planners.pop(spec.name, None)
             self._stop_reasons.setdefault(spec.name, StopReason.autoStart)
@@ -611,6 +619,15 @@ class RuntimeSupervisor:
         settings = self.copy_settings()
         return model_copies.clear(settings.directory, in_use=self._copies_in_use())
 
+    def _forget_ended(self, name: str) -> None:
+        """Drop the record of a supervision loop that has already ended.
+        Nothing is running, so nothing is stopped."""
+        self._processes.pop(name, None)
+        self._planners.pop(name, None)
+        self._readiness.pop(name, None)
+        self._proved_ready.pop(name, None)
+        self._load_progress.forget(name)
+
     async def remove_and_stop(self, name: str) -> None:
         await self._cancel_copy(name)
         sp = self._processes.pop(name, None)
@@ -702,7 +719,8 @@ class RuntimeSupervisor:
         been spawned yet, but a second Start would begin a second copy
         of the same 25 GB file into the same destination.
         """
-        return name in self._processes or name in self._copy_jobs
+        sp = self._processes.get(name)
+        return (sp is not None and sp.supervising) or name in self._copy_jobs
 
     async def _cancel_copy(self, name: str) -> None:
         """Stop a copy in flight and wait for its thread to notice."""

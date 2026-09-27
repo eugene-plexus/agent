@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+from eugene_plexus_agent import logs
 from eugene_plexus_agent.console_logging import (
     _ANSI_SGR_RE,
     _TeeStream,
@@ -98,7 +99,11 @@ def test_tee_buffers_partial_lines_until_newline(tmp_path: Path) -> None:
     tee.write("hello ")  # no newline yet
     assert seen == []
     tee.write("world\n")  # completes the line
-    assert seen == ["hello world"]
+    # One record, stamped at receipt and tagged (2026-09-27, `logs.stamp`).
+    assert len(seen) == 1
+    assert logs.parse(seen[0]).text == "hello world"
+    assert logs.parse(seen[0]).source == "agent"
+    assert logs.parse(seen[0]).time is not None
 
 
 def test_install_is_idempotent_within_a_process(tmp_path: Path) -> None:
