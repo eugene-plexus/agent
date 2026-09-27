@@ -53,6 +53,7 @@ from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 from ._http import internal_client
 from .auth_state import AuthState
 from .child_env import child_environment, reserved_override
+from .exit_codes import explain_windows_exit
 
 # How long an exiting child gets to finish flushing before we SIGKILL it
 # during agent shutdown. Long enough for a /v1/admin/restart-style
@@ -704,10 +705,16 @@ class SupervisedProcess:
         if collision is not None:
             return collision
         try:
-            return self._planner.explain_exit(return_code, tail)
+            explained = self._planner.explain_exit(return_code, tail)
         except Exception:
             self._log.exception("%s: explaining the exit failed", self.name)
-            return None
+            explained = None
+        if explained is not None:
+            return explained
+        # Last, because a planner knows its own program's messages better,
+        # and Windows' own status is the one thing every child shares.
+        windows = explain_windows_exit(return_code)
+        return f"{self.name} exited: {windows}" if windows else None
 
     async def _pipe_child_output(self, stream: asyncio.StreamReader | None) -> None:
         """Drain a child's stdout/stderr pipe and re-emit each line with
