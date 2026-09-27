@@ -43,6 +43,7 @@ from ..admission import (
     PENDING_STATUSES,
     LibraryFitClient,
     RunningRuntime,
+    admission_split,
     check_admission,
 )
 from ..companions import (
@@ -306,6 +307,7 @@ def _reserve(request: Request, spec: RuntimeSpec, admission: Admission | None) -
         spec.name,
         device_index=admission.device.index if admission.device is not None else None,
         size_bytes=admission.requiredBytes,
+        shares=admission_split(spec, admission, _ledger(request).entries()),
     )
 
 

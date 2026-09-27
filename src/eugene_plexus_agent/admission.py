@@ -15,9 +15,13 @@ is the behaviour this replaces.
 Two inputs, both measured on the host that will spawn:
 
 * **Free memory per device**, live, from `engines/devices.py`. The
-  budget is the *largest single* target device's free memory, because
-  llama.cpp's default split is by layers and a model that fits across
-  two cards and on neither is `split`, not `fits`.
+  budget is one card's free memory, or, for a launch the engine spreads
+  across several cards (`place`), what those cards have free between
+  them. Until 2026-09-27 it was always the largest single card, on the
+  reasoning that a model which fits across two cards and on neither is
+  `split` -- which is wrong: llama.cpp puts whole layers on each card,
+  so that model runs entirely in GPU memory, and `split` made admission
+  refuse it.
 * **Required bytes**, from the library's fit computation when a
   `library` component is in this agent's topology (the same arithmetic
   the discovery screen shows, at the context this spec asks for), and
@@ -176,6 +180,7 @@ class FitSource(Protocol):
         vram_bytes: int | None,
         ram_bytes: int | None,
         unified_memory: bool = False,
+        gpu_count: int = 1,
     ) -> LibraryFit | None: ...
 
 
@@ -260,6 +265,7 @@ class LibraryFitClient:
         vram_bytes: int | None,
         ram_bytes: int | None,
         unified_memory: bool = False,
+        gpu_count: int = 1,
     ) -> LibraryFit | None:
         try:
             client = self._client()
@@ -290,6 +296,8 @@ class LibraryFitClient:
                 params["ramBytes"] = ram_bytes
             if unified_memory:
                 params["unifiedMemory"] = "true"
+            if gpu_count > 1:
+                params["gpuCount"] = gpu_count
             response = await client.get(
                 f"{self._base}/v1/models/{quote(str(model['id']), safe='')}/fit",
                 params=params,
@@ -382,6 +390,205 @@ def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeD
     # A pin to a device this host does not have is an engine error at
     # spawn; admission measures against everything rather than nothing.
     return chosen or accelerators
+
+
+# --- which cards a launch uses --------------------------------------------
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where one launch lands: one card, or every card it spreads across.
+
+    **Added 2026-09-27.** Admission used to take the largest single card
+    and score against it, and its own docstring said a model that fits
+    across two cards and on neither is `split`. That is not what split
+    means: llama.cpp puts whole layers on each card, so a model spread
+    across two 5090s runs entirely in GPU memory, and `split` (spilling
+    into system RAM) made a full-offload launch refuse a model the engine
+    would have served.
+    """
+
+    main: ComputeDevice
+    devices: tuple[ComputeDevice, ...]
+    shares: tuple[float, ...]
+    """Each card's fraction of the model, in `devices` order."""
+    free: int | None
+    total: int | None
+    reserved: int
+    budget: int | None
+    """What the verdict is computed against. For one card, its free
+    memory less what is reserved on it. For several, the most the model
+    can be while every card's share still fits in what that card has
+    left, which is the sum when the shares follow free memory."""
+
+    @property
+    def spread(self) -> bool:
+        return len(self.devices) > 1
+
+
+def _int_flag(value: object, default: int) -> int:
+    try:
+        return int(value) if value is not None else default  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return default
+
+
+def spread_devices(spec: RuntimeSpec, targets: list[ComputeDevice]) -> list[ComputeDevice]:
+    """The cards one launch of `spec` spreads the model across, if several.
+
+    * **llama.cpp** splits across every visible card unless `splitMode`
+      is `none` (then it uses one, `mainGpu`). Visible means what
+      `target_devices` already narrowed by `CUDA_VISIBLE_DEVICES` or
+      `HIP_VISIBLE_DEVICES`, so a runtime pinned to one card is one card.
+    * **vLLM** uses `tensorParallelSize` x `pipelineParallelSize` cards,
+      one by default.
+
+    Cards of one kind only: the build computes on one backend, and the
+    device list is ordered so the first accelerator is the one it uses.
+    Empty means one card.
+    """
+    accelerators = [d for d in targets if d.kind is not ComputeDeviceKind.cpu]
+    if len(accelerators) < 2:
+        return []
+    kind = accelerators[0].kind
+    same = [d for d in accelerators if d.kind is kind]
+    flags = spec.flags or {}
+    if spec.engine is EngineKind.llama_cpp:
+        if str(flags.get("splitMode") or "").strip().lower() == "none":
+            return []
+        return same if len(same) > 1 else []
+    if spec.engine is EngineKind.vllm:
+        count = _int_flag(flags.get("tensorParallelSize"), 1) * _int_flag(
+            flags.get("pipelineParallelSize"), 1
+        )
+        return same[:count] if count > 1 and len(same) > 1 else []
+    return []
+
+
+def split_shares(
+    spec: RuntimeSpec,
+    devices: Sequence[ComputeDevice],
+    spare: Callable[[ComputeDevice], int | None],
+) -> list[float]:
+    """Each card's fraction of the model, in order.
+
+    `tensorSplit` when the runtime sets it, as llama.cpp reads it: one
+    proportion per card in order, a missing one being zero. Otherwise
+    each card's share of the memory left free, which is llama.cpp's own
+    default (it splits by free memory). vLLM's tensor parallelism shards
+    evenly.
+    """
+    count = len(devices)
+    if spec.engine is EngineKind.vllm:
+        return [1.0 / count] * count
+    raw = (spec.flags or {}).get("tensorSplit")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            values = [float(part) for part in raw.split(",") if part.strip()]
+        except ValueError:
+            values = []
+        values = (values + [0.0] * count)[:count]
+        total = sum(v for v in values if v > 0)
+        if total > 0:
+            return [max(v, 0.0) / total for v in values]
+    spares = [max(spare(d) or 0, 0) for d in devices]
+    total_spare = sum(spares)
+    if total_spare <= 0:
+        return [1.0 / count] * count
+    return [s / total_spare for s in spares]
+
+
+def place(
+    spec: RuntimeSpec,
+    targets: list[ComputeDevice],
+    reservations: Sequence[Reservation] = (),
+) -> Placement:
+    """Which card, or cards, this launch measures against."""
+
+    def held(device: ComputeDevice) -> int:
+        return held_bytes(reservations, device_index=device.index, exclude=spec.name)
+
+    def spare(device: ComputeDevice) -> int | None:
+        free = device.memoryFreeBytes
+        return None if free is None else max(0, free - held(device))
+
+    spread = spread_devices(spec, targets)
+    if not spread:
+        # Largest single device by free memory -- the card the engine
+        # would have to fit on -- MINUS what this node has already
+        # promised to launches that have not taken their memory yet.
+        device = max(
+            targets, key=lambda d: (s if (s := spare(d)) is not None else -1, -(d.index or 0))
+        )
+        reserved = held(device)
+        free = device.memoryFreeBytes
+        return Placement(
+            main=device,
+            devices=(device,),
+            shares=(1.0,),
+            free=free,
+            total=device.memoryTotalBytes,
+            reserved=reserved,
+            budget=max(0, free - reserved) if free is not None else None,
+        )
+
+    shares = split_shares(spec, spread, spare)
+    kept = [(d, p) for d, p in zip(spread, shares, strict=True) if p > 0]
+    devices = tuple(d for d, _ in kept)
+    fractions = tuple(p for _, p in kept)
+    spares = [spare(d) for d in devices]
+    budget: int | None
+    if any(s is None for s in spares):
+        budget = None
+    else:
+        # The card that fills first bounds the whole model.
+        budget = int(min((s or 0) / p for s, p in zip(spares, fractions, strict=True)))
+    frees = [d.memoryFreeBytes for d in devices]
+    totals = [d.memoryTotalBytes for d in devices]
+    main_index = (spec.flags or {}).get("mainGpu")
+    main = next(
+        (d for d in devices if main_index is not None and d.index == _int_flag(main_index, -1)),
+        devices[0],
+    )
+    return Placement(
+        main=main,
+        devices=devices,
+        shares=fractions,
+        free=None if any(f is None for f in frees) else sum(f or 0 for f in frees),
+        total=None if any(t is None for t in totals) else sum(t or 0 for t in totals),
+        reserved=sum(held(d) for d in devices),
+        budget=budget,
+    )
+
+
+def admission_split(
+    spec: RuntimeSpec, admission: Admission, reservations: Sequence[Reservation] = ()
+) -> list[tuple[int, int]]:
+    """A split launch's promise, divided the way its weights will be.
+
+    From the answer the route already has, the cards and their free
+    memory, less what the ledger holds on each: the same numbers the
+    verdict divided the model by. A first version divided by free memory
+    alone, and a test of two equal cards, one spoken for, caught it
+    promising half of a new launch to the card that had no room.
+    """
+    devices = admission.devices or []
+    required = admission.requiredBytes or 0
+    if len(devices) < 2 or required <= 0:
+        return []
+
+    def spare(device: ComputeDevice) -> int | None:
+        free = device.memoryFreeBytes
+        if free is None:
+            return None
+        return max(0, free - held_bytes(reservations, device_index=device.index, exclude=spec.name))
+
+    shares = split_shares(spec, devices, spare)
+    return [
+        (d.index, int(required * p))
+        for d, p in zip(devices, shares, strict=True)
+        if d.index is not None and p > 0
+    ]
 
 
 def wants_full_offload(spec: RuntimeSpec) -> bool:
@@ -575,28 +782,23 @@ async def check_admission(
             warning="; ".join(warnings) or "no device detected",
         )
 
-    # Largest single device by free memory — the card the engine would
-    # actually have to fit on — MINUS what this node has already promised
-    # to launches that have not taken their memory yet. Free memory is a
-    # live reading, so the card a second launch picks has to be the one
-    # with room left after the first, not the one that still looks empty.
-    def _spare(device: ComputeDevice) -> int:
-        free = device.memoryFreeBytes
-        if free is None:
-            return -1
-        return max(0, free - held_bytes(reservations, device_index=device.index, exclude=spec.name))
-
-    device = max(targets, key=lambda d: (_spare(d), -(d.index or 0)))
-    free = device.memoryFreeBytes
-    total = device.memoryTotalBytes
-    # This runtime's own reservation is never counted against it: a
-    # restart re-measures a runtime that already holds one, and counting
-    # it would refuse every restart.
-    reserved = held_bytes(reservations, device_index=device.index, exclude=spec.name)
-    # The budget the verdict is computed against. `freeBytes` on the wire
-    # stays the card's own reading, because reporting the reduced number
-    # there would be a claim about the card that is not true.
-    budget = max(0, free - reserved) if free is not None else None
+    # The card, or cards, the engine would actually have to fit on,
+    # MINUS what this node has already promised to launches that have not
+    # taken their memory yet. Free memory is a live reading, so the card a
+    # second launch picks has to be the one with room left after the
+    # first, not the one that still looks empty. This runtime's own
+    # reservation is never counted against it: a restart re-measures a
+    # runtime that already holds one, and counting it would refuse every
+    # restart. `freeBytes` on the wire stays the cards' own reading,
+    # because reporting the reduced number there would be a claim about
+    # the card that is not true.
+    placement = place(spec, targets, reservations)
+    device = placement.main
+    free = placement.free
+    total = placement.total
+    reserved = placement.reserved
+    budget = placement.budget
+    cards = len(placement.devices)
     # `ram_bytes` means "system RAM a partial offload can spill into,
     # BESIDE the device pool". On a discrete GPU that is real; on Apple
     # unified memory the "VRAM" pool and host RAM are the same silicon,
@@ -626,6 +828,7 @@ async def check_admission(
             vram_bytes=budget,
             ram_bytes=ram_available if spillover_device else None,
             unified_memory=unified,
+            gpu_count=cards,
         )
         if answer is not None:
             required = answer.required_bytes
@@ -646,13 +849,22 @@ async def check_admission(
             # included: an assumption the caller cannot see is one they
             # cannot argue with, and this one decides the verdict.
             context_length = context_length or ASSUMED_CONTEXT_LENGTH
-            required = file_size_requirement(size, context_length)
+            # One allowance per card: each holds its own compute buffers.
+            required = file_size_requirement(size, context_length) + OVERHEAD_BYTES * (cards - 1)
             fit = local_verdict(required, free=budget, total=total, ram_available=ram_available)
         else:
             warnings.append(f"{spec.modelPath} could not be sized on disk")
 
     decision = decide(fit, full_offload=full_offload)
-    where = f"device {device.index} ({device.name or device.kind.value})"
+    where = (
+        f"{cards} cards ("
+        + ", ".join(f"device {d.index} {d.name or d.kind.value}" for d in placement.devices)
+        + ")"
+        if placement.spread
+        else f"device {device.index} ({device.name or device.kind.value})"
+    )
+    has = "have" if placement.spread else "has"
+    between = " between them" if placement.spread else ""
     held = (
         "Held by: "
         + ", ".join(
@@ -684,7 +896,10 @@ async def check_admission(
     # context, never about the model -- and the refusal said "lower
     # contextSize" with no number to lower it to.
     fits_up_to = (
-        f" It fits up to {max_context_length} context on this device." if max_context_length else ""
+        f" It fits up to {max_context_length} context on "
+        + ("these cards." if placement.spread else "this device.")
+        if max_context_length
+        else ""
     )
     basis_text = (
         "library metadata"
@@ -713,7 +928,8 @@ async def check_admission(
     elif decision is AdmissionDecision.admit:
         reason = (
             f"admit: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) and "
-            f"{where} has {_gib(free)} free of {_gib(total)};{reserved_text} verdict {fit.value}"
+            f"{where} {has} {_gib(free)} free of {_gib(total)}{between};{reserved_text} "
+            f"verdict {fit.value}"
             + (
                 " with partial offload requested, so the spill is the operator's choice"
                 if not full_offload and fit is not AdmissionFit.fits
@@ -743,7 +959,7 @@ async def check_admission(
         fix = waiting + rest if waiting else f"{rest[0].upper()}{rest[1:]}"
         reason = (
             f"refuse: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) but "
-            f"{where} has {_gib(free)} free of {_gib(total)};{reserved_text} "
+            f"{where} {has} {_gib(free)} free of {_gib(total)}{between};{reserved_text} "
             f"verdict {fit.value}.{fits_up_to} "
             f"{held}{slot_text} {fix}"
         )
@@ -758,6 +974,7 @@ async def check_admission(
         reservedBytes=reserved or None,
         totalBytes=total,
         device=device,
+        devices=list(placement.devices) if placement.spread else None,
         contextLength=context_length,
         maxContextLength=max_context_length,
         blockers=blockers,

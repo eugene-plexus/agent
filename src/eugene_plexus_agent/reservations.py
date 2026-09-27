@@ -92,6 +92,13 @@ class Reservation:
     """`perf_counter()` at the moment of reserving. A duration, so never
     `monotonic()`: on the Python both installers provision that is
     `GetTickCount64` on Windows, a 15.6 ms grid."""
+    shares: tuple[tuple[int, int], ...] = ()
+    """For a launch spread across several cards: `(device index, bytes)`
+    per card, the promise divided the way the weights will be. Empty for
+    one card, which `device_index` names. Without it a split launch was
+    either counted in full against one card, understating the other, or
+    against every card (`device_index=None`), refusing a second launch
+    on memory the first will never touch."""
 
 
 class ReservationLedger:
@@ -111,7 +118,14 @@ class ReservationLedger:
         self._clock = clock
         self._held: dict[str, Reservation] = {}
 
-    def reserve(self, runtime: str, *, device_index: int | None, size_bytes: int) -> None:
+    def reserve(
+        self,
+        runtime: str,
+        *,
+        device_index: int | None,
+        size_bytes: int,
+        shares: Iterable[tuple[int, int]] = (),
+    ) -> None:
         """Record what a launch of `runtime` is about to take.
 
         Replaces rather than adds: a runtime has one launch in flight,
@@ -130,6 +144,7 @@ class ReservationLedger:
             device_index=device_index,
             size_bytes=size_bytes,
             at=self._clock(),
+            shares=tuple(shares),
         )
 
     def reconcile(self, pending: Iterable[str]) -> None:
@@ -172,6 +187,14 @@ def held_bytes(
     total = 0
     for reservation in reservations:
         if exclude is not None and reservation.runtime == exclude:
+            continue
+        if reservation.shares:
+            # A split launch: each card's own share, and the whole of it
+            # when the question is about no card in particular.
+            if device_index is None:
+                total += reservation.size_bytes
+            else:
+                total += dict(reservation.shares).get(device_index, 0)
             continue
         if reservation.device_index is not None and reservation.device_index != device_index:
             continue

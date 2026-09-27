@@ -77,12 +77,21 @@ class DeviceSnapshot:
 
 
 def _run(argv: list[str]) -> str | None:
-    """Run a vendor probe; its stdout, or None if it did not work."""
-    if shutil.which(argv[0]) is None:
+    """Run a vendor probe; its stdout, or None if it did not work.
+
+    **The resolved path, not the bare name** -- R2.3's finding in
+    `host._run`, which this copy never got (found 2026-09-27).
+    `CreateProcess` searches System32 before PATH, so on Windows a bare
+    `nvidia-smi` ran the System32 copy whatever `which` had found, and
+    the device list and the engine picker could be reading two different
+    programs.
+    """
+    exe = shutil.which(argv[0])
+    if exe is None:
         return None
     try:
         proc = subprocess.run(
-            argv,
+            [exe, *argv[1:]],
             capture_output=True,
             env=child_environment(),
             text=True,

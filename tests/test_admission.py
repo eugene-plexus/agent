@@ -296,23 +296,51 @@ async def test_blockers_name_what_holds_the_device_evictable_first(tmp_path: Pat
     assert "Stop one of them" in result.reason
 
 
-@pytest.mark.anyio
-async def test_the_largest_free_card_is_the_one_measured(tmp_path: Path) -> None:
+def _uneven_pair() -> object:
     snapshot = fake_devices(free=8 * GIB, total=32 * GIB, count=2)
     # Card 1 has more free memory than card 0.
     devices = list(snapshot.devices)
     devices[1] = devices[1].model_copy(update={"memoryFreeBytes": 20 * GIB})
-    snapshot = snapshot.__class__(
+    return snapshot.__class__(
         devices=tuple(devices),
         warnings=(),
         ram_total_bytes=snapshot.ram_total_bytes,
         ram_available_bytes=snapshot.ram_available_bytes,
         detected_at=snapshot.detected_at,
     )
+
+
+@pytest.mark.anyio
+async def test_a_launch_on_one_card_is_measured_against_the_one_with_room(
+    tmp_path: Path,
+) -> None:
+    """**Amended 2026-09-27, not added to.** This test was
+    `test_the_largest_free_card_is_the_one_measured` and drove a default
+    llama.cpp launch on two cards. That launch spreads across BOTH, so
+    "the largest card" was the wrong model of it, and the test is how that
+    model came to read as intended. The rule it asserted still holds where
+    one card is what the engine uses: `splitMode: none`."""
     result = await check_admission(
-        _spec(_model(tmp_path, 10 * GIB)), snapshot=snapshot, library=None, running=[]
+        _spec(_model(tmp_path, 10 * GIB), flags={"splitMode": "none"}),
+        snapshot=_uneven_pair(),  # type: ignore[arg-type]
+        library=None,
+        running=[],
     )
     assert result.device is not None and result.device.index == 1
+    assert result.devices is None
+    assert result.decision is AdmissionDecision.admit
+
+
+@pytest.mark.anyio
+async def test_a_default_launch_on_two_cards_is_measured_against_both(tmp_path: Path) -> None:
+    result = await check_admission(
+        _spec(_model(tmp_path, 10 * GIB)),
+        snapshot=_uneven_pair(),  # type: ignore[arg-type]
+        library=None,
+        running=[],
+    )
+    assert [d.index for d in result.devices or []] == [0, 1]
+    assert result.freeBytes == 28 * GIB
     assert result.decision is AdmissionDecision.admit
 
 

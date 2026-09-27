@@ -2864,7 +2864,7 @@ class Admission(BaseModel):
     )
     freeBytes: int | None = Field(
         None,
-        description='Free memory on the largest single target device at the\nmoment of measurement. Free, not total: M3 measured 2.9 GiB\nof a 32 GiB card held on an idle desktop.\n\n**The verdict is computed against this minus\n`reservedBytes`**, not against this. Reporting the reduced\nnumber here instead would be a claim about the card that is\nnot true.\n',
+        description='Free memory on the target device at the moment of\nmeasurement, or on every card a split launch spreads across,\nsummed (`devices`). Free, not total: M3 measured 2.9 GiB of\na 32 GiB card held on an idle desktop.\n\n**The verdict is computed against this minus\n`reservedBytes`**, not against this. Reporting the reduced\nnumber here instead would be a claim about the card that is\nnot true.\n',
         ge=0,
     )
     reservedBytes: int | None = Field(
@@ -2872,9 +2872,18 @@ class Admission(BaseModel):
         description='Memory this node has already promised to launches that have\nnot taken it yet, on that same device, and which was\ntherefore subtracted from `freeBytes` before the verdict.\nAbsent or `0` when nothing is in flight.\n\nIt exists because free memory is a live reading and a launch\nspends it slowly. A runtime that was admitted three seconds\nago has read no weights; one that is `copying` has no\nprocess at all, for as long as the file takes to cross the\nwire. Without this, two launches in quick succession both\nmeasured the same free memory and both were told `fits`, the\nsecond one for memory the first had already spent.\n\nReleased when the runtime is next observed past its start,\nwhen it is stopped or deleted, or on a timeout, so an\nabandoned launch cannot hold a card for the life of the\nprocess. A dry run never adds to it; declaring a runtime\nthat starts does, `force` included, because `force` is the\noperator overriding the verdict and not the launch becoming\nfree.\n',
         ge=0,
     )
-    totalBytes: int | None = Field(None, ge=0)
+    totalBytes: int | None = Field(
+        None,
+        description="The target device's memory, or every split card's, summed.",
+        ge=0,
+    )
     device: ComputeDevice | None = Field(
-        None, description='The device the verdict is about.'
+        None,
+        description='The device the verdict is about. For a launch spread across\nseveral cards, the main one (`mainGpu`, else the first).\n',
+    )
+    devices: list[ComputeDevice] | None = Field(
+        None,
+        description="Every card a launch spreads the model across, when that is\nmore than one: llama.cpp splits across every visible card\nunless the runtime is pinned (`CUDA_VISIBLE_DEVICES`,\n`HIP_VISIBLE_DEVICES`) or `splitMode` is `none`, and vLLM\nuses `tensorParallelSize` cards.\n\nAdded 2026-09-27. Before it, a launch was scored against the\nlargest single card, and a model that fits across two 5090s\nand on neither read `split` (spilling into system RAM),\nwhich a full-offload launch refuses. The verdict is now\ncomputed against the cards' combined free memory, less each\ncard's own reservations, and each card's share of the\nweights follows `tensorSplit` when one is set and each\ncard's free memory when not (llama.cpp's default).\n",
     )
     contextLength: int | None = Field(
         None,

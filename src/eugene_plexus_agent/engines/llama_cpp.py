@@ -612,6 +612,7 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     "threads": "--threads",
     "parallelSlots": "--parallel",
     "mainGpu": "--main-gpu",
+    "splitMode": "--split-mode",
     "tensorSplit": "--tensor-split",
     "flashAttention": "--flash-attn",
     "continuousBatching": "--cont-batching",
@@ -763,6 +764,24 @@ _FLAG_FIELDS: list[ConfigField] = [
         category="performance",
         valueType=ConfigValueType.integer,
         minimum=0,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="splitMode",
+        label="Split across GPUs",
+        description=(
+            "How one model is spread across several GPUs. By layer is "
+            "llama.cpp's default: each card holds whole layers and the "
+            "memory adds up. By row splits each weight across the cards and "
+            "can be faster on cards joined by a fast link. Tensor is "
+            "upstream's experimental parallel split. One GPU only uses the "
+            "Main GPU and leaves the others free. Read off llama-server "
+            "b11211's own help."
+        ),
+        category="performance",
+        valueType=ConfigValueType.enum,
+        enumValues=["layer", "row", "tensor", "none"],
+        enumLabels=["By layer", "By row", "Tensor (experimental)", "One GPU only"],
         requiresRestart=True,
     ),
     ConfigField(

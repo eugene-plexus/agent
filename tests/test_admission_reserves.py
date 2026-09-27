@@ -41,7 +41,12 @@ from eugene_plexus_agent._generated.models import (
     RuntimeSpec,
     RuntimeStatus,
 )
-from eugene_plexus_agent.admission import LibraryFit, RunningRuntime, check_admission
+from eugene_plexus_agent.admission import (
+    LibraryFit,
+    RunningRuntime,
+    admission_split,
+    check_admission,
+)
 from eugene_plexus_agent.reservations import ReservationLedger
 
 from .conftest import fake_devices
@@ -455,13 +460,19 @@ async def test_the_device_pick_avoids_the_card_that_is_already_spoken_for(
     tmp_path: Path,
 ) -> None:
     """Two cards, one of them promised away. Picking by the card's own
-    free reading lands the launch on the one that only LOOKS emptier."""
+    free reading lands the launch on the one that only LOOKS emptier.
+
+    **Amended 2026-09-27:** a one-card launch (`splitMode: none`). A
+    default llama.cpp launch spreads across both cards, which the test
+    below covers."""
     ledger = ReservationLedger()
     # Device 0 reads emptier and is spoken for; device 1 has room left.
     snapshot = fake_devices(free=24 * GIB, total=32 * GIB, count=2)
     ledger.reserve("a", device_index=0, size_bytes=22 * GIB)
+    spec = _spec("b", _model(tmp_path, 10 * GIB, "pick"))
+    spec = spec.model_copy(update={"flags": {**(spec.flags or {}), "splitMode": "none"}})
     result = await check_admission(
-        _spec("b", _model(tmp_path, 10 * GIB, "pick")),
+        spec,
         snapshot=snapshot,
         library=None,
         running=[],
@@ -469,6 +480,33 @@ async def test_the_device_pick_avoids_the_card_that_is_already_spoken_for(
     )
     assert result.device is not None and result.device.index == 1
     assert result.decision is AdmissionDecision.admit
+
+
+@pytest.mark.anyio
+async def test_a_split_launch_puts_most_of_itself_where_the_room_is(tmp_path: Path) -> None:
+    """The same two cards, a default launch that spreads across both. The
+    share follows what each card has left, so the spoken-for card takes
+    little, and the new launch's own promise is divided the same way."""
+    ledger = ReservationLedger()
+    snapshot = fake_devices(free=24 * GIB, total=32 * GIB, count=2)
+    ledger.reserve("a", device_index=0, size_bytes=22 * GIB)
+    spec = _spec("b", _model(tmp_path, 10 * GIB, "split"))
+    result = await check_admission(
+        spec, snapshot=snapshot, library=None, running=[], reservations=ledger.entries()
+    )
+    assert result.decision is AdmissionDecision.admit
+    assert [d.index for d in result.devices or []] == [0, 1]
+    assert result.reservedBytes == 22 * GIB
+    ledger.reserve(
+        "b",
+        device_index=result.device.index if result.device else None,
+        size_bytes=result.requiredBytes or 0,
+        shares=admission_split(spec, result, ledger.entries()),
+    )
+    on_0 = ledger.held_bytes(device_index=0, exclude="a")
+    on_1 = ledger.held_bytes(device_index=1, exclude="a")
+    assert 0 < on_0 < on_1
+    assert on_0 + on_1 == pytest.approx(result.requiredBytes, abs=2)
 
 
 @pytest.mark.anyio
