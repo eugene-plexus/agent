@@ -464,9 +464,9 @@ def test_plan_latest_stops_at_once_on_a_reason_about_the_host(
     calls: list[str] = []
     real = adapter.plan_acquisition
 
-    def spy(host: HostAccelerator, release: Release):  # type: ignore[no-untyped-def]
+    def spy(host: HostAccelerator, release: Release, **kwargs):  # type: ignore[no-untyped-def]
         calls.append(release.version)
-        return real(host, release)
+        return real(host, release, **kwargs)
 
     monkeypatch.setattr(adapter, "plan_acquisition", spy)
     monkeypatch.setattr(

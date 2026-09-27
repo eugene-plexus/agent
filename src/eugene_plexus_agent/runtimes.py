@@ -64,6 +64,7 @@ from .engines.acquisition import (
 from .engines.base import DiscoveredBinary
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
+from .engines.llama_cpp import alternatives as llama_alternatives
 from .library_folders import RulesProvider, effective_rules
 from .model_copies import resolve_local_path
 from .model_paths import PathRule, rules_from_config
@@ -989,6 +990,7 @@ def plan_for(
     *,
     version: str | None = None,
     host: HostAccelerator | None = None,
+    variant: str | None = None,
 ) -> AcquisitionPlan | Unavailable:
     """What we would fetch for this host, or why we cannot.
 
@@ -1021,7 +1023,7 @@ def plan_for(
         # The newest build that carries THIS host's assets, which since
         # 2026-09-15 is not always the newest build with assets: a release
         # mid-upload has some and not ours.
-        return adapter.plan_latest(detected)
+        return adapter.plan_latest(detected, variant=variant)
     listed = adapter.releases.list_releases()
     if not listed:
         # Not "that build is not recent": nothing is listed at all, and
@@ -1035,7 +1037,7 @@ def plan_for(
                 f"{adapter.binary_name}; only recent builds can be installed"
             )
         )
-    return adapter.plan_acquisition(detected, release)
+    return adapter.plan_acquisition(detected, release, variant=variant)
 
 
 def _acquisition_for(kind: EngineKind, host: HostAccelerator) -> EngineAcquisition:
@@ -1086,10 +1088,19 @@ def _acquisition_for(kind: EngineKind, host: HostAccelerator) -> EngineAcquisiti
             latestPublishedAt=latest.published_at if latest else None,
             checkedAt=checked_at,
         )
+    # The expert's menu comes from the release the plan was made against:
+    # the newest one may be mid-upload and list builds this host would
+    # then be refused.
+    planned = (
+        next((r for r in adapter.builds() if r.version == plan.version), latest)
+        if isinstance(adapter, LlamaCppAdapter)
+        else None
+    )
     return EngineAcquisition(
         policy=Policy.managed,
         installable=True,
         variant=plan.variant,
+        alternatives=llama_alternatives(detected, planned) if planned is not None else [],
         detected=detected,
         latestVersion=latest.version if latest else None,
         latestPublishedAt=latest.published_at if latest else None,

@@ -175,6 +175,7 @@ class FitSource(Protocol):
         context_length: int | None,
         vram_bytes: int | None,
         ram_bytes: int | None,
+        unified_memory: bool = False,
     ) -> LibraryFit | None: ...
 
 
@@ -258,6 +259,7 @@ class LibraryFitClient:
         context_length: int | None,
         vram_bytes: int | None,
         ram_bytes: int | None,
+        unified_memory: bool = False,
     ) -> LibraryFit | None:
         try:
             client = self._client()
@@ -286,6 +288,8 @@ class LibraryFitClient:
                 params["vramBytes"] = vram_bytes
             if ram_bytes is not None:
                 params["ramBytes"] = ram_bytes
+            if unified_memory:
+                params["unifiedMemory"] = "true"
             response = await client.get(
                 f"{self._base}/v1/models/{quote(str(model['id']), safe='')}/fit",
                 params=params,
@@ -601,7 +605,12 @@ async def check_admission(
     # metal device therefore gets no spillover term: its budget IS the
     # unified pool (and today `memoryFreeBytes` is absent there, so the
     # verdict is honestly `unknown` until a real Mac measures it).
-    spillover_device = device.kind not in (ComputeDeviceKind.cpu, ComputeDeviceKind.metal)
+    #
+    # **Every shared-memory device is that case** (2026-09-27): an
+    # integrated GPU computes out of the same RAM, and so does a GB10.
+    # Before `sharedMemory` existed only a Mac was known to be one.
+    unified = device.kind is ComputeDeviceKind.metal or bool(device.sharedMemory)
+    spillover_device = device.kind is not ComputeDeviceKind.cpu and not unified
     ram_available = snapshot.ram_available_bytes if spillover_device else 0
     blockers = _blockers(spec, targets, snapshot, running)
     full_offload = wants_full_offload(spec)
@@ -616,6 +625,7 @@ async def check_admission(
             context_length=context_length,
             vram_bytes=budget,
             ram_bytes=ram_available if spillover_device else None,
+            unified_memory=unified,
         )
         if answer is not None:
             required = answer.required_bytes

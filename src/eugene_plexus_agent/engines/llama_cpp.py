@@ -217,7 +217,7 @@ class LlamaCppAdapter(EngineAdapter):
         )
 
     def plan_latest(
-        self, host: HostAccelerator, *, force: bool = False
+        self, host: HostAccelerator, *, force: bool = False, variant: str | None = None
     ) -> AcquisitionPlan | Unavailable:
         """The newest build this host can actually be given.
 
@@ -247,7 +247,7 @@ class LlamaCppAdapter(EngineAdapter):
             return Unavailable(reason=self.no_release_list_reason())
         first: Unavailable | None = None
         for release in builds[:FALLBACK_BUILDS]:
-            plan = self.plan_acquisition(host, release)
+            plan = self.plan_acquisition(host, release, variant=variant)
             if isinstance(plan, AcquisitionPlan):
                 if release is not builds[0]:
                     log.info(
@@ -275,7 +275,7 @@ class LlamaCppAdapter(EngineAdapter):
         )
 
     def plan_acquisition(
-        self, host: HostAccelerator, release: Release
+        self, host: HostAccelerator, release: Release, *, variant: str | None = None
     ) -> AcquisitionPlan | Unavailable:
         """Which assets to fetch for this host from ONE release, or why we cannot.
 
@@ -291,18 +291,21 @@ class LlamaCppAdapter(EngineAdapter):
         `plan_latest` is the caller that chooses the release; this answers
         for the one it is handed, and marks a refusal `release_bound` when
         another release might carry what this one lacks.
-        """
-        variant = _variant_for(host, release)
-        if isinstance(variant, Unavailable):
-            return variant
 
-        assets = _match_assets(release, variant)
+        `variant` is the operator's choice over the default, and has to be
+        one `alternatives` offers.
+        """
+        chosen = _chosen_variant(host, release, variant)
+        if isinstance(chosen, Unavailable):
+            return chosen
+
+        assets = _match_assets(release, chosen)
         if isinstance(assets, Unavailable):
             return assets
 
         return AcquisitionPlan(
             version=release.version,
-            variant=variant,
+            variant=chosen,
             assets=assets,
             binary_name=self.binary_name,
         )
@@ -840,10 +843,15 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
         if accelerator is Accelerator.vulkan:
             # **The build every non-NVIDIA Windows GPU gets** (review
             # §6.1 #11). One asset covers AMD and Intel, needs no vendor
-            # SDK, and upstream publishes it in every release -- which is
-            # why it is Vulkan and not `win-sycl-x64`, a name that
-            # appears nowhere this repo can verify.
+            # SDK, and upstream publishes it in every release.
             return f"win-vulkan-{host.arch.value}"
+        if accelerator is Accelerator.sycl and host.arch is Arch.x64:
+            # `sycl` is reported only when oneAPI's own `sycl-ls` saw an
+            # Intel GPU. Until 2026-09-27 this branch was missing and such
+            # a machine got the CPU build: the comment above said
+            # `win-sycl-x64` appeared nowhere, which stopped being true
+            # (b11211 publishes it) without anyone re-reading a release.
+            return "win-sycl-x64"
         return f"win-cpu-{host.arch.value}"
 
     # Linux. **Upstream publishes CUDA builds here now**, and it did not
@@ -854,9 +862,57 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
         return _cuda_variant(host, release)
     if accelerator is Accelerator.rocm:
         return f"ubuntu-rocm-10.0-{host.arch.value}"
-    if accelerator is Accelerator.sycl:
+    if accelerator is Accelerator.sycl and host.arch is Arch.x64:
         return "ubuntu-sycl-fp16-x64"
+    if accelerator is Accelerator.vulkan:
+        # An AMD card without ROCm, an Intel card without oneAPI, an
+        # NVIDIA card on the Mesa driver (2026-09-27). Before, the first
+        # got a CPU build and the second a SYCL build it could not load.
+        return f"ubuntu-vulkan-{host.arch.value}"
     return f"ubuntu-{host.arch.value}" if host.arch is Arch.arm64 else "ubuntu-x64"
+
+
+_PLATFORM_PREFIX = {Os.windows: "win-", Os.linux: "ubuntu-", Os.macos: "macos-"}
+
+
+def alternatives(host: HostAccelerator, release: Release) -> list[str]:
+    """Every server build `release` publishes for this OS and CPU.
+
+    The expert's menu (`EngineInstallRequest.variant`). Read off the
+    release rather than a table, because upstream adds a family every few
+    months: `win-sycl-x64`, `win-openvino-*` and `win-opencl-adreno-arm64`
+    all arrived without this code hearing about it.
+    """
+    if host.os is None or host.arch is None:
+        return []
+    prefix = _PLATFORM_PREFIX[host.os]
+    suffix = f"-{host.arch.value}"
+    return [v for v in _published_variants(release) if v.startswith(prefix) and v.endswith(suffix)]
+
+
+def _chosen_variant(
+    host: HostAccelerator, release: Release, requested: str | None
+) -> str | Unavailable:
+    """The default build, or the one the operator asked for if it is here."""
+    if requested is None:
+        return _variant_for(host, release)
+    offered = alternatives(host, release)
+    if requested in offered:
+        return requested
+    platform_name = host.os.value if host.os is not None else "this operating system"
+    arch_name = host.arch.value if host.arch is not None else "this CPU"
+    prefix = _PLATFORM_PREFIX.get(host.os) if host.os is not None else None
+    fits_host = bool(prefix and requested.startswith(prefix) and host.arch is not None)
+    return Unavailable(
+        reason=(
+            f"{requested!r} is not a build release {release.version} publishes for "
+            f"{platform_name} on {arch_name}. It publishes: {', '.join(offered) or '(none)'}."
+        ),
+        # A build this machine could run, missing from this release, may be
+        # in the one before it (a release mid-upload); anything else will
+        # not be in any release.
+        release_bound=fits_host,
+    )
 
 
 def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:

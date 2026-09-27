@@ -427,7 +427,12 @@ async def install_engine(engine: str, body: EngineInstallRequest | None = None) 
     # Same thread treatment as the listing above, for the same reason:
     # this resolves the host and may reach upstream, and the operator
     # who pressed Install is not the only person using this agent.
-    plan = await asyncio.to_thread(plan_for, kind, version=body.version if body else None)
+    plan = await asyncio.to_thread(
+        plan_for,
+        kind,
+        version=body.version if body else None,
+        variant=body.variant if body else None,
+    )
     if isinstance(plan, Unavailable):
         # 422, not 404 or 500: the request was well-formed and the engine
         # exists — this host simply has nothing installable, which on

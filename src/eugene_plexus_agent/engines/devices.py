@@ -37,6 +37,8 @@ from datetime import UTC, datetime
 
 from .._generated.models import ComputeDevice, ComputeDeviceKind
 from ..child_env import child_environment
+from . import gpu_probe
+from . import host as host_mod
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +55,7 @@ APPLE_WIRED_LIMIT_FRACTION = 0.75
 
 Runner = Callable[[list[str]], str | None]
 MemoryReader = Callable[[], tuple[int | None, int | None]]
+AdapterLister = Callable[[], list[gpu_probe.Adapter]]
 
 
 @dataclass(frozen=True)
@@ -183,7 +186,18 @@ def host_memory(run: Runner = _run) -> tuple[int | None, int | None]:
 # --- accelerators -----------------------------------------------------------
 
 
-def _nvidia(run: Runner, warnings: list[str]) -> list[ComputeDevice]:
+# What `nvidia-smi` prints in a memory column it will not fill: `[N/A]` in
+# CSV, `Not Supported` in its table. GB10 (DGX Spark) has no memory of its
+# own to report, which is the case this is for.
+_NVIDIA_UNREPORTED = {"[n/a]", "n/a", "[not supported]", "not supported"}
+
+
+def _nvidia(
+    run: Runner,
+    warnings: list[str],
+    ram_total: int | None = None,
+    ram_available: int | None = None,
+) -> list[ComputeDevice]:
     """Verified against a real RTX 5090 on Windows. `nounits` keeps the
     CSV numeric; the memory columns are MiB, nvidia-smi's own unit."""
     out = run(
@@ -202,6 +216,27 @@ def _nvidia(run: Runner, warnings: list[str]) -> list[ComputeDevice]:
         fields = [f.strip() for f in line.split(",")]
         if len(fields) < 4:
             warnings.append(f"could not parse an nvidia-smi row: {line.strip()!r}")
+            continue
+        if fields[0].isdigit() and {fields[2].lower(), fields[3].lower()} <= _NVIDIA_UNREPORTED:
+            # **Unified memory, NVIDIA's kind** (GB10 / DGX Spark). Until
+            # 2026-09-27 this row was "could not parse" and the machine
+            # read "no GPU". UNVERIFIED: written from NVIDIA's documented
+            # behaviour, no GB10 has reported here.
+            warnings.append(
+                f"{fields[1]} reports no memory of its own, so it is read as computing "
+                "out of host memory (NVIDIA's unified memory). Untested against real "
+                "hardware."
+            )
+            devices.append(
+                ComputeDevice(
+                    kind=ComputeDeviceKind.cuda,
+                    index=int(fields[0]),
+                    name=fields[1],
+                    memoryTotalBytes=ram_total,
+                    memoryFreeBytes=ram_available,
+                    sharedMemory=True,
+                )
+            )
             continue
         try:
             index = int(fields[0])
@@ -314,22 +349,129 @@ def _apple(ram_total: int | None, warnings: list[str]) -> list[ComputeDevice]:
             # Free is genuinely unknowable without the wired-page count;
             # left absent so admission reports `unknown` rather than
             # inventing a number.
+            sharedMemory=True,
         )
     ]
 
 
-def detect_devices(*, run: Runner = _run, memory: MemoryReader | None = None) -> DeviceSnapshot:
+_FAMILY_KIND = {
+    "vulkan": ComputeDeviceKind.vulkan,
+    "rocm": ComputeDeviceKind.rocm,
+    "sycl": ComputeDeviceKind.xpu,
+}
+
+
+def _os_devices(
+    warnings: list[str],
+    ram_available: int | None,
+    lister: AdapterLister,
+) -> list[ComputeDevice]:
+    """The GPUs no vendor tool answered for, from the operating system.
+
+    **The half R2.3 did not build** (2026-09-27). R2.3 taught the engine
+    picker to see an Intel or AMD card on Windows and give it the Vulkan
+    build, and this list went on asking only vendor tools. So an Intel
+    Arc mini PC ran the Vulkan build and read "no GPU", and every fit,
+    admission and starter pick on it was scored against system RAM.
+
+    `gpu_probe.family` is the decision the engine picker makes too, so
+    the cards listed here are the ones the build that was chosen uses.
+    """
+    os_name, arch = host_mod.platform_names()
+    try:
+        found = lister()
+    except gpu_probe.GpuProbeError as exc:
+        warnings.append(f"could not list this machine's GPUs from the operating system: {exc}")
+        return []
+    if not found:
+        return []
+    os_kind = host_mod._detect_os()
+    has_intel = any(a.vendor == gpu_probe.INTEL for a in found)
+    chosen = gpu_probe.family(
+        os_name,
+        arch,
+        found,
+        vulkan_loader=gpu_probe.vulkan_loader_present(os_name),
+        rocm=host_mod.rocm_installed(os_kind),
+        sycl=has_intel and host_mod.sycl_sees_gpu(),
+    )
+    warnings.extend(chosen.notes)
+    kind = _FAMILY_KIND.get(chosen.accelerator)
+    if kind is None:
+        return []
+    devices: list[ComputeDevice] = []
+    for index, adapter in enumerate(chosen.adapters):
+        total, free = adapter.budget(ram_available)
+        if total is None:
+            warnings.append(
+                f"{adapter.name} does not report its memory on this platform, so every fit "
+                "against it is unknown rather than a guess."
+            )
+        elif free is None:
+            warnings.append(
+                f"how much of {adapter.name}'s memory is in use could not be read, so its "
+                "free memory is unknown and admission cannot refuse on it."
+            )
+        devices.append(
+            ComputeDevice(
+                kind=kind,
+                index=index,
+                name=adapter.name,
+                memoryTotalBytes=total,
+                memoryFreeBytes=free,
+                sharedMemory=True if adapter.integrated else None,
+            )
+        )
+    return devices
+
+
+def _left_out(found: list[gpu_probe.Adapter], served_by: str) -> list[str]:
+    """A sentence for each discrete GPU the chosen build cannot use.
+
+    A second vendor's card beside an NVIDIA one gets nothing from the CUDA
+    build, and a card the product skips without a word is a card its
+    owner concludes is broken. Integrated GPUs beside a card are left
+    out silently: that is every desktop with a graphics card.
+    """
+    return [
+        f"{adapter.name} is also here, and the {served_by} build this machine uses cannot "
+        "compute on it. Install the Vulkan build under the engine's other builds to use "
+        "every card."
+        for adapter in found
+        if not adapter.integrated and adapter.vendor not in (gpu_probe.NVIDIA, gpu_probe.OTHER)
+    ]
+
+
+def _os_adapters_quietly(lister: AdapterLister) -> list[gpu_probe.Adapter]:
+    try:
+        return lister()
+    except gpu_probe.GpuProbeError as exc:
+        log.debug("could not list GPUs from the operating system: %s", exc)
+        return []
+
+
+def detect_devices(
+    *,
+    run: Runner = _run,
+    memory: MemoryReader | None = None,
+    os_adapters: AdapterLister | None = None,
+) -> DeviceSnapshot:
     """Every device this host can compute on, with live memory.
 
     The CPU is always last, carrying host memory, so a box with no
     accelerator still has a budget for a CPU-only launch and a
     `Node.devices` that is not empty.
+
+    `os_adapters` replaces the operating system's GPU list, for tests.
     """
     warnings: list[str] = []
     ram_total, ram_available = memory() if memory is not None else host_memory(run)
+    lister = os_adapters or gpu_probe.adapters
 
     devices: list[ComputeDevice] = []
-    devices += _nvidia(run, warnings)
+    devices += _nvidia(run, warnings, ram_total, ram_available)
+    if devices and sys.platform != "darwin":
+        warnings.extend(_left_out(_os_adapters_quietly(lister), "CUDA"))
     devices += _amd(run, warnings)
     devices += _intel(run, warnings)
     if (
@@ -338,6 +480,8 @@ def detect_devices(*, run: Runner = _run, memory: MemoryReader | None = None) ->
         and platform.machine().lower() in ("arm64", "aarch64")
     ):
         devices += _apple(ram_total, warnings)
+    elif not devices and sys.platform != "darwin":
+        devices += _os_devices(warnings, ram_available, lister)
 
     devices.append(
         ComputeDevice(

@@ -401,6 +401,20 @@ def _no_port_held_elsewhere(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_gpus_from_the_operating_system(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The OS's own GPU list is empty unless a test says otherwise.
+
+    `gpu_probe.adapters()` asks DXCore on Windows and sysfs on Linux, so
+    without this every device and host test would describe the machine
+    it ran on: a 5090 and an integrated Radeon here, nothing on CI. The
+    same leak as the ambient environment, one layer down.
+    """
+    from eugene_plexus_agent.engines import gpu_probe
+
+    monkeypatch.setattr(gpu_probe, "adapters", lambda os_name=None: [])
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:
         monkeypatch.delenv(key, raising=False)

@@ -167,6 +167,15 @@ class ComputeDeviceKind(StrEnum):
     """
     What kind of device this is.
 
+    `vulkan` is a GPU served by llama.cpp's Vulkan build, which needs
+    nothing but the graphics driver: an Intel Arc, an AMD Radeon or
+    any other vendor's card on a machine without that vendor's
+    compute SDK. Added 2026-09-27. Before it, such a card was
+    invisible to this list even when the Vulkan build was the one
+    installed to serve it, so every fit on that machine was scored
+    against host memory. `rocm` and `xpu` are for a card whose SDK
+    is present.
+
     A named schema rather than an inline enum because an inline one
     generated a bare `Kind` class, which is too generic to sit in a
     module every component imports.
@@ -184,6 +193,7 @@ class ComputeDeviceKind(StrEnum):
     rocm = 'rocm'
     xpu = 'xpu'
     metal = 'metal'
+    vulkan = 'vulkan'
     cpu = 'cpu'
 
 
@@ -1563,6 +1573,24 @@ class Accelerator(StrEnum):
     is actually installed, which is what makes
     `win-rocm-10.0-x64` reachable rather than dead code.
 
+    **Since 2026-09-27 the same holds on Linux**, and SYCL is
+    narrower there. An AMD card without ROCm, an Intel card
+    without oneAPI, and an NVIDIA card with no `nvidia-smi` (the
+    Mesa driver) get `vulkan` and `ubuntu-vulkan-*` when the
+    Vulkan loader is installed. Before, the AMD card got a CPU
+    build, and any machine with Intel graphics (so every Intel
+    laptop, by the `i915` driver) got `ubuntu-sycl-fp16-x64`,
+    which needs a oneAPI runtime that such a machine rarely
+    has. `sycl` now means `sycl-ls` answered.
+
+    **A Qualcomm Adreno (Snapdragon X) is `none`, and says why.**
+    Upstream publishes no Vulkan build for Windows on ARM. Its
+    `win-opencl-adreno-arm64` build is documented as tuned for
+    Q4_0 models, which are not what the starter set downloads,
+    and no one on the project has run it. So the CPU build, which
+    upstream tunes for ARM, is the default, and the OpenCL one is
+    available through `EngineInstallRequest.variant`.
+
     """
 
     none = 'none'
@@ -1586,7 +1614,7 @@ class HostAccelerator(BaseModel):
     arch: Arch | None = None
     accelerator: Accelerator | None = Field(
         None,
-        description='`metal` is reported on Apple silicon even though there is no\nseparate Metal asset - the plain macOS build has it compiled\nin, and saying `none` there would read as "no GPU".\n\n`vulkan` is how a non-NVIDIA GPU on **Windows** is served,\nand it exists because until 2026-09-18 there was no answer\nat all: the ROCm probe looked for `rocm-smi` or `/opt/rocm`\nand the SYCL probe for `sycl-ls` or Linux sysfs, none of\nwhich exists on Windows, so every AMD and Intel card there\nfell through to `none` - a CPU build, a fit scored against\nRAM, and the starter set inverted to the smallest model, on\na machine built around a graphics card.\n\nVulkan rather than ROCm or SYCL for that case because\nupstream publishes `win-vulkan-x64` in every release, it\nneeds no vendor SDK, and one build covers AMD and Intel\nalike. `rocm` is still reported on Windows when the HIP SDK\nis actually installed, which is what makes\n`win-rocm-10.0-x64` reachable rather than dead code.\n',
+        description='`metal` is reported on Apple silicon even though there is no\nseparate Metal asset - the plain macOS build has it compiled\nin, and saying `none` there would read as "no GPU".\n\n`vulkan` is how a non-NVIDIA GPU on **Windows** is served,\nand it exists because until 2026-09-18 there was no answer\nat all: the ROCm probe looked for `rocm-smi` or `/opt/rocm`\nand the SYCL probe for `sycl-ls` or Linux sysfs, none of\nwhich exists on Windows, so every AMD and Intel card there\nfell through to `none` - a CPU build, a fit scored against\nRAM, and the starter set inverted to the smallest model, on\na machine built around a graphics card.\n\nVulkan rather than ROCm or SYCL for that case because\nupstream publishes `win-vulkan-x64` in every release, it\nneeds no vendor SDK, and one build covers AMD and Intel\nalike. `rocm` is still reported on Windows when the HIP SDK\nis actually installed, which is what makes\n`win-rocm-10.0-x64` reachable rather than dead code.\n\n**Since 2026-09-27 the same holds on Linux**, and SYCL is\nnarrower there. An AMD card without ROCm, an Intel card\nwithout oneAPI, and an NVIDIA card with no `nvidia-smi` (the\nMesa driver) get `vulkan` and `ubuntu-vulkan-*` when the\nVulkan loader is installed. Before, the AMD card got a CPU\nbuild, and any machine with Intel graphics (so every Intel\nlaptop, by the `i915` driver) got `ubuntu-sycl-fp16-x64`,\nwhich needs a oneAPI runtime that such a machine rarely\nhas. `sycl` now means `sycl-ls` answered.\n\n**A Qualcomm Adreno (Snapdragon X) is `none`, and says why.**\nUpstream publishes no Vulkan build for Windows on ARM. Its\n`win-opencl-adreno-arm64` build is documented as tuned for\nQ4_0 models, which are not what the starter set downloads,\nand no one on the project has run it. So the CPU build, which\nupstream tunes for ARM, is the default, and the OpenCL one is\navailable through `EngineInstallRequest.variant`.\n',
     )
     acceleratorVersion: str | None = Field(
         None,
@@ -1602,6 +1630,10 @@ class EngineInstallRequest(BaseModel):
     version: str | None = Field(
         None,
         description='A specific upstream build to install. Omit for the newest.\nPresent so an operator who found a regression can pin the\nbuild that worked, which is the whole reason we record the\nversion rather than just "installed".\n',
+    )
+    variant: str | None = Field(
+        None,
+        description="Install this build variant instead of the one chosen for\nthis host, e.g. `win-sycl-x64` for an Intel Arc through\noneAPI rather than Vulkan, or `win-cpu-x64` to rule the GPU\nout while diagnosing. Omit it for the default, which is what\n`EngineAcquisition.variant` names. It must be one of\n`EngineAcquisition.alternatives` (a variant the release\npublishes for this operating system and CPU); anything else\nis a 422 that lists them.\n\nThis is the expert's way past a default chosen for hardware\nnobody on the project has run, which is most of it. It does\nnot change how this host's devices are reported: those\nfollow the default build, so a model is still scored against\nthe card the default would use.\n",
     )
 
 
@@ -2445,13 +2477,17 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card.\n",
+        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
         ge=0,
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
         None,
         description='Free decides whether a model fits, not total — M3 measured\n2.9 GiB of a 32 GiB card already held on an idle desktop.\nBoth are reported so the difference is visible rather than\nsurprising.\n',
+    )
+    sharedMemory: bool | None = Field(
+        None,
+        description='True when this device has no memory of its own and computes\nout of the host\'s RAM: an integrated GPU (an Intel Arc or\nIris in a laptop or mini PC, an AMD Radeon 780M or Strix\nHalo), Apple silicon, NVIDIA\'s GB10. Then `memoryTotalBytes`\nis how much RAM the operating system lets the GPU address,\nplus any carve-out reserved for it at boot, and\n`memoryFreeBytes` is what is left of that. There is no second\npool for a partial offload to spill into, so a fit that also\ncounted host RAM would count the same memory twice.\n\nAbsent or false for a card with memory of its own. Added\n2026-09-27, when an Intel Arc mini PC read "no GPU" and the\nonly unified-memory case the install knew was a Mac.\n',
     )
 
 
@@ -2619,6 +2655,10 @@ class EngineAcquisition(BaseModel):
     )
     variant: str | None = Field(
         None, description='The asset variant that would be fetched, when installable.'
+    )
+    alternatives: list[str] | None = Field(
+        None,
+        description='Every variant the newest usable release publishes for this\noperating system and CPU, the default included, for\n`EngineInstallRequest.variant`. On a Windows x64 machine that\nis the CPU, CUDA, Vulkan, ROCm, SYCL and OpenVINO builds; on\nLinux the same families under `ubuntu-`. Empty when no\nrelease could be read.\n',
     )
     reason: str | None = Field(
         None,

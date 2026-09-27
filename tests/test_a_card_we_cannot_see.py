@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 import pytest
 
 from eugene_plexus_agent._generated.models import Accelerator, Arch, HostAccelerator, Os
+from eugene_plexus_agent.engines import gpu_probe
 from eugene_plexus_agent.engines import host as host_mod
 from eugene_plexus_agent.engines.acquisition import Release, ReleaseAsset, Unavailable
 from eugene_plexus_agent.engines.llama_cpp import LlamaCppAdapter
@@ -80,11 +81,41 @@ def windows(monkeypatch):
     monkeypatch.setattr(host_mod.platform, "machine", lambda: "AMD64")
     monkeypatch.setattr(host_mod.shutil, "which", lambda name: None)
     monkeypatch.setattr(host_mod, "_windows_hip_sdk_present", lambda: False)
+    monkeypatch.setattr(gpu_probe, "vulkan_loader_present", lambda os_name: True)
     return monkeypatch
 
 
+_VENDOR_OF = {"amd": gpu_probe.AMD, "intel": gpu_probe.INTEL, "nvidia": gpu_probe.NVIDIA}
+
+
 def _video_controllers(monkeypatch, names: list[str]) -> None:
-    monkeypatch.setattr(host_mod, "_windows_display_adapters", lambda: names)
+    """These adapters, as DXCore would list them (discrete, vendor from the name).
+
+    Since 2026-09-27 DXCore is how Windows adapters are read; the WMI
+    names R2.3 used are the fallback for a Windows without DXCore, and
+    the tests of that fallback say so by name.
+    """
+    listed = [
+        gpu_probe.Adapter(
+            name=name,
+            vendor=next((v for k, v in _VENDOR_OF.items() if k in name.lower()), gpu_probe.OTHER),
+            integrated=False,
+            dedicated_bytes=16 * 1024**3,
+            shared_bytes=8 * 1024**3,
+        )
+        for name in names
+    ]
+    monkeypatch.setattr(gpu_probe, "adapters", lambda os_name=None: listed)
+
+
+def _no_dxcore(monkeypatch, wmi_names: list[str]) -> None:
+    """A Windows older than DXCore: only `Win32_VideoController`'s names."""
+
+    def _raise(os_name=None):
+        raise gpu_probe.GpuProbeError("DXCore is not on this machine")
+
+    monkeypatch.setattr(gpu_probe, "adapters", _raise)
+    monkeypatch.setattr(host_mod, "_windows_display_adapters", lambda: wmi_names)
 
 
 # --------------------------------------------------------------------------- #
@@ -133,7 +164,21 @@ def test_an_adapter_that_is_not_a_gpu_is_still_none(windows, adapter) -> None:
     what says so, by naming four adapters nobody should build for and
     letting the one surviving mechanism reject all of them.
     """
-    _video_controllers(windows, [adapter])
+    _no_dxcore(windows, [adapter])
+    assert host_mod.detect_host().accelerator is Accelerator.none
+
+
+def test_without_dxcore_the_wmi_names_still_choose_vulkan(windows) -> None:
+    """R2.3's mechanism survives as the fallback, and still works."""
+    _no_dxcore(windows, ["Intel(R) Arc(TM) A770 Graphics"])
+    assert host_mod.detect_host().accelerator is Accelerator.vulkan
+
+
+def test_without_dxcore_a_snapdragon_is_not_sent_for_a_build_nobody_publishes(windows) -> None:
+    """`_VULKAN_VENDORS` lists Qualcomm and Adreno, and there is no
+    `win-vulkan-arm64`: the install failed with "no asset" until 2026-09-27."""
+    windows.setattr(host_mod.platform, "machine", lambda: "ARM64")
+    _no_dxcore(windows, ["Qualcomm(R) Adreno(TM) X1-85 GPU"])
     assert host_mod.detect_host().accelerator is Accelerator.none
 
 

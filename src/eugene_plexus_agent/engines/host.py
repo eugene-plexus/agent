@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .._generated.models import Accelerator, Arch, HostAccelerator, Os
 from ..child_env import child_environment
+from . import gpu_probe
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,12 @@ def detect_host() -> HostAccelerator:
             _probe_compute_capability() if accelerator is Accelerator.cuda else None
         ),
     )
+
+
+def platform_names() -> tuple[str, str]:
+    """`(os, arch)` spelled as `HostAccelerator` spells them, or `""`."""
+    os_kind, arch = _detect_os(), _detect_arch()
+    return (os_kind.value if os_kind else "", arch.value if arch else "")
 
 
 def _detect_os() -> Os | None:
@@ -104,22 +111,67 @@ def _detect_accelerator(os_kind: Os | None, arch: Arch | None) -> tuple[Accelera
     if _has_nvidia():
         return Accelerator.cuda, None
 
-    if _has_rocm():
+    # A vendor tool that answers is the strongest evidence there is.
+    if _output(["rocm-smi", "--showid"]):
         return Accelerator.rocm, None
-    if _has_sycl():
+    if sycl_sees_gpu():
         return Accelerator.sycl, None
 
-    # **Windows, last, because everything above is better where it
-    # applies** (review §6.1 #11). Every probe above looks for a vendor
-    # tool or a Linux sysfs path, and a Windows machine with an AMD or
-    # Intel card has neither unless its owner installed an SDK — so
-    # until this branch existed, every one of them fell through to
-    # `none`: a CPU build, a fit scored against RAM, and the starter set
-    # inverted to the smallest model, on a machine built around a GPU.
-    if os_kind is Os.windows:
-        return _windows_fallback_accelerator(), None
+    return _os_accelerator(os_kind, arch), None
 
-    return Accelerator.none, None
+
+def _os_accelerator(os_kind: Os | None, arch: Arch | None) -> Accelerator:
+    """The build for a machine no vendor tool answered on, from the OS's
+    own list of GPUs (`gpu_probe`).
+
+    **Last, because everything above is better where it applies** (review
+    §6.1 #11). Every probe above looks for a vendor tool, and a machine
+    with an AMD or Intel card has none unless its owner installed an SDK.
+    Until 2026-09-18 every such Windows machine fell through to `none`: a
+    CPU build, a fit scored against RAM and the starter set inverted to
+    the smallest model, on a machine built around a GPU.
+
+    **And until 2026-09-27 Linux still did.** An AMD card without ROCm got
+    the CPU build although upstream publishes `ubuntu-vulkan-x64`. Any
+    machine with Intel graphics got `ubuntu-sycl-fp16-x64` because the
+    `i915` driver directory existed, which is every Intel laptop, and
+    that build needs a oneAPI runtime such a machine rarely has. Both now
+    take Vulkan when its loader is installed.
+
+    `gpu_probe.family` decides, and the device list calls the same
+    function, so the build and the cards a fit is scored against cannot
+    disagree.
+    """
+    os_name = os_kind.value if os_kind is not None else ""
+    arch_name = arch.value if arch is not None else ""
+    try:
+        found = gpu_probe.adapters(os_name)
+    except gpu_probe.GpuProbeError as exc:
+        log.info("could not list this machine's GPUs: %s", exc)
+        if os_kind is Os.windows:
+            return _windows_fallback_accelerator(arch)
+        return Accelerator.rocm if rocm_installed(os_kind) else Accelerator.none
+    if not found and rocm_installed(os_kind):
+        # ROCm installed and the OS listing nothing is a container that
+        # sees `/opt/rocm` and not `/sys/class/drm`. The owner put ROCm
+        # there on purpose; it keeps the build it had before this probe.
+        return Accelerator.rocm
+    chosen = gpu_probe.family(
+        os_name,
+        arch_name,
+        found,
+        vulkan_loader=gpu_probe.vulkan_loader_present(os_name),
+        rocm=rocm_installed(os_kind),
+    )
+    for note in chosen.notes:
+        log.info("%s", note)
+    if chosen.adapters:
+        log.info(
+            "no vendor tool answered; %s will be served by the %s build",
+            ", ".join(a.name for a in chosen.adapters),
+            chosen.accelerator,
+        )
+    return Accelerator(chosen.accelerator)
 
 
 class Probe(enum.Enum):
@@ -247,40 +299,42 @@ def _has_nvidia() -> bool:
     return bool(output and output.strip())
 
 
-def _has_rocm() -> bool:
-    if _output(["rocm-smi", "--showid"]):
-        return True
-    if platform.system().lower() == "windows":
-        # **Windows ROCm is the HIP SDK, and nothing else says it is
-        # there.** `rocm-smi` and `/opt/rocm` are both Linux-only, so
-        # `_has_rocm` could never be true here and `win-rocm-10.0-x64`
-        # was dead code that read as AMD support. This makes it
-        # reachable without betting the common case on it: an AMD owner
-        # who has not installed the SDK gets the Vulkan build, which
-        # works.
+def rocm_installed(os_kind: Os | None) -> bool:
+    """AMD's compute SDK is on disk, whether or not its tool answered.
+
+    **Windows ROCm is the HIP SDK, and nothing else says it is there.**
+    `rocm-smi` and `/opt/rocm` are both Linux-only, so this could never
+    be true on Windows and `win-rocm-10.0-x64` was dead code that read as
+    AMD support. On Linux `rocm-smi` is not always on PATH even where
+    ROCm is installed, and the install prefix is stable enough to check
+    directly. Either way ROCm is chosen only for an AMD adapter
+    (`gpu_probe.family`); an AMD owner without the SDK gets Vulkan, which
+    works.
+    """
+    if os_kind is Os.windows:
         return _windows_hip_sdk_present()
-    # `rocm-smi` is not always on PATH even where ROCm is installed, and the
-    # install prefix is stable enough to be worth checking directly.
     return Path("/opt/rocm").is_dir()
 
 
-def _has_sycl() -> bool:
-    """Intel GPU, as far as we can tell without a toolkit installed.
+# `[level_zero:gpu][level_zero:0] Intel(R) Arc(TM) A770 Graphics ...` from a
+# current oneAPI, `[ext_oneapi_level_zero:gpu:0] ...` from an older one.
+_SYCL_GPU_RE = re.compile(r"\[[a-z_]+:gpu", re.IGNORECASE)
 
-    `sycl-ls` only exists once oneAPI is set up, which is exactly the
-    situation where the operator does not need us to guess. The DRM device
-    check catches a bare Arc / Xe card on Linux with nothing installed.
 
-    Deliberately still Linux-shaped: on Windows an Intel card is served
-    by the Vulkan build, because upstream publishes `win-sycl-x64`
-    nowhere this repo can see and a variant nobody ships turns a slow
-    install into a failed one.
+def sycl_sees_gpu() -> bool:
+    """oneAPI is set up and its runtime can see an Intel GPU.
+
+    **A GPU, not merely an answer.** `sycl-ls` also lists the CPU's
+    OpenCL device, so oneAPI installed on a machine with no Intel GPU
+    used to read as SYCL and fetch a build for a card that is not there.
+
+    **And no longer the `i915` driver directory** (2026-09-27). That
+    directory exists on every Linux machine with Intel graphics, which is
+    every Intel laptop. It selected `ubuntu-sycl-fp16-x64`, whose runtime
+    such a machine rarely has installed. Those machines take Vulkan now.
     """
-    if _output(["sycl-ls"]):
-        return True
-    by_path = Path("/sys/bus/pci/drivers/i915")
-    xe = Path("/sys/bus/pci/drivers/xe")
-    return by_path.is_dir() or xe.is_dir()
+    output = _output(["sycl-ls"])
+    return bool(output and _SYCL_GPU_RE.search(output))
 
 
 # --------------------------------------------------------------------------- #
@@ -347,16 +401,19 @@ def _windows_display_adapters() -> list[str]:
         return []
 
 
-def _windows_fallback_accelerator() -> Accelerator:
-    """What a Windows machine gets when no vendor tool answered.
+def _windows_fallback_accelerator(arch: Arch | None) -> Accelerator:
+    """What a Windows machine gets when DXCore could not be asked.
 
-    Vulkan rather than ROCm or SYCL, and the reason is about the user's
-    machine rather than about a table: upstream ships
+    The mechanism R2.3 built, kept for a Windows older than DXCore
+    (version 2004): `Win32_VideoController` has names and no memory
+    figures, which is enough to choose a build and not to score a fit.
+    Vulkan rather than ROCm or SYCL, because upstream ships
     `llama-*-bin-win-vulkan-x64.zip` in every release, it needs no
-    vendor SDK, and one build covers AMD and Intel alike. An owner who
-    has installed the HIP SDK gets ROCm instead, which `_has_rocm`
-    decided before this was reached.
+    vendor SDK, and one build covers AMD and Intel alike -- but only on
+    x64, because there is no `win-vulkan-arm64` for a Snapdragon to take.
     """
+    if not gpu_probe.vulkan_build_published("windows", arch.value if arch else ""):
+        return Accelerator.none
     for name in _windows_display_adapters():
         lowered = name.lower()
         if any(vendor in lowered for vendor in _VULKAN_VENDORS):
@@ -365,4 +422,4 @@ def _windows_fallback_accelerator() -> Accelerator:
     return Accelerator.none
 
 
-__all__ = ["detect_host"]
+__all__ = ["detect_host", "platform_names", "rocm_installed", "sycl_sees_gpu"]
