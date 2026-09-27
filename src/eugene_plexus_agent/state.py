@@ -397,8 +397,37 @@ CONFIG_FIELDS: list[ConfigField] = [
         default=model_copies.DEFAULT_MIN_FREE_GB,
     ),
 ]
+CONFIG_FIELDS += [
+    ConfigField(
+        key="updateChecks",
+        label="Check for updates",
+        description=(
+            "Look for a newer version of Eugene a minute after it starts and every six "
+            "hours, and say so when there is one. Nothing is installed without you "
+            "pressing Update. Turn it off and this machine never asks GitHub."
+        ),
+        category="updates",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
+        key="updateChannel",
+        label="Update channel",
+        description=(
+            "Where updates come from. Edge is the newest version that has passed every "
+            "check, the same one the edge container image is built from. Releases is the "
+            "newest published release. Left unset, it follows what this machine was "
+            "installed from: a release install follows releases, anything else edge."
+        ),
+        category="updates",
+        valueType=ConfigValueType.enum,
+        enumValues=["edge", "releases"],
+        enumLabels=["Edge", "Releases"],
+    ),
+]
 CATEGORY_LABELS: dict[str, str] = {
     "setup": "Setup",
+    "updates": "Updates",
     "security": "Security",
     "ui": "Appearance",
     "engines": "Engines",

@@ -1,0 +1,65 @@
+# Written by the Eugene Plexus agent to update this install. Safe to delete.
+#
+# Run by a one-shot scheduled task, never by the agent: the installer's first
+# act is to stop the agent, and the agent's children die with it. PowerShell
+# from Windows itself, never Python from the install: the installer stops
+# processes running from inside the install folder.
+$ErrorActionPreference = 'Continue'
+$dir = @@DIR@@
+$log = @@LOG@@
+$err = Join-Path $dir 'update-errors.log'
+$started = @@STARTED@@
+$target = @@TARGET@@
+$installer = Join-Path $dir 'install.ps1'
+$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$argList = @(
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+    '-File', $installer, '-Prefix', @@PREFIX@@
+) + @(@@FLAGS@@)
+# **Quoted by hand.** Windows PowerShell 5.1's Start-Process joins an
+# argument array with spaces and quotes nothing, so a folder with a space
+# in it -- any account name with one -- was split in two and the
+# installer never ran. Found by running this script, not by reading it.
+$argLine = ($argList | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
+
+$code = 1
+try {
+    $p = Start-Process -FilePath $ps -ArgumentList $argLine -Wait -PassThru -NoNewWindow `
+        -RedirectStandardOutput $log -RedirectStandardError $err
+    $code = $p.ExitCode
+}
+catch {
+    ($_ | Out-String) | Out-File -FilePath $err -Append -Encoding utf8
+}
+
+$tail = @()
+foreach ($f in @($log, $err)) {
+    if (Test-Path -LiteralPath $f) {
+        $tail += Get-Content -LiteralPath $f -Tail 12 -ErrorAction SilentlyContinue
+    }
+}
+if ($code -eq 0) {
+    $outcome = 'succeeded'
+    $detail = "Installed $target."
+}
+else {
+    # Whatever the installer left behind, bring the agent back: a node that
+    # is running reports its failure, a node that is stopped reports nothing.
+    @@RESTART@@
+    $outcome = 'failed'
+    $lines = ($tail | Where-Object { $_ }) -join ' | '
+    $detail = "The installer exited with $code. Its last lines: $lines"
+}
+$record = [ordered]@{
+    target     = $target
+    startedAt  = $started
+    finishedAt = (Get-Date).ToUniversalTime().ToString('o')
+    outcome    = $outcome
+    detail     = $detail
+    log        = $log
+}
+$json = $record | ConvertTo-Json -Compress
+$utf8 = New-Object Text.UTF8Encoding $false
+[IO.File]::WriteAllText((Join-Path $dir 'last.json'), $json, $utf8)
+Remove-Item -LiteralPath (Join-Path $dir 'running.json') -Force -ErrorAction SilentlyContinue
+& schtasks.exe /Delete /TN 'EugenePlexusUpdate' /F | Out-Null

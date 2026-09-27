@@ -30,7 +30,16 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "modelCopyMinFreeGb",
         "uvBinary",
         "allowCustomApps",
+        "updateChecks",
+        "updateChannel",
     }
+    # Checking is on by default and installs nothing; the channel is unset
+    # so it follows what the machine was installed from.
+    checks = next(f for f in body["fields"] if f["key"] == "updateChecks")
+    assert checks["category"] == "updates" and checks["default"] is True
+    channel = next(f for f in body["fields"] if f["key"] == "updateChannel")
+    assert channel["enumValues"] == ["edge", "releases"] and channel.get("default") is None
+    assert body["categories"]["updates"] == "Updates"
     # Apps have their own category; running code that is not in the
     # catalogue is an expert switch and off until someone turns it on.
     custom = next(f for f in body["fields"] if f["key"] == "allowCustomApps")

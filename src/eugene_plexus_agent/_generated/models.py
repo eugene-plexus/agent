@@ -1064,6 +1064,107 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
+class ComponentName(StrEnum):
+    """
+    One of the six packages an install is made of. Named rather than
+    inline: an inline enum here renamed the engine install's `State`
+    to `State1` in the agent's generated models (the S6 trap again).
+
+    """
+
+    agent = 'agent'
+    control = 'control'
+    gateway = 'gateway'
+    inference_driver = 'inference-driver'
+    library = 'library'
+    ui = 'ui'
+
+
+class InstalledComponentState(StrEnum):
+    """
+    `stamped`: built from a GitHub archive, `commit` is its commit.
+    `development`: a git checkout, which keeps the placeholder.
+    `unrecorded`: installed before components recorded their
+    commit (before 2026-09-27), so its version is unknown.
+    `missing`: not installed in this agent's environment.
+
+    """
+
+    stamped = 'stamped'
+    development = 'development'
+    unrecorded = 'unrecorded'
+    missing = 'missing'
+
+
+class InstallMechanism(StrEnum):
+    """
+    What keeps this install running, which decides whether and how it
+    can update itself. `container` never can: its code is its image,
+    and an update is a new image. `none` means somebody started the
+    agent by hand.
+
+    """
+
+    windows_service = 'windows_service'
+    windows_task = 'windows_task'
+    systemd_system = 'systemd_system'
+    systemd_user = 'systemd_user'
+    launchd = 'launchd'
+    container = 'container'
+    none = 'none'
+
+
+class ContainerInstall(BaseModel):
+    image: str = Field(
+        ...,
+        description='The image this container was built as, e.g. `ghcr.io/eugene-plexus/control-plane:edge`.',
+    )
+    host: str | None = Field(
+        None,
+        description='What runs the container, when its own template says so\n(`unraid`, `compose`). Absent otherwise: from inside a\ncontainer nothing reliable says what launched it, and the\ngeneral Docker steps are given instead.\n',
+    )
+
+
+class UpdateStep(BaseModel):
+    text: str
+    command: str | None = Field(
+        None, description='A command to copy, when the step is one.'
+    )
+
+
+class UpdateChannel(StrEnum):
+    edge = 'edge'
+    releases = 'releases'
+
+
+class UpdateChannelSource(StrEnum):
+    """
+    `setting`: `updateChannel` on this agent's config.
+    `inferred`: not set, so `releases` when the installed commits
+    are exactly one of the recent releases, and `edge` otherwise.
+
+    """
+
+    setting = 'setting'
+    inferred = 'inferred'
+
+
+class UpdateOutcome(StrEnum):
+    running = 'running'
+    succeeded = 'succeeded'
+    failed = 'failed'
+
+
+class UpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    target: str = Field(
+        ...,
+        description='The `ref` of `NodeUpdate.newest` the caller was shown. Refused\nunless it is still the newest this agent found, so a click is\nnever an update to something the person did not see -- and\nthe only thing a caller can ask for is what this agent itself\nfound on its channel.\n',
+    )
+
+
 class BoundAddress(BaseModel):
     process: str = Field(
         ...,
@@ -2629,6 +2730,61 @@ class ComponentEntry(BaseModel):
     safeMode: bool | None = False
 
 
+class InstalledComponent(BaseModel):
+    name: ComponentName
+    state: InstalledComponentState
+    commit: str | None = Field(
+        None,
+        description='The full commit id, when `state` is `stamped`.',
+        pattern='^[0-9a-f]{40}$',
+    )
+
+
+class UpdateTarget(BaseModel):
+    channel: UpdateChannel
+    ref: str = Field(
+        ...,
+        description='What `POST /v1/node/update` must name: the specs commit for\n`edge`, the release tag for `releases`.\n',
+    )
+    release: str | None = Field(
+        None, description='The release tag, on the `releases` channel.'
+    )
+    specsCommit: str | None = Field(None, pattern='^[0-9a-f]{40}$')
+    publishedAt: AwareDatetime | None = None
+    components: dict[str, str] = Field(
+        ..., description='Component name to the commit its installer pins.'
+    )
+
+
+class UpdateApply(BaseModel):
+    """
+    Whether this install can update itself from the app, and when it
+    cannot, what a person does instead.
+
+    """
+
+    possible: bool
+    reason: str | None = Field(None, description='Why it cannot, in a sentence.')
+    steps: list[UpdateStep] | None = Field(
+        None,
+        description='What to do instead, for an install that cannot update itself\n-- a container (pull the new image and recreate it, with the\nwords for the platform its template names), or a machine\nnothing starts automatically.\n',
+    )
+
+
+class UpdateRun(BaseModel):
+    target: str = Field(..., description='The `ref` being installed.')
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = None
+    outcome: UpdateOutcome
+    detail: str | None = Field(
+        None,
+        description="What happened, in words; on a failure, the installer's own\nlast lines and what state the machine was left in.\n",
+    )
+    log: str | None = Field(
+        None, description='Where the whole installer output is, on this machine.'
+    )
+
+
 class HostFirewall(BaseModel):
     """
     What the host firewall says about the ports this install
@@ -3134,6 +3290,71 @@ class DirectoryListing(BaseModel):
     )
 
 
+class NodeInstall(BaseModel):
+    """
+    What is installed on this machine, read from the code itself.
+
+    **Each component reports the commit it was built from**, stamped
+    into its `_build.py` by `git archive` when GitHub made the source
+    archive the installer downloaded (`export-subst`). Nothing of ours
+    writes it and there is no record file to edit, so it says what is
+    actually installed rather than what an installer meant to install:
+    a package that half-failed to upgrade reports its old commit, and a
+    mixed install is visible as one.
+
+    """
+
+    components: list[InstalledComponent] = Field(
+        ..., description="The six packages, in the installers' order."
+    )
+    mechanism: InstallMechanism
+    development: bool = Field(
+        ...,
+        description='A development checkout: at least one component is a git\ncheckout rather than an archive, so it has no commit to\ncompare and is never offered an update.\n',
+    )
+    container: ContainerInstall | None = None
+
+
+class NodeUpdate(BaseModel):
+    """
+    Whether this install is behind its channel, and whether it can
+    update itself.
+
+    **Two channels.** `edge` is the head of `main`, gated: the newest
+    `main` commit on which every workflow that ran succeeded, CI among
+    them -- the same commit the `:edge` container image was built from,
+    so a native install is never offered what the container was not.
+    `releases` is the newest published release, checked against the
+    checksums in its own `manifest.json`.
+
+    Checked when the agent starts and every six hours, and on
+    `POST /v1/node/update/check`. Off with `updateChecks: false` on
+    this agent's config.
+
+    """
+
+    enabled: bool
+    channel: UpdateChannel
+    channelSource: UpdateChannelSource
+    checkedAt: AwareDatetime | None = None
+    error: str | None = Field(
+        None,
+        description='Why the last check could not finish, and what it was trying to reach.',
+    )
+    newest: UpdateTarget | None = None
+    available: bool = Field(
+        ...,
+        description='`newest` differs from what is installed. Never true for a\ndevelopment checkout.\n',
+    )
+    behind: list[str] = Field(
+        ...,
+        description='The components whose installed commit is not the one in `newest`.',
+    )
+    apply: UpdateApply
+    running: UpdateRun | None = None
+    last: UpdateRun | None = None
+
+
 class NodeReach(BaseModel):
     """
     Whether other devices can reach this machine, as **evidence**
@@ -3372,6 +3593,8 @@ class NodeIdentity(BaseModel):
         examples=['2026-09-16T14:03:21.482Z'],
     )
     reach: NodeReach | None = None
+    install: NodeInstall | None = None
+    update: NodeUpdate | None = None
 
 
 class UnenrollResult(BaseModel):

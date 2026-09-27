@@ -34,6 +34,7 @@ from . import (
     default_topology,
     enrollment,
     host_allowlist,
+    install_info,
     install_permissions,
     keyring_store,
     node_identity,
@@ -61,6 +62,7 @@ from .routes import health as health_routes
 from .routes import node as node_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
+from .routes import updates as update_routes
 from .runtimes import RuntimeSupervisor, close_installers
 from .settings import Settings, load_settings
 from .state import AgentState
@@ -391,11 +393,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # during a revocation, a sign-out or a root-key rotation catches up by
     # itself. The push is the fast path; this is the one that cannot miss.
     bundle_task = asyncio.create_task(_pull_trust_bundle(app), name="trust-bundle-pull")
+    # Is this install behind its channel? A minute after boot and every six
+    # hours after, never on the request path: GET /v1/node reads the last
+    # result. See specs docs/design/in-app-updates.md.
+    update_task: asyncio.Task[None] | None = None
+    if not settings.safe_mode:
+        update_task = asyncio.create_task(
+            update_routes.checker_for(app).run_forever(install_info.describe), name="update-check"
+        )
     try:
         yield
     finally:
         bundle_task.cancel()
         await asyncio.gather(bundle_task, return_exceptions=True)
+        if update_task is not None:
+            update_task.cancel()
+            await asyncio.gather(update_task, return_exceptions=True)
         # Apps first: they are clients of everything below, and a spoke
         # outliving the hub it talks to only produces errors in its log.
         if apps_task is not None and not apps_task.done():
@@ -695,6 +708,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(apps_routes.router)
     # This host's identity and devices; reads only, operator or service.
     app.include_router(node_routes.router)
+    # Checking for and installing a newer version; operator-only.
+    app.include_router(update_routes.router)
 
     # The browser surface, registered LAST and in this order. The proxy
     # is deliberately unauthenticated — it is the path the login request

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Written by the Eugene Plexus agent to update this install. Safe to delete.
+#
+# Run as a transient `systemd-run --user` unit, outside the agent's own
+# cgroup: the installer's first act is to stop the agent's unit, and
+# anything inside that unit's cgroup would stop with it.
+DIR=@@DIR@@
+LOG=@@LOG@@
+TARGET=@@TARGET@@
+STARTED=@@STARTED@@
+
+sh "$DIR/install.sh" --user --update >"$LOG" 2>&1
+CODE=$?
+if [ "$CODE" = 0 ]; then
+    OUTCOME=succeeded
+    DETAIL="Installed $TARGET."
+else
+    # Bring the agent back whatever the installer left behind.
+    systemctl --user start eugene-plexus-agent >/dev/null 2>&1 || true
+    OUTCOME=failed
+    DETAIL="The installer exited with $CODE. Its last lines: $(tail -n 12 "$LOG" | tr '\n' '|')"
+fi
+
+# JSON string escaping: backslash and quote escaped, control bytes dropped.
+esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\000-\037'; }
+FINISHED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+{
+    printf '{"target":"%s","startedAt":"%s",' "$(esc "$TARGET")" "$(esc "$STARTED")"
+    printf '"finishedAt":"%s","outcome":"%s",' "$FINISHED" "$OUTCOME"
+    printf '"detail":"%s","log":"%s"}' "$(esc "$DETAIL")" "$(esc "$LOG")"
+} >"$DIR/last.json.tmp" && mv "$DIR/last.json.tmp" "$DIR/last.json"
+rm -f "$DIR/running.json"

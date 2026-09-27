@@ -70,6 +70,7 @@ from ..node_identity import (
 )
 from ..state import AgentState
 from ..trust import BundleRollback
+from .updates import node_update_view
 
 log = logging.getLogger(__name__)
 
@@ -212,6 +213,9 @@ async def get_node(request: Request) -> NodeIdentity:
         request,
         advertise=str(identity.advertiseUrl) if identity.advertiseUrl else None,
     )
+    # What is installed and whether it is behind: from the code itself and
+    # the last check, never a network call here -- every console polls this.
+    identity.install, identity.update = await asyncio.to_thread(node_update_view, request)
     return identity
 
 
