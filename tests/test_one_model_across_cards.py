@@ -189,11 +189,83 @@ def test_vllm_uses_as_many_cards_as_it_is_told() -> None:
     assert place(tp, uneven).budget == 20 * GIB
 
 
-def test_cards_of_another_kind_are_not_in_the_split() -> None:
-    """Linux with both vendors' tools answering: the CUDA build uses the
-    NVIDIA cards and nothing else."""
-    mixed = [_card(0, 30), _card(1, 30), _card(2, 20, ComputeDeviceKind.rocm)]
-    assert [d.index for d in spread_devices(_spec(10), mixed)] == [0, 1]
+def test_a_llama_cpp_split_takes_every_card_the_build_uses_whatever_its_kind() -> None:
+    """**Amended 2026-09-27**, from "cards of another kind are not in the
+    split". The device list now names exactly what the build uses, and the
+    `+vulkan` build uses an AMD card beside NVIDIA through its second
+    backend; the case that test guarded (a ROCm card the CUDA build cannot
+    reach) no longer reaches the list at all."""
+    mixed = [_card(0, 30), _card(0, 20, ComputeDeviceKind.vulkan)]
+    spread = spread_devices(_spec(10), mixed)
+    assert [(d.kind.value, d.index) for d in spread] == [("cuda", 0), ("vulkan", 0)]
+    assert place(_spec(10), mixed).budget == 50 * GIB
+
+
+def test_vllm_splits_across_its_own_kind_only() -> None:
+    """vLLM has no Vulkan backend."""
+    tp = _spec(10, engine="vllm", flags={"tensorParallelSize": 2})
+    mixed = [_card(0, 30), _card(0, 20, ComputeDeviceKind.vulkan), _card(1, 30)]
+    assert [(d.kind.value, d.index) for d in spread_devices(tp, mixed)] == [
+        ("cuda", 0),
+        ("cuda", 1),
+    ]
+
+
+def test_cuda_0_and_vulkan_0_are_two_cards() -> None:
+    """A promise on CUDA device 0 is not a promise on Vulkan device 0."""
+    held = [
+        Reservation(runtime="a", device_index=0, device_kind="cuda", size_bytes=20 * GIB, at=0.0)
+    ]
+    assert held_bytes(held, device_index=0, device_kind="vulkan", exclude=None) == 0
+    assert held_bytes(held, device_index=0, device_kind="cuda", exclude=None) == 20 * GIB
+    # A reservation from before kinds were recorded matches any.
+    legacy = [Reservation(runtime="b", device_index=0, size_bytes=5 * GIB, at=0.0)]
+    assert held_bytes(legacy, device_index=0, device_kind="vulkan", exclude=None) == 5 * GIB
+
+
+def test_a_pin_reaches_its_own_kind_only() -> None:
+    both = _snapshot(_card(0, 30), _card(1, 30), _card(1, 20, ComputeDeviceKind.vulkan))
+    targets = admission_module.target_devices(_spec(10, env={"CUDA_VISIBLE_DEVICES": "1"}), both)
+    assert [(d.kind.value, d.index) for d in targets] == [("cuda", 1)]
+
+
+def test_an_explicit_cuda_list_is_measured_and_a_vulkan_name_is_not() -> None:
+    cards = list(TWO_5090S.accelerators())
+    cuda = _spec(10, flags={"devices": "CUDA1"})
+    assert [d.index for d in admission_module.target_devices(cuda, TWO_5090S)] == [1]
+    igpu = _spec(10, flags={"devices": "CUDA0,Vulkan1"})
+    assert place(igpu, admission_module.target_devices(igpu, TWO_5090S)).budget is None
+    assert place(cuda, cards).budget is not None
+
+
+@pytest.mark.anyio
+async def test_a_launch_naming_a_vulkan_device_is_admitted_unmeasured() -> None:
+    """The integrated-GPU overflow test path: not judged, not refused."""
+    result = await check_admission(
+        _spec(40, flags={"devices": "CUDA0,Vulkan1"}),
+        snapshot=TWO_5090S,
+        library=None,
+        running=[],
+    )
+    assert result.decision is AdmissionDecision.admit
+    assert result.fit is AdmissionFit.unknown
+
+
+def test_two_cards_and_a_vulkan_name_is_still_unmeasured() -> None:
+    """Both 5090s plus the integrated GPU as overflow: the two CUDA cards
+    are a split, and the Vulkan name still leaves nothing honest to
+    measure the whole against. The first sabotage pass found this path
+    untested."""
+    spec = _spec(10, flags={"devices": "CUDA0,CUDA1,Vulkan2"})
+    targets = admission_module.target_devices(spec, TWO_5090S)
+    placement = place(spec, targets)
+    assert placement.spread
+    assert placement.budget is None
+
+
+def test_device_none_is_the_processor() -> None:
+    targets = admission_module.target_devices(_spec(10, flags={"devices": "none"}), TWO_5090S)
+    assert [d.kind.value for d in targets] == ["cpu"]
 
 
 def test_the_main_gpu_is_the_main_card() -> None:
@@ -244,7 +316,7 @@ def test_a_split_promise_counts_on_each_card_by_its_share() -> None:
         device_index=0,
         size_bytes=40 * GIB,
         at=0.0,
-        shares=((0, 30 * GIB), (1, 10 * GIB)),
+        shares=(("cuda", 0, 30 * GIB), ("cuda", 1, 10 * GIB)),
     )
     assert held_bytes([split], device_index=0, exclude=None) == 30 * GIB
     assert held_bytes([split], device_index=1, exclude=None) == 10 * GIB
@@ -285,6 +357,9 @@ def test_the_ledger_takes_a_split_promise(tmp_path: Path) -> None:
 
     ledger = ReservationLedger()
     ledger.reserve(
-        "big", device_index=0, size_bytes=40 * GIB, shares=[(0, 30 * GIB), (1, 10 * GIB)]
+        "big",
+        device_index=0,
+        size_bytes=40 * GIB,
+        shares=[("cuda", 0, 30 * GIB), ("cuda", 1, 10 * GIB)],
     )
     assert ledger.held_bytes(device_index=1, exclude=None) == 10 * GIB

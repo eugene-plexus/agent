@@ -384,7 +384,9 @@ def test_the_other_builds_are_every_one_published_for_this_os_and_cpu() -> None:
     assert alternatives(_WINDOWS_X64, _release()) == [
         "win-cpu-x64",
         "win-cuda-12.4-x64",
+        "win-cuda-12.4-x64+vulkan",
         "win-cuda-13.4-x64",
+        "win-cuda-13.4-x64+vulkan",
         "win-openvino-2026.4-x64",
         "win-rocm-10.0-x64",
         "win-sycl-x64",
@@ -498,18 +500,47 @@ def test_the_integrated_gpu_beside_a_card_does_not_become_the_budget(os_is) -> N
     assert [d.name for d in devices] == ["NVIDIA GeForce RTX 5090"]
 
 
-def test_a_card_the_cuda_build_cannot_use_is_named(os_is) -> None:
+def _smi(argv: list[str]) -> str | None:
+    return "0, NVIDIA GeForce RTX 5090, 32607, 29996\n" if argv[0] == "nvidia-smi" else None
+
+
+def test_a_discrete_card_beside_nvidia_joins_the_list_on_windows(os_is) -> None:
+    """**Amended 2026-09-27**, from "a card the CUDA build cannot use is
+    named". The build for this machine is now the CUDA one with the Vulkan
+    backend added, which uses the Radeon card; the integrated GPU still
+    stays out, as llama.cpp keeps it out while a card is present."""
     os_is("Windows")
-
-    def _smi(argv: list[str]) -> str | None:
-        return "0, NVIDIA GeForce RTX 5090, 32607, 29996\n" if argv[0] == "nvidia-smi" else None
-
     snapshot = detect_devices(
         run=_smi, memory=_memory, os_adapters=lambda: [RADEON_IGPU, RTX_5090, RX_7900]
     )
+    assert [(d.kind.value, d.name) for d in snapshot.accelerators()] == [
+        ("cuda", "NVIDIA GeForce RTX 5090"),
+        ("vulkan", "AMD Radeon RX 7900 XTX"),
+    ]
+    assert not [w for w in snapshot.warnings if "is also here" in w], snapshot.warnings
+
+
+def test_on_linux_the_card_beside_nvidia_is_named_and_why(os_is) -> None:
+    """The Linux CUDA and Vulkan builds cannot be combined, measured."""
+    os_is("Linux", "x86_64")
+    snapshot = detect_devices(run=_smi, memory=_memory, os_adapters=lambda: [RTX_5090, RX_7900])
     assert [d.name for d in snapshot.accelerators()] == ["NVIDIA GeForce RTX 5090"]
-    named = [w for w in snapshot.warnings if "is also here" in w]
-    assert len(named) == 1 and "AMD Radeon RX 7900 XTX" in named[0], snapshot.warnings
+    [named] = [w for w in snapshot.warnings if "is also here" in w]
+    assert "AMD Radeon RX 7900 XTX" in named and "core libraries differ" in named
+
+
+def test_other_vendors_tools_are_not_read_beside_nvidia(os_is) -> None:
+    """`rocm-smi` beside `nvidia-smi` on Linux listed a card the CUDA build
+    cannot use, and a split would have counted it."""
+    os_is("Linux", "x86_64")
+
+    def _both(argv: list[str]) -> str | None:
+        if argv[0] == "rocm-smi":
+            return "device,VRAM Total Memory (B),VRAM Total Used Memory (B)\ncard0,25753026560,0\n"
+        return _smi(argv)
+
+    snapshot = detect_devices(run=_both, memory=_memory, os_adapters=lambda: [])
+    assert [d.kind.value for d in snapshot.accelerators()] == ["cuda"]
 
 
 def test_a_gb10_computes_out_of_host_memory(os_is) -> None:

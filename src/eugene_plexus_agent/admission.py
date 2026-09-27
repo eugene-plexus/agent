@@ -52,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -372,6 +373,74 @@ def pinned_indices(env: dict[str, str] | None) -> set[int] | None:
     return None
 
 
+# Which kind of card each pin variable names. A pin reaches its own
+# backend only: CUDA_VISIBLE_DEVICES hides CUDA devices and says nothing
+# to Vulkan, which is why a pinned runtime on a `+vulkan` build is also
+# given an empty GGML_VK_VISIBLE_DEVICES (`LlamaCppAdapter.default_env`).
+_PIN_KINDS = {
+    "CUDA_VISIBLE_DEVICES": ComputeDeviceKind.cuda,
+    "HIP_VISIBLE_DEVICES": ComputeDeviceKind.rocm,
+    "ROCR_VISIBLE_DEVICES": ComputeDeviceKind.rocm,
+}
+
+# `CUDA0`, `Vulkan1`, `ROCm0`: llama.cpp's own device names.
+_DEVICE_NAME_RE = re.compile(r"^(?P<backend>[A-Za-z]+)(?P<index>\d+)$")
+
+
+def pin_kind(env: dict[str, str] | None) -> ComputeDeviceKind | None:
+    """The kind of card the spec's pin variable names, if it pins."""
+    for var in _PIN_ENV_VARS:
+        if env and env.get(var) is not None:
+            return _PIN_KINDS.get(var)
+    return None
+
+
+def explicit_devices(
+    spec: RuntimeSpec, accelerators: Sequence[ComputeDevice]
+) -> tuple[list[ComputeDevice], list[str]] | None:
+    """The runtime's own `devices` list (llama.cpp's `--device`), mapped.
+
+    `CUDA<n>` is the n-th CUDA card. A Vulkan name cannot be mapped:
+    Vulkan numbers every GPU in the machine, the NVIDIA ones included,
+    in an order no tool here reads, so `Vulkan1` might be the integrated
+    GPU or the second card. Those come back unmapped, and the launch is
+    admitted without a memory check rather than measured against a
+    guess. This is the expert's path (an integrated GPU as overflow,
+    measured once on one rig and not judged: see the two-card record),
+    and `unknown` never refuses. `None` means the runtime names no list.
+    """
+    if spec.engine is not EngineKind.llama_cpp:
+        return None
+    raw = (spec.flags or {}).get("devices")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    mapped: list[ComputeDevice] = []
+    unmapped: list[str] = []
+    for name in (part.strip() for part in raw.split(",") if part.strip()):
+        if name.lower() == "none":
+            continue
+        match = _DEVICE_NAME_RE.match(name)
+        backend = match.group("backend").lower() if match else ""
+        kind = {"cuda": ComputeDeviceKind.cuda, "rocm": ComputeDeviceKind.rocm}.get(backend)
+        device = (
+            next(
+                (
+                    d
+                    for d in accelerators
+                    if d.kind is kind and d.index == int(match.group("index"))
+                ),
+                None,
+            )
+            if match and kind is not None
+            else None
+        )
+        if device is None:
+            unmapped.append(name)
+        elif device not in mapped:
+            mapped.append(device)
+    return mapped, unmapped
+
+
 def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeDevice]:
     """The devices a launch of `spec` would land on.
 
@@ -383,10 +452,25 @@ def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeD
     if not accelerators:
         cpu = snapshot.cpu()
         return [cpu] if cpu is not None else []
+    explicit = explicit_devices(spec, accelerators)
+    if explicit is not None:
+        mapped, unmapped = explicit
+        if mapped:
+            return mapped
+        if not unmapped:
+            # `--device none`: the processor only.
+            cpu = snapshot.cpu()
+            return [cpu] if cpu is not None else accelerators
+        return accelerators
     pinned = pinned_indices(spec.env)
     if pinned is None:
         return accelerators
-    chosen = [d for d in accelerators if d.index is not None and d.index in pinned]
+    kind = pin_kind(spec.env)
+    chosen = [
+        d
+        for d in accelerators
+        if d.index is not None and d.index in pinned and (kind is None or d.kind is kind)
+    ]
     # A pin to a device this host does not have is an engine error at
     # spawn; admission measures against everything rather than nothing.
     return chosen or accelerators
@@ -456,7 +540,11 @@ def spread_devices(spec: RuntimeSpec, targets: list[ComputeDevice]) -> list[Comp
     if spec.engine is EngineKind.llama_cpp:
         if str(flags.get("splitMode") or "").strip().lower() == "none":
             return []
-        return same if len(same) > 1 else []
+        # **Every card in the list, whatever its kind** (2026-09-27). The
+        # device list names exactly what the build chosen for this
+        # machine uses, and the `+vulkan` build uses an AMD or Intel card
+        # beside the NVIDIA one through its second backend.
+        return accelerators
     if spec.engine is EngineKind.vllm:
         count = _int_flag(flags.get("tensorParallelSize"), 1) * _int_flag(
             flags.get("pipelineParallelSize"), 1
@@ -506,13 +594,33 @@ def place(
     """Which card, or cards, this launch measures against."""
 
     def held(device: ComputeDevice) -> int:
-        return held_bytes(reservations, device_index=device.index, exclude=spec.name)
+        return held_bytes(
+            reservations,
+            device_index=device.index,
+            exclude=spec.name,
+            device_kind=device.kind.value,
+        )
 
     def spare(device: ComputeDevice) -> int | None:
         free = device.memoryFreeBytes
         return None if free is None else max(0, free - held(device))
 
     spread = spread_devices(spec, targets)
+    if not spread and explicit_devices(spec, targets) not in (None, ([], [])):
+        mapped, unmapped_names = explicit_devices(spec, targets) or ([], [])
+        if unmapped_names:
+            # A device named that no reading here covers: nothing honest
+            # to measure against, so the budget is unknown.
+            device = mapped[0] if mapped else targets[0]
+            return Placement(
+                main=device,
+                devices=(device,),
+                shares=(1.0,),
+                free=device.memoryFreeBytes,
+                total=device.memoryTotalBytes,
+                reserved=held(device),
+                budget=None,
+            )
     if not spread:
         # Largest single device by free memory -- the card the engine
         # would have to fit on -- MINUS what this node has already
@@ -532,13 +640,15 @@ def place(
             budget=max(0, free - reserved) if free is not None else None,
         )
 
+    explicit = explicit_devices(spec, targets)
+    unmapped = bool(explicit and explicit[1])
     shares = split_shares(spec, spread, spare)
     kept = [(d, p) for d, p in zip(spread, shares, strict=True) if p > 0]
     devices = tuple(d for d, _ in kept)
     fractions = tuple(p for _, p in kept)
     spares = [spare(d) for d in devices]
     budget: int | None
-    if any(s is None for s in spares):
+    if unmapped or any(s is None for s in spares):
         budget = None
     else:
         # The card that fills first bounds the whole model.
@@ -563,7 +673,7 @@ def place(
 
 def admission_split(
     spec: RuntimeSpec, admission: Admission, reservations: Sequence[Reservation] = ()
-) -> list[tuple[int, int]]:
+) -> list[tuple[str, int, int]]:
     """A split launch's promise, divided the way its weights will be.
 
     From the answer the route already has, the cards and their free
@@ -581,11 +691,20 @@ def admission_split(
         free = device.memoryFreeBytes
         if free is None:
             return None
-        return max(0, free - held_bytes(reservations, device_index=device.index, exclude=spec.name))
+        return max(
+            0,
+            free
+            - held_bytes(
+                reservations,
+                device_index=device.index,
+                exclude=spec.name,
+                device_kind=device.kind.value,
+            ),
+        )
 
     shares = split_shares(spec, devices, spare)
     return [
-        (d.index, int(required * p))
+        (d.kind.value, d.index, int(required * p))
         for d, p in zip(devices, shares, strict=True)
         if d.index is not None and p > 0
     ]

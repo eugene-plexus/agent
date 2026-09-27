@@ -27,6 +27,7 @@ from .._generated.models import (
     Os,
     RuntimeCapabilities,
     RuntimeSpec,
+    Secondary,
 )
 from ..child_env import child_environment
 from .acquisition import (
@@ -299,15 +300,23 @@ class LlamaCppAdapter(EngineAdapter):
         if isinstance(chosen, Unavailable):
             return chosen
 
-        assets = _match_assets(release, chosen)
+        base, plugin = split_variant(chosen)
+        assets = _match_assets(release, base)
         if isinstance(assets, Unavailable):
             return assets
+        plugin_assets: tuple[ReleaseAsset, ...] = ()
+        if plugin is not None:
+            found = _match_assets(release, plugin)
+            if isinstance(found, Unavailable):
+                return found
+            plugin_assets = found
 
         return AcquisitionPlan(
             version=release.version,
             variant=chosen,
-            assets=assets,
+            assets=assets + plugin_assets,
             binary_name=self.binary_name,
+            plugins=frozenset(a.name for a in plugin_assets),
         )
 
     # --- diagnosing -------------------------------------------------------
@@ -338,6 +347,27 @@ class LlamaCppAdapter(EngineAdapter):
         )
 
     # --- launching --------------------------------------------------------
+
+    def default_env(self, spec: RuntimeSpec, binary: DiscoveredBinary) -> dict[str, str]:
+        """An empty `GGML_VK_VISIBLE_DEVICES` for a pinned runtime on a combined build.
+
+        **A pin reaches its own backend only** (measured 2026-09-27 on the
+        `+vulkan` build): `CUDA_VISIBLE_DEVICES=-1` hid every CUDA device,
+        and llama.cpp loaded the model onto the same 5090 through Vulkan
+        instead. So two replicas pinned to two cards would each also have
+        taken every card through Vulkan. Emptying the Vulkan list keeps a
+        pin meaning one card. It is a default the engine cannot be correct
+        without: the runtime's own `env` or an explicit `devices` list
+        still wins.
+        """
+        if not _combined_build(binary.path.parent):
+            return {}
+        if (spec.flags or {}).get("devices"):
+            return {}
+        env = spec.env or {}
+        if any(env.get(var) is not None for var in _BACKEND_PINS):
+            return {"GGML_VK_VISIBLE_DEVICES": ""}
+        return {}
 
     def build_argv(self, spec: RuntimeSpec, binary: DiscoveredBinary, port: int) -> list[str]:
         argv = [
@@ -613,6 +643,7 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     "parallelSlots": "--parallel",
     "mainGpu": "--main-gpu",
     "splitMode": "--split-mode",
+    "devices": "--device",
     "tensorSplit": "--tensor-split",
     "flashAttention": "--flash-attn",
     "continuousBatching": "--cont-batching",
@@ -767,6 +798,24 @@ _FLAG_FIELDS: list[ConfigField] = [
         requiresRestart=True,
     ),
     ConfigField(
+        key="devices",
+        label="GPUs to use",
+        description=(
+            "Which devices to spread the model across, by llama.cpp's own "
+            "names, comma-separated: CUDA0, Vulkan1. Leave empty for every "
+            "discrete card, which is llama.cpp's default. Naming an "
+            "integrated GPU here (with a combined +vulkan build) is how to "
+            "test it as overflow beside a card. A Vulkan name cannot be "
+            "matched to a card Eugene measured, so such a launch is not "
+            "checked against memory. Run llama-server --list-devices to see "
+            "the names."
+        ),
+        category="performance",
+        valueType=ConfigValueType.string,
+        pattern=r"^\s*[A-Za-z]+\d*(\s*,\s*[A-Za-z]+\d*)*\s*$",
+        requiresRestart=True,
+    ),
+    ConfigField(
         key="splitMode",
         label="Split across GPUs",
         description=(
@@ -856,7 +905,13 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
 
     if host.os is Os.windows:
         if accelerator is Accelerator.cuda:
-            return _cuda_variant(host, release)
+            cuda = _cuda_variant(host, release)
+            if isinstance(cuda, str) and host.secondary is Secondary.vulkan:
+                # A discrete AMD or Intel card beside the NVIDIA one:
+                # the CUDA build with the Vulkan backend added, so both
+                # are used (HostAccelerator.secondary).
+                return f"{cuda}{VULKAN_SUFFIX}"
+            return cuda
         if accelerator is Accelerator.rocm:
             return f"win-rocm-10.0-{host.arch.value}"
         if accelerator is Accelerator.vulkan:
@@ -893,6 +948,29 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
 
 _PLATFORM_PREFIX = {Os.windows: "win-", Os.linux: "ubuntu-", Os.macos: "macos-"}
 
+_BACKEND_PINS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+
+
+def _combined_build(directory: Path) -> bool:
+    """A build carrying the Vulkan backend beside a CUDA or HIP one."""
+    names = {p.name.lower() for p in directory.glob("*ggml-*")}
+    vulkan = {"ggml-vulkan.dll", "libggml-vulkan.so"} & names
+    other = {"ggml-cuda.dll", "libggml-cuda.so", "ggml-hip.dll", "libggml-hip.so"} & names
+    return bool(vulkan and other)
+
+
+#: A build with the Vulkan backend from the same release added to it.
+VULKAN_SUFFIX = "+vulkan"
+
+
+def split_variant(variant: str) -> tuple[str, str | None]:
+    """`win-cuda-13.4-x64+vulkan` -> (`win-cuda-13.4-x64`, `win-vulkan-x64`)."""
+    if not variant.endswith(VULKAN_SUFFIX):
+        return variant, None
+    base = variant[: -len(VULKAN_SUFFIX)]
+    arch = base.rsplit("-", 1)[-1]
+    return base, f"win-vulkan-{arch}"
+
 
 def alternatives(host: HostAccelerator, release: Release) -> list[str]:
     """Every server build `release` publishes for this OS and CPU.
@@ -906,7 +984,16 @@ def alternatives(host: HostAccelerator, release: Release) -> list[str]:
         return []
     prefix = _PLATFORM_PREFIX[host.os]
     suffix = f"-{host.arch.value}"
-    return [v for v in _published_variants(release) if v.startswith(prefix) and v.endswith(suffix)]
+    offered = [
+        v for v in _published_variants(release) if v.startswith(prefix) and v.endswith(suffix)
+    ]
+    vulkan = f"win-vulkan-{host.arch.value}"
+    if host.os is Os.windows and vulkan in offered:
+        # Each CUDA build with the Vulkan backend added: the default for
+        # a second vendor's card beside NVIDIA, and the expert's way to
+        # try an integrated GPU as overflow (with the `devices` flag).
+        offered += [f"{v}{VULKAN_SUFFIX}" for v in offered if v.startswith("win-cuda-")]
+    return sorted(offered)
 
 
 def _chosen_variant(

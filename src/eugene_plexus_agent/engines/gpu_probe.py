@@ -144,6 +144,36 @@ def vulkan_build_published(os_name: str, arch: str) -> bool:
     return os_name == "linux" and arch in ("x64", "arm64")
 
 
+def combinable_with_cuda(os_name: str, arch: str) -> bool:
+    """Whether the Vulkan backend can be added to the CUDA build here.
+
+    Windows x64 only. Upstream's Windows CUDA and Vulkan builds share
+    byte-identical core libraries and the backends are plug-ins; the
+    Vulkan one adds exactly `ggml-vulkan.dll` (measured on b11211). The
+    Linux builds are compiled separately, and even `libggml-base.so`
+    differs between them, so adding one's backend to the other would be
+    an ABI gamble.
+    """
+    return os_name == "windows" and arch == "x64"
+
+
+def beside_nvidia(
+    os_name: str, arch: str, adapters: Sequence[Adapter], *, vulkan_loader: bool
+) -> list[Adapter]:
+    """The discrete AMD or Intel cards a Vulkan backend beside CUDA would add.
+
+    What llama.cpp does with the combined build and nothing pinned: every
+    discrete GPU through whichever backend reaches it, an NVIDIA card
+    once (it skips the Vulkan copy of a card CUDA already has, by PCI
+    id), and no integrated GPU while there is a discrete one. So a
+    discrete Radeon or Arc beside a 5090 joins the split, and the
+    integrated GPU in the same machine does not.
+    """
+    if not vulkan_loader or not combinable_with_cuda(os_name, arch):
+        return []
+    return [a for a in adapters if not a.integrated and a.vendor in (AMD, INTEL)]
+
+
 def vulkan_selection(adapters: Sequence[Adapter]) -> list[Adapter]:
     """The adapters llama.cpp's Vulkan backend uses when nothing is pinned.
 
@@ -636,6 +666,8 @@ __all__ = [
     "Family",
     "GpuProbeError",
     "adapters",
+    "beside_nvidia",
+    "combinable_with_cuda",
     "family",
     "linux_adapters",
     "vulkan_build_published",

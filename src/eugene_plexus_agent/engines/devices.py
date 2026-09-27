@@ -434,21 +434,68 @@ def _os_devices(
     return devices
 
 
-def _left_out(found: list[gpu_probe.Adapter], served_by: str) -> list[str]:
-    """A sentence for each discrete GPU the chosen build cannot use.
+def _left_out(found: list[gpu_probe.Adapter], os_name: str, vulkan_loader: bool) -> list[str]:
+    """A sentence for each discrete GPU beside NVIDIA that nothing will use.
 
-    A second vendor's card beside an NVIDIA one gets nothing from the CUDA
-    build, and a card the product skips without a word is a card its
-    owner concludes is broken. Integrated GPUs beside a card are left
-    out silently: that is every desktop with a graphics card.
+    On Windows with the Vulkan loader, a discrete AMD or Intel card beside
+    an NVIDIA one is not left out: the build is the CUDA one with the
+    Vulkan backend added (`_beside_nvidia`). What is left is named, with
+    why, because a card the product skips without a word is a card its
+    owner concludes is broken. Integrated GPUs beside a card are left out
+    silently: that is every desktop with a graphics card.
     """
+    if gpu_probe.combinable_with_cuda(os_name, "x64") and not vulkan_loader:
+        why = (
+            "the Vulkan backend that would add it needs the Vulkan loader "
+            "(vulkan-1.dll), which its graphics driver installs"
+        )
+    elif os_name == "linux":
+        why = (
+            "on Linux the CUDA and Vulkan builds are compiled separately and their core "
+            "libraries differ, so they cannot be combined into one that uses both"
+        )
+    else:
+        why = "no build published for this machine carries both backends"
     return [
-        f"{adapter.name} is also here, and the {served_by} build this machine uses cannot "
-        "compute on it. Install the Vulkan build under the engine's other builds to use "
-        "every card."
+        f"{adapter.name} is also here, and the CUDA build this machine uses cannot compute "
+        f"on it: {why}."
         for adapter in found
         if not adapter.integrated and adapter.vendor not in (gpu_probe.NVIDIA, gpu_probe.OTHER)
     ]
+
+
+def _beside_nvidia(
+    found: list[gpu_probe.Adapter], ram_available: int | None, warnings: list[str]
+) -> list[ComputeDevice]:
+    """A discrete AMD or Intel card beside NVIDIA, as the combined build sees it.
+
+    **Added 2026-09-27** for a second vendor's card. `gpu_probe.beside_nvidia`
+    is the rule and the engine picker calls it too, so a card is listed
+    exactly when the build chosen for this machine carries the Vulkan
+    backend that reaches it. Named ones it does not reach are said.
+    """
+    os_name, arch = host_mod.platform_names()
+    loader = gpu_probe.vulkan_loader_present(os_name)
+    extra = gpu_probe.beside_nvidia(os_name, arch, found, vulkan_loader=loader)
+    warnings.extend(_left_out([a for a in found if a not in extra], os_name, loader))
+    devices: list[ComputeDevice] = []
+    for index, adapter in enumerate(extra):
+        total, free = adapter.budget(ram_available)
+        if free is None:
+            warnings.append(
+                f"how much of {adapter.name}'s memory is in use could not be read, so its "
+                "free memory is unknown and admission cannot refuse on it."
+            )
+        devices.append(
+            ComputeDevice(
+                kind=ComputeDeviceKind.vulkan,
+                index=index,
+                name=adapter.name,
+                memoryTotalBytes=total,
+                memoryFreeBytes=free,
+            )
+        )
+    return devices
 
 
 def _os_adapters_quietly(lister: AdapterLister) -> list[gpu_probe.Adapter]:
@@ -479,10 +526,16 @@ def detect_devices(
 
     devices: list[ComputeDevice] = []
     devices += _nvidia(run, warnings, ram_total, ram_available)
-    if devices and sys.platform != "darwin":
-        warnings.extend(_left_out(_os_adapters_quietly(lister), "CUDA"))
-    devices += _amd(run, warnings)
-    devices += _intel(run, warnings)
+    if devices:
+        # **Beside NVIDIA, only what the build reaches.** `rocm-smi` and
+        # `xpu-smi` used to be read here too, so a Linux machine with an
+        # NVIDIA card and a ROCm one listed both, and a launch would have
+        # been scored across a card the CUDA build cannot use.
+        if sys.platform != "darwin":
+            devices += _beside_nvidia(_os_adapters_quietly(lister), ram_available, warnings)
+    else:
+        devices += _amd(run, warnings)
+        devices += _intel(run, warnings)
     if (
         not devices
         and sys.platform == "darwin"

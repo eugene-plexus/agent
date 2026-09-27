@@ -1478,7 +1478,7 @@ class ManagedEngine(BaseModel):
     )
     variant: str = Field(
         ...,
-        description='Which asset was chosen, e.g. `win-cuda-13.3-x64`. Recorded\nbecause it is the answer to "why is this slow" often enough\nto be worth surfacing: a host that fell back to a CPU build\nlooks identical from the outside otherwise.\n',
+        description='Which asset was chosen, e.g. `win-cuda-13.3-x64`. Recorded\nbecause it is the answer to "why is this slow" often enough\nto be worth surfacing: a host that fell back to a CPU build\nlooks identical from the outside otherwise.\n\nA `+vulkan` suffix (`win-cuda-13.4-x64+vulkan`, since\n2026-09-27) is that build with the Vulkan backend from the\nsame release added, so a second vendor\'s card can be used\nbeside an NVIDIA one in one process.\n',
     )
     installedAt: AwareDatetime | None = None
     sizeBytes: int | None = Field(
@@ -1601,6 +1601,30 @@ class Accelerator(StrEnum):
     vulkan = 'vulkan'
 
 
+class Secondary(StrEnum):
+    """
+    A second backend the build carries, for GPUs the first cannot
+    use: `vulkan` for a discrete AMD or Intel card beside an
+    NVIDIA one. The variant is then the CUDA build with the
+    Vulkan backend from the same release added (`+vulkan`), and
+    llama.cpp uses every discrete card through whichever backend
+    reaches it. It skips a card reachable through both, by its
+    PCI id. Added 2026-09-27; absent when there is no such card.
+
+    **Windows only.** Upstream's Windows CUDA and Vulkan builds
+    share byte-identical core libraries, and the backends are
+    plug-ins, so one can be added to the other. The install
+    checks that and refuses if a release breaks it. The Linux
+    builds are compiled separately and their ggml core differs
+    (`libggml-base.so`, measured on b11211). Combining them
+    would be an ABI gamble, so a second vendor's card on Linux
+    is named as unused instead.
+
+    """
+
+    vulkan = 'vulkan'
+
+
 class HostAccelerator(BaseModel):
     """
     What the agent detected about this machine, insofar as it
@@ -1615,6 +1639,10 @@ class HostAccelerator(BaseModel):
     accelerator: Accelerator | None = Field(
         None,
         description='`metal` is reported on Apple silicon even though there is no\nseparate Metal asset - the plain macOS build has it compiled\nin, and saying `none` there would read as "no GPU".\n\n`vulkan` is how a non-NVIDIA GPU on **Windows** is served,\nand it exists because until 2026-09-18 there was no answer\nat all: the ROCm probe looked for `rocm-smi` or `/opt/rocm`\nand the SYCL probe for `sycl-ls` or Linux sysfs, none of\nwhich exists on Windows, so every AMD and Intel card there\nfell through to `none` - a CPU build, a fit scored against\nRAM, and the starter set inverted to the smallest model, on\na machine built around a graphics card.\n\nVulkan rather than ROCm or SYCL for that case because\nupstream publishes `win-vulkan-x64` in every release, it\nneeds no vendor SDK, and one build covers AMD and Intel\nalike. `rocm` is still reported on Windows when the HIP SDK\nis actually installed, which is what makes\n`win-rocm-10.0-x64` reachable rather than dead code.\n\n**Since 2026-09-27 the same holds on Linux**, and SYCL is\nnarrower there. An AMD card without ROCm, an Intel card\nwithout oneAPI, and an NVIDIA card with no `nvidia-smi` (the\nMesa driver) get `vulkan` and `ubuntu-vulkan-*` when the\nVulkan loader is installed. Before, the AMD card got a CPU\nbuild, and any machine with Intel graphics (so every Intel\nlaptop, by the `i915` driver) got `ubuntu-sycl-fp16-x64`,\nwhich needs a oneAPI runtime that such a machine rarely\nhas. `sycl` now means `sycl-ls` answered.\n\n**A Qualcomm Adreno (Snapdragon X) is `none`, and says why.**\nUpstream publishes no Vulkan build for Windows on ARM. Its\n`win-opencl-adreno-arm64` build is documented as tuned for\nQ4_0 models, which are not what the starter set downloads,\nand no one on the project has run it. So the CPU build, which\nupstream tunes for ARM, is the default, and the OpenCL one is\navailable through `EngineInstallRequest.variant`.\n',
+    )
+    secondary: Secondary | None = Field(
+        None,
+        description="A second backend the build carries, for GPUs the first cannot\nuse: `vulkan` for a discrete AMD or Intel card beside an\nNVIDIA one. The variant is then the CUDA build with the\nVulkan backend from the same release added (`+vulkan`), and\nllama.cpp uses every discrete card through whichever backend\nreaches it. It skips a card reachable through both, by its\nPCI id. Added 2026-09-27; absent when there is no such card.\n\n**Windows only.** Upstream's Windows CUDA and Vulkan builds\nshare byte-identical core libraries, and the backends are\nplug-ins, so one can be added to the other. The install\nchecks that and refuses if a release breaks it. The Linux\nbuilds are compiled separately and their ggml core differs\n(`libggml-base.so`, measured on b11211). Combining them\nwould be an ABI gamble, so a second vendor's card on Linux\nis named as unused instead.\n",
     )
     acceleratorVersion: str | None = Field(
         None,
@@ -2658,7 +2686,7 @@ class EngineAcquisition(BaseModel):
     )
     alternatives: list[str] | None = Field(
         None,
-        description='Every variant the newest usable release publishes for this\noperating system and CPU, the default included, for\n`EngineInstallRequest.variant`. On a Windows x64 machine that\nis the CPU, CUDA, Vulkan, ROCm, SYCL and OpenVINO builds; on\nLinux the same families under `ubuntu-`. Empty when no\nrelease could be read.\n',
+        description="Every variant the newest usable release publishes for this\noperating system and CPU, the default included, for\n`EngineInstallRequest.variant`. On a Windows x64 machine that\nis the CPU, CUDA, Vulkan, ROCm, SYCL and OpenVINO builds; on\nLinux the same families under `ubuntu-`. Empty when no\nrelease could be read.\n\nOn Windows each CUDA build is also offered with `+vulkan`\n(see `HostAccelerator.secondary`). That is the default for a\nmachine with an AMD or Intel card beside an NVIDIA one, and\nthe expert's way to test an integrated GPU as overflow, with\nthe runtime's `devices` flag naming it.\n",
     )
     reason: str | None = Field(
         None,

@@ -23,7 +23,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .._generated.models import Accelerator, Arch, HostAccelerator, Os
+from .._generated.models import Accelerator, Arch, HostAccelerator, Os, Secondary
 from ..child_env import child_environment
 from . import gpu_probe
 
@@ -55,7 +55,37 @@ def detect_host() -> HostAccelerator:
         computeCapability=(
             _probe_compute_capability() if accelerator is Accelerator.cuda else None
         ),
+        secondary=_secondary(os_kind, arch) if accelerator is Accelerator.cuda else None,
     )
+
+
+def _secondary(os_kind: Os | None, arch: Arch | None) -> Secondary | None:
+    """`vulkan` when a discrete AMD or Intel card sits beside the NVIDIA one.
+
+    Then the build is the CUDA one with the Vulkan backend added, and
+    llama.cpp uses both cards (2026-09-27). `gpu_probe.beside_nvidia` is
+    the rule, and the device list calls it too, so the build and the
+    cards a launch is scored against cannot disagree.
+    """
+    os_name = os_kind.value if os_kind is not None else ""
+    arch_name = arch.value if arch is not None else ""
+    if not gpu_probe.combinable_with_cuda(os_name, arch_name):
+        return None
+    try:
+        found = gpu_probe.adapters(os_name)
+    except gpu_probe.GpuProbeError as exc:
+        log.info("could not list this machine's GPUs: %s", exc)
+        return None
+    extra = gpu_probe.beside_nvidia(
+        os_name, arch_name, found, vulkan_loader=gpu_probe.vulkan_loader_present(os_name)
+    )
+    if not extra:
+        return None
+    log.info(
+        "%s beside the NVIDIA card: the CUDA build gets the Vulkan backend added",
+        ", ".join(a.name for a in extra),
+    )
+    return Secondary.vulkan
 
 
 def platform_names() -> tuple[str, str]:

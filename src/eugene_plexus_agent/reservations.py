@@ -92,13 +92,19 @@ class Reservation:
     """`perf_counter()` at the moment of reserving. A duration, so never
     `monotonic()`: on the Python both installers provision that is
     `GetTickCount64` on Windows, a 15.6 ms grid."""
-    shares: tuple[tuple[int, int], ...] = ()
-    """For a launch spread across several cards: `(device index, bytes)`
+    shares: tuple[tuple[str, int, int], ...] = ()
+    """For a launch spread across several cards: `(kind, index, bytes)`
     per card, the promise divided the way the weights will be. Empty for
     one card, which `device_index` names. Without it a split launch was
     either counted in full against one card, understating the other, or
     against every card (`device_index=None`), refusing a second launch
     on memory the first will never touch."""
+    device_kind: str | None = None
+    """The kind of the card `device_index` names (`cuda`, `vulkan` ...).
+    **A card is its kind and its index** (2026-09-27): with an AMD card
+    beside an NVIDIA one, CUDA device 0 and Vulkan device 0 are two
+    cards, and keying by index alone counted one's promise against the
+    other. `None` matches any kind, as every reservation before it did."""
 
 
 class ReservationLedger:
@@ -124,7 +130,8 @@ class ReservationLedger:
         *,
         device_index: int | None,
         size_bytes: int,
-        shares: Iterable[tuple[int, int]] = (),
+        shares: Iterable[tuple[str, int, int]] = (),
+        device_kind: str | None = None,
     ) -> None:
         """Record what a launch of `runtime` is about to take.
 
@@ -145,6 +152,7 @@ class ReservationLedger:
             size_bytes=size_bytes,
             at=self._clock(),
             shares=tuple(shares),
+            device_kind=device_kind,
         )
 
     def reconcile(self, pending: Iterable[str]) -> None:
@@ -164,11 +172,15 @@ class ReservationLedger:
         self._expire()
         return list(self._held.values())
 
-    def held_bytes(self, *, device_index: int | None, exclude: str | None) -> int:
+    def held_bytes(
+        self, *, device_index: int | None, exclude: str | None, device_kind: str | None = None
+    ) -> int:
         """What is promised on one device, ignoring one runtime's own
         claim -- a restart re-measures the runtime that already holds
         one, and counting it against itself refuses every restart."""
-        return held_bytes(self.entries(), device_index=device_index, exclude=exclude)
+        return held_bytes(
+            self.entries(), device_index=device_index, exclude=exclude, device_kind=device_kind
+        )
 
     def _expire(self) -> None:
         cutoff = self._clock() - self._ttl
@@ -181,6 +193,7 @@ def held_bytes(
     *,
     device_index: int | None,
     exclude: str | None,
+    device_kind: str | None = None,
 ) -> int:
     """The pure half, so admission can sum a list it was handed without
     reaching for the ledger it came from."""
@@ -194,7 +207,17 @@ def held_bytes(
             if device_index is None:
                 total += reservation.size_bytes
             else:
-                total += dict(reservation.shares).get(device_index, 0)
+                total += sum(
+                    size
+                    for kind, index, size in reservation.shares
+                    if index == device_index and (device_kind is None or kind == device_kind)
+                )
+            continue
+        if (
+            device_kind is not None
+            and reservation.device_kind is not None
+            and reservation.device_kind != device_kind
+        ):
             continue
         if reservation.device_index is not None and reservation.device_index != device_index:
             continue

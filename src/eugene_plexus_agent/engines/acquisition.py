@@ -132,6 +132,14 @@ class AcquisitionPlan:
     #: Resolved by search rather than declared, because archive layouts
     #: differ between platforms and upstream has changed them before.
     binary_name: str
+    #: Names of assets whose backend is ADDED to the build rather than
+    #: unpacked over it: the Vulkan build, for a `+vulkan` variant
+    #: (2026-09-27). Each is unpacked beside the build, every file both
+    #: carry must be byte-identical, and only the files the build lacks
+    #: are copied in. A release where they differ is refused, because
+    #: two backends compiled against different cores in one process is a
+    #: crash nobody could diagnose.
+    plugins: frozenset[str] = frozenset()
 
     @property
     def total_bytes(self) -> int:
@@ -791,12 +799,22 @@ class EngineInstaller:
             _verify(asset, archive)
 
         progress.state = State.extracting
+        plugins = [a for a in archives if a.name in plan.plugins]
         for archive in archives:
+            if archive in plugins:
+                continue
             progress.message = f"extracting {archive.name}"
             _extract(archive, staging)
             # The archive itself is dead weight once unpacked, and these are
             # hundreds of megabytes.
             archive.unlink(missing_ok=True)
+        for index, archive in enumerate(plugins):
+            progress.message = f"adding the backend in {archive.name}"
+            side = staging / f".plugin-{index}"
+            _extract(archive, side)
+            archive.unlink(missing_ok=True)
+            _merge_backend(side, staging, archive.name)
+            _remove_quietly(side)
 
         binary = _find_binary(staging, plan.binary_name)
         if binary is None:
@@ -858,6 +876,55 @@ def _verify(asset: ReleaseAsset, archive: Path) -> None:
         raise AcquisitionError(
             f"{asset.name} failed verification: expected sha256 {expected}, got {actual}"
         )
+
+
+def _merge_backend(side: Path, build: Path, archive_name: str) -> None:
+    """Add the files of `side` that `build` lacks; refuse if a shared one differs.
+
+    Upstream's archives for one release are built from one commit, and
+    on Windows every file the CUDA and Vulkan builds both carry is
+    byte-identical (measured on b11211: the only difference is
+    `ggml-vulkan.dll`). That identity is what makes adding one backend
+    to the other safe, so it is checked here rather than assumed. A
+    release that breaks it is refused with the file named.
+    """
+    side_root = _single_root(side)
+    build_root = _single_root(build)
+    added: list[str] = []
+    for source in sorted(p for p in side_root.rglob("*") if p.is_file()):
+        relative = source.relative_to(side_root)
+        target = build_root / relative
+        if target.exists():
+            if _sha256(source) != _sha256(target):
+                raise AcquisitionError(
+                    f"{archive_name} carries a {relative} that differs from the one in the build "
+                    "it would be added to, so the two were not built together and cannot be "
+                    "combined. Install the plain build instead."
+                )
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        added.append(str(relative))
+    if not added:
+        raise AcquisitionError(f"{archive_name} added nothing to the build; nothing to combine")
+    log.info("added %s from %s", ", ".join(added), archive_name)
+
+
+def _single_root(directory: Path) -> Path:
+    """The directory itself, or its one subdirectory when an archive wraps
+    everything in one (the Linux tarballs do: `llama-b11211/`)."""
+    entries = [p for p in directory.iterdir() if not p.name.startswith(".plugin-")]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return directory
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _extract(archive: Path, destination: Path) -> None:
