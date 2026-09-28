@@ -477,6 +477,16 @@ class ConfigValueType(StrEnum):
     password a password input, and must not display a redacted
     entry as though its password were empty.
 
+    `string_list` (P1, 2026-09-27) is an ordered JSON array of
+    strings with no further meaning to the type: a list of plain
+    values the field's own description explains. Its first users are
+    the inference-driver's `catalogueInclude` and `catalogueExclude`,
+    model-id patterns for a provider account. It exists for the
+    reason `url_list` does: a comma-separated text field is a bug
+    report, and reusing `path_list` or `url_list` would tell every UI
+    to open a directory picker or an address field. UIs render it as
+    an add/remove list of text fields.
+
     """
 
     string = 'string'
@@ -496,6 +506,7 @@ class ConfigValueType(StrEnum):
     path_mappings = 'path_mappings'
     library_folders = 'library_folders'
     share_credentials = 'share_credentials'
+    string_list = 'string_list'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -1445,7 +1456,7 @@ class ClientKeyLimits(BaseModel):
     )
     allowedModels: list[AllowedModel] | None = Field(
         None,
-        description='Null permits all. Empty permits none. Exact alias and actual target IDs must both be allowed.',
+        description="Null permits all. Empty permits none. Both the id the caller\nasked for and every model actually tried (a slot's fallback\ntargets) must be allowed.\n\nAn entry is an exact id, or a pattern with `*` (P1,\n2026-09-27): `*` matches any run of characters, `/` included,\nand is the only wildcard, so `openrouter/*` allows every\nmodel of the account named `openrouter`\n(`openrouter/anthropic/claude-opus-5.5`) and nothing else.\nWithout it, scoping a key to one account means typing out\nhundreds of names. The same matcher runs in the gateway, the\nagent and the control root.\n",
         max_length=100,
     )
     maxConcurrentRequests: int | None = Field(2, ge=1, le=64)

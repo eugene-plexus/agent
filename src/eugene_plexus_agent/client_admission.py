@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 from datetime import datetime
 from typing import Any
@@ -12,6 +13,26 @@ from typing import Any
 LEASE_SECONDS = 30.0
 WINDOW_SECONDS = 60.0
 MAX_ENTRIES = 50_000
+
+
+def model_permitted(allowed: list[str], model: str) -> bool:
+    """`allowedModels` entries are exact ids or `*` patterns (P1, 2026-09-27).
+
+    `*` matches any run of characters, `/` included, and is the only
+    wildcard: `openrouter/*` allows every model of the account named
+    `openrouter`. The same rule is copied into the gateway, which applies
+    it to the list of models a key can see; components share schemas, not
+    code, so the few lines are duplicated rather than imported.
+    """
+    for pattern in allowed:
+        if "*" not in pattern:
+            if pattern == model:
+                return True
+            continue
+        parts = [re.escape(part) for part in pattern.split("*")]
+        if re.fullmatch(".*".join(parts), model, flags=re.DOTALL) is not None:
+            return True
+    return False
 
 
 class AdmissionRefusal(Exception):
@@ -179,7 +200,7 @@ def decide(
         if not model:
             raise AdmissionRefusal(422, "A model is required for inference admission.")
         allowed = limits.get("allowedModels") if limits else None
-        if allowed is not None and model not in allowed:
+        if allowed is not None and not model_permitted(allowed, model):
             raise AdmissionRefusal(403, "This client key does not permit the requested model.")
         if existing is not None:
             if (

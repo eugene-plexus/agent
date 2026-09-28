@@ -90,3 +90,24 @@ def test_standalone_http_limits_and_operator_edit(authed_client):
         ).status_code
         == 422
     )
+
+
+def test_an_account_pattern_admits_its_models_and_nothing_else(tmp_path):
+    """P1: `openrouter/*` scopes a key to one provider account; `*` is the
+    only wildcard and crosses `/`."""
+    store = ClientKeyStore(tmp_path / "keys.json")
+    store.add(replace(_record(), limits={"allowedModels": ["openrouter/*", "qwen3-8b"]}))
+    store.admit(key_id="abc", action="acquire", request_id="a", model="openrouter/anthropic/x")
+    store.admit(key_id="abc", action="acquire", request_id="b", model="qwen3-8b")
+    for i, model in enumerate(("work/anthropic/x", "qwen3-8b-instruct", "openrouter")):
+        with pytest.raises(AdmissionRefusal) as caught:
+            store.admit(key_id="abc", action="acquire", request_id=f"no{i}", model=model)
+        assert caught.value.status == 403, model
+
+
+def test_only_star_is_special() -> None:
+    from eugene_plexus_agent.client_admission import model_permitted
+
+    assert model_permitted(["a?b"], "a?b") and not model_permitted(["a?b"], "axb")
+    assert model_permitted(["*:free"], "openrouter/respan/span-01-lite:free")
+    assert not model_permitted([], "anything")
