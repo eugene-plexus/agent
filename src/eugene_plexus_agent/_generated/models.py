@@ -130,6 +130,174 @@ class ImageContentPart(BaseModel):
     image_url: ImageUrl
 
 
+class InputAudioFormat(StrEnum):
+    """
+    OpenAI's two input formats, which `llama-server` also reads.
+    OpenRouter accepts more; they are refused rather than passed to
+    a backend that may not. Named rather than inline so a later
+    inline enum cannot rename it (S6's `Source1`).
+
+    """
+
+    wav = 'wav'
+    mp3 = 'mp3'
+
+
+class InputFile(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    filename: str | None = Field(
+        None,
+        description='The name the model is shown. Optional; forwarded when set.\n',
+        max_length=255,
+    )
+    file_data: str | None = Field(
+        None,
+        description='The file as a `data:application/pdf;base64,...` URL, at most\n10 MiB decoded, beginning `%PDF-`. Bare base64 is accepted\nand carried as that data URL, because OpenAI\'s own schema\ndescribes it as base64 while OpenRouter refuses anything but\nthe URL (measured 2026-09-28: *"Invalid content"*).\n',
+        max_length=13981100,
+    )
+    file_id: str | None = Field(
+        None,
+        description="Refused with a 400. It names a file uploaded to one\nprovider's store, which this install does not have; send\n`file_data`.\n",
+    )
+
+
+class AudioOutputFormat(StrEnum):
+    """
+    The formats OpenAI's chat audio output names (P2b, 2026-09-28).
+
+    **Asked for, only `wav` and `pcm16` can be served**, because
+    every audio-output model behind an account answers audio only
+    when streamed and only as `pcm16` (measured 2026-09-28, OpenAI's
+    own 400: *"Supported values are: 'pcm16'"*). A non-streamed
+    answer is the stream assembled, and `wav` is that with a WAV
+    header; a streamed answer is `pcm16`. The other four would need a
+    transcoder and are refused, naming the two that work (P2-1).
+
+    **Reported, it is what the bytes are, not what was asked.**
+    Lyria answers MP3 whatever it is asked for (measured), so its
+    audio is labelled `mp3` from its own header (P2-2). `pcm16` is
+    raw little-endian 16-bit mono samples with no header, at the
+    24 kHz OpenAI documents.
+
+    Named rather than inline so a later inline enum cannot rename it
+    (S6's `Source1`).
+
+    """
+
+    wav = 'wav'
+    mp3 = 'mp3'
+    flac = 'flac'
+    opus = 'opus'
+    aac = 'aac'
+    pcm16 = 'pcm16'
+
+
+class ReasoningEffort(StrEnum):
+    """
+    How much a reasoning model thinks before it answers: OpenAI's
+    `reasoning_effort` (P2c, 2026-09-28). Measured on
+    `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
+    `low`, 275 at `high`. A setting, so it routes only to a model
+    that lists it (A2).
+
+    """
+
+    none = 'none'
+    minimal = 'minimal'
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+    xhigh = 'xhigh'
+
+
+class Verbosity(StrEnum):
+    """
+    OpenAI's `verbosity`, how long the answer is. A setting, routed as A2 says.
+    """
+
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Prediction(BaseModel):
+    """
+    OpenAI's predicted output: text the answer is expected to repeat
+    most of, which a backend can use to answer faster. A setting,
+    routed as A2 says.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['content']
+    content: str | list[TextContentPart]
+
+
+class WebSearchContextSize(StrEnum):
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Approximate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    city: str | None = None
+    country: str | None = None
+    region: str | None = None
+    timezone: str | None = None
+
+
+class WebSearchUserLocation(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['approximate']
+    approximate: Approximate
+
+
+class PromptCacheRetention(StrEnum):
+    """
+    OpenAI's `prompt_cache_retention`, a hint (see `prompt_cache_key`).
+    """
+
+    in_memory = 'in_memory'
+    field_24h = '24h'
+
+
+class ServiceTier(StrEnum):
+    """
+    OpenAI's `service_tier`, a hint carried to OpenAI's own API only.
+    """
+
+    auto = 'auto'
+    default = 'default'
+    flex = 'flex'
+    scale = 'scale'
+    priority = 'priority'
+
+
+class ChatTopLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+
+
+class UrlCitation(BaseModel):
+    url: str
+    title: str | None = None
+    start_index: int | None = Field(
+        None,
+        description="Where in `content` the citation applies. Perplexity's Sonar sends 0 for all.",
+    )
+    end_index: int | None = None
+
+
 class BackendKind(StrEnum):
     """
     Which wire protocol an inference-driver instance speaks to its
@@ -2613,6 +2781,72 @@ class Component(BaseModel):
     )
 
 
+class InputAudio(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    data: str = Field(
+        ...,
+        description="The audio, base64-encoded, with no `data:` prefix (OpenAI's\nshape). At most 10 MiB decoded. Checked against `format`:\na WAV must begin `RIFF....WAVE` and an MP3 with an ID3 tag\nor a frame sync, so a mislabelled clip is refused here\nrather than as whatever the provider happens to say.\n",
+        max_length=13981016,
+    )
+    format: InputAudioFormat
+
+
+class FileContentPart(BaseModel):
+    """
+    A document the model reads, in OpenAI's chat shape. PDF only.
+    Carried only to a model whose backend confirms file input
+    (`capabilities.fileInput`).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['file']
+    file: InputFile
+
+
+class WebSearchOptions(BaseModel):
+    """
+    Ask the model to search the web before it answers: OpenAI's
+    `web_search_options`. The search is the model provider's, not this
+    install's. A setting, routed as A2 says; **listed is not promised**
+    (OpenRouter lists it for `gpt-4o-mini`, and OpenAI refuses it for
+    that model, measured), so a provider's refusal is still the
+    caller's 400. The citations come back as `annotations`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    search_context_size: WebSearchContextSize | None = None
+    user_location: WebSearchUserLocation | None = None
+
+
+class ChatTokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    top_logprobs: list[ChatTopLogprob] | None = None
+
+
+class ChatAnnotation(BaseModel):
+    """
+    A web source the answer cites, OpenAI's shape (P2c). Carried back
+    from a search the provider ran for `web_search_options`. Only
+    `url_citation` is carried: OpenRouter's own `file` annotations are
+    a cache of how it parsed a PDF, not a citation, and no OpenAI
+    client reads them.
+
+    """
+
+    type: Literal['url_citation']
+    url_citation: UrlCitation
+
+
 class ComputeDevice(BaseModel):
     """
     One compute device on one host, as that host's agent detected it.
@@ -3284,12 +3518,32 @@ class ComponentList(BaseModel):
     )
 
 
-class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
-    root: list[TextContentPart | ImageContentPart] = Field(
-        ...,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
-        min_length=1,
+class InputAudioContentPart(BaseModel):
+    """
+    A recording the model hears, in OpenAI's chat shape. Carried only
+    to a model whose backend confirms audio input
+    (`capabilities.audioInput`); nothing else is asked, so a model
+    that cannot hear it never answers as though it had.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    type: Literal['input_audio']
+    input_audio: InputAudio
+
+
+class ChatLogprobs(BaseModel):
+    """
+    The chosen tokens' log probabilities, OpenAI's shape (P2c). Asked
+    for with `logprobs` (and `top_logprobs` for alternatives). Streamed,
+    each frame carries the entries for its own tokens.
+
+    """
+
+    content: list[ChatTokenLogprob] | None = None
+    refusal: list[ChatTokenLogprob] | None = None
 
 
 class DirectoryListing(BaseModel):
@@ -3537,36 +3791,6 @@ class LibraryFolderReach(BaseModel):
     folders: list[LibraryFolderStatus]
 
 
-class Message(BaseModel):
-    """
-    A single message in a conversation. Deliberately close to the
-    OpenAI / Anthropic chat message format so drivers don't have to
-    re-shape on every hop.
-
-    """
-
-    role: Role
-    content: str | MessageContent1 | None = Field(
-        None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
-    )
-    toolCalls: list[dict[str, Any]] | None = Field(
-        None,
-        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
-    )
-    toolCallId: str | None = Field(
-        None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
-    )
-    reasoning: str | None = Field(
-        None,
-        description="On an **assistant** message: the reasoning the model produced\nfor that turn, as the backend reported it separately from\n`content` (`reasoning_content` on llama.cpp, `reasoning` on\nvLLM). Handed back so the next turn of a tool loop reaches\nthe model with its own earlier thinking.\n\n**Load-bearing rather than decorative, and measured:**\nllama.cpp b10948 renders a history turn's reasoning into the\nprompt for templates that preserve it (Qwen3, gpt-oss) --\nthe same tool-loop request was 172 prompt tokens without it\nand 184 with a twelve-token canary. Dropped here, a model\nresuming a tool loop has forgotten why it called the tool.\n\nAbsent on every other role, and an adapter whose backend\nhas no such channel (the agentic CLIs, a hosted OpenAI\nendpoint) omits it upstream rather than inventing one.\n",
-    )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
-    )
-
-
 class NodeIdentity(BaseModel):
     """
     What this agent knows about its own host and its own place in an
@@ -3660,3 +3884,49 @@ class UnenrollResult(BaseModel):
 
 class EngineList(BaseModel):
     engines: list[EngineDescriptor]
+
+
+class MessageContent1(
+    RootModel[
+        list[
+            TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
+        ]
+    ]
+):
+    root: list[
+        TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
+    ] = Field(
+        ...,
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        min_length=1,
+    )
+
+
+class Message(BaseModel):
+    """
+    A single message in a conversation. Deliberately close to the
+    OpenAI / Anthropic chat message format so drivers don't have to
+    re-shape on every hop.
+
+    """
+
+    role: Role
+    content: str | MessageContent1 | None = Field(
+        None,
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    reasoning: str | None = Field(
+        None,
+        description="On an **assistant** message: the reasoning the model produced\nfor that turn, as the backend reported it separately from\n`content` (`reasoning_content` on llama.cpp, `reasoning` on\nvLLM). Handed back so the next turn of a tool loop reaches\nthe model with its own earlier thinking.\n\n**Load-bearing rather than decorative, and measured:**\nllama.cpp b10948 renders a history turn's reasoning into the\nprompt for templates that preserve it (Qwen3, gpt-oss) --\nthe same tool-loop request was 172 prompt tokens without it\nand 184 with a twelve-token canary. Dropped here, a model\nresuming a tool loop has forgotten why it called the tool.\n\nAbsent on every other role, and an adapter whose backend\nhas no such channel (the agentic CLIs, a hosted OpenAI\nendpoint) omits it upstream rather than inventing one.\n",
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
