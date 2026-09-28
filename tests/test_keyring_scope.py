@@ -122,6 +122,27 @@ def test_the_probe_says_no_when_the_backend_refuses_writes(fake_keyring: _FakeKe
     assert keyring_store.probe_sync() is False
 
 
+def test_a_refused_probe_does_not_read_as_a_failed_unlock(
+    fake_keyring: _FakeKeyring, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The probe once logged the master-key write's *"master key NOT
+    persisted"*, which reads as a failed unlock when only the check ran.
+    One line now, naming the check and the backend's reason, and no
+    warning at all: nothing went wrong that anyone must act on."""
+    keyring_store.reset_probe_cache()
+    fake_keyring.raise_on.add("set")
+    with caplog.at_level("DEBUG", logger=keyring_store.__name__):
+        assert keyring_store.probe_sync() is False
+    text = caplog.text
+    assert "master key" not in text
+    assert "keyring check" in text
+    assert "nothing was unlocked" in text
+    assert "refused" in text
+    assert "simulated backend failure" in text  # the backend's own reason
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+    assert len(caplog.records) == 1
+
+
 def test_the_probe_says_no_when_a_write_does_not_read_back(fake_keyring: _FakeKeyring) -> None:
     """A backend that accepts writes and returns nothing is the `fail`
     backend wearing a hat; a read-back is what makes this a measurement."""
