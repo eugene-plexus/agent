@@ -36,6 +36,21 @@ from eugene_plexus_agent.engines.acquisition import (
 )
 from eugene_plexus_agent.engines.llama_cpp import LlamaCppAdapter
 
+
+@pytest.fixture(autouse=True)
+def _undo_the_release_patches_for_real() -> object:
+    """The tests here patch `list_releases` on `adapter.releases`, which is
+    ONE instance shared by every adapter (a class attribute). monkeypatch
+    undoes an instance patch by setting the original *bound method* back on
+    the instance, so it stays in the instance's `__dict__` and shadows any
+    later patch of the class. `test_every_gpu_the_os_can_see`'s class-level
+    patch was then ignored and it asked the real GitHub: it passed while
+    GitHub answered and failed in CI the day the runner was rate-limited
+    (2026-09-29; reproduced here with the network refused)."""
+    yield
+    vars(LlamaCppAdapter.releases).pop("list_releases", None)
+
+
 # --------------------------------------------------------------------------- #
 # A real release, trimmed. Names and the two-asset CUDA shape are verbatim.
 # --------------------------------------------------------------------------- #
