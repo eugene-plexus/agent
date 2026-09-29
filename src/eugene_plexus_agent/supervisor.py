@@ -158,6 +158,15 @@ _COMPONENT_SPECS: dict[ComponentKind, _ComponentSpec] = {
         env_prefix="EUGENE_PLEXUS_LIBRARY",
         log_label="library",
     ),
+    # A search account (P8): one per provider account, like a driver per
+    # backend. Its own prefix, not the driver's: a child inherits only the
+    # variables carrying its own prefix, so a shared one would hand each
+    # kind the other's.
+    ComponentKind.tool_driver: _ComponentSpec(
+        module="eugene_plexus_tool_driver",
+        env_prefix="EUGENE_PLEXUS_TOOL_DRIVER",
+        log_label="tools",
+    ),
     # The control root is supervised like anything else, and that is the
     # point of the M5 split rather than an accident of it: if the control
     # root supervised processes it would need a second copy of this
@@ -413,7 +422,7 @@ class _ComponentPlanner:
         # trust root: it holds its own token key and signs the bundle
         # every node trusts.
         if self._auth_state is not None and self.entry.kind not in _TRUST_ROOT_KINDS:
-            kind_value = self.entry.kind.value  # "gateway", "inference-driver"
+            kind_value = self.entry.kind.value  # "gateway", "inference-driver", ...
             trust = self._auth_state.trust
             env[f"{prefix}_TRUST_BUNDLE_FILE"] = str(trust.bundle_path)
             env[f"{prefix}_TRUST_AUTHORITY"] = trust.authority
@@ -422,7 +431,7 @@ class _ComponentPlanner:
                 sub=kind_value, audience=trust.recipient
             )
             if (
-                kind_value in {"library", "inference-driver"}
+                kind_value in {"library", "inference-driver", "tool-driver"}
                 and self._auth_state.master_key is not None
             ):
                 env[f"{prefix}_MASTER_KEY"] = base64.b64encode(self._auth_state.master_key).decode(

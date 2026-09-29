@@ -145,6 +145,19 @@ def test_drivers_resolve_by_name(client: TestClient, sent: list[httpx.Request]) 
     assert str(sent[-1].url) == "http://drv.invalid:8081/v1/info"
 
 
+def test_a_search_account_resolves_by_name_like_a_driver(
+    app: FastAPI, client: TestClient, sent: list[httpx.Request]
+) -> None:
+    """P8: a tool-driver's config page is reached through the proxy by the
+    account's name, exactly as a driver's is."""
+    declare(app, "searx", "tool-driver", "http://tools.invalid:8190/")
+    assert client.get("/api/proxy/searx/v1/config").status_code == 200
+    assert str(sent[-1].url) == "http://tools.invalid:8190/v1/config"
+    # A name that is neither kind's is still a 503 naming it.
+    missing = client.get("/api/proxy/nosuch/v1/config")
+    assert missing.status_code == 503 and "search account" in missing.json()["detail"]["detail"]
+
+
 def test_agent_target_resolves_to_this_process(
     client: TestClient, sent: list[httpx.Request]
 ) -> None:

@@ -72,16 +72,26 @@ FIRST_CHECK_DELAY_SECONDS = 60.0
 
 _TIMEOUT_SECONDS = 10.0
 _MAX_BYTES = 4 * 1024 * 1024
-_PIN = re.compile(r"^PIN_(AGENT|CONTROL|GATEWAY|DRIVER|LIBRARY|UI)=([0-9a-f]{40})\b", re.MULTILINE)
+_PIN = re.compile(
+    r"^PIN_(AGENT|CONTROL|GATEWAY|DRIVER|LIBRARY|TOOL_DRIVER|UI)=([0-9a-f]{40})\b", re.MULTILINE
+)
 _PIN_NAMES = {
     "AGENT": "agent",
     "CONTROL": "control",
     "GATEWAY": "gateway",
     "DRIVER": "inference-driver",
     "LIBRARY": "library",
+    "TOOL_DRIVER": "tool-driver",
     "UI": "ui",
 }
 COMPONENT_NAMES = tuple(_PIN_NAMES.values())
+#: Components an installer or a release from before they existed does not
+#: pin. **Optional in a target, never in an install**: every release up to
+#: v0.1.0-alpha.5 predates the tool-driver (P8), and requiring its pin would
+#: make every one of them unreadable -- no release channel at all -- while
+#: an install that lacks it is simply behind a target that has it.
+ADDED_LATER = frozenset({"tool-driver"})
+REQUIRED_NAMES = tuple(n for n in COMPONENT_NAMES if n not in ADDED_LATER)
 _TAG = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$")
 _FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
@@ -167,9 +177,9 @@ def _get_text(get: Fetch, url: str) -> str:
 
 
 def parse_pins(install_sh: str) -> dict[str, str]:
-    """The six pins an `install.sh` carries, by component name."""
+    """The pins an `install.sh` carries, by component name."""
     found = {_PIN_NAMES[m.group(1)]: m.group(2) for m in _PIN.finditer(install_sh)}
-    missing = [name for name in COMPONENT_NAMES if name not in found]
+    missing = [name for name in REQUIRED_NAMES if name not in found]
     if missing:
         raise CheckFailed(
             f"the installer on the channel pins no commit for {', '.join(missing)}, "
@@ -265,7 +275,7 @@ def recent_releases(get: Fetch = fetch, *, limit: int = 5) -> list[Target]:
         components = manifest.get("components") if isinstance(manifest, dict) else None
         files = manifest.get("files") if isinstance(manifest, dict) else None
         if not isinstance(components, dict) or not all(
-            isinstance(components.get(n), str) for n in COMPONENT_NAMES
+            isinstance(components.get(n), str) for n in REQUIRED_NAMES
         ):
             continue
         installers: dict[str, Installer] = {}
@@ -283,7 +293,9 @@ def recent_releases(get: Fetch = fetch, *, limit: int = 5) -> list[Target]:
                 release=tag,
                 specs_commit=specs_commit if isinstance(specs_commit, str) else None,
                 published_at=_timestamp(release.get("published_at")),
-                components={n: components[n] for n in COMPONENT_NAMES},
+                components={
+                    n: components[n] for n in COMPONENT_NAMES if isinstance(components.get(n), str)
+                },
                 installers=installers,
             )
         )
@@ -317,7 +329,11 @@ def behind(install: NodeInstall, target: Target) -> list[str]:
     a channel offers now.
     """
     have = installed_commits(install)
-    return [name for name in COMPONENT_NAMES if have.get(name) != target.components.get(name)]
+    return [
+        name
+        for name in COMPONENT_NAMES
+        if name in target.components and have.get(name) != target.components.get(name)
+    ]
 
 
 def infer_channel(
@@ -332,7 +348,7 @@ def infer_channel(
         )
     have = installed_commits(install)
     for release in releases:
-        if all(have.get(name) == release.components.get(name) for name in COMPONENT_NAMES):
+        if all(have.get(name) == pin for name, pin in release.components.items()):
             return UpdateChannel.releases, UpdateChannelSource.inferred
     return UpdateChannel.edge, UpdateChannelSource.inferred
 

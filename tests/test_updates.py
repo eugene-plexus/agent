@@ -49,7 +49,9 @@ from eugene_plexus_agent._generated.models import (
 )
 
 SHA = {name: f"{i}" * 40 for i, name in enumerate(updates.COMPONENT_NAMES, start=1)}
-NEW = {name: f"{chr(ord('a') + i)}" * 40 for i, name in enumerate(updates.COMPONENT_NAMES)}
+# Two hex digits repeated: one letter per component ran out of hex at the
+# seventh (`g`), which is how the tool-driver's pin first read as missing.
+NEW = {name: f"{0xA0 + i:02x}" * 20 for i, name in enumerate(updates.COMPONENT_NAMES)}
 SPECS_OK = "c" * 40
 SPECS_RED = "d" * 40
 SPECS_RUNNING = "e" * 40
@@ -87,9 +89,10 @@ def _install_sh(pins: dict[str, str]) -> str:
         "gateway": "GATEWAY",
         "inference-driver": "DRIVER",
         "library": "LIBRARY",
+        "tool-driver": "TOOL_DRIVER",
         "ui": "UI",
     }
-    lines = [f"PIN_{names[n]}={pins[n]}" for n in updates.COMPONENT_NAMES]
+    lines = [f"PIN_{names[n]}={pins[n]}" for n in updates.COMPONENT_NAMES if n in pins]
     lines[-1] += "   # branch `dist`, not `main`"
     return "#!/bin/sh\n" + "\n".join(lines) + "\n"
 
@@ -721,3 +724,49 @@ def test_a_per_user_linux_install_updates_from_a_transient_unit(
     assert argv[-1].endswith("run-update.sh")
     directory = update_apply.update_dir(tmp_path)
     assert "--user --update" in (directory / "run-update.sh").read_text()
+
+
+# --------------------------------------------------------------------------- #
+# A component that joined later (the tool-driver, P8)
+# --------------------------------------------------------------------------- #
+
+BEFORE_P8 = {n: sha for n, sha in NEW.items() if n != "tool-driver"}
+
+
+def test_an_installer_from_before_the_tool_driver_is_still_read() -> None:
+    """Every release up to v0.1.0-alpha.5 pins six components. Requiring
+    the seventh would make each of them unreadable -- no release channel
+    at all for a new agent -- so a pin added later is optional in a target."""
+    pins = updates.parse_pins(_install_sh(BEFORE_P8))
+    assert "tool-driver" not in pins and pins["ui"] == NEW["ui"]
+    # And one that is missing a component every release has is still refused.
+    with pytest.raises(updates.CheckFailed, match="gateway"):
+        updates.parse_pins(_install_sh({n: s for n, s in NEW.items() if n != "gateway"}))
+
+
+def test_a_release_manifest_from_before_the_tool_driver_is_offered() -> None:
+    web = _releases_web()
+    base = "https://github.com/eugene-plexus/specs/releases/download"
+    old = web.pages[f"{base}/v0.1.0-alpha.3/manifest.json"]
+    old["components"] = dict(BEFORE_P8)
+    found = updates.recent_releases(web)
+    assert [t.release for t in found] == ["v0.1.0-alpha.3", "v0.1.0-alpha.2"]
+    assert "tool-driver" not in found[0].components
+
+
+def test_a_target_without_the_tool_driver_does_not_count_it_as_behind() -> None:
+    """An install that has it is not behind a target from before it existed."""
+    target = updates.Target(channel=UpdateChannel.releases, ref="v0", components=BEFORE_P8)
+    assert updates.behind(_install(NEW), target) == []
+    # And an install matching every pin the release has is on that release.
+    release = updates.Target(channel=UpdateChannel.releases, ref="v0", components=dict(SHA))
+    release.components.pop("tool-driver")
+    assert updates.infer_channel(_install(SHA), [release])[0] is UpdateChannel.releases
+
+
+def test_an_install_without_the_tool_driver_is_behind_a_target_that_pins_it() -> None:
+    """The other direction: an alpha.5 install updating to an edge that has
+    the tool-driver must install it, not skip it."""
+    target = updates.Target(channel=UpdateChannel.edge, ref=SPECS_OK, components=NEW)
+    older = dict(NEW) | {"tool-driver": None}
+    assert updates.behind(_install(older), target) == ["tool-driver"]

@@ -116,6 +116,9 @@ PROXY_PREFIX = "/api/proxy"
 # place it can be wrong.
 _SINGLETON_KINDS = {"gateway": "gateway", "library": "library", "control": "control"}
 
+#: The kinds a target names by `name` rather than by kind.
+_NAMED_KINDS = frozenset({"inference-driver", "tool-driver"})
+
 # `node:<name>` addresses another node's AGENT rather than a component
 # on it -- for the surfaces that are per-agent by nature (a runtime's
 # start/stop, which engines a host has, an engine install). `agent` is
@@ -250,8 +253,11 @@ def resolve_local(request: Request, target: str) -> str | None:
                 return str(entry.url)
         return None
 
+    # By name for the kinds that multiply: a driver per backend and, since
+    # P8, a tool-driver per search account. A search account's config page
+    # is reached through here, the same way a driver's is.
     for entry in entries:
-        if str(entry.kind) == "inference-driver" and entry.name == target and str(entry.url):
+        if str(entry.kind) in _NAMED_KINDS and entry.name == target and str(entry.url):
             return str(entry.url)
     return None
 
@@ -289,7 +295,11 @@ async def resolve_target(request: Request, target: str) -> Route:
         return Route(base=local)
 
     kind = _SINGLETON_KINDS.get(target)
-    article = f"component of kind {kind!r}" if kind else f"inference-driver named {target!r}"
+    article = (
+        f"component of kind {kind!r}"
+        if kind
+        else f"inference-driver or search account named {target!r}"
+    )
 
     # Already forwarded once. A second hop can only be a resolution
     # loop, so this ends here rather than going back out.

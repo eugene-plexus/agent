@@ -111,3 +111,31 @@ def test_only_star_is_special() -> None:
     assert model_permitted(["a?b"], "a?b") and not model_permitted(["a?b"], "axb")
     assert model_permitted(["*:free"], "openrouter/respan/span-01-lite:free")
     assert not model_permitted([], "anything")
+
+
+def test_a_keys_tool_scope_survives_a_restart_and_reaches_the_gateway(tmp_path):
+    """P8: `allowedTools` rides on the admission answer the gateway reads.
+    Absent (every key minted before P8) means every tool; a list narrows."""
+    path = tmp_path / "keys.json"
+    store = ClientKeyStore(path)
+    store.add(replace(_record(), limits={"allowedTools": []}))
+    store = ClientKeyStore(path)
+    store.load()
+    result = store.admit(key_id="abc", action="acquire", request_id="one", model="m")
+    assert result["limits"]["allowedTools"] == []
+    store.set_limits("abc", {"allowedModels": None})
+    result = store.admit(key_id="abc", action="acquire", request_id="two", model="m")
+    assert "allowedTools" not in result["limits"]
+
+
+def test_a_bad_tool_scope_is_a_client_error(authed_client):
+    for tools in ([" "], ["web_search", "web_search"], "web_search", ["x" * 65]):
+        response = authed_client.post(
+            "/v1/auth/client-keys", json={"name": "bad", "limits": {"allowedTools": tools}}
+        )
+        assert response.status_code == 422, (tools, response.text)
+    made = authed_client.post(
+        "/v1/auth/client-keys", json={"name": "ok", "limits": {"allowedTools": ["web_search"]}}
+    )
+    assert made.status_code in (200, 201), made.text
+    assert made.json()["key"]["limits"]["allowedTools"] == ["web_search"]

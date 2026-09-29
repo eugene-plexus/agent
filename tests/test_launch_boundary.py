@@ -52,6 +52,8 @@ def _component(kind: str, env: dict[str, str] | None = None) -> ComponentEntry:
         ("gateway", "GATEWAY"),
         ("library", "LIBRARY"),
         ("inference-driver", "DRIVER"),
+        # P8: a search account holds a Brave key sealed with the master key.
+        ("tool-driver", "TOOL_DRIVER"),
         ("control", "CONTROL"),
     ],
 )

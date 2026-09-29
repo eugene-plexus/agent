@@ -46,12 +46,23 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(value, dict) or value.keys() - {
         "allowedModels",
+        "allowedTools",
         "maxConcurrentRequests",
         "requestsPerMinute",
         "localOnly",
     }:
         raise ValueError("invalid client limits")
     allowed = value.get("allowedModels")
+    tools = value.get("allowedTools")
+    # P8: the tools the hub runs itself that this key may have run for it.
+    # Null (or absent, on every key minted before P8) permits them all.
+    if tools is not None and (
+        not isinstance(tools, list)
+        or len(tools) > 100
+        or any(not isinstance(t, str) or not t.strip() or len(t) > 64 for t in tools)
+        or len(set(tools)) != len(tools)
+    ):
+        raise ValueError("invalid allowed tools")
     if "localOnly" in value and not isinstance(value["localOnly"], bool):
         raise ValueError("localOnly must be a boolean")
     if allowed is not None and (
@@ -69,6 +80,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
     return {
         **({"localOnly": True} if value.get("localOnly") else {}),
         "allowedModels": allowed,
+        **({"allowedTools": tools} if tools is not None else {}),
         "maxConcurrentRequests": concurrency,
         "requestsPerMinute": rate,
     }
