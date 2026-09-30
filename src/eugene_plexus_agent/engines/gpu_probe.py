@@ -631,10 +631,53 @@ def metal_device() -> MetalDevice | None:
     except (AttributeError, OSError, ValueError) as e:
         log.debug("Metal did not answer: %s", e)
         return None
+    working_set = working_set_bytes(working_set, _wired_limit_mb())
     if working_set <= 0:
         return None
     name = raw.decode("utf-8", errors="replace").strip() if raw else None
     return MetalDevice(name=name or None, working_set_bytes=working_set, unified_memory=unified)
+
+
+def working_set_bytes(metal_figure: int, wired_limit_mb: int | None) -> int:
+    """What the GPU may hold: a wired limit someone set, else Metal's figure.
+
+    **Measured on GitHub's macOS runners (A4, 2026-09-30).** After
+    `sudo sysctl iogpu.wired_limit_mb=5973`, a new process's Metal device
+    reported 6,263,144,448 bytes, which is 5973 MiB exactly. A process
+    that already had its device kept the old figure, because Metal hands
+    a process one device object and its `recommendedMaxWorkingSetSize`
+    is fixed when that object is made. The agent and the library run for
+    days, so the sysctl is read on every call and wins whenever it is set;
+    0, the default, means Metal's own figure.
+    """
+    if wired_limit_mb and wired_limit_mb > 0:
+        return wired_limit_mb * 1024 * 1024
+    return metal_figure
+
+
+def _wired_limit_mb() -> int | None:
+    """`iogpu.wired_limit_mb` (macOS 14 and later), through `sysctlbyname`;
+    None when it cannot be read, 0 at its default."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "/usr/lib/libSystem.B.dylib")
+        value = ctypes.c_uint64(0)
+        size = ctypes.c_size_t(ctypes.sizeof(value))
+        libc.sysctlbyname.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        if libc.sysctlbyname(
+            b"iogpu.wired_limit_mb", ctypes.byref(value), ctypes.byref(size), None, 0
+        ):
+            return None
+    except (AttributeError, OSError) as e:
+        log.debug("iogpu.wired_limit_mb could not be read: %s", e)
+        return None
+    # A 4-byte sysctl fills the low half of the zeroed 8-byte buffer.
+    return int(value.value & ((1 << (8 * size.value)) - 1)) if size.value in (4, 8) else None
 
 
 # --------------------------------------------------------------------------- #
@@ -761,4 +804,5 @@ __all__ = [
     "vulkan_loader_present",
     "vulkan_selection",
     "windows_adapters",
+    "working_set_bytes",
 ]
