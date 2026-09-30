@@ -70,15 +70,21 @@ MAX_OUTPUT = 4 * 1024 * 1024
 QUALITY_CONTEXT = 4096
 QUALITY_CHUNKS = 4
 MIN_EVALUATION_TOKENS = 2 * QUALITY_CONTEXT
+# High was 96.5% until the bundled text proved harder than wikitext: the
+# MoE model's 8-bit cache scored 96.32% ± 0.21 on it against 97.29% there
+# (Troy lowered it, 2026-09-30). Low's other lever, a smaller file, is the
+# page's (moe-aware-fit call C).
 THRESHOLDS: dict[ProfileBuildAccuracy, float] = {
-    ProfileBuildAccuracy.high: 96.5,
+    ProfileBuildAccuracy.high: 96.0,
     ProfileBuildAccuracy.medium: 92.0,
+    ProfileBuildAccuracy.low: 88.0,
 }
 # What each level may consider, most precise first. Max never measures.
 CANDIDATE_TYPES: dict[ProfileBuildAccuracy, tuple[CacheType, ...]] = {
     ProfileBuildAccuracy.max: (CacheType.f16,),
     ProfileBuildAccuracy.high: (CacheType.f16, CacheType.q8_0),
     ProfileBuildAccuracy.medium: (CacheType.f16, CacheType.q8_0, CacheType.q4_0),
+    ProfileBuildAccuracy.low: (CacheType.f16, CacheType.q8_0, CacheType.q4_0),
 }
 PRECISION_ORDER = (CacheType.f16, CacheType.q8_0, CacheType.q4_0)
 

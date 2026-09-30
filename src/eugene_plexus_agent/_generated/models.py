@@ -96,15 +96,21 @@ class ProfileBuildAccuracy(StrEnum):
     * `max` — the f16 cache only; nothing that changes answers, so
       no quality measurement is made.
     * `high` — a cache type is allowed when it picks the same next
-      token as `max` at least 96.5% of the time on the evaluation
-      text, counting its measured rate minus one standard error.
+      token as `max` at least 96% of the time on the evaluation
+      text, counting its measured rate minus one standard error
+      (96.5% until 2026-09-30, when the bundled text proved harder
+      than wikitext).
     * `medium` — the same test at 92%.
+    * `low` — the same test at 88%. Low's other lever, a smaller file
+      of the same model offered after a build, is the page's, not the
+      build's (`docs/design/moe-aware-fit.md` call C).
 
     """
 
     max = 'max'
     high = 'high'
     medium = 'medium'
+    low = 'low'
 
 
 class CacheType(StrEnum):
@@ -2713,10 +2719,14 @@ class AdmissionFit(StrEnum):
     mapped onto a decision by what the spec asked for. `fits` admits.
     `tight` — inside total memory but not free memory — and `split`
     — needs host memory too — refuse a full-offload launch and admit
-    one whose `gpuLayers` is set below full, because then the
-    operator chose partial offload. `no` refuses. `unknown` admits
-    with a warning: a verdict from a budget that could not be
-    measured is worse than none.
+    a partial one. A launch is partial when `gpuLayers` is set below
+    full, because then the operator chose it, **or when `gpuLayers`
+    is unset on a llama.cpp build whose own `--fit` is on** (the
+    default in every build the installers ship), because then
+    llama.cpp places the model itself, experts or layers in host
+    memory as needed (2026-09-30, `docs/design/moe-aware-fit.md`
+    call A). `no` refuses. `unknown` admits with a warning: a verdict
+    from a budget that could not be measured is worse than none.
 
     """
 

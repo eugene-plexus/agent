@@ -82,6 +82,40 @@ def test_a_placement_flag_a_build_cannot_carry_is_refused():
         parse_fit("-ngl -1")
 
 
+def test_high_admits_the_8_bit_cache_the_acceptance_run_measured():
+    # PB1's GPU runs: the MoE model's q8_0 cache scored 96.32% ± 0.21 on the
+    # bundled text. Troy lowered High to 96% for exactly this (2026-09-30);
+    # at the old 96.5% it failed.
+    from eugene_plexus_agent._generated.models import ProfileBuildAccuracy
+    from eugene_plexus_agent.profile_builds import THRESHOLDS
+
+    measured = KLD_Q8.replace("97.289 ± 0.127", "96.320 ± 0.210")
+    high = THRESHOLDS[ProfileBuildAccuracy.high]
+    assert quality_from_output(measured, CacheType.q8_0, high).passes
+    assert not quality_from_output(measured, CacheType.q8_0, 96.5).passes
+
+
+@pytest.mark.asyncio
+async def test_low_allows_the_4_bit_cache_medium_refuses(tmp_path):
+    # The MoE model's q4_0 cache on the bundled text: 88.40% ± 0.35 (run 3).
+    moe_q4 = KLD_Q8.replace("97.289 ± 0.127", "88.400 ± 0.350")
+    allowed = {}
+    for level in ("medium", "low"):
+        (tmp_path / level).mkdir()
+        manager = _runner(tmp_path / level, FakeTools(q4=moe_q4))
+        manager.start(
+            _request(level),
+            _plan(tmp_path / level),
+            node="n",
+            restarts=[],
+            evaluation={"source": "bundled"},
+            after=None,
+        )
+        job = await _finish(manager)
+        allowed[level] = [c.value for c in job.allowedCacheTypes]
+    assert allowed == {"medium": ["f16", "q8_0"], "low": ["f16", "q8_0", "q4_0"]}
+
+
 def test_quality_reads_same_top_token_and_applies_the_boundary_rule():
     q8 = quality_from_output(KLD_Q8, CacheType.q8_0, 96.5)
     assert q8.sameTopTokenPercent == pytest.approx(97.289)
@@ -218,8 +252,8 @@ def _plan(tmp_path, contexts=(4096, 65536)):
 class FakeTools:
     """Answers each tool's argv the way the real ones did in §0."""
 
-    def __init__(self, *, q8=KLD_Q8, short=False, fail_bench=False):
-        self.q8, self.short, self.fail_bench = q8, short, fail_bench
+    def __init__(self, *, q8=KLD_Q8, q4=KLD_Q4, short=False, fail_bench=False):
+        self.q8, self.q4, self.short, self.fail_bench = q8, q4, short, fail_bench
         self.calls: list[list[str]] = []
 
     def __call__(self, argv):
@@ -229,7 +263,8 @@ class FakeTools:
             if self.short:
                 return 1, "", "you need at least 8192 tokens ... tokenizes to only 900 tokens"
             if "--kl-divergence" in argv:
-                return 0, self.q8, ""
+                cache = argv[argv.index("--cache-type-k") + 1]
+                return 0, (self.q4 if cache == "q4_0" else self.q8), ""
             Path(argv[argv.index("--kl-divergence-base") + 1]).write_bytes(b"base")
             return 0, "", ""
         if name == "llama-fit-params":

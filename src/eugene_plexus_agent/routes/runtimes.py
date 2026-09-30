@@ -61,12 +61,14 @@ from ..dependencies import (
 )
 from ..engines.acquisition import AcquisitionError, Unavailable
 from ..engines.devices import detect_devices
+from ..engines.llama_cpp import LlamaCppAdapter, places_by_itself
 from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, rules_from_config
 from ..node_work import runtime_launch
 from ..reservations import ReservationLedger
 from ..runtimes import (
     RuntimeSupervisor,
+    _configured_binary,
     describe_engines,
     installer_for,
     plan_for,
@@ -325,6 +327,19 @@ def _reserve(request: Request, spec: RuntimeSpec, admission: Admission | None) -
     )
 
 
+def engine_places(spec: RuntimeSpec, get_config) -> bool:  # type: ignore[no-untyped-def]
+    """Whether this spec's llama-server places a model by itself (`--fit`).
+
+    The seam admission calls, so tests pin it to the machine they
+    describe rather than the one they run on; the reading itself is
+    `places_by_itself`.
+    """
+    if spec.engine is not EngineKind.llama_cpp:
+        return False
+    adapter = LlamaCppAdapter()
+    return places_by_itself(adapter, spec, _configured_binary(adapter, get_config))
+
+
 async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
@@ -363,6 +378,7 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
         # So admission asks about the file a launch would actually open,
         # including this node's own copy when it holds one.
         copy_settings=supervisor.copy_settings() if supervisor is not None else None,
+        engine_places=await asyncio.to_thread(engine_places, spec, state.get_config),
     )
 
 

@@ -592,6 +592,24 @@ def _supported_long_flags(binary: Path) -> frozenset[str] | None:
     return found
 
 
+def places_by_itself(adapter: LlamaCppAdapter, spec: RuntimeSpec, configured: str | None) -> bool:
+    """Whether the llama-server this spec would run lists `--fit` in its help.
+
+    Every build the installers ship has it, on by default, and with it an
+    unset `gpuLayers` asks llama.cpp to place the model, experts or layers
+    in host memory as needed (moe-aware-fit call A). Read off the build's
+    own `--help`, cached per binary, so a configured old build without
+    `--fit` keeps the full-offload reading. Anything that cannot be
+    resolved or asked answers False, the conservative reading.
+    """
+    try:
+        found = adapter.resolve_binary(spec, configured=configured)
+    except Exception:
+        return False
+    flags = _supported_long_flags(found.path)
+    return flags is not None and "--fit" in flags
+
+
 def _load_mode_argv(flags: dict, binary: Path) -> list[str]:
     """Translate `noMmap` / `mlock` into whichever spelling this binary takes.
 

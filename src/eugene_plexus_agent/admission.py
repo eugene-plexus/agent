@@ -726,26 +726,48 @@ def admission_split(
     ]
 
 
-def wants_full_offload(spec: RuntimeSpec) -> bool:
+def wants_full_offload(spec: RuntimeSpec, *, engine_places: bool = False) -> bool:
     """Whether the spec asks for the whole model on the accelerator.
 
-    llama.cpp with `gpuLayers` unset, negative (`-1` is "all" upstream),
-    or at/above 99 is full offload; below is the operator choosing
-    partial offload knowingly, which is what turns `tight` and `split`
-    from refusals into admits. vLLM has no partial offload, so it is
-    always full.
+    llama.cpp with `gpuLayers` negative (`-1` is "all" upstream) or at or
+    above 99 is full offload; below is the operator choosing partial
+    offload knowingly, which is what turns `tight` and `split` from
+    refusals into admits. vLLM has no partial offload, so it is always
+    full.
+
+    **Unset depends on the build** (2026-09-30, moe-aware-fit call A).
+    `engine_places` is the caller saying this spec's llama-server lists
+    `--fit` in its own help, which every build the installers ship does,
+    on by default. There an unset `gpuLayers` asks llama.cpp to place the
+    model, experts or layers in host memory as needed -- a partial launch
+    the engine arranges, not a demand for the whole model on the card. It
+    was read as full offload, which refused every `split` a profile build
+    saves (it leaves `gpuLayers` unset on purpose) on exactly the cards
+    where the build had just measured it running. A spec passing
+    `--fit off` gets the old reading back.
     """
     if spec.engine is not EngineKind.llama_cpp:
         return True
     flags = spec.flags or {}
     layers = flags.get("gpuLayers")
     if layers is None:
-        return True
+        return not (engine_places and not fit_disabled(spec))
     try:
         count = int(layers)
     except (TypeError, ValueError):
         return True
     return count < 0 or count >= FULL_OFFLOAD_LAYERS
+
+
+def fit_disabled(spec: RuntimeSpec) -> bool:
+    """Whether the spec's raw arguments switch llama.cpp's own fit off."""
+    args = [a.strip().lower() for a in (spec.extraArgs or [])]
+    for i, arg in enumerate(args):
+        if arg in ("--fit=off", "-fit=off"):
+            return True
+        if arg in ("--fit", "-fit") and i + 1 < len(args) and args[i + 1] == "off":
+            return True
+    return False
 
 
 def model_size_bytes(model_path: str) -> int | None:
@@ -874,6 +896,7 @@ async def check_admission(
     exists: Callable[[str], bool] | None = None,
     copy_settings: model_copies.CopySettings | None = None,
     folders_unread: str | None = None,
+    engine_places: bool = False,
 ) -> Admission:
     """Measure `spec` against the device it targets, right now.
 
@@ -885,6 +908,8 @@ async def check_admission(
     refusal's prose. `folders_unread` is why this node could not read the
     Library's folders on this request, when it could not: then no folder's
     mount may have applied, and the refusal has to say so.
+    `engine_places` is whether this spec's llama-server places a model by
+    itself (`wants_full_offload`).
     """
     sizer = size_of or model_size_bytes
     is_there = exists or path_exists
@@ -958,7 +983,8 @@ async def check_admission(
     spillover_device = device.kind is not ComputeDeviceKind.cpu and not unified
     ram_available = snapshot.ram_available_bytes if spillover_device else 0
     blockers = _blockers(spec, targets, snapshot, running)
-    full_offload = wants_full_offload(spec)
+    full_offload = wants_full_offload(spec, engine_places=engine_places)
+    engine_spills = not full_offload and (spec.flags or {}).get("gpuLayers") is None
 
     # Required bytes: the library when it answers, the file otherwise.
     required: int | None = None
@@ -1074,7 +1100,10 @@ async def check_admission(
             f"{where} {has} {_gib(free)} free of {_gib(total)}{between};{reserved_text} "
             f"verdict {fit.value}"
             + (
-                " with partial offload requested, so the spill is the operator's choice"
+                " with GPU layers left to llama.cpp, which places what does not fit "
+                "in system memory itself"
+                if engine_spills and fit is not AdmissionFit.fits
+                else " with partial offload requested, so the spill is the operator's choice"
                 if not full_offload and fit is not AdmissionFit.fits
                 else ""
             )

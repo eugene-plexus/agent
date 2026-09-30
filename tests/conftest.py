@@ -415,6 +415,21 @@ def _no_gpus_from_the_operating_system(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_llama_server_places_models_by_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Admission reads no real llama-server's help unless a test says otherwise.
+
+    `engine_places` resolves the spec's binary and asks whether it lists
+    `--fit` (moe-aware-fit call A). A developer's box has real builds in
+    its engine store, CI has none, so without this every admission route
+    test would describe the machine it ran on. False is the conservative
+    answer, and the one CI gives; tests of the rule itself opt in.
+    """
+    from eugene_plexus_agent.routes import runtimes as runtime_routes
+
+    monkeypatch.setattr(runtime_routes, "engine_places", lambda spec, get_config: False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:
         monkeypatch.delenv(key, raising=False)
