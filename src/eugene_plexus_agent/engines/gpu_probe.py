@@ -26,6 +26,9 @@ mechanism for every vendor, and it needs nothing installed:
   this code knows, so an Intel card's size is reported as unknown.
   **The Linux half is unverified on real hardware**: it is written from
   the kernel's documented sysfs ABI.
+* **macOS: Metal**, for the one device Apple silicon has and the share of
+  unified memory Metal lets it hold (`metal_device`). Measured on GitHub's
+  macOS runners (A4, 2026-09-30), where it matched MLX's own figure.
 
 **This file is copied, not shared.** The agent and the library each keep
 an identical copy, because components share schemas and not code. It
@@ -553,6 +556,88 @@ def _windows_usage() -> dict[str, tuple[int | None, int | None]]:
 
 
 # --------------------------------------------------------------------------- #
+# macOS: Metal's own answer
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class MetalDevice:
+    """The system's default Metal device, as Metal describes it."""
+
+    name: str | None
+    #: `recommendedMaxWorkingSetSize`: how much of unified memory the GPU
+    #: may hold before Metal starts refusing or paging. This, not RAM, is
+    #: what decides whether a model loads on Apple silicon.
+    working_set_bytes: int
+    unified_memory: bool
+
+
+def metal_device() -> MetalDevice | None:
+    """Ask Metal for the default device's name and working-set limit.
+
+    **Why (A4, 2026-09-30).** Both copies of the Apple budget were
+    `0.75 * hw.memsize`, written from documentation. Metal's own figure on
+    GitHub's macOS runners is two thirds: 5,010,800,640 of 7,516,192,768
+    bytes on a 7 GB M1 and 10,021,601,280 of 15,032,385,536 on a 14 GB
+    M2 Pro, on macos-14, -15 and -26, byte for byte what MLX's
+    `mx.device_info()` reports. So a small Mac was told a model fits that
+    Metal will not hold. This reads the number the driver itself uses.
+
+    Stdlib only: the Objective-C runtime through ctypes, every message sent
+    through a prototype of its own, because `objc_msgSend` must not be
+    called as a variadic function on arm64. CoreGraphics is loaded first,
+    since a process that has not linked it can be given no default device.
+    The work runs inside an autorelease pool, so the name string does not
+    leak per call. None when any of it is missing; the caller falls back
+    to a fraction of RAM and says so.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        metal = ctypes.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
+        objc = ctypes.CDLL(ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib")
+    except OSError as e:
+        log.debug("Metal cannot be loaded in this process: %s", e)
+        return None
+    try:
+        metal.MTLCreateSystemDefaultDevice.restype = ctypes.c_void_p
+        metal.MTLCreateSystemDefaultDevice.argtypes = []
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.objc_autoreleasePoolPush.restype = ctypes.c_void_p
+        objc.objc_autoreleasePoolPop.argtypes = [ctypes.c_void_p]
+        send_address = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+
+        def send(obj: int, selector: bytes, restype: Any) -> Any:
+            prototype = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p)
+            return prototype(send_address)(obj, objc.sel_registerName(selector))
+
+        pool = objc.objc_autoreleasePoolPush()
+        try:
+            device = metal.MTLCreateSystemDefaultDevice()
+            if not device:
+                return None
+            try:
+                working_set = int(send(device, b"recommendedMaxWorkingSetSize", ctypes.c_uint64))
+                unified = bool(send(device, b"hasUnifiedMemory", ctypes.c_bool))
+                label = send(device, b"name", ctypes.c_void_p)
+                raw = send(label, b"UTF8String", ctypes.c_char_p) if label else None
+            finally:
+                # A Create function returns a retained object.
+                send(device, b"release", None)
+        finally:
+            objc.objc_autoreleasePoolPop(pool)
+    except (AttributeError, OSError, ValueError) as e:
+        log.debug("Metal did not answer: %s", e)
+        return None
+    if working_set <= 0:
+        return None
+    name = raw.decode("utf-8", errors="replace").strip() if raw else None
+    return MetalDevice(name=name or None, working_set_bytes=working_set, unified_memory=unified)
+
+
+# --------------------------------------------------------------------------- #
 # Linux: sysfs
 # --------------------------------------------------------------------------- #
 
@@ -665,11 +750,13 @@ __all__ = [
     "Adapter",
     "Family",
     "GpuProbeError",
+    "MetalDevice",
     "adapters",
     "beside_nvidia",
     "combinable_with_cuda",
     "family",
     "linux_adapters",
+    "metal_device",
     "vulkan_build_published",
     "vulkan_loader_present",
     "vulkan_selection",

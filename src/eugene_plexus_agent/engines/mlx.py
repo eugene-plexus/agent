@@ -60,7 +60,10 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import httpx
@@ -225,17 +228,20 @@ class MlxAdapter(EngineAdapter):
         against and builds an environment of its own: mlx-lm never goes
         into Eugene's venv (`watchdog-venv-is-runtime` — the agent's
         environment is the component runtime, and an engine's
-        dependencies do not belong in it). The notes carry the Rosetta
-        trap, because a Rosetta terminal makes uv fetch an x86_64
-        CPython and the failure surfaces as Metal being unreachable.
+        dependencies do not belong in it). It names the install's own uv
+        by path and asks for a native arm64 CPython by name, so it runs
+        in the person's shell as shown and cannot build an x86_64
+        environment from a Rosetta terminal (both measured on a GitHub
+        macOS runner, A4).
         """
         apple = host.os is Os.macos and host.arch is Arch.arm64
         if not apple:
             return ManualInstall(docsUrl=INSTALL_DOCS_URL, notes=_NOT_APPLE_NOTES)
+        uv = _uv_for_recipe()
         return ManualInstall(
             command=(
-                "uv venv ~/eugene-mlx && uv pip install --python "
-                f'~/eugene-mlx/bin/python "mlx-lm=={UPSTREAM_VERSION_PINNED}"'
+                f"{uv} venv --python {_NATIVE_PYTHON} ~/eugene-mlx && {uv} pip install "
+                f'--python ~/eugene-mlx/bin/python "mlx-lm=={UPSTREAM_VERSION_PINNED}"'
             ),
             docsUrl=INSTALL_DOCS_URL,
             notes=(
@@ -243,11 +249,11 @@ class MlxAdapter(EngineAdapter):
                 "`~/eugene-mlx/bin/mlx_lm.server` - the console script, not a Python "
                 "interpreter or the venv directory; its shebang binds its own "
                 "interpreter, so nothing needs activating and the path survives an "
-                "agent restart and the launchd environment. Check the environment is "
-                "native ARM before trusting it: `~/eugene-mlx/bin/python -c "
-                '"import platform; print(platform.machine())"` must print `arm64` - '
-                "a Rosetta terminal makes uv fetch an x86_64 CPython, after which "
-                "MLX cannot reach Metal."
+                "agent restart and the launchd environment. The command asks for a "
+                "native arm64 Python by name, so a Rosetta terminal cannot give the "
+                "environment an x86_64 one (which cannot reach Metal); "
+                '`~/eugene-mlx/bin/python -c "import platform; print(platform.machine())"` '
+                "prints `arm64` to confirm it."
             ),
         )
 
@@ -428,6 +434,33 @@ class MlxAdapter(EngineAdapter):
             categories=_CATEGORIES,
             fields=_FLAG_FIELDS,
         )
+
+
+# uv's name for a native Apple silicon CPython, the same request install.sh
+# makes. Asking by architecture is what makes the recipe safe from a Rosetta
+# terminal, where a bare `uv venv` could pick an x86_64 interpreter (A4).
+_NATIVE_PYTHON = "cpython-3.12-macos-aarch64-none"
+
+
+def _uv_for_recipe() -> str:
+    """The `uv` the install recipe should name, as a shell word.
+
+    **The install's own, by absolute path** (A4, 2026-09-30). `install.sh`
+    puts uv in `<prefix>/bin` and never on PATH, so a recipe that began
+    with a bare `uv` answered `uv: command not found` on a Mac that had
+    just installed Eugene with uv - measured on a GitHub runner, which is
+    that Mac exactly. The agent's venv is `<prefix>/venv`, so the uv
+    beside it is found from `sys.prefix`. Otherwise one on the agent's own
+    PATH, and otherwise the bare word, which is right for anyone who
+    installed uv themselves.
+    """
+    own = Path(sys.prefix).parent / "bin" / "uv"
+    if own.is_file():
+        return shlex.quote(str(own))
+    found = shutil.which("uv")
+    if found:
+        return shlex.quote(found)
+    return "uv"
 
 
 def _says_unavailable(health: httpx.Response) -> bool:

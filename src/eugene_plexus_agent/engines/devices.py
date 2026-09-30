@@ -15,8 +15,10 @@ disagree by a few MiB across a second; admission uses this one because
 this is the host that spawns.
 
 Only the NVIDIA path has met real hardware (the RTX 5090 this was
-written against). ROCm, Intel and Apple unified memory are written from
-their tools' documented output and are **unverified**; each failure
+written against), and Apple silicon a virtual Mac: GitHub's macOS
+runners, where the budget is Metal's own working-set figure (A4,
+2026-09-30). ROCm and Intel are written from their tools' documented
+output and are **unverified**; each failure
 appends a warning rather than defaulting silently, because a fit verdict
 computed from a wrong budget is worse than no verdict — and admission
 never refuses on `unknown`.
@@ -48,10 +50,13 @@ MIB = 1024 * 1024
 # wedged. Admission runs behind a POST an operator is waiting on.
 _PROBE_TIMEOUT_SECONDS = 10.0
 
-# Apple silicon: the GPU addresses host RAM, capped by the wired limit.
-# 75% is the default `iogpu.wired_limit_pct`; the library uses the same
-# figure, and both say so in a warning.
-APPLE_WIRED_LIMIT_FRACTION = 0.75
+# Apple silicon: the GPU addresses host RAM, up to the working set Metal
+# allows, which `gpu_probe.metal_device()` reads from Metal itself. This
+# fraction is only the fallback when Metal cannot be asked. It was 0.75,
+# from documentation; Metal reports two thirds on every runner measured
+# (A4, 2026-09-30), and a budget that is too high says "fits" about a
+# model Metal will not hold. The library carries the same figure.
+APPLE_WIRED_LIMIT_FRACTION = 2 / 3
 
 Runner = Callable[[list[str]], str | None]
 MemoryReader = Callable[[], tuple[int | None, int | None]]
@@ -338,23 +343,53 @@ def _intel(run: Runner, warnings: list[str]) -> list[ComputeDevice]:
     return devices
 
 
-def _apple(ram_total: int | None, warnings: list[str]) -> list[ComputeDevice]:
-    """UNVERIFIED — from Apple's documented behaviour. No separate VRAM
-    pool: the GPU addresses host RAM up to the wired limit. Reporting
-    zero here would tell a 96 GB Mac it has no GPU."""
-    if ram_total is None:
+def _apple_chip(run: Runner = _run) -> str | None:
+    """`Apple M2 Pro`, where `platform.processor()` says only `arm`."""
+    out = run(["sysctl", "-n", "machdep.cpu.brand_string"])
+    return (out or "").strip() or None
+
+
+def _cpu_name() -> str:
+    if sys.platform == "darwin":
+        chip = _apple_chip()
+        if chip:
+            return chip
+    return platform.processor() or platform.machine() or "CPU"
+
+
+def _apple(
+    ram_total: int | None,
+    warnings: list[str],
+    metal: Callable[[], gpu_probe.MetalDevice | None] | None = None,
+) -> list[ComputeDevice]:
+    """No separate VRAM pool: the GPU addresses host RAM up to the working
+    set Metal allows. Reporting zero here would tell a 96 GB Mac it has no
+    GPU.
+
+    The budget is Metal's own `recommendedMaxWorkingSetSize`, read on this
+    host (A4, 2026-09-30: it matched MLX's figure on GitHub's macOS
+    runners). Only when Metal cannot be asked is it a fraction of RAM, and
+    then a warning says so."""
+    device = (metal or gpu_probe.metal_device)()
+    if device is not None:
+        budget = device.working_set_bytes
+        name = device.name or _apple_chip() or "Apple silicon"
+    elif ram_total is None:
         warnings.append("could not read total memory, so the unified-memory budget is unknown")
         return []
-    warnings.append(
-        f"unified memory: reporting {APPLE_WIRED_LIMIT_FRACTION:.0%} of RAM as the GPU budget "
-        "(the default iogpu.wired_limit_pct). Untested against real hardware."
-    )
+    else:
+        budget = int(ram_total * APPLE_WIRED_LIMIT_FRACTION)
+        name = _apple_chip() or "Apple silicon"
+        warnings.append(
+            f"unified memory: Metal could not be asked for its working-set limit, so "
+            f"{APPLE_WIRED_LIMIT_FRACTION:.0%} of RAM is reported as the GPU budget"
+        )
     return [
         ComputeDevice(
             kind=ComputeDeviceKind.metal,
             index=0,
-            name=platform.processor() or "Apple silicon",
-            memoryTotalBytes=int(ram_total * APPLE_WIRED_LIMIT_FRACTION),
+            name=name,
+            memoryTotalBytes=budget,
             # Free is genuinely unknowable without the wired-page count;
             # left absent so admission reports `unknown` rather than
             # inventing a number.
@@ -549,7 +584,7 @@ def detect_devices(
         ComputeDevice(
             kind=ComputeDeviceKind.cpu,
             index=0,
-            name=platform.processor() or platform.machine() or "CPU",
+            name=_cpu_name(),
             memoryTotalBytes=ram_total,
             memoryFreeBytes=ram_available,
         )
