@@ -229,6 +229,12 @@ def redact_entries(stored: object) -> list[dict[str, object]]:
     edits -- and it has to be able to tell *there is a password stored*
     from *there is no password*, because the first is a row that works
     and the second is a row that does not.
+
+    **`hasPassword` is how** (2026-09-30). This docstring said so from the
+    start and the answer never did: every row came back `password: None`,
+    so a row with a stored password and a row without one were identical,
+    and the UI told somebody "saved" about a password that never was.
+    Whether one is stored, never the password.
     """
     if not isinstance(stored, list):
         return []
@@ -241,6 +247,7 @@ def redact_entries(stored: object) -> list[dict[str, object]]:
                 "host": entry.get("host"),
                 "username": entry.get("username"),
                 "password": None,
+                "hasPassword": has_password(entry),
             }
         )
     return out

@@ -42,7 +42,9 @@ def test_writing_back_a_redacted_row_keeps_the_password() -> None:
     assert error is None
 
     redacted = share_credentials.redact_entries(stored)
-    assert redacted == [{"host": "nas", "username": "tcorbin", "password": None}]
+    assert redacted == [
+        {"host": "nas", "username": "tcorbin", "password": None, "hasPassword": True}
+    ]
 
     # The UI edits the user name on the row it was shown and PATCHes it.
     written_back = [{"host": "nas", "username": "someone-else", "password": None}]
@@ -270,5 +272,28 @@ def test_the_config_endpoint_never_hands_back_a_password(authed_client: TestClie
     read = authed_client.get("/v1/config")
     assert read.status_code == 200
     rows = read.json()["shareCredentials"]
-    assert rows == [{"host": "nas", "username": "u", "password": None}]
+    assert rows == [{"host": "nas", "username": "u", "password": None, "hasPassword": True}]
     assert "hunter2" not in read.text
+
+
+def test_a_row_says_whether_a_password_is_stored(authed_client: TestClient) -> None:
+    """Every row came back `password: None`, so one with a stored password
+    and one without were identical and the UI said "saved" about both
+    (2026-09-30). Presence only -- never the password."""
+    saved = authed_client.patch(
+        "/v1/config",
+        json={
+            "shareCredentials": [
+                {"host": "nas", "username": "u", "password": "hunter2"},
+                {"host": "other", "username": "v"},
+            ]
+        },
+    )
+    assert saved.json()["rejected"] == []
+    rows = authed_client.get("/v1/config").json()["shareCredentials"]
+    assert [(r["host"], r["hasPassword"]) for r in rows] == [("nas", True), ("other", False)]
+    assert all(r["password"] is None for r in rows)
+    # And null is the default -- no logins -- rather than refused.
+    reset = authed_client.patch("/v1/config", json={"shareCredentials": None})
+    assert reset.json()["rejected"] == [] and "shareCredentials" in reset.json()["applied"]
+    assert authed_client.get("/v1/config").json()["shareCredentials"] == []

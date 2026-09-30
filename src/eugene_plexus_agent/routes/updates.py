@@ -16,8 +16,15 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 
 from .. import install_info, update_apply
 from .._generated.common_models import Problem
-from .._generated.models import NodeInstall, NodeUpdate, UpdateRequest, UpdateRun
+from .._generated.models import (
+    NodeInstall,
+    NodeUpdate,
+    UpdateChannel,
+    UpdateRequest,
+    UpdateRun,
+)
 from ..dependencies import require_operator_session
+from ..state import default_update_channel
 from ..updates import UpdateChecker, valid_ref
 
 log = logging.getLogger(__name__)
@@ -30,7 +37,13 @@ def checker_for(app: FastAPI) -> UpdateChecker:
     """This agent's one checker, made on first use."""
     found = getattr(app.state, "update_checker", None)
     if found is None:
-        found = UpdateChecker(setting=app.state.agent_state.get_config)
+        state = app.state.agent_state
+        found = UpdateChecker(
+            setting=state.get_config,
+            default_channel=lambda: UpdateChannel(default_update_channel()),
+            settling=state.update_channel_settling,
+            settle=lambda channel: state.settle_update_channel(channel.value),
+        )
         app.state.update_checker = found
     return found
 
@@ -45,7 +58,7 @@ def _prefix(request: Request):  # type: ignore[no-untyped-def]
 
 def _view(request: Request, install: NodeInstall) -> NodeUpdate:
     check = checker(request)
-    result = check.result()
+    result = check.current()
     target = result.newest if result is not None else None
     prefix = _prefix(request)
     ready = install.mechanism.value == "systemd_system" and update_apply.system_unit_ready()
@@ -117,7 +130,7 @@ async def update_now(request: Request, body: UpdateRequest) -> UpdateRun:
             f"The update to {view.running.target[:12]} started at "
             f"{view.running.startedAt:%H:%M} UTC is still running on this machine.",
         )
-    result = checker(request).result()
+    result = checker(request).current()
     target = result.newest if result is not None else None
     if target is None:
         raise _problem(
@@ -140,11 +153,22 @@ async def update_now(request: Request, body: UpdateRequest) -> UpdateRun:
             "Check again and look before updating.",
         )
     if not view.available:
+        name = target.release or target.ref[:12]
+        if view.ahead:
+            # Never a downgrade dressed as an update (2026-09-30).
+            raise _problem(
+                409,
+                "update-nothing-newer",
+                "This machine is newer",
+                f"{name} is older than what this machine runs in "
+                f"{', '.join(view.ahead)}, so installing it would move those back. "
+                "Nothing is installed.",
+            )
         raise _problem(
             409,
             "update-nothing-newer",
             "Already up to date",
-            f"This machine already runs {target.release or target.ref[:12]}.",
+            f"This machine already runs {name}.",
         )
     try:
         return await asyncio.to_thread(

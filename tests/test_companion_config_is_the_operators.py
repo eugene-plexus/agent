@@ -130,3 +130,32 @@ async def test_an_unreadable_companion_config_does_not_stop_the_boot(
     after = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert after["provider"] == "openai_compat_custom"
     assert after["runtimeName"] == "qwen3-a"
+
+
+async def test_a_companion_is_told_which_keys_the_agent_manages(
+    authed_client: TestClient, settings: Any, stub_supervisor: StubSupervisor
+) -> None:
+    """Settings never lie (2026-09-30): the driver shows these read-only.
+
+    A new companion carries the list at spawn; one declared before the
+    list existed is given it once, at the next reconcile, and restarted
+    from the new entry -- the supervisor holds the entry it started from.
+    """
+    assert authed_client.post("/v1/runtimes", json=_runtime()).status_code == 201
+    comps = {c["name"]: c for c in authed_client.get("/v1/components").json()["components"]}
+    env = comps["qwen3-a-driver"]["spawn"]["env"]
+    assert env[companions.MANAGED_KEYS_ENV].split(",") == list(companions.MANAGED_KEYS)
+
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    entry = state.get_topology_entry("qwen3-a-driver")
+    old = entry.model_copy(update={"spawn": entry.spawn.model_copy(update={"env": None})})
+    state.update_topology_entry("qwen3-a-driver", old)
+    stub_supervisor.calls.clear()
+    await companions.reconcile(state, stub_supervisor)
+    after = state.get_topology_entry("qwen3-a-driver")
+    assert after.spawn.env[companions.MANAGED_KEYS_ENV]
+    assert ("add_and_start", "qwen3-a-driver") in stub_supervisor.calls
+    # And once named, a later reconcile leaves it alone.
+    stub_supervisor.calls.clear()
+    await companions.reconcile(state, stub_supervisor)
+    assert stub_supervisor.calls == []

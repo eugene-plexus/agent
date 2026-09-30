@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
 from typing import Any
 
@@ -17,7 +18,10 @@ from fastapi import APIRouter, Request
 from .. import enrollment, keyring_store, library_folders, model_paths, share_credentials
 from .._generated.common_models import (
     ConfigDocument,
+    ConfigField,
     ConfigFieldError,
+    ConfigFieldStatus,
+    ConfigFieldStatusLevel,
     ConfigSchema,
     ConfigTestRequest,
     ConfigTestResult,
@@ -53,7 +57,158 @@ async def get_config(request: Request) -> ConfigDocument:
 @router.get("/v1/config/schema", response_model=ConfigSchema)
 async def get_config_schema(request: Request) -> ConfigSchema:
     state: AgentState = request.app.state.agent_state
-    return state.as_config_schema()
+    schema = state.as_config_schema()
+    keyring: bool | None = None
+    if state.get_config("securityMode") == "os_keyring":
+        # Memoised per process, but a locked Secret Service can block on a
+        # prompt nobody answers: the same deadline `/v1/auth/status` keeps.
+        from .auth import KEYRING_PROBE_BUDGET_SECONDS
+
+        try:
+            keyring = await asyncio.wait_for(
+                asyncio.to_thread(keyring_store.probe_sync), timeout=KEYRING_PROBE_BUDGET_SECONDS
+            )
+        except TimeoutError:
+            keyring = None
+    live = await asyncio.to_thread(_live_facts, request, state)
+    live["keyring"] = keyring
+    schema.fields = [_with_live_facts(f, live) for f in schema.fields]
+    return schema
+
+
+def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
+    """What this machine can say, now, about what an unset or chosen value
+    does. Blocking lookups (PATH, the keyring probe): off the event loop.
+
+    **Settings never lie** (2026-09-30): an empty engine path is not
+    "nothing" -- it is whatever PATH finds; an unset advertise address is
+    the one derived from the route to the root; a security mode this
+    machine cannot carry out is not the mode it runs.
+    """
+    from .. import apps, node_identity, reach
+    from .node import _listeners
+
+    settings = getattr(request.app.state, "settings", None)
+    record = request.app.state.node_identity.record
+    advertise = node_identity.effective_advertise_url(
+        state.get_config("advertiseUrl"), record.advertise_url
+    )
+    try:
+        bound = reach.bound_addresses(_listeners(request))
+        agent_bound = next((b for b in bound if b.process == "agent"), None)
+        restart = reach.restart_required(advertise_url=advertise, agent_bound=agent_bound)
+    except Exception:  # pragma: no cover - a status line is never a reason to fail the schema
+        restart = False
+    uv = apps.find_uv(None)
+    return {
+        "derived_advertise": (
+            node_identity.effective_advertise_url(None, record.advertise_url)
+            if record.advertise_url
+            else None
+        ),
+        "advertise_restart": restart,
+        "vllm": shutil.which("vllm"),
+        "mlx": shutil.which("mlx_lm.server"),
+        "uv": str(uv) if uv is not None else None,
+        "passphrase_path": getattr(settings, "passphrase_file", None),
+        "mode": state.get_config("securityMode"),
+        "copy_enabled": state.get_config("modelCopyEnabled") is True,
+        "copy_dir": state.get_config("modelCopyDir"),
+    }
+
+
+def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
+    update: dict[str, Any] = {}
+    key = field.key
+    if key == "advertiseUrl":
+        derived = live["derived_advertise"]
+        update["unsetMeans"] = (
+            f"Derived when this machine joined the install: {derived}."
+            if derived
+            else "Not set, and nothing derived: other machines cannot reach this one, "
+            "which is right for a single machine."
+        )
+        if derived:
+            update["unsetResolvesTo"] = derived
+        if live["advertise_restart"]:
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning,
+                text=(
+                    "This machine's own agent still listens only on 127.0.0.1, and a "
+                    "listening socket is fixed for the life of a process: it answers on "
+                    "this address after its next restart."
+                ),
+            )
+    elif key in ("vllmBinary", "mlxBinary"):
+        found = live["vllm" if key == "vllmBinary" else "mlx"]
+        script = "vllm" if key == "vllmBinary" else "mlx_lm.server"
+        update["unsetMeans"] = (
+            f"Not set: uses the `{script}` found on PATH ({found}), unless a runtime names "
+            "its own binary."
+            if found
+            else f"Not set, and no `{script}` is on PATH: a runtime on this engine needs its "
+            "own binary until this is set."
+        )
+        if found:
+            update["unsetResolvesTo"] = found
+    elif key == "uvBinary":
+        found = live["uv"]
+        update["unsetMeans"] = (
+            f"Not set: uses {found}, the uv beside this install or on PATH."
+            if found
+            else "Not set, and no uv is beside this install or on PATH: apps cannot be "
+            "installed until this is set."
+        )
+        if found:
+            update["unsetResolvesTo"] = found
+    elif key == "kevPython":
+        update["unsetMeans"] = (
+            "Not set: Kev reads as not installed. It is never looked for on PATH, because a "
+            "bare python is not evidence of a Kev environment."
+        )
+    elif key == "modelCopyDir":
+        update["unsetMeans"] = "Not set: nothing is copied, even with copying turned on."
+        if live["copy_enabled"] and not live["copy_dir"]:
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning,
+                text="Copying is on, but with no folder nothing is copied.",
+            )
+    elif key == "securityMode":
+        status = _security_mode_status(live)
+        if status is not None:
+            update["status"] = status
+    return field.model_copy(update=update) if update else field
+
+
+def _security_mode_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
+    mode = live["mode"]
+    if mode == "os_keyring" and live["keyring"] is False:
+        return ConfigFieldStatus(
+            level=ConfigFieldStatusLevel.warning,
+            text=(
+                "This machine's keyring refused a test entry, so it cannot keep the key: "
+                "it asks for the passphrase at every start, as Prompt on startup does."
+            ),
+        )
+    if mode == "passphrase_file":
+        path = live["passphrase_path"]
+        if path is None:
+            return ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning,
+                text=(
+                    "This agent has no passphrase file configured "
+                    "(EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE, which the Linux system install "
+                    "sets), so it asks for the passphrase at every start, as Prompt on "
+                    "startup does."
+                ),
+            )
+        if not path.is_file():
+            return ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.info,
+                text=f"{path} is written at your next sign-in; until then a restart asks "
+                "for the passphrase.",
+            )
+    return None
 
 
 @router.post("/v1/config/test", response_model=ConfigTestResult)
@@ -232,6 +387,12 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     if state.get_config("advertiseUrl") != prior_advertise:
         await _announce_advertise_url(request)
 
+    # A new channel is checked now, so Versions says what the new channel
+    # holds rather than nothing until the next six-hourly check. A result
+    # for the old channel is already set aside (`UpdateChecker.current`).
+    if "updateChannel" in result.applied and state.get_config("updateChecks") is not False:
+        _check_updates_soon(request)
+
     if prior_mode == "os_keyring" and new_mode != "os_keyring":
         # Operator moved to the stronger boundary. The stored auto-
         # unlock secret must go — otherwise the install would still
@@ -260,6 +421,28 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
 SHARE_CREDENTIALS_KEY = "shareCredentials"
 
 
+def _check_updates_soon(request: Request) -> None:
+    from .. import install_info
+    from .updates import checker_for
+
+    app = request.app
+
+    async def run() -> None:
+        try:
+            install = await asyncio.to_thread(install_info.describe)
+            await checker_for(app).check(install)
+        except Exception:  # pragma: no cover - a background check never fails a PATCH
+            log.exception("update check after a channel change failed")
+
+    tasks = getattr(app.state, "background_checks", None)
+    if tasks is None:
+        tasks = set()
+        app.state.background_checks = tasks
+    task = asyncio.get_running_loop().create_task(run(), name="update-check-after-channel")
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
 def _seal_share_credentials(
     request: Request, body: ConfigUpdateRequest
 ) -> tuple[ConfigUpdateRequest, ConfigFieldError | None]:
@@ -277,6 +460,11 @@ def _seal_share_credentials(
     patch = body.model_dump(exclude_unset=True)
     if SHARE_CREDENTIALS_KEY not in patch:
         return body, None
+    if patch[SHARE_CREDENTIALS_KEY] is None:
+        # `null` is the contract's "back to the default", and the default is
+        # no logins. It used to be refused ("expected a list"), so the UI's
+        # Reset to default could not reset this field at all.
+        patch[SHARE_CREDENTIALS_KEY] = []
     state: AgentState = request.app.state.agent_state
     auth = request.app.state.auth_state
     sealed, error = share_credentials.merge_and_seal(

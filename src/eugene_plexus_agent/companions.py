@@ -88,6 +88,19 @@ MANAGED_KEYS = (
     "upstreamModelId",
     "decisionMaxConcurrent",
 )
+
+#: Handed to every companion at spawn, naming `MANAGED_KEYS`, so the driver
+#: shows them read-only and refuses a PATCH of them (2026-09-30, settings
+#: never lie). Before, all five were ordinary editable fields: an edit
+#: stuck until this agent's next boot rewrote it, so the page showed a
+#: value that was about to stop being true.
+MANAGED_KEYS_ENV = "EUGENE_PLEXUS_DRIVER_MANAGED_KEYS"
+
+
+def _companion_env() -> dict[str, str]:
+    return {MANAGED_KEYS_ENV: ",".join(MANAGED_KEYS)}
+
+
 """The five fields the agent owns in a companion's config file.
 
 **Everything else in that document belongs to the operator** (R2.5).
@@ -145,7 +158,7 @@ def _read_config(path: Path) -> dict[str, Any]:
 
 
 def _write_config(path: Path, managed: dict[str, Any]) -> bool:
-    """Set the three fields we manage; leave the rest of the file alone.
+    """Set the fields we manage (`MANAGED_KEYS`); leave the rest of the file alone.
 
     **True iff a MANAGED key moved**, which is what the caller turns
     into a restart. Not "iff the bytes changed": an operator's edit
@@ -240,7 +253,7 @@ async def ensure_companion(
             name=name,
             kind=ComponentKind.inference_driver,
             url=f"http://127.0.0.1:{state.allocate_component_port()}",  # type: ignore[arg-type]
-            spawn=SpawnConfig(configFile=str(path)),
+            spawn=SpawnConfig(configFile=str(path), env=_companion_env()),
             safeMode=False,
         )
         entry = state.add_topology_entry(entry)
@@ -248,6 +261,23 @@ async def ensure_companion(
         if supervisor is not None:
             supervisor.add_and_start(entry)
         return entry
+
+    spawn = existing.spawn
+    if (
+        spawn is not None
+        and (spawn.env or {}).get(MANAGED_KEYS_ENV) != _companion_env()[MANAGED_KEYS_ENV]
+    ):
+        # A companion declared before its managed keys were named: name
+        # them, once. The supervisor holds the entry it started from, so
+        # it is started again from the new one.
+        env = dict(spawn.env or {}) | _companion_env()
+        updated = existing.model_copy(update={"spawn": spawn.model_copy(update={"env": env})})
+        state.update_topology_entry(name, updated)
+        log.info("companion driver %s now names the keys this agent manages", name)
+        if supervisor is not None:
+            await supervisor.remove_and_stop(name)
+            supervisor.add_and_start(updated)
+        return updated
 
     if changed and supervisor is not None:
         # `modelId` and `runtimeName` are read at driver startup; a

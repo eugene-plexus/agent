@@ -24,6 +24,7 @@ What is pinned here:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -107,11 +108,41 @@ def _run(name: str, sha: str, status: str = "completed", conclusion: str | None 
     }
 
 
+#: When the commits in `SHA` and `NEW` were made: `NEW` is the later build.
+OLD_DATE = "2026-09-20T10:00:00Z"
+NEW_DATE = "2026-09-28T10:00:00Z"
+
+
+def _commit_url(name: str, commit: str) -> str:
+    return f"https://api.github.com/repos/eugene-plexus/{name}/git/commits/{commit}"
+
+
+def _dates(*sets: tuple[dict[str, str], str]) -> dict[str, Any]:
+    """GitHub's git-data answers for each (commits, date) pair."""
+    pages: dict[str, Any] = {}
+    for commits, when in sets:
+        for name, commit in commits.items():
+            pages[_commit_url(name, commit)] = {"sha": commit, "committer": {"date": when}}
+    return pages
+
+
+@pytest.fixture(autouse=True)
+def _fresh_commit_dates():
+    """The module keeps each commit's date for its lifetime; a test's
+    fixture dates must not answer for the next test."""
+    updates._COMMIT_DATES.clear()
+    yield
+    updates._COMMIT_DATES.clear()
+
+
 class Web:
-    """GitHub, as its API and raw files answer, keyed by URL."""
+    """GitHub, as its API and raw files answer, keyed by URL.
+
+    Knows when every commit in `SHA` (older) and `NEW` (newer) was made,
+    because an update is offered only when it is newer."""
 
     def __init__(self, pages: dict[str, Any]) -> None:
-        self.pages = pages
+        self.pages = _dates((SHA, OLD_DATE), (NEW, NEW_DATE)) | pages
         self.asked: list[str] = []
 
     def __call__(self, url: str) -> bytes:
@@ -305,35 +336,119 @@ def test_a_failed_check_says_what_happened() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_behind_is_every_component_not_at_the_pin() -> None:
+def test_behind_is_every_component_older_than_the_pin() -> None:
+    web = Web({})
     target = updates.Target(channel=UpdateChannel.edge, ref=SPECS_OK, components=NEW)
-    assert updates.behind(_install(NEW), target) == []
+    same = updates.place(_install(NEW), target, web)
+    assert same.behind == [] and same.ahead == [] and not same.newer
     half = dict(NEW) | {"gateway": SHA["gateway"]}
-    assert updates.behind(_install(half), target) == ["gateway"]
+    placed = updates.place(_install(half), target, web)
+    assert placed.behind == ["gateway"] and placed.ahead == [] and placed.newer
     # Installed before commits were recorded: behind, not unknown.
-    assert "agent" in updates.behind(_install(dict(NEW) | {"agent": None}), target)
+    assert "agent" in updates.place(_install(dict(NEW) | {"agent": None}), target, web).behind
 
 
-def test_an_unset_channel_follows_what_was_installed() -> None:
+def test_an_older_target_is_never_newer() -> None:
+    """Troy, 2026-09-29: an older build must never be offered as an update.
+    A machine installed from `main` that follows releases, or one installed
+    from a commit whose checks are still running, runs something NEWER than
+    its channel's newest -- and "different" used to be offered as "newer"."""
+    older = updates.Target(channel=UpdateChannel.releases, ref="v0", components=SHA)
+    placed = updates.place(_install(NEW), older, Web({}))
+    assert placed.ahead == list(updates.COMPONENT_NAMES)
+    assert placed.behind == [] and placed.newer is False
+
+
+def test_a_mixed_install_is_not_offered_what_would_move_a_part_back() -> None:
+    target = updates.Target(channel=UpdateChannel.edge, ref=SPECS_OK, components=NEW)
+    mixed = dict(SHA) | {"gateway": "7" * 40}
+    web = Web(_dates(({"gateway": "7" * 40}, "2026-09-30T00:00:00Z")))
+    placed = updates.place(_install(mixed), target, web)
+    assert placed.ahead == ["gateway"] and "agent" in placed.behind
+    assert placed.newer is False
+
+
+def test_a_commit_whose_date_cannot_be_read_fails_the_check() -> None:
+    """Newer cannot be guessed. A lookup that fails is a check that says why."""
+    target = updates.Target(channel=UpdateChannel.edge, ref=SPECS_OK, components=NEW)
+    web = Web({_commit_url("gateway", NEW["gateway"]): OSError("rate limited")})
+    with pytest.raises(updates.CheckFailed, match=re.escape("api.github.com")):
+        updates.place(_install(dict(NEW) | {"gateway": SHA["gateway"]}), target, web)
+
+
+def test_the_old_rule_is_kept_only_to_settle_a_channel_once() -> None:
     releases = updates.recent_releases(_releases_web())
-    assert updates.infer_channel(_install(SHA), releases) == (
-        UpdateChannel.releases,
-        UpdateChannelSource.inferred,
-    )
-    assert updates.infer_channel(_install({n: "9" * 40 for n in SHA}), releases)[0] is (
-        UpdateChannel.edge
-    )
+    assert updates.channel_before_default(_install(SHA), releases) is UpdateChannel.releases
+    unknown = _install({n: "9" * 40 for n in SHA})
+    assert updates.channel_before_default(unknown, releases) is UpdateChannel.edge
     # A container's own tag says it.
     tagged = _install(
         mechanism=InstallMechanism.container,
         container=ContainerInstall(image="ghcr.io/eugene-plexus/control-plane:v0.1.0-alpha.3"),
     )
-    assert updates.infer_channel(tagged, [])[0] is UpdateChannel.releases
+    assert updates.channel_before_default(tagged, []) is UpdateChannel.releases
     edge = _install(
         mechanism=InstallMechanism.container,
         container=ContainerInstall(image="ghcr.io/eugene-plexus/control-plane:edge"),
     )
-    assert updates.infer_channel(edge, [])[0] is UpdateChannel.edge
+    assert updates.channel_before_default(edge, []) is UpdateChannel.edge
+    assert not hasattr(updates, "infer_channel")
+
+
+async def test_an_unsaved_channel_is_the_default() -> None:
+    checker = updates.UpdateChecker(setting={}.get, get=_releases_web())
+    assert checker.channel() == (UpdateChannel.releases, UpdateChannelSource.default)
+    result = await checker.check(_install(SHA))
+    assert result.channel is UpdateChannel.releases and result.error is None
+    edge = updates.UpdateChecker(setting={}.get, default_channel=lambda: UpdateChannel.edge)
+    assert edge.channel() == (UpdateChannel.edge, UpdateChannelSource.default)
+
+
+async def test_a_pending_install_saves_the_channel_it_followed_and_checks_it() -> None:
+    saved: list[UpdateChannel] = []
+    web = _releases_web()
+    checker = updates.UpdateChecker(
+        setting={}.get, get=web, settling=lambda: not saved, settle=saved.append
+    )
+    assert checker.channel() == (None, UpdateChannelSource.pending)
+    # On alpha.2 exactly: it followed releases, and that is what is saved.
+    result = await checker.check(_install(SHA))
+    assert saved == [UpdateChannel.releases]
+    assert result.channel is UpdateChannel.releases
+    assert result.source is UpdateChannelSource.setting
+    assert result.newest is not None and result.newest.release == "v0.1.0-alpha.3"
+
+
+async def test_a_pending_install_that_cannot_read_the_releases_follows_nothing() -> None:
+    """It used to fall back to edge -- which is how a release install could
+    be handed an edge build whenever that one request failed."""
+    saved: list[UpdateChannel] = []
+    web = Web({RELEASES_URL: OSError("down")} | _edge_web([_run("CI", SPECS_OK)]).pages)
+    checker = updates.UpdateChecker(
+        setting={}.get, get=web, settling=lambda: not saved, settle=saved.append
+    )
+    result = await checker.check(_install(SHA))
+    assert saved == [] and result.channel is None and result.newest is None
+    assert result.error and "list of releases" in result.error
+    view = checker.view(
+        _install(SHA), apply=update_apply.plan(_install(SHA), None, system_unit_ready=False)
+    )
+    assert view.channel is None and view.channelSource is UpdateChannelSource.pending
+    assert view.available is False
+    assert not any("actions/runs" in url for url in web.asked)
+
+
+async def test_a_result_for_another_channel_is_not_offered() -> None:
+    settings: dict[str, Any] = {"updateChannel": "edge"}
+    checker = updates.UpdateChecker(setting=settings.get, get=_edge_web([_run("CI", SPECS_OK)]))
+    await checker.check(_install(SHA))
+    install = _install(SHA)
+    plan = update_apply.plan(install, None, system_unit_ready=False)
+    assert checker.view(install, apply=plan).available is True
+    settings["updateChannel"] = "releases"
+    view = checker.view(install, apply=plan)
+    assert view.available is False and view.newest is None
+    assert view.channel is UpdateChannel.releases
 
 
 async def test_a_check_that_fails_keeps_what_the_last_one_found() -> None:
@@ -699,6 +814,22 @@ def test_up_to_date_is_not_updated_again(authed_client: TestClient, monkeypatch)
     assert r.status_code == 409 and r.json()["detail"]["title"] == "Already up to date"
 
 
+def test_an_older_newest_is_refused_and_never_called_newer(
+    authed_client: TestClient, monkeypatch
+) -> None:
+    """The route refuses a downgrade, and GET /v1/node never calls it available."""
+    _checked(authed_client, _install(NEW), _edge_web([_run("CI", SPECS_OK)], SHA), monkeypatch)
+    authed_client.post("/v1/node/update/check")
+    update = authed_client.get("/v1/node").json()["update"]
+    assert update["available"] is False
+    assert set(update["ahead"]) == set(updates.COMPONENT_NAMES) and update["behind"] == []
+    started: list[str] = []
+    monkeypatch.setattr(update_apply, "start", lambda **kw: started.append("ran"))
+    r = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
+    assert r.status_code == 409 and r.json()["detail"]["title"] == "This machine is newer"
+    assert started == []
+
+
 def test_update_is_operator_only(client: TestClient) -> None:
     assert client.post("/v1/node/update", json={"target": SPECS_OK}).status_code == 401
     assert client.post("/v1/node/update/check").status_code == 401
@@ -754,14 +885,16 @@ def test_a_release_manifest_from_before_the_tool_driver_is_offered() -> None:
     assert "tool-driver" not in found[0].components
 
 
-def test_a_target_without_the_tool_driver_does_not_count_it_as_behind() -> None:
-    """An install that has it is not behind a target from before it existed."""
+def test_an_install_with_the_tool_driver_is_ahead_of_a_target_from_before_it() -> None:
+    """An install that has it is not behind a target from before it
+    existed -- it is newer, so that target is not offered."""
     target = updates.Target(channel=UpdateChannel.releases, ref="v0", components=BEFORE_P8)
-    assert updates.behind(_install(NEW), target) == []
-    # And an install matching every pin the release has is on that release.
+    placed = updates.place(_install(NEW), target, Web({}))
+    assert placed.behind == [] and placed.ahead == ["tool-driver"] and not placed.newer
+    # And an install matching every pin the release has was on that release.
     release = updates.Target(channel=UpdateChannel.releases, ref="v0", components=dict(SHA))
     release.components.pop("tool-driver")
-    assert updates.infer_channel(_install(SHA), [release])[0] is UpdateChannel.releases
+    assert updates.channel_before_default(_install(SHA), [release]) is UpdateChannel.releases
 
 
 def test_an_install_without_the_tool_driver_is_behind_a_target_that_pins_it() -> None:
@@ -769,4 +902,4 @@ def test_an_install_without_the_tool_driver_is_behind_a_target_that_pins_it() ->
     the tool-driver must install it, not skip it."""
     target = updates.Target(channel=UpdateChannel.edge, ref=SPECS_OK, components=NEW)
     older = dict(NEW) | {"tool-driver": None}
-    assert updates.behind(_install(older), target) == ["tool-driver"]
+    assert updates.place(_install(older), target, Web({})).behind == ["tool-driver"]

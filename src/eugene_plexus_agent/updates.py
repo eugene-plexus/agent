@@ -13,17 +13,25 @@
   `manifest.json`, whose installer checksums the download is checked
   against.
 
-**What is compared** is the six commits the installed code carries
-(`install_info`) against the six the channel's installer pins. A
+**What is compared** is the seven commits the installed code carries
+(`install_info`) against the seven the channel's installer pins. A
 component installed before commits were recorded counts as behind. A
 development checkout is never offered an update.
 
-**The channel** is `updateChannel` on this agent's config when set.
-Otherwise it is inferred:
-- `releases` when the installed commits are exactly one of the recent
-  releases;
-- for a container, whatever its image tag says;
-- `edge` otherwise.
+**Only a newer version is offered** (2026-09-30). A commit that differs is
+placed by its date: the channel's is older (`ahead`) or newer (`behind`),
+and an update is offered only when something is behind and nothing is
+ahead. Before this, "different" was offered as "newer", so a machine
+installed from `main` that followed `releases` -- or one installed from a
+commit whose checks were still running -- was told an older build was an
+update.
+
+**The channel** is `updateChannel` on this agent's config, and when it is
+not saved, the default: `releases`, or what the environment names
+(`EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL`, `edge` in the `:edge`
+container image). It used to be inferred afresh at every check; an install
+from before that saves, once, the channel it followed (`state.py`,
+"The update channel's one-time settling").
 
 Everything reaches GitHub through `describe_fetch_failure`, so a failed
 check says what happened -- rate limit, certificate, timeout -- in the
@@ -321,49 +329,142 @@ def installed_commits(install: NodeInstall) -> dict[str, str | None]:
     }
 
 
-def behind(install: NodeInstall, target: Target) -> list[str]:
-    """Components whose installed commit is not the target's pin.
+#: When each component commit was made, by (component, commit). A commit
+#: never changes, so this is kept for the life of the process: the installed
+#: commits are looked up once, and each new target's once.
+_COMMIT_DATES: dict[tuple[str, str], datetime] = {}
 
-    A component with no recorded commit is behind: it can only have been
-    installed before commits were recorded, which is older than anything
-    a channel offers now.
+
+def commit_date(get: Fetch, name: str, commit: str) -> datetime:
+    """When `commit` of component `name` was made, from GitHub's git data.
+
+    The git-data endpoint rather than `compare`: it answers with the
+    commit object alone, where a comparison carries every changed file and
+    grows with the distance between the two -- weeks of `main` against a
+    release is megabytes.
+    """
+    key = (name, commit)
+    found = _COMMIT_DATES.get(key)
+    if found is not None:
+        return found
+    url = f"https://api.github.com/repos/eugene-plexus/{name}/git/commits/{commit}"
+    body = _get_json(get, url)
+    committer = body.get("committer") if isinstance(body, dict) else None
+    when = _timestamp(committer.get("date") if isinstance(committer, dict) else None)
+    if when is None:
+        raise CheckFailed(
+            f"{url} did not say when {name} {commit[:12]} was made, so whether the "
+            "channel's version is newer than this one cannot be told"
+        )
+    _COMMIT_DATES[key] = when
+    return when
+
+
+def _cached_only(url: str) -> bytes:
+    raise CheckFailed(f"{url} has not been read yet")
+
+
+@dataclass(frozen=True)
+class Placement:
+    """Where this install stands against a target, component by component."""
+
+    #: Older than the target's pin, missing, or installed before commits
+    #: were recorded (which is older than anything a channel offers now).
+    behind: list[str]
+    #: Newer than the target's pin, or a part the target predates.
+    ahead: list[str]
+
+    @property
+    def newer(self) -> bool:
+        """The target is newer: something moves forward and nothing back."""
+        return bool(self.behind) and not self.ahead
+
+
+def place(install: NodeInstall, target: Target, get: Fetch = fetch) -> Placement:
+    """Place each component whose commit differs from the target's pin.
+
+    **Newer is a later commit date, never merely a different commit**
+    (2026-09-30). The comparison this replaced was `!=`, so a machine that
+    ran a newer build than its channel's newest was offered the older one
+    as "A newer version is ready".
+
+    A commit made in the same second as the target's, but a different one,
+    is counted as ahead: it cannot be shown to be older, and an update must
+    never move a part back.
     """
     have = installed_commits(install)
-    return [
-        name
-        for name in COMPONENT_NAMES
-        if name in target.components and have.get(name) != target.components.get(name)
-    ]
+    behind: list[str] = []
+    ahead: list[str] = []
+    for name in COMPONENT_NAMES:
+        mine = have.get(name)
+        pinned = target.components.get(name)
+        if pinned is None:
+            # A target that predates the part entirely: every release up
+            # to alpha.5 predates the tool-driver. Installed, it is newer.
+            if mine is not None:
+                ahead.append(name)
+            continue
+        if mine == pinned:
+            continue
+        if mine is None:
+            behind.append(name)
+            continue
+        if commit_date(get, name, pinned) > commit_date(get, name, mine):
+            behind.append(name)
+        else:
+            ahead.append(name)
+    return Placement(behind=behind, ahead=ahead)
 
 
-def infer_channel(
-    install: NodeInstall, releases: list[Target]
-) -> tuple[UpdateChannel, UpdateChannelSource]:
-    """The channel an unset `updateChannel` means for this install."""
+# --------------------------------------------------------------------------- #
+# The update channel's one-time settling (2026-09-30)
+# --------------------------------------------------------------------------- #
+#
+# Until 2026-09-30 an unset `updateChannel` was inferred afresh at every
+# check. It is a binary choice with a default now (Troy), and an install
+# that never saved one keeps the channel it followed: `state.py` settles a
+# container's at load, from its image, and a native install's is settled by
+# its first update check that can read the release list, with this. Nothing
+# else may call it -- it is the old rule, kept only to be applied once.
+
+
+def container_channel_before_default(image: str) -> UpdateChannel:
+    """What an unset channel followed in a container: its image tag."""
+    tag = image.rsplit(":", 1)[-1] if ":" in image else ""
+    return UpdateChannel.releases if _TAG.match(tag) else UpdateChannel.edge
+
+
+def channel_before_default(install: NodeInstall, releases: list[Target]) -> UpdateChannel:
+    """What an unset channel followed on this install before it had a default."""
     if install.container is not None:
-        tag = install.container.image.rsplit(":", 1)[-1] if ":" in install.container.image else ""
-        return (
-            (UpdateChannel.releases if _TAG.match(tag) else UpdateChannel.edge),
-            UpdateChannelSource.inferred,
-        )
+        return container_channel_before_default(install.container.image)
     have = installed_commits(install)
     for release in releases:
         if all(have.get(name) == pin for name, pin in release.components.items()):
-            return UpdateChannel.releases, UpdateChannelSource.inferred
-    return UpdateChannel.edge, UpdateChannelSource.inferred
+            return UpdateChannel.releases
+    return UpdateChannel.edge
 
 
 # --------------------------------------------------------------------------- #
 # The checker a node runs
 # --------------------------------------------------------------------------- #
 
+#: While checks are off, how often the loop looks at the setting again, so
+#: turning them back on checks within a minute rather than up to six hours.
+RECHECK_SETTING_SECONDS = 60.0
+
 
 @dataclass
 class CheckResult:
-    channel: UpdateChannel
+    #: None only while the channel is `pending` and the release list that
+    #: decides it could not be read.
+    channel: UpdateChannel | None
     source: UpdateChannelSource
     checked_at: datetime | None = None
     newest: Target | None = None
+    placement: Placement | None = None
+    #: The install the placement was made for.
+    commits: dict[str, str | None] = field(default_factory=dict)
     error: str | None = None
 
 
@@ -380,9 +481,15 @@ class UpdateChecker:
         *,
         setting: Callable[[str], Any],
         get: Fetch = fetch,
+        default_channel: Callable[[], UpdateChannel] = lambda: UpdateChannel.releases,
+        settling: Callable[[], bool] = lambda: False,
+        settle: Callable[[UpdateChannel], None] = lambda channel: None,
     ) -> None:
         self._setting = setting
         self._get = get
+        self._default_channel = default_channel
+        self._settling = settling
+        self._settle = settle
         self._result: CheckResult | None = None
         self._lock = asyncio.Lock()
         self._last_attempt: float | None = None
@@ -393,59 +500,117 @@ class UpdateChecker:
         return value is not False
 
     def configured_channel(self) -> UpdateChannel | None:
+        """The channel saved on this agent's config, if one is."""
         value = self._setting("updateChannel")
         try:
             return UpdateChannel(value) if value else None
         except ValueError:
             return None
 
-    def _check_now(self, install: NodeInstall) -> CheckResult:
+    def channel(self) -> tuple[UpdateChannel | None, UpdateChannelSource]:
+        """The channel this machine follows now, and why. No network."""
         chosen = self.configured_channel()
-        releases: list[Target] = []
-        if chosen is None:
+        if chosen is not None:
+            return chosen, UpdateChannelSource.setting
+        if self._settling():
+            return None, UpdateChannelSource.pending
+        return self._default_channel(), UpdateChannelSource.default
+
+    def _check_now(self, install: NodeInstall) -> CheckResult:
+        now = datetime.now(UTC)
+        channel, source = self.channel()
+        releases: list[Target] | None = None
+        if channel is None:
+            # An install from before the default that never saved a
+            # channel: the release list says which it followed, so read it
+            # first -- and never fall back to a guess when it cannot be
+            # read, which is how a release install used to be handed an
+            # edge build whenever that one request failed.
             try:
                 releases = recent_releases(self._get)
-            except CheckFailed:
-                # Inference falls back to edge; the check below reports
-                # whatever it cannot reach itself.
-                releases = []
-            channel, source = infer_channel(install, releases)
-        else:
-            channel, source = chosen, UpdateChannelSource.setting
-        result = CheckResult(channel=channel, source=source, checked_at=datetime.now(UTC))
+            except CheckFailed as exc:
+                return CheckResult(
+                    channel=None,
+                    source=source,
+                    checked_at=now,
+                    error=(
+                        "Which channel this machine follows is decided from the list of "
+                        f"releases, which could not be read: {exc}"
+                    ),
+                )
+            channel = channel_before_default(install, releases)
+            self._settle(channel)
+            source = UpdateChannelSource.setting
+            log.warning(
+                "updateChannel was never saved; this machine followed %s, and that is now "
+                "saved as its update channel so an update cannot move it to another one",
+                channel.value,
+            )
+        commits = installed_commits(install)
+        result = CheckResult(channel=channel, source=source, checked_at=now, commits=commits)
         try:
             if channel is UpdateChannel.edge:
-                result.newest = newest_edge(self._get)
+                newest = newest_edge(self._get)
             else:
-                result.newest = releases[0] if releases else newest_release(self._get)
+                newest = releases[0] if releases else newest_release(self._get)
+            placement = (
+                Placement(behind=[], ahead=[])
+                if install.development
+                else place(install, newest, self._get)
+            )
+            result.newest, result.placement = newest, placement
         except CheckFailed as exc:
             result.error = str(exc)
             previous = self._result
             if previous is not None and previous.channel is channel:
                 # What the last good check found still stands.
                 result.newest = previous.newest
+                result.placement = previous.placement
+                result.commits = previous.commits
         return result
 
     async def check(self, install: NodeInstall) -> CheckResult:
         async with self._lock:
             self._last_attempt = time.perf_counter()
             result = await asyncio.to_thread(self._check_now, install)
+            label = result.channel.value if result.channel is not None else "channel not decided"
             if result.error:
-                log.warning("update check (%s): %s", result.channel.value, result.error)
-            elif result.newest is not None:
-                gone = behind(install, result.newest)
-                if gone and not install.development:
+                log.warning("update check (%s): %s", label, result.error)
+            elif result.newest is not None and result.placement is not None:
+                if result.placement.newer:
                     log.info(
                         "an update is available on %s (%s): %s",
-                        result.channel.value,
+                        label,
                         result.newest.ref[:12],
-                        ", ".join(gone),
+                        ", ".join(result.placement.behind),
+                    )
+                elif result.placement.ahead:
+                    log.info(
+                        "this machine is newer than the newest on %s (%s) in: %s",
+                        label,
+                        result.newest.ref[:12],
+                        ", ".join(result.placement.ahead),
                     )
             self._result = result
             return result
 
     def result(self) -> CheckResult | None:
         return self._result
+
+    def current(self) -> CheckResult | None:
+        """The last check, when it was made for the channel followed now.
+
+        A result for another channel -- the setting changed since -- says
+        nothing about this one, and installing its target would be an
+        update from a channel the machine no longer follows.
+        """
+        result = self._result
+        if result is None:
+            return None
+        channel, _ = self.channel()
+        if result.channel is not None and channel is not None and result.channel is not channel:
+            return None
+        return result
 
     def view(
         self,
@@ -455,31 +620,45 @@ class UpdateChecker:
         running: UpdateRun | None = None,
         last: UpdateRun | None = None,
     ) -> NodeUpdate:
-        result = self._result
+        channel, source = self.channel()
+        result = self.current()
         if result is None:
-            chosen = self.configured_channel()
-            channel = chosen or infer_channel(install, [])[0]
-            source = UpdateChannelSource.setting if chosen else UpdateChannelSource.inferred
             return NodeUpdate(
                 enabled=self.enabled,
                 channel=channel,
                 channelSource=source,
                 available=False,
                 behind=[],
+                ahead=[],
                 apply=apply,
                 running=running,
                 last=last,
             )
-        stale = behind(install, result.newest) if result.newest is not None else []
+        placement = result.placement
+        if placement is not None and result.commits != installed_commits(install):
+            # Installed commits moved since the check (an update that did not
+            # restart this agent): only dates already read can place them.
+            try:
+                placement = (
+                    place(install, result.newest, _cached_only)
+                    if result.newest is not None
+                    else None
+                )
+            except CheckFailed:
+                placement = None
+        behind = placement.behind if placement is not None else []
+        ahead = placement.ahead if placement is not None else []
+        development = install.development
         return NodeUpdate(
             enabled=self.enabled,
-            channel=result.channel,
-            channelSource=result.source,
+            channel=result.channel if result.channel is not None else channel,
+            channelSource=result.source if result.channel is not None else source,
             checkedAt=result.checked_at,
             error=result.error,
             newest=result.newest.model() if result.newest is not None else None,
-            available=bool(stale) and not install.development,
-            behind=stale if not install.development else [],
+            available=placement is not None and placement.newer and not development,
+            behind=[] if development else behind,
+            ahead=[] if development else ahead,
             apply=apply,
             running=running,
             last=last,
@@ -489,13 +668,25 @@ class UpdateChecker:
         """At start, then every six hours; sooner again after a failure."""
         await asyncio.sleep(FIRST_CHECK_DELAY_SECONDS)
         while True:
+            if not self.enabled:
+                await asyncio.sleep(RECHECK_SETTING_SECONDS)
+                continue
             wait = CHECK_EVERY_SECONDS
-            if self.enabled:
-                try:
-                    result = await self.check(install())
-                    if result.error:
-                        wait = RETRY_AFTER_FAILURE_SECONDS
-                except Exception:  # pragma: no cover - a check must never kill the loop
-                    log.exception("update check failed unexpectedly")
+            try:
+                result = await self.check(install())
+                if result.error:
                     wait = RETRY_AFTER_FAILURE_SECONDS
-            await asyncio.sleep(wait)
+            except Exception:  # pragma: no cover - a check must never kill the loop
+                log.exception("update check failed unexpectedly")
+                wait = RETRY_AFTER_FAILURE_SECONDS
+            await self._sleep_while_enabled(wait)
+
+    async def _sleep_while_enabled(self, seconds: float) -> None:
+        """Sleep `seconds`, but return early if checks are turned off, so the
+        loop's own sleep does not outlast the setting that decides it."""
+        deadline = time.perf_counter() + seconds
+        while self.enabled:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(left, RECHECK_SETTING_SECONDS))
