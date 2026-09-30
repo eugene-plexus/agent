@@ -9,14 +9,31 @@ import logging
 import math
 import re
 import subprocess
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from . import orphan_kill
-from ._generated.models import Benchmark, BenchmarkPoint, BenchmarkRequest, BenchmarkState
+from ._generated.models import (
+    Benchmark,
+    BenchmarkPoint,
+    BenchmarkRequest,
+    BenchmarkState,
+    MeasurementRestart,
+    MeasurementRestartState,
+)
 from .child_env import child_environment
+
+# Called once when a job ends, however it ends: starts again what the job
+# stopped (measurement_node.restart_stopped) and returns what became of each.
+AfterJob = Callable[[], Awaitable[list[MeasurementRestart]]]
+
+INTERRUPTED_RESTART = (
+    "The agent restarted during the measurement. A model set to start automatically "
+    "came back with it; start any other from its page."
+)
 
 log = logging.getLogger(__name__)
 TIMEOUT = 900
@@ -59,6 +76,8 @@ def benchmark_args(
         "tensorSplit",
         "noMmap",
         "mlock",
+        "cacheType",
+        "memoryMargin",
     }
     if set(flags) - known:
         raise ValueError("Unsupported benchmark settings: " + ", ".join(sorted(set(flags) - known)))
@@ -113,9 +132,24 @@ def benchmark_args(
             raise ValueError("tensorSplit must contain comma-separated nonnegative proportions.")
         argv += ["--tensor-split", "/".join(part.strip() for part in value.split(","))]
         required.add("--tensor-split")
+    cache = flags.get("cacheType")
+    if cache is not None:
+        if cache not in ("f16", "q8_0", "q4_0"):
+            raise ValueError("cacheType must be f16, q8_0 or q4_0.")
+        argv += ["--cache-type-k", cache, "--cache-type-v", cache]
+        required |= {"--cache-type-k", "--cache-type-v"}
+    if "memoryMargin" in flags:
+        margin = flags["memoryMargin"]
+        if type(margin) is not int or not 0 <= margin <= 65536:
+            raise ValueError("memoryMargin must be an integer number of MiB, 0 to 65536.")
+        # The server fits the model to memory at launch with this margin;
+        # llama-bench does the same only when asked, so ask.
+        argv += ["--fit-target", str(margin)]
+        required.add("--fit-target")
     # The runtime adapter emits presence-only booleans: false leaves the
     # engine default alone. Do the same here instead of forcing a different mode.
-    if flags.get("flashAttention"):
+    # A quantised cache needs flash attention, as the adapter also ensures.
+    if flags.get("flashAttention") or cache in ("q8_0", "q4_0"):
         argv += ["--flash-attn", "on"]
         required.add("--flash-attn")
     if flags.get("noMmap") or flags.get("mlock"):
@@ -173,6 +207,8 @@ class Benchmarks:
         self.task: asyncio.Task[None] | None = None
         self.process: asyncio.subprocess.Process | None = None
         self.stopping = False
+        self.after: AfterJob | None = None
+        self.shutting_down = False
         try:
             self.jobs = [
                 Benchmark.model_validate(j) for j in json.loads(path.read_text(encoding="utf-8"))
@@ -187,6 +223,10 @@ class Benchmarks:
                 job.state = BenchmarkState.failed
                 job.detail = "Agent restarted before the benchmark finished. Start a new benchmark."
                 job.finishedAt = datetime.now(UTC)
+                for restart in job.restarts or []:
+                    if restart.state == MeasurementRestartState.pending:
+                        restart.state = MeasurementRestartState.skipped
+                        restart.detail = INTERRUPTED_RESTART
                 interrupted = True
         if interrupted:
             try:
@@ -216,6 +256,8 @@ class Benchmarks:
         model: Path,
         argv: list[str],
         depths: list[int],
+        restarts: list[MeasurementRestart] | None = None,
+        after: AfterJob | None = None,
     ) -> Benchmark:
         if self.active:
             raise ValueError("A benchmark is already running on this node.")
@@ -238,6 +280,7 @@ class Benchmarks:
                 "modelModifiedAt": datetime.fromtimestamp(stat.st_mtime, UTC),
                 "command": argv,
                 "hardware": {},
+                "restarts": [r.model_dump(mode="json") for r in restarts or []],
             }
         )
         previous = self.jobs
@@ -248,6 +291,7 @@ class Benchmarks:
             self.jobs = previous
             raise
         self.stopping = False
+        self.after = after
         self.task = asyncio.create_task(self._run(job, argv))
         return job
 
@@ -273,6 +317,10 @@ class Benchmarks:
         return job
 
     async def close(self) -> None:
+        # The agent is shutting down: starting models now would spawn
+        # processes the supervisor is about to stop. They come back at the
+        # next boot if they are set to start automatically.
+        self.shutting_down = True
         if self.active:
             await self.cancel(self.jobs[-1].id)
 
@@ -397,3 +445,32 @@ class Benchmarks:
                 self._save()
             except OSError:
                 log.exception("Could not save completed benchmark")
+            await self._restart_after(job)
+
+    async def _restart_after(self, job: Benchmark) -> None:
+        """Start again what this job stopped, then record what happened.
+
+        Runs after the job's own state is saved, so a restart that takes
+        a while never delays the answer to "did the benchmark finish". The
+        manager stays active until it returns, which keeps a launch from
+        racing the restarts.
+        """
+        after, self.after = self.after, None
+        if after is None:
+            return
+        if self.shutting_down:
+            for restart in job.restarts or []:
+                if restart.state == MeasurementRestartState.pending:
+                    restart.state = MeasurementRestartState.skipped
+                    restart.detail = INTERRUPTED_RESTART
+            with contextlib.suppress(OSError):
+                self._save()
+            return
+        try:
+            job.restarts = await after()
+        except Exception:
+            log.exception("Restarting what a benchmark stopped failed")
+        try:
+            self._save()
+        except OSError:
+            log.exception("Could not save the benchmark's restarts")

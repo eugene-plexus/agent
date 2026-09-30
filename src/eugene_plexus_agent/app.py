@@ -61,6 +61,7 @@ from .routes import directories as directories_routes
 from .routes import health as health_routes
 from .routes import logs as logs_routes
 from .routes import node as node_routes
+from .routes import profile_builds as profile_build_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
 from .routes import updates as update_routes
@@ -421,6 +422,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         benchmarks = getattr(app.state, "benchmarks", None)
         if benchmarks is not None:
             await benchmarks.close()
+        profile_builds = getattr(app.state, "profile_builds", None)
+        if profile_builds is not None:
+            await profile_builds.close()
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
         permissions_task = app.state.install_permissions_task
@@ -705,6 +709,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # component that sees demand.
     app.include_router(runtimes_routes.router)
     app.include_router(benchmark_routes.router)
+    app.include_router(profile_build_routes.router)
     # Optional apps. Operator-only on every route; declared on the router.
     app.include_router(apps_routes.router)
     # This host's identity and devices; reads only, operator or service.

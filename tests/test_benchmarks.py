@@ -41,9 +41,31 @@ def test_depth_sweep_preserves_profile_and_leaves_generation_room():
     assert "--parallel" not in args and "--ctx-size" not in args
 
 
+def test_a_built_profiles_memory_settings_carry_into_the_benchmark():
+    # A profile the builder wrote must be benchmarkable, with the same cache
+    # and the same margin the server will use; refusing it would be worse.
+    help_text = HELP + " --cache-type-k --cache-type-v --fit-target"
+    args, _ = benchmark_args(
+        request(cacheType="q4_0", memoryMargin=2048), Path("bench"), "/models/a.gguf", help_text
+    )
+    assert args[args.index("--cache-type-k") + 1] == "q4_0"
+    assert args[args.index("--cache-type-v") + 1] == "q4_0"
+    assert args[args.index("--fit-target") + 1] == "2048"
+    assert args[args.index("--flash-attn") + 1] == "on"  # a quantised cache needs it
+    with pytest.raises(ValueError, match="cache-type"):
+        benchmark_args(request(cacheType="q8_0"), Path("bench"), "/models/a.gguf", HELP)
+
+
 @pytest.mark.parametrize(
     "flags",
-    [{"parallelSlots": 2}, {"contextSize": 0}, {"gpuLayers": "1,99"}, {"tensorSplit": "1;--rpc x"}],
+    [
+        {"parallelSlots": 2},
+        {"contextSize": 0},
+        {"gpuLayers": "1,99"},
+        {"tensorSplit": "1;--rpc x"},
+        {"cacheType": "q2_k"},
+        {"memoryMargin": -1},
+    ],
 )
 def test_unsupported_or_malformed_profile_is_refused(flags):
     with pytest.raises(ValueError):

@@ -31,11 +31,14 @@ def test_reads_and_writes_require_operator(client, app):
 
 
 def test_busy_runtime_refuses_without_stopping(authed_client, stub_runtime_supervisor):
+    # Nothing agreed to, so nothing stopped: the same 409 R6.1 gave, now
+    # naming the model and saying how to agree (2026-09-30, Troy).
     spec = request_body()["runtime"]
     assert authed_client.post("/v1/runtimes", json=spec).status_code == 201
     before = list(stub_runtime_supervisor.calls)
     response = authed_client.post("/v1/benchmarks", json=request_body())
-    assert response.status_code == 409 and "Stop" in response.text
+    assert response.status_code == 409
+    assert "test" in response.json()["detail"] and "Agree" in response.json()["detail"]
     assert stub_runtime_supervisor.calls == before
 
 
@@ -139,6 +142,121 @@ def test_launch_race_is_serialized_in_both_directions(
                 assert (await client.post("/v1/runtimes", json=body["runtime"])).status_code == 201
 
     authed_client.portal.call(scenario)
+
+
+def _startable(monkeypatch, tmp_path):
+    """A benchmark request whose job starts and then idles until cancelled."""
+    from eugene_plexus_agent.routes import benchmarks
+
+    monkeypatch.setattr(
+        benchmarks, "prepare_binary", lambda *a: (Path(sys.executable), "fixture", "fixture")
+    )
+    original = benchmarks.benchmark_args
+    monkeypatch.setattr(
+        benchmarks,
+        "benchmark_args",
+        lambda body, binary, model, help_text=None: (
+            ([sys.executable, "-c", "import time; time.sleep(60)"], [0, 1984, 3968])
+            if help_text == "fixture"
+            else original(body, binary, model, help_text)
+        ),
+    )
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"fixture")
+    body = request_body()
+    body["runtime"]["modelPath"] = str(model)
+    return body
+
+
+def _declare(client, tmp_path, name):
+    path = tmp_path / f"{name}.gguf"
+    path.write_bytes(b"fixture")
+    spec = {"name": name, "engine": "llama_cpp", "modelPath": str(path)}
+    assert client.post("/v1/runtimes", json=spec).status_code == 201
+
+
+def test_preflight_lists_what_is_running_and_changes_nothing(
+    authed_client, stub_runtime_supervisor, monkeypatch, tmp_path
+):
+    body = _startable(monkeypatch, tmp_path)
+    _declare(authed_client, tmp_path, "busy")
+    before = list(stub_runtime_supervisor.calls)
+    answer = authed_client.post("/v1/benchmarks/preflight", json=body).json()
+    assert answer["runningRuntimes"] == ["busy"]
+    assert answer["problems"] == []
+    assert stub_runtime_supervisor.calls == before
+    assert authed_client.get("/v1/benchmarks").json() == {"benchmarks": []}
+
+
+def test_agreed_stop_is_measurement_and_restarts_after(
+    authed_client, stub_runtime_supervisor, monkeypatch, tmp_path
+):
+    body = _startable(monkeypatch, tmp_path)
+    _declare(authed_client, tmp_path, "busy")
+    body["stopRuntimes"] = ["busy"]
+    started = authed_client.post("/v1/benchmarks", json=body)
+    assert started.status_code == 202, started.text
+    assert ("stop_one", "busy") in stub_runtime_supervisor.calls
+    runtime = authed_client.get("/v1/runtimes/busy").json()
+    assert runtime["status"] == "stopped" and runtime["stopReason"] == "measurement"
+    assert [(r["name"], r["state"]) for r in started.json()["restarts"]] == [("busy", "pending")]
+    # A start while the benchmark runs is refused; the restart is the job's.
+    assert authed_client.post("/v1/runtimes/busy/start").status_code == 409
+    job = authed_client.post(f"/v1/benchmarks/{started.json()['id']}/cancel").json()
+    assert job["state"] == "cancelled"
+    assert [r["state"] for r in job["restarts"]] == ["restarted"]
+    assert stub_runtime_supervisor.is_running("busy")
+    stored = authed_client.get("/v1/benchmarks").json()["benchmarks"][0]
+    assert stored["restarts"][0]["state"] == "restarted"
+
+
+def test_a_model_started_after_the_question_is_never_stopped(
+    authed_client, stub_runtime_supervisor, monkeypatch, tmp_path
+):
+    body = _startable(monkeypatch, tmp_path)
+    _declare(authed_client, tmp_path, "busy")
+    _declare(authed_client, tmp_path, "late")
+    body["stopRuntimes"] = ["busy"]
+    before = list(stub_runtime_supervisor.calls)
+    response = authed_client.post("/v1/benchmarks", json=body)
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "late" in detail and "busy" not in detail
+    assert stub_runtime_supervisor.calls == before
+
+
+def test_restart_after_off_leaves_them_stopped(
+    authed_client, stub_runtime_supervisor, monkeypatch, tmp_path
+):
+    body = _startable(monkeypatch, tmp_path)
+    _declare(authed_client, tmp_path, "busy")
+    body |= {"stopRuntimes": ["busy"], "restartAfter": False}
+    started = authed_client.post("/v1/benchmarks", json=body).json()
+    job = authed_client.post(f"/v1/benchmarks/{started['id']}/cancel").json()
+    assert [r["state"] for r in job["restarts"]] == ["skipped"]
+    assert not stub_runtime_supervisor.is_running("busy")
+
+
+def test_refusal_after_stopping_puts_them_back_at_once(
+    authed_client, stub_runtime_supervisor, monkeypatch, tmp_path
+):
+    from eugene_plexus_agent._generated.models import AdmissionDecision
+    from eugene_plexus_agent.routes import benchmarks
+
+    body = _startable(monkeypatch, tmp_path)
+    _declare(authed_client, tmp_path, "busy")
+    body["stopRuntimes"] = ["busy"]
+
+    async def refuse(*args):
+        return SimpleNamespace(decision=AdmissionDecision.refuse, reason="too big for this card")
+
+    monkeypatch.setattr(benchmarks, "_admission_for", refuse)
+    response = authed_client.post("/v1/benchmarks", json=body)
+    assert response.status_code == 422 and "too big" in response.text
+    calls = [c for c in stub_runtime_supervisor.calls if c[1] == "busy"]
+    assert calls[-2:] == [("stop_one", "busy"), ("add_and_start", "busy")]
+    assert stub_runtime_supervisor.is_running("busy")
+    assert authed_client.get("/v1/benchmarks").json() == {"benchmarks": []}
 
 
 def test_gateway_wake_cannot_bypass_benchmark(authed_client, app):

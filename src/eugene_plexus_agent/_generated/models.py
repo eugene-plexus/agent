@@ -17,6 +17,56 @@ from pydantic import (
 )
 
 
+class MeasurementPreflight(BaseModel):
+    """
+    What starting a benchmark or a profile build with this request
+    would do, without doing it: the runtimes it would need to stop
+    (the question the page asks), anything that would refuse it, and
+    the time it would take where that can be estimated.
+
+    """
+
+    runningRuntimes: list[str] = Field(
+        ...,
+        description='Runtimes on this node that are not stopped. Pass them as `stopRuntimes` to agree to stopping them.',
+    )
+    problems: list[str] = Field(
+        ...,
+        description='Plain sentences, one per reason the job would be refused. Empty when it can start.',
+    )
+    estimateSeconds: int | None = Field(
+        None,
+        description='Roughly how long the job would take here; null when it cannot be estimated.',
+        ge=0,
+    )
+    detail: str | None = Field(
+        None, description='How the estimate was reached, in words.'
+    )
+
+
+class MeasurementRestartState(StrEnum):
+    """
+    * `pending` — stopped for the job; the job has not ended.
+    * `restarted` — started again after the job.
+    * `refused` — admission refused the restart (the reason is in `detail`); it was not forced.
+    * `failed` — the start was attempted and did not happen.
+    * `skipped` — the request set `restartAfter: false`.
+
+    """
+
+    pending = 'pending'
+    restarted = 'restarted'
+    refused = 'refused'
+    failed = 'failed'
+    skipped = 'skipped'
+
+
+class MeasurementRestart(BaseModel):
+    name: str
+    state: MeasurementRestartState
+    detail: str | None = None
+
+
 class Sample(RootModel[float]):
     root: float = Field(..., gt=0.0)
 
@@ -37,6 +87,136 @@ class BenchmarkState(StrEnum):
 
 class Depth(RootModel[int]):
     root: int = Field(..., ge=0)
+
+
+class ProfileBuildAccuracy(StrEnum):
+    """
+    A promise about quality, measured on this model rather than
+    assumed (`docs/design/profile-builder.md` §3):
+    * `max` — the f16 cache only; nothing that changes answers, so
+      no quality measurement is made.
+    * `high` — a cache type is allowed when it picks the same next
+      token as `max` at least 96.5% of the time on the evaluation
+      text, counting its measured rate minus one standard error.
+    * `medium` — the same test at 92%.
+
+    """
+
+    max = 'max'
+    high = 'high'
+    medium = 'medium'
+
+
+class CacheType(StrEnum):
+    """
+    llama.cpp's KV-cache precision, always set for K and V together:
+    the flash-attention kernels of the builds measured handle
+    matching pairs only.
+
+    """
+
+    f16 = 'f16'
+    q8_0 = 'q8_0'
+    q4_0 = 'q4_0'
+
+
+class ProfileBuildPhase(StrEnum):
+    """
+    * `quality` — measuring what each lower cache precision the
+      accuracy level could allow costs on this model.
+    * `candidates` — asking llama.cpp's fit where each context and
+      cache type would be placed (nothing loads).
+    * `measuring` — llama-bench on each candidate, with fit's
+      placement passed explicitly.
+    * `confirming` — loading the recommended candidate once in
+      llama-server and checking it serves.
+    * `finished` — the job has ended; `state` says how.
+
+    """
+
+    quality = 'quality'
+    candidates = 'candidates'
+    measuring = 'measuring'
+    confirming = 'confirming'
+    finished = 'finished'
+
+
+class EvaluationTextSource(StrEnum):
+    bundled = 'bundled'
+    custom = 'custom'
+
+
+class ProfileBuildEvaluation(BaseModel):
+    """
+    Which text the quality measurement used. A custom text is identified, never stored.
+    """
+
+    source: EvaluationTextSource
+    sha256: str | None = None
+    tokens: int | None = Field(None, ge=0)
+
+
+class CacheQuality(BaseModel):
+    cacheType: CacheType
+    sameTopTokenPercent: float = Field(
+        ...,
+        description='How often this cache picks the same next token as the f16 cache, on the evaluation text.',
+        ge=0.0,
+        le=100.0,
+    )
+    standardError: float = Field(
+        ...,
+        description='The standard error of `sameTopTokenPercent`, in percentage points.',
+        ge=0.0,
+    )
+    meanKld: float = Field(
+        ...,
+        description="Mean KL divergence from the f16 cache's token distribution. Evidence for experts; the accuracy level is decided on `sameTopTokenPercent`.",
+        ge=0.0,
+    )
+    tokensScored: int = Field(..., ge=1)
+    passes: bool = Field(
+        ...,
+        description="Whether `sameTopTokenPercent - standardError` clears the requested accuracy level's threshold.",
+    )
+
+
+class BuildCandidate(BaseModel):
+    contextSize: int = Field(..., ge=256)
+    cacheType: CacheType
+    placement: list[str] = Field(
+        ...,
+        description="The arguments llama.cpp's fit chose for this context and cache (for example `-ngl -1 -ot …`), exactly as measured.",
+    )
+    decodeTokensPerSecond: float | None = Field(
+        None,
+        description='llama-bench decode speed with an empty context. Null until measured.',
+        gt=0.0,
+    )
+    deepDepth: int | None = Field(
+        None,
+        description='The context depth of the second decode measurement: 2,048 for\nevery candidate, so candidates are compared at one depth. A\ncandidate measured at half its own context reads slower for\nbeing deeper, not for its settings.\n',
+        ge=0,
+    )
+    deepDecodeTokensPerSecond: float | None = Field(None, gt=0.0)
+    prefillTokensPerSecond: float | None = Field(
+        None,
+        description='Relative only. llama-bench reads prefill 6–30% above what llama-server reports.',
+        gt=0.0,
+    )
+    onFrontier: bool | None = Field(
+        None, description='Not both slower and shorter than another measured candidate.'
+    )
+    confirmed: bool | None = Field(
+        None,
+        description='Whether llama-server loaded and served this candidate in the confirm phase; null when it was not the one confirmed.',
+    )
+    graphicsMemoryBytes: int | None = Field(
+        None,
+        description='Graphics memory used while confirming, where the node can measure it.',
+        ge=0,
+    )
+    detail: str | None = None
 
 
 class ComponentKind(StrEnum):
@@ -2495,6 +2675,11 @@ class StopReason(StrEnum):
       next request if `startOnDemand` is set.
     * `autoStart` — declared with `autoStart: false` and never
       started in this agent's lifetime.
+    * `measurement` — stopped, with the operator's agreement, so a
+      benchmark or a profile build could measure this node. It
+      starts again when that job ends unless the request asked
+      otherwise, and while the job runs a start or a gateway wake is
+      refused with 409.
 
     A reason beside `status: stopped` rather than three new members
     of `RuntimeStatus`, because the state is the same state — the
@@ -2506,6 +2691,7 @@ class StopReason(StrEnum):
     operator = 'operator'
     idle = 'idle'
     autoStart = 'autoStart'
+    measurement = 'measurement'
 
 
 class AdmissionDecision(StrEnum):
@@ -2786,6 +2972,14 @@ class BenchmarkRequest(BaseModel):
     runtime: RuntimeSpec
     repetitions: int | None = Field(3, ge=1, le=5)
     tokens: int | None = Field(128, ge=16, le=256)
+    stopRuntimes: list[str] | None = Field(
+        [],
+        description='The runtimes the operator agreed to stop for this job, as the\npreflight listed them. The job stops exactly these. A runtime\nrunning on the node that is NOT in this list refuses the job\nwith 409, so a model started between the question and the\nclick is never stopped without being asked about. Names in\nthe list that are already stopped are ignored.\n',
+    )
+    restartAfter: bool | None = Field(
+        True,
+        description="Start the runtimes this job stopped again when it ends —\ncompleted, failed, cancelled or timed out. Each restart goes\nthrough admission like an operator's Start and is reported on\nthe job's `restarts`; a refused or failed one is reported by\nname, never forced.\n",
+    )
 
 
 class Benchmark(BaseModel):
@@ -2809,10 +3003,79 @@ class Benchmark(BaseModel):
         None,
         description='CPU/GPU/backend identity reported by the benchmark executable.',
     )
+    restarts: list[MeasurementRestart] | None = Field(
+        None,
+        description='The runtimes this job stopped, and what became of each afterwards.',
+    )
 
 
 class BenchmarkList(BaseModel):
     benchmarks: list[Benchmark]
+
+
+class ProfileBuildRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    modelId: str = Field(..., max_length=256, min_length=1)
+    profileId: str | None = Field(
+        None,
+        description='The profile the build started from, if any. The build never writes a profile; the UI saves its result.',
+        max_length=256,
+    )
+    runtime: RuntimeSpec
+    accuracy: ProfileBuildAccuracy
+    memoryMarginMiB: int | None = Field(
+        None,
+        description="Graphics memory to leave free on every device, passed to fit\nas `--fit-target`. Null is llama.cpp's own default (1024 MiB).\n",
+        ge=0,
+        le=65536,
+    )
+    evaluationText: str | None = Field(
+        None,
+        description="The operator's own text for the quality measurement. Null\nuses the text bundled with the agent. It must yield at least\n8,192 tokens for this model (two 4,096-token chunks); a\nshorter text is refused with its token count. Not stored: the\nbuild keeps its SHA-256, and its token count when\nllama-perplexity reports one (it does when it refuses a text).\n",
+        max_length=2097152,
+    )
+    stopRuntimes: list[str] | None = Field(
+        [], description='Same rule as `BenchmarkRequest.stopRuntimes`.'
+    )
+    restartAfter: bool | None = Field(
+        True, description='Same rule as `BenchmarkRequest.restartAfter`.'
+    )
+
+
+class ProfileBuild(BaseModel):
+    id: str
+    node: str
+    modelId: str
+    profileId: str | None = None
+    runtime: RuntimeSpec
+    accuracy: ProfileBuildAccuracy
+    memoryMarginMiB: int | None = None
+    evaluation: ProfileBuildEvaluation
+    state: BenchmarkState
+    phase: ProfileBuildPhase
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str
+    quality: list[CacheQuality]
+    allowedCacheTypes: list[CacheType] | None = None
+    candidates: list[BuildCandidate]
+    recommended: int | None = Field(
+        None,
+        description='Index into `candidates` of the default choice: the longest\ncontext on the frontier whose decode speed at the common depth\nis at least 80% of the fastest measured. Speeds within 3% of\neach other count as equal, so where every context places alike\nthe longest wins. Null when nothing was measured.\n',
+        ge=0,
+    )
+    engineVersion: str | None = None
+    localPath: str | None = None
+    modelSizeBytes: int | None = Field(None, ge=0)
+    hardware: dict[str, str] | None = None
+    restarts: list[MeasurementRestart]
+
+
+class ProfileBuildList(BaseModel):
+    builds: list[ProfileBuild]
 
 
 class Component(BaseModel):

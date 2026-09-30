@@ -94,6 +94,42 @@ def test_curated_flags_become_cli_arguments(
     assert argv[argv.index("--tensor-split") + 1] == "0.6,0.4"
 
 
+def test_cache_type_is_one_choice_for_k_and_v(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary
+) -> None:
+    # The flash-attention kernels handle matching pairs only, so the one
+    # setting writes both flags; a quantised cache brings flash attention.
+    argv = adapter.build_argv(_spec(flags={"cacheType": "q8_0"}), binary, port=8090)
+    assert argv[argv.index("--cache-type-k") + 1] == "q8_0"
+    assert argv[argv.index("--cache-type-v") + 1] == "q8_0"
+    assert argv[argv.index("--flash-attn") + 1] == "on"
+
+    full = adapter.build_argv(_spec(flags={"cacheType": "f16"}), binary, port=8090)
+    assert full[full.index("--cache-type-k") + 1] == "f16" and "--flash-attn" not in full
+
+    # Flash attention already asked for: one switch, not two.
+    both = adapter.build_argv(
+        _spec(flags={"cacheType": "q4_0", "flashAttention": True}), binary, port=8090
+    )
+    assert both.count("--flash-attn") == 1
+
+    unset = adapter.build_argv(_spec(flags={}), binary, port=8090)
+    assert "--cache-type-k" not in unset and "--cache-type-v" not in unset
+
+
+def test_memory_margin_is_fits_target(adapter: LlamaCppAdapter, binary: DiscoveredBinary) -> None:
+    argv = adapter.build_argv(_spec(flags={"memoryMargin": 4096}), binary, port=8090)
+    assert argv[argv.index("--fit-target") + 1] == "4096"
+    assert "--fit-target" not in adapter.build_argv(_spec(flags={}), binary, port=8090)
+
+
+def test_new_memory_settings_say_what_unset_means(adapter: LlamaCppAdapter) -> None:
+    fields = {f.key: f for f in adapter.flag_schema().fields}
+    for key in ("cacheType", "memoryMargin"):
+        assert fields[key].unsetMeans, key
+    assert fields["cacheType"].enumValues == ["f16", "q8_0", "q4_0"]
+
+
 def test_boolean_flags_are_presence_only(
     adapter: LlamaCppAdapter, binary: DiscoveredBinary
 ) -> None:
@@ -337,17 +373,24 @@ def test_every_schema_flag_reaches_the_command_line_somehow(
     """A flag in the schema that nothing translates would render in the UI
     and then KeyError at spawn.
 
-    Two routes now: most keys are a one-to-one CLI name, and `noMmap` /
+    Three routes now: most keys are a one-to-one CLI name, `noMmap` /
     `mlock` collapse into a single `--load-mode` value whose spelling
-    depends on the binary. A key in neither set is the defect this
-    guards; a key in BOTH would be built twice.
+    depends on the binary, and `cacheType` expands into the K/V pair of
+    flags. A key in no set is the defect this guards; a key in two would
+    be built twice.
     """
-    from eugene_plexus_agent.engines.llama_cpp import _FLAG_CLI_NAMES, _LOAD_MODE_KEYS
+    from eugene_plexus_agent.engines.llama_cpp import (
+        _FLAG_CLI_NAMES,
+        _LOAD_MODE_KEYS,
+        CACHE_TYPE_KEY,
+    )
 
     direct = set(_FLAG_CLI_NAMES)
     collapsed = set(_LOAD_MODE_KEYS)
+    expanded = {CACHE_TYPE_KEY}
     assert not (direct & collapsed), "a key translated twice would be passed twice"
-    assert {f.key for f in adapter.flag_schema().fields} == direct | collapsed
+    assert not (direct & expanded) and not (collapsed & expanded)
+    assert {f.key for f in adapter.flag_schema().fields} == direct | collapsed | expanded
 
 
 def test_unknown_flags_are_reported_not_dropped(adapter: LlamaCppAdapter) -> None:

@@ -393,6 +393,14 @@ class LlamaCppAdapter(EngineAdapter):
                 # Not a presence-only switch any more; handled together
                 # below, because the two collapse into one CLI value.
                 continue
+            if field.key == CACHE_TYPE_KEY:
+                cache = flags.get(CACHE_TYPE_KEY)
+                argv += cache_type_argv(cache)
+                if cache not in (None, "f16") and not flags.get("flashAttention"):
+                    # A quantised V cache needs flash attention; `auto` may
+                    # leave it off on some backends, which fails at load.
+                    argv += ["--flash-attn", "on"]
+                continue
             if field.key not in flags:
                 continue
             value = flags[field.key]
@@ -647,7 +655,26 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     "tensorSplit": "--tensor-split",
     "flashAttention": "--flash-attn",
     "continuousBatching": "--cont-batching",
+    "memoryMargin": "--fit-target",
 }
+
+# The cache precision is one choice written as two CLI flags, because the
+# flash-attention kernels of every build measured handle matching K/V pairs
+# only (`FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16`, b11215,
+# docs/design/profile-builder.md M7). Offering K and V separately would
+# offer combinations that fall back to slow paths.
+CACHE_TYPE_KEY = "cacheType"
+CACHE_TYPES = ("f16", "q8_0", "q4_0")
+
+
+def cache_type_argv(value: object) -> list[str]:
+    """`--cache-type-k T --cache-type-v T`, or nothing for an unset value."""
+    if value is None:
+        return []
+    if value not in CACHE_TYPES:
+        raise ValueError(f"cacheType must be one of {', '.join(CACHE_TYPES)}")
+    return ["--cache-type-k", str(value), "--cache-type-v", str(value)]
+
 
 _FLAG_FIELDS: list[ConfigField] = [
     ConfigField(
@@ -769,6 +796,40 @@ _FLAG_FIELDS: list[ConfigField] = [
         category="performance",
         valueType=ConfigValueType.boolean,
         default=False,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=CACHE_TYPE_KEY,
+        label="Memory precision",
+        description=(
+            "How precisely the model keeps what it has read so far (its KV "
+            "cache). Full is exact. 8-bit and 4-bit use about half and a "
+            "quarter of the memory, leaving room for more text or more of the "
+            "model on the graphics card, and change answers slightly: how much "
+            "depends on the model, by as much as ninefold between two measured "
+            "ones, so the profile builder measures it on yours. 8-bit and "
+            "4-bit need flash attention, which is switched on with them."
+        ),
+        category="memory",
+        valueType=ConfigValueType.enum,
+        enumValues=list(CACHE_TYPES),
+        enumLabels=["Full (16-bit)", "8-bit", "4-bit"],
+        unsetMeans="Full precision (16-bit), llama.cpp's own default.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="memoryMargin",
+        label="Leave this much graphics memory free (MiB)",
+        description=(
+            "When llama.cpp decides how much of the model goes on each graphics "
+            "card, it leaves this much memory unused on every one. Raise it if "
+            "you game or render on the same card while a model is loaded."
+        ),
+        category="memory",
+        valueType=ConfigValueType.integer,
+        minimum=0,
+        maximum=65536,
+        unsetMeans="1024 MiB on each card, llama.cpp's own default.",
         requiresRestart=True,
     ),
     ConfigField(

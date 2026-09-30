@@ -15,11 +15,13 @@ def launch_lock(request: Request) -> asyncio.Lock:
 
 
 async def runtime_launch(request: Request) -> AsyncIterator[None]:
+    from .measurement_node import active_measurement
+
     async with launch_lock(request):
-        manager = getattr(request.app.state, "benchmarks", None)
-        if manager is not None and manager.active:
+        if kind := active_measurement(request.app):
             raise HTTPException(
                 409,
-                "A benchmark is running on this node. Cancel it or wait before starting a model.",
+                f"{kind} is running on this node. Cancel it or wait before starting a model; "
+                "models it stopped start again when it ends.",
             )
         yield
