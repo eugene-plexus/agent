@@ -82,11 +82,10 @@ def test_engines_declare_which_model_formats_they_load(authed_client: TestClient
     assert by_kind["vllm"]["modelFormats"] == ["safetensors"]
     # MLX claims the format, not the conversion: an MLX model is
     # safetensors plus a config.json, which is exactly what upstream's
-    # own `probably_mlx_lm` check looks for. Whether a *vanilla* HF
-    # safetensors model loads unconverted is one of the pending Mac
-    # checks — see docs/design/mlx-engine.md in specs.
+    # own `probably_mlx_lm` check looks for. A *vanilla* HF safetensors
+    # model loads unconverted (A4, on GitHub's macOS runners).
     assert by_kind["mlx"]["modelFormats"] == ["safetensors"]
-    assert by_kind["mlx"]["experimental"] is True
+    assert by_kind["mlx"]["experimental"] is False
     # Kev loads its own checkpoint format and nothing else: the format
     # is what keeps a decision model off every chat engine's launch
     # button and every chat model off Kev's.

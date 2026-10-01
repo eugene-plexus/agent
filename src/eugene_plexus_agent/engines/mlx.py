@@ -9,8 +9,11 @@ branch version, and **re-verified against the `v0.31.3` tag on
 2026-09-22 for this port** — still the newest release that day. M4's
 lesson was that the vLLM adapter needed no change on first contact
 *because* each claim had been read off upstream first; this leans on
-that method entirely. `experimental = True` until a physical Mac run is
-recorded — see `docs/design/mlx-engine.md` in specs.
+that method entirely. **Not experimental since A4 (2026-09-30)**: the
+real `mlx_lm.server` ran under this adapter on GitHub's macOS runners,
+which expose Metal, and every check of our integration passed (Troy:
+we own the integration, not MLX) — see `docs/design/mlx-engine.md` and
+`docs/acceptance/a4-macos-runner-run.md` in specs.
 
 **What makes this engine awkward, and it is not argv.** At the pinned
 release, `mlx_lm.server` is the only one of the three that cannot be
@@ -184,9 +187,9 @@ class MlxAdapter(EngineAdapter):
     install_policy = Policy.manual
     configured_binary_key = "mlxBinary"
 
-    #: Never proved on the hardware it targets. Flip only when a
-    #: physical Apple silicon acceptance run is recorded.
-    experimental = True
+    #: Proved on Apple silicon (virtual) by A4, 2026-09-30, on Troy's call
+    #: that the runner's evidence is enough; a rented Mac was declined.
+    experimental = False
 
     # --- discovery --------------------------------------------------------
 

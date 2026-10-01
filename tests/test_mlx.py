@@ -92,13 +92,14 @@ def _patch_client(handler: Any) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_mlx_is_registered_and_experimental() -> None:
+def test_mlx_is_registered_and_no_longer_experimental() -> None:
     adapter = adapter_for(EngineKind.mlx)
     assert isinstance(adapter, MlxAdapter)
     assert ADAPTERS[EngineKind.mlx] is adapter
-    # Experimental until a physical Apple silicon run is recorded — the
-    # UI badges off this instead of hardcoding a list.
-    assert adapter.experimental is True
+    # Proved on GitHub's macOS runners (A4, 2026-09-30); Troy took the
+    # label off on that evidence. The UI still offers it only where a
+    # Mac can install it, by a rule that no longer needs this flag.
+    assert adapter.experimental is False
     assert MlxAdapter.model_formats == (ModelFormat.safetensors,)
     assert MlxAdapter.install_policy is Policy.manual
     assert MlxAdapter.configured_binary_key == "mlxBinary"

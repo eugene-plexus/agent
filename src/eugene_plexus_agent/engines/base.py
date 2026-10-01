@@ -207,8 +207,8 @@ class EngineAdapter(abc.ABC):
     configured_binary_key: str | None = None
 
     #: True while this engine's integration has never been proved on the
-    #: hardware it targets — `mlx` until a physical Apple silicon run is
-    #: recorded. Reported on `EngineDescriptor.experimental` so the UI
+    #: hardware it targets — Kev today; `mlx` was until A4 (2026-09-30)
+    #: proved it on GitHub's macOS runners. Reported on `EngineDescriptor.experimental` so the UI
     #: can badge the option instead of hardcoding a list that goes stale
     #: the day the evidence lands. A property of the *integration*, not
     #: of this host.
