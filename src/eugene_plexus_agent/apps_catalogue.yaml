@@ -4,6 +4,29 @@
 # at a pinned commit and each `version` is that commit, the way the
 # installers pin the hub's own packages.
 #
-# Empty until the first app exists. See specs
-# docs/design/apps-and-spokes.md for the order they arrive in.
-[]
+# A catalogue entry names a commit on the app's `dist` branch where it has
+# one: `main` at a named commit plus its built front end, which `main`
+# gitignores and a GitHub archive would otherwise not carry (C3,
+# workbench-v1.md W10). The order apps arrive in is specs
+# docs/design/apps-and-spokes.md.
+
+- id: workbench
+  name: Workbench
+  summary: >-
+    Chat with the models this install serves, and search the web while you
+    do. Signs people in with Eugene: the owner with the passphrase, a small
+    business with an account for each person.
+  homepage: https://github.com/eugene-plexus/workbench
+  source: https://github.com/eugene-plexus/workbench/archive/b5bc13efcc9df2424033c08116279df75f1e5351.tar.gz
+  version: b5bc13efcc9df2424033c08116279df75f1e5351
+  package: eugene-plexus-workbench
+  entry: eugene_plexus_workbench
+  python: "3.12"
+  ui: true
+  configTrio: true
+  uses: [inference]
+  signIn: true
+  signInCallbackPath: /oidc/callback
+  # It runs nothing a model chooses on this machine, so it installs where
+  # an app cannot have an account of its own too (C1).
+  localActions: false

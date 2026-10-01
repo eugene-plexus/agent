@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -258,6 +259,26 @@ def test_the_shipped_catalogue_parses() -> None:
     )
     assert isinstance(raw, list)
     assert apps.load_catalogue() == [apps.normalized(AppManifest.model_validate(i)) for i in raw]
+
+
+def test_every_shipped_app_is_pinned_to_an_archive_at_its_own_commit() -> None:
+    """A version is the commit its archive was made at, so what installs is
+    what the entry names and an update is a different commit."""
+    for manifest in apps.load_catalogue():
+        assert re.fullmatch(r"[0-9a-f]{40}", manifest.version), manifest.id
+        assert manifest.source == (
+            f"https://github.com/eugene-plexus/{manifest.id}/archive/{manifest.version}.tar.gz"
+        ), manifest.id
+
+
+def test_workbench_signs_people_in_and_runs_nothing_a_model_chooses() -> None:
+    """C3: it registers to sign people in with Eugene at install, publishes
+    its one setting, and installs where apps have no account of their own."""
+    (workbench,) = [m for m in apps.load_catalogue() if m.id == "workbench"]
+    assert workbench.signIn is True and workbench.signInCallbackPath == "/oidc/callback"
+    assert workbench.configTrio is True and workbench.ui is True
+    assert workbench.localActions is False
+    assert workbench.entry == "eugene_plexus_workbench"
 
 
 def test_the_catalogue_says_why_it_cannot_install(
