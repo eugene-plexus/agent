@@ -15,6 +15,7 @@ exists only because somebody signed in asked for it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -218,6 +219,7 @@ async def uninstall(request: Request, app_id: str, purge: bool = False) -> Respo
             f"No app called {app_id!r} is installed on this node.",
         )
     await _revoke_key(request, manager, app_id)
+    await _drop_sign_in(request, manager, app_id)
     try:
         await manager.uninstall(app_id, purge=purge)
     except Exception as exc:
@@ -230,6 +232,62 @@ async def uninstall(request: Request, app_id: str, purge: bool = False) -> Respo
         ) from exc
     log.info("uninstalled app %s%s", app_id, " and its data" if purge else "")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+async def _ensure_sign_in(request: Request, manager: AppManager, manifest: AppManifest) -> None:
+    """Register an app that signs people in with Eugene, with the caller's
+    credential, and write its secret beside its key (C2).
+
+    The secret file exists for every app, empty for one that does not sign
+    in: the Linux unit loads it as a credential, and systemd will not start
+    a unit whose credential is missing.
+    """
+    store = manager.store
+    secret_file = store.oidc_secret_file(manifest.id)
+    secret_file.parent.mkdir(parents=True, exist_ok=True)
+    if not manifest.signIn:
+        if not secret_file.exists():
+            write_private(secret_file, "")
+        return
+    if store.oidc_client(manifest.id) and secret_file.is_file() and secret_file.stat().st_size:
+        return
+    await _drop_sign_in(request, manager, manifest.id)
+    node = manager.node_name() or "this-node"
+    created = await registry(request).forward(
+        "POST",
+        "/v1/oidc/clients",
+        authorization=request.headers.get("authorization"),
+        body={
+            "name": manifest.name,
+            "redirectUris": manager.sign_in_redirects(
+                manifest.id, manifest.signInCallbackPath or "/oidc/callback"
+            ),
+            "owner": f"app:{manifest.id}@{node}",
+        },
+    )
+    write_private(secret_file, created["clientSecret"])
+    store.put_oidc_client(manifest.id, created["client"]["clientId"])
+    log.info("registered app %s to sign people in with Eugene", manifest.id)
+
+
+async def _drop_sign_in(request: Request, manager: AppManager, app_id: str) -> None:
+    """Remove the app's sign-in client, or raise and change nothing. A
+    client the root has never heard of is already gone."""
+    client_id = manager.store.oidc_client(app_id)
+    if client_id is None:
+        return
+    try:
+        await registry(request).forward(
+            "DELETE",
+            f"/v1/oidc/clients/{client_id}",
+            authorization=request.headers.get("authorization"),
+        )
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+    manager.store.drop_oidc_client(app_id)
+    with contextlib.suppress(OSError):
+        write_private(manager.store.oidc_secret_file(app_id), "")
 
 
 async def _ensure_key(request: Request, manager: AppManager, app_id: str) -> None:
@@ -298,6 +356,7 @@ async def install(request: Request, app_id: str) -> AppInstall:
             f"{manifest.name} {manifest.version} is already installed on this node.",
         )
     await _ensure_key(request, manager, app_id)
+    await _ensure_sign_in(request, manager, manifest)
     uv = manager.uv()
     assert uv is not None  # installable() just said so
 

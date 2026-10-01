@@ -82,6 +82,8 @@ def load_spec(path: str) -> dict:
         spec["keyFile"] = os.path.join(credentials, "client_key")
     if not spec.get("adminTokenFile") and credentials:
         spec["adminTokenFile"] = os.path.join(credentials, "admin_token")
+    if not spec.get("oidcSecretFile") and credentials:
+        spec["oidcSecretFile"] = os.path.join(credentials, "oidc_secret")
     return spec
 
 
@@ -108,6 +110,9 @@ def child_environment(spec: dict) -> dict[str, str]:
     token = _secret(spec.get("adminTokenFile"))
     if token:
         env["EUGENE_PLEXUS_APP_ADMIN_TOKEN"] = token
+    # Its sign-in secret (C2), for an app the agent told which client it is.
+    if env.get("EUGENE_PLEXUS_APP_OIDC_CLIENT_ID") and spec.get("oidcSecretFile"):
+        env["EUGENE_PLEXUS_APP_OIDC_SECRET_FILE"] = spec["oidcSecretFile"]
     env["PYTHONUNBUFFERED"] = "1"
     return env
 

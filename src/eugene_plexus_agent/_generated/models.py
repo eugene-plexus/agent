@@ -3031,6 +3031,14 @@ class App(BaseModel):
     localActions: bool | None = Field(
         None, description='What its manifest declares (`AppManifest.localActions`).'
     )
+    signIn: bool | None = Field(
+        None,
+        description='Whether it signs people in with Eugene (`AppManifest.signIn`).',
+    )
+    oidcClientId: str | None = Field(
+        None,
+        description='The id it signs people in with, as an app registered with the\ncontrol root (`/v1/oidc/clients` on `control.yaml`). Absent when\nit does not sign people in, or its registration failed (`detail`\nsays why).\n',
+    )
     installedAt: AwareDatetime | None = None
     pid: int | None = None
     lastRestart: AwareDatetime | None = None
@@ -3778,7 +3786,10 @@ class AppManifest(BaseModel):
     `EUGENE_PLEXUS_APP_GATEWAY_URL` (absent when none could be
     found), keeps its state under `EUGENE_PLEXUS_APP_DATA_DIR`, and —
     with `configTrio` — requires `EUGENE_PLEXUS_APP_ADMIN_TOKEN` as
-    the bearer on its config trio.
+    the bearer on its config trio. With `signIn`, it signs people in
+    with Eugene (C2) using `EUGENE_PLEXUS_APP_OIDC_ISSUER`,
+    `EUGENE_PLEXUS_APP_OIDC_CLIENT_ID` and the secret in the file
+    named by `EUGENE_PLEXUS_APP_OIDC_SECRET_FILE`.
 
     """
 
@@ -3836,6 +3847,15 @@ class AppManifest(BaseModel):
     )
     uses: list[AppHubSurface] | None = Field(
         ['inference'], description="The hub surfaces the app's key is scoped to."
+    )
+    signIn: bool | None = Field(
+        False,
+        description="Whether the app signs people in with Eugene (C2). At install\nthe agent registers it as an app that signs in with Eugene,\nwith `signInCallbackPath` on each address it is opened at, and\nhands it the client's id and secret. Uninstall removes it.\n",
+    )
+    signInCallbackPath: str | None = Field(
+        '/oidc/callback',
+        description="Where on the app's own origin Eugene sends a person back after signing in.",
+        pattern='^/[A-Za-z0-9._~/-]*$',
     )
     localActions: bool | None = Field(
         True,

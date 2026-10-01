@@ -75,6 +75,9 @@ LAUNCHER_FILE = "app_launcher.py"
 APP_PYTHONS = "pythons"
 SPEC_FILE = "launch.json"
 ADMIN_TOKEN_FILE = "admin_token"
+#: Mirrors pps.OIDC_SECRET_FILE: the app's sign-in secret (C2), empty when it
+#: signs nobody in. The Linux unit loads it as a credential.
+OIDC_SECRET_FILE = "oidc_secret"
 CTL_DIR = "ctl"
 
 SERVICE_PREFIX = "EugenePlexusApp-"
@@ -237,6 +240,7 @@ def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
         "EUGENE_PLEXUS_APP_ADMIN_TOKEN",
         "EUGENE_PLEXUS_APP_KEY_FILE",
         "EUGENE_PLEXUS_APP_DATA_DIR",
+        "EUGENE_PLEXUS_APP_OIDC_SECRET_FILE",
     ):
         env.pop(name, None)
     spec: dict = {
@@ -250,6 +254,7 @@ def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
         spec["dataDir"] = str(plan.data_dir)
         spec["keyFile"] = str(plan.key_file)
         spec["adminTokenFile"] = str(plan.data_dir / ADMIN_TOKEN_FILE)
+        spec["oidcSecretFile"] = str(plan.data_dir / OIDC_SECRET_FILE)
     return spec
 
 
@@ -311,6 +316,7 @@ class WindowsServiceRunner:
         write_private(spec_path, json.dumps(spec, indent=2))
         plan.data_dir.mkdir(parents=True, exist_ok=True)
         write_private(plan.data_dir / ADMIN_TOKEN_FILE, plan.admin_token)
+        _ensure_secret_file(plan.data_dir)
 
         manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
         try:
@@ -537,6 +543,8 @@ class SystemdRunner:
         (app_dir / SPEC_FILE).write_text(json.dumps(spec, indent=2), encoding="utf-8")
         os.chmod(app_dir / SPEC_FILE, 0o644)
         write_private(app_dir / ADMIN_TOKEN_FILE, plan.admin_token)
+        # The unit loads it as a credential and will not start without it.
+        _ensure_secret_file(plan.data_dir)
         # The template unit runs `<apps>/<id>/python`: this version's
         # interpreter, swapped in one rename when the version changes.
         link = app_dir / "python"
@@ -595,6 +603,12 @@ class SystemdRunner:
 
     def token_file(self, app_id: str, data_dir: Path) -> Path:
         return self._apps / app_id / ADMIN_TOKEN_FILE
+
+
+def _ensure_secret_file(data_dir: Path) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    if not (data_dir / OIDC_SECRET_FILE).exists():
+        write_private(data_dir / OIDC_SECRET_FILE, "")
 
 
 def _open_for_others(tree: Path) -> None:

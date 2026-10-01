@@ -89,6 +89,10 @@ UNREADABLE_SUFFIX = ".unreadable"
 CATALOGUE_RESOURCE = "apps_catalogue.yaml"
 INSTALL_METADATA = "install.json"
 KEY_FILE = "client_key"
+#: The app's secret as a client that signs people in with Eugene (C2). Always
+#: present, empty for an app that does not: the Linux unit loads it as a
+#: credential, and systemd refuses to start a unit whose credential is missing.
+OIDC_SECRET_FILE = "oidc_secret"
 
 #: The installed version and one to roll back to, as for engines.
 RETAINED_VERSIONS = 2
@@ -259,6 +263,7 @@ class AppStore:
         self._installed: dict[str, InstalledApp] = {}
         self._keys: dict[str, AppKey] = {}
         self._custom: dict[str, AppManifest] = {}
+        self._oidc: dict[str, str] = {}
         self._degraded_reason: str | None = None
 
     @property
@@ -295,6 +300,7 @@ class AppStore:
             manifest = normalized(AppManifest.model_validate(item))
             custom[manifest.id] = manifest
         self._installed, self._keys, self._custom = installed, keys, custom
+        self._oidc = {str(k): str(v) for k, v in (raw.get("oidc") or {}).items()}
 
     def load_or_degrade(self) -> str | None:
         """Load, or come up with no apps and say why -- never raise.
@@ -307,6 +313,7 @@ class AppStore:
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
             self._installed, self._keys, self._custom = {}, {}, {}
+            self._oidc = {}
             self._degraded_reason = reason
             target = self._path.with_suffix(self._path.suffix + UNREADABLE_SUFFIX)
             with contextlib.suppress(OSError):
@@ -329,6 +336,7 @@ class AppStore:
                 for app_id, k in self._keys.items()
             },
             "custom": [m.model_dump(mode="json", exclude_none=True) for m in self._custom.values()],
+            "oidc": dict(self._oidc),
         }
         write_private(self._path, yaml.safe_dump(out, sort_keys=True, default_flow_style=False))
         # A degraded boot is repaired by the first successful write.
@@ -349,6 +357,7 @@ class AppStore:
     def remove(self, app_id: str) -> None:
         self._installed.pop(app_id, None)
         self._keys.pop(app_id, None)
+        self._oidc.pop(app_id, None)
         self._write()
 
     def taken_ports(self) -> set[int]:
@@ -365,6 +374,20 @@ class AppStore:
 
     def drop_key(self, app_id: str) -> None:
         if self._keys.pop(app_id, None) is not None:
+            self._write()
+
+    # --- signing in with Eugene (C2) ------------------------------------
+
+    def oidc_client(self, app_id: str) -> str | None:
+        """The client id this app signs people in with, when it does."""
+        return self._oidc.get(app_id)
+
+    def put_oidc_client(self, app_id: str, client_id: str) -> None:
+        self._oidc[app_id] = client_id
+        self._write()
+
+    def drop_oidc_client(self, app_id: str) -> None:
+        if self._oidc.pop(app_id, None) is not None:
             self._write()
 
     # --- custom entries -------------------------------------------------
@@ -393,6 +416,9 @@ class AppStore:
 
     def key_file(self, app_id: str) -> Path:
         return self.data_dir(app_id) / KEY_FILE
+
+    def oidc_secret_file(self, app_id: str) -> Path:
+        return self.data_dir(app_id) / OIDC_SECRET_FILE
 
 
 def _url(value: str | None) -> AnyUrl | None:
@@ -699,11 +725,13 @@ class _AppPlanner:
         store: AppStore,
         gateway_url: Callable[[], str | None],
         bind_host: Callable[[], str | None],
+        oidc_issuer: Callable[[], str | None] = lambda: None,
     ) -> None:
         self.record = record
         self._store = store
         self._gateway_url = gateway_url
         self._bind_host = bind_host
+        self._oidc_issuer = oidc_issuer
         self.admin_token: str | None = None
 
     @property
@@ -754,6 +782,14 @@ class _AppPlanner:
         gateway = self._gateway_url()
         if gateway:
             env[f"{ENV_PREFIX}_GATEWAY_URL"] = gateway
+        # C2: an app that signs people in with Eugene is told where, as
+        # which client, and where its secret is.
+        client_id = self._store.oidc_client(record.id)
+        issuer = self._oidc_issuer()
+        if record.manifest.signIn and client_id and issuer:
+            env[f"{ENV_PREFIX}_OIDC_ISSUER"] = issuer
+            env[f"{ENV_PREFIX}_OIDC_CLIENT_ID"] = client_id
+            env[f"{ENV_PREFIX}_OIDC_SECRET_FILE"] = str(self._store.oidc_secret_file(record.id))
         env["PYTHONUNBUFFERED"] = "1"
         return SpawnPlan(
             argv=[str(python), "-m", record.manifest.entry],
@@ -908,8 +944,11 @@ class AppManager:
         resolve_gateway: GatewayResolver,
         ingress_url: Callable[[], str] | None = None,
         accounts: app_accounts.AccountSupport | None = None,
+        oidc_issuer: Callable[[], str | None] | None = None,
     ) -> None:
         self.store = store
+        self._oidc_issuer = oidc_issuer or (lambda: None)
+        self._reserved_ports: dict[str, int] = {}
         self.catalogue = {m.id: m for m in catalogue}
         self._get_config = get_config
         self._bind_host = bind_host
@@ -1061,6 +1100,8 @@ class AppManager:
             ),
             account=self._account(record.id),
             localActions=record.manifest.localActions is not False,
+            signIn=bool(record.manifest.signIn),
+            oidcClientId=self.store.oidc_client(record.id),
             installedAt=record.installed_at,
             pid=pid,
             lastRestart=restarted,
@@ -1078,8 +1119,34 @@ class AppManager:
 
     # --- ports ----------------------------------------------------------
 
+    def reserve_port(self, app_id: str) -> int:
+        """The port this app will have: its own if installed, otherwise one
+        set aside now, so its sign-in callback can be registered before
+        the install finishes (C2) and the install then takes the same one."""
+        existing = self.store.get(app_id)
+        if existing is not None:
+            return existing.port
+        if app_id not in self._reserved_ports:
+            self._reserved_ports[app_id] = self.allocate_port()
+        return self._reserved_ports[app_id]
+
+    def sign_in_redirects(self, app_id: str, path: str) -> list[str]:
+        """Every address a browser may open this app at, with its callback:
+        this node's advertised host, and loopback for a browser on it."""
+        port = self.reserve_port(app_id)
+        hosts = [self._advertise_host() or "127.0.0.1", "127.0.0.1", "localhost"]
+        out = []
+        for host in dict.fromkeys(hosts):
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            out.append(f"http://{host}:{port}{path}")
+        return out
+
+    def oidc_issuer(self) -> str | None:
+        return self._oidc_issuer()
+
     def allocate_port(self) -> int:
-        taken = self.store.taken_ports()
+        taken = self.store.taken_ports() | set(self._reserved_ports.values())
         for candidate in range(APP_PORT_BASE, APP_PORT_BASE + APP_PORT_SPAN):
             if candidate in taken:
                 continue
@@ -1103,6 +1170,7 @@ class AppManager:
             store=self.store,
             gateway_url=lambda: self._gateway.get(record.id),
             bind_host=self._bind_host,
+            oidc_issuer=self._oidc_issuer,
         )
         self.supervisor.start(planner)
 
@@ -1134,7 +1202,7 @@ class AppManager:
                 record = InstalledApp(
                     manifest=manifest,
                     origin=origin,
-                    port=self.allocate_port(),
+                    port=self._reserved_ports.pop(manifest.id, 0) or self.allocate_port(),
                     installed_at=datetime.now(UTC),
                 )
             else:

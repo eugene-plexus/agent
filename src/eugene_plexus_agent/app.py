@@ -62,6 +62,7 @@ from .routes import health as health_routes
 from .routes import log_ingress as log_ingress_routes
 from .routes import logs as logs_routes
 from .routes import node as node_routes
+from .routes import oidc_forward as oidc_forward_routes
 from .routes import profile_builds as profile_build_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
@@ -320,6 +321,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 resolve_gateway=lambda: resolve_gateway_for_apps(app),
                 # C1: where an app's launcher sends what the app prints.
                 ingress_url=lambda: f"http://127.0.0.1:{int(settings.bind_port)}/v1/logs",
+                # C2: where an app on this machine signs people in -- this
+                # agent's /oidc, at the address a browser opens the app at.
+                oidc_issuer=lambda: _oidc_issuer(
+                    _app_advertise_host(state, identity), int(settings.bind_port)
+                ),
             )
     app_manager: apps.AppManager | None = app.state.apps
 
@@ -583,6 +589,15 @@ async def _announce_address(
         log.warning("could not announce this node's address: %s", exc)
 
 
+def _oidc_issuer(host: str | None, port: int) -> str:
+    """This agent's /oidc as a browser reaches it (C2): the advertised host,
+    else loopback, bracketed when it is an IPv6 literal."""
+    host = host or "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}/oidc"
+
+
 def _app_advertise_host(state: AgentState, identity: node_identity.NodeIdentityStore) -> str | None:
     """The host another device opens an app's UI on, or None for loopback."""
     advertise = node_identity.effective_advertise_url(
@@ -723,6 +738,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The log ingress (C1): POST /v1/logs, the one route that takes a client
     # key, write-only and only from a key with writeLogs.
     app.include_router(log_ingress_routes.router)
+    # Signing in with Eugene (C2): /oidc/* forwards to the control root.
+    app.include_router(oidc_forward_routes.router)
 
     # The browser surface, registered LAST and in this order. The proxy
     # is deliberately unauthenticated — it is the path the login request
