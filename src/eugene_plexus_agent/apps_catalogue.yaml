@@ -17,8 +17,8 @@
     do. Signs people in with Eugene: the owner with the passphrase, a small
     business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/b5bc13efcc9df2424033c08116279df75f1e5351.tar.gz
-  version: b5bc13efcc9df2424033c08116279df75f1e5351
+  source: https://github.com/eugene-plexus/workbench/archive/736e1ceb85a2dfd71f67f0b708f54f03b92a218a.tar.gz
+  version: 736e1ceb85a2dfd71f67f0b708f54f03b92a218a
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
