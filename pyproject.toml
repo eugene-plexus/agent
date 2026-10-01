@@ -156,6 +156,8 @@ module = [
     "win32gui",
     # ...plus the one the install-permissions check reads ACLs with.
     "win32security",
+    # ...plus pywin32's error type, for the app services (C1).
+    "pywintypes",
 ]
 ignore_missing_imports = true
 

@@ -59,6 +59,7 @@ from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import directories as directories_routes
 from .routes import health as health_routes
+from .routes import log_ingress as log_ingress_routes
 from .routes import logs as logs_routes
 from .routes import node as node_routes
 from .routes import profile_builds as profile_build_routes
@@ -317,6 +318,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 advertise_host=lambda: _app_advertise_host(state, identity),
                 node_name=lambda: identity.record.name if identity.record.enrolled else None,
                 resolve_gateway=lambda: resolve_gateway_for_apps(app),
+                # C1: where an app's launcher sends what the app prints.
+                ingress_url=lambda: f"http://127.0.0.1:{int(settings.bind_port)}/v1/logs",
             )
     app_manager: apps.AppManager | None = app.state.apps
 
@@ -717,6 +720,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Checking for and installing a newer version; operator-only.
     app.include_router(update_routes.router)
     app.include_router(logs_routes.router)
+    # The log ingress (C1): POST /v1/logs, the one route that takes a client
+    # key, write-only and only from a key with writeLogs.
+    app.include_router(log_ingress_routes.router)
 
     # The browser surface, registered LAST and in this order. The proxy
     # is deliberately unauthenticated — it is the path the login request

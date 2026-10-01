@@ -34,7 +34,7 @@ import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import _http, apps
+from eugene_plexus_agent import _http, app_accounts, apps
 from eugene_plexus_agent._generated.models import (
     AppManifest,
     AppOrigin,
@@ -57,6 +57,9 @@ def _manifest(**overrides: Any) -> AppManifest:
         "version": "v1",
         "package": "tiny-app",
         "entry": "tiny_app",
+        # It runs nothing a model chooses, so it installs on any node; the
+        # C1 refusal is tested with this overridden.
+        "localActions": False,
     }
     base.update(overrides)
     return apps.normalized(AppManifest.model_validate(base))
@@ -122,6 +125,9 @@ def _manager(tmp_path: Path, **kw: Any) -> apps.AppManager:
         advertise_host=lambda: None,
         node_name=lambda: "node-a",
         resolve_gateway=gateway,
+        # Whatever this machine is, a unit test's manager makes no accounts
+        # unless it says otherwise.
+        accounts=kw.pop("accounts", app_accounts.AccountSupport(None, "tests make no accounts")),
     )
     manager.supervisor = FakeAppSupervisor()  # type: ignore[assignment]
     return manager

@@ -1892,6 +1892,10 @@ class ClientKeyLimits(BaseModel):
         description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
         max_length=100,
     )
+    writeLogs: bool | None = Field(
+        False,
+        description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
+    )
     maxConcurrentRequests: int | None = Field(2, ge=1, le=64)
     requestsPerMinute: int | None = Field(60, ge=1, le=10000)
 
@@ -2859,6 +2863,63 @@ class AppHubSurface(StrEnum):
     inference = 'inference'
 
 
+class AppIsolation(StrEnum):
+    """
+    Which OS account an app runs as (C1, `workbench.md` §2).
+
+    * `own_account` -- one of its own, created for it, that cannot
+      open the install's keys, the control root's files or another
+      app's directory. The OS service manager runs it, and a launcher
+      inside that account forwards what it prints to `POST /v1/logs`.
+    * `agent_account` -- the agent's, on an install that cannot create
+      accounts (per-user Windows, Linux `--user`, macOS). Only an app
+      with `localActions: false` is installed there.
+
+    """
+
+    own_account = 'own_account'
+    agent_account = 'agent_account'
+
+
+class OtlpLogsRequest(BaseModel):
+    """
+    OTLP's `ExportLogsServiceRequest` in its JSON encoding
+    (opentelemetry-proto, `collector/logs/v1`). What the agent reads:
+    `resourceLogs[].scopeLogs[].logRecords[]`, and in each record
+    `severityText` (else `severityNumber`) and `body`. A body that is
+    a string is the text, one log line per line of it; any other value
+    is written as JSON. Lines are stamped when they arrive, as every
+    line in the log is; a record's own time is not used. The source is
+    the sending key, never anything in the record. Everything else
+    OTLP defines is accepted and ignored.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    resourceLogs: list[dict[str, Any]] | None = None
+
+
+class PartialSuccess(BaseModel):
+    rejectedLogRecords: str | None = Field(
+        None,
+        description="As OTLP's JSON encoding writes an int64: a decimal string.\n",
+        pattern='^[0-9]+$',
+    )
+    errorMessage: str | None = None
+
+
+class OtlpLogsResponse(BaseModel):
+    """
+    OTLP's `ExportLogsServiceResponse`. Empty when every record was
+    written; otherwise `partialSuccess` says how many were not and why.
+
+    """
+
+    partialSuccess: PartialSuccess | None = None
+
+
 class AppOrigin(StrEnum):
     """
     * `catalogue` — shipped with this agent release.
@@ -2962,6 +3023,14 @@ class App(BaseModel):
         description='The client key minted for it. Revoking that key cuts the app\noff from the hub; uninstalling revokes it.\n',
     )
     keyName: str | None = None
+    isolation: AppIsolation | None = None
+    account: str | None = Field(
+        None,
+        description="The OS account it runs as, as the OS names it:\n`NT SERVICE\\EugenePlexusApp-<id>`, the dynamic user of\n`eugene-plexus-app@<id>.service`, or the agent's own.\n",
+    )
+    localActions: bool | None = Field(
+        None, description='What its manifest declares (`AppManifest.localActions`).'
+    )
     installedAt: AwareDatetime | None = None
     pid: int | None = None
     lastRestart: AwareDatetime | None = None
@@ -3768,6 +3837,10 @@ class AppManifest(BaseModel):
     uses: list[AppHubSurface] | None = Field(
         ['inference'], description="The hub surfaces the app's key is scoped to."
     )
+    localActions: bool | None = Field(
+        True,
+        description="Whether the app runs anything a model chooses on this machine:\na file or shell tool, an MCP server, its own plugins. In the\nagent's own account such an action could reach the install's\nkeys (`workbench.md` §1), so an app that declares `true` is\ninstalled only where the agent can give apps an OS account of\ntheir own (`AppCatalogue.ownAccounts`). Elsewhere the install\nis refused with the reason.\n\nDefaults to `true`: an entry that does not say is treated as\none that does.\n",
+    )
 
 
 class AppCatalogueEntry(BaseModel):
@@ -3786,6 +3859,14 @@ class AppCatalogue(BaseModel):
     )
     reason: str | None = Field(
         None, description='Why not, and what to do. Present when `installable: false`.'
+    )
+    ownAccounts: bool | None = Field(
+        None,
+        description="Whether this node runs each app in an OS account of its own\n(C1): a virtual service account on the Windows service install,\na systemd dynamic user on the Linux system install. Where it\ndoes not, apps run as the agent's account, and only an app with\n`localActions: false` may be installed. Absent from an agent\nthat predates the field.\n",
+    )
+    ownAccountsReason: str | None = Field(
+        None,
+        description='Why this node cannot give apps their own accounts, and which\ninstall would. Present when `ownAccounts` is false.\n',
     )
 
 

@@ -57,13 +57,14 @@ import httpx
 import yaml
 from pydantic import AnyUrl, ValidationError
 
-from . import ports
+from . import app_accounts, ports
 from ._generated.models import (
     App,
     AppCatalogue,
     AppCatalogueEntry,
     AppHubSurface,
     AppInstall,
+    AppIsolation,
     AppManifest,
     AppOrigin,
     ComponentStatus,
@@ -619,6 +620,12 @@ class AppInstaller:
         # variables, the same boundary a foreign binary gets -- and keep
         # the user's proxy, because a package index is egress.
         env = child_environment()
+        # C1: app interpreters live apart from the agent's, so an app's own
+        # account is granted those and never the agent's; and copied, not
+        # linked from uv's cache, so a grant on a venv's files is a grant on
+        # those files and nothing that shares their inode.
+        env["UV_PYTHON_INSTALL_DIR"] = str(target.parent.parent.parent / app_accounts.APP_PYTHONS)
+        env["UV_LINK_MODE"] = "copy"
 
         progress.state = State1.creating
         progress.message = f"building a Python {manifest.python} environment"
@@ -899,6 +906,8 @@ class AppManager:
         advertise_host: Callable[[], str | None],
         node_name: Callable[[], str | None],
         resolve_gateway: GatewayResolver,
+        ingress_url: Callable[[], str] | None = None,
+        accounts: app_accounts.AccountSupport | None = None,
     ) -> None:
         self.store = store
         self.catalogue = {m.id: m for m in catalogue}
@@ -908,7 +917,19 @@ class AppManager:
         self._node_name = node_name
         self._resolve_gateway = resolve_gateway
         self.installer = AppInstaller()
-        self.supervisor = AppSupervisor()
+        # C1: each app in an account of its own where this install can make
+        # one; the agent's own supervisor, and its account, where it cannot.
+        self.accounts = accounts if accounts is not None else app_accounts.detect()
+        self.supervisor: AppSupervisor | app_accounts.OwnAccountSupervisor
+        if self.accounts.available:
+            self.supervisor = app_accounts.OwnAccountSupervisor(
+                app_accounts.runner_for(self.accounts, store.root),
+                ingress=ingress_url or (lambda: ""),
+                data_dir=store.data_dir,
+                key_file=store.key_file,
+            )
+        else:
+            self.supervisor = AppSupervisor()
         self._gateway: dict[str, str | None] = {}
         self._detail: dict[str, str | None] = {}
         self._lock = asyncio.Lock()
@@ -974,7 +995,28 @@ class AppManager:
                     )
                 )
         reason = self.installable(enrolled=enrolled)
-        return AppCatalogue(apps=entries, installable=reason is None, reason=reason)
+        return AppCatalogue(
+            apps=entries,
+            installable=reason is None,
+            reason=reason,
+            ownAccounts=self.accounts.available,
+            ownAccountsReason=self.accounts.reason,
+        )
+
+    def local_actions_refusal(self, manifest: AppManifest) -> str | None:
+        """Why `manifest` may not be installed on this node, or None (C1).
+
+        An app that runs what a model chooses, in the agent's own account,
+        could reach the install's keys; it installs only where it gets an
+        account of its own. An entry that does not say is treated as one
+        that does.
+        """
+        if self.accounts.available or manifest.localActions is False:
+            return None
+        return (
+            f"{manifest.name} runs actions a model chooses on this machine, so it needs an "
+            f"account of its own, and this install cannot make one. {self.accounts.reason}"
+        )
 
     # --- views ----------------------------------------------------------
 
@@ -1014,12 +1056,22 @@ class AppManager:
             uses=list(record.manifest.uses or []),
             keyId=key.key_id if key else None,
             keyName=key.key_name if key else None,
+            isolation=(
+                AppIsolation.own_account if self.accounts.available else AppIsolation.agent_account
+            ),
+            account=self._account(record.id),
+            localActions=record.manifest.localActions is not False,
             installedAt=record.installed_at,
             pid=pid,
             lastRestart=restarted,
             lastError=error,
             detail=detail,
         )
+
+    def _account(self, app_id: str) -> str:
+        if isinstance(self.supervisor, app_accounts.OwnAccountSupervisor):
+            return self.supervisor.account(app_id)
+        return "the agent's own account"
 
     def views(self) -> list[App]:
         return [self.view(r) for r in self.store.installed()]
@@ -1106,7 +1158,11 @@ class AppManager:
 
     async def uninstall(self, app_id: str, *, purge: bool) -> None:
         await self.installer.cancel(app_id)
-        await self.supervisor.stop(app_id)
+        if isinstance(self.supervisor, app_accounts.OwnAccountSupervisor):
+            # Its service and its account go with it.
+            await self.supervisor.remove(app_id, purge=purge)
+        else:
+            await self.supervisor.stop(app_id)
         self.store.remove(app_id)
         self._gateway.pop(app_id, None)
         self._detail.pop(app_id, None)

@@ -39,6 +39,7 @@ from .._generated.models import (
     AppManifest,
     AppOrigin,
     ClientKeyCreateRequest,
+    ClientKeyLimits,
 )
 from .._http import shared_internal_client
 from .._private_files import write_private
@@ -238,7 +239,9 @@ async def _ensure_key(request: Request, manager: AppManager, app_id: str) -> Non
     node = manager.node_name() or "this-node"
     created = await mint_client_key(
         request,
-        ClientKeyCreateRequest(name=f"app:{app_id}@{node}"),
+        # writeLogs: the launcher that runs an app in its own account sends
+        # what the app prints to POST /v1/logs with this key (C1).
+        ClientKeyCreateRequest(name=f"app:{app_id}@{node}", limits=ClientKeyLimits(writeLogs=True)),
         authorization=request.headers.get("authorization"),
     )
     key_file.parent.mkdir(parents=True, exist_ok=True)
@@ -269,6 +272,9 @@ async def install(request: Request, app_id: str) -> AppInstall:
         raise _problem(422, "Apps cannot be installed here", reason)
     if origin is AppOrigin.custom and not _custom_allowed(request):
         raise _problem(status.HTTP_403_FORBIDDEN, "Custom apps are off", _CUSTOM_OFF)
+    refusal = manager.local_actions_refusal(manifest)
+    if refusal is not None:
+        raise _problem(status.HTTP_409_CONFLICT, "Needs an account of its own", refusal)
     if manager.installer.running(app_id):
         raise _problem(
             status.HTTP_409_CONFLICT,

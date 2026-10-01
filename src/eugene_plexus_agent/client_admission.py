@@ -50,6 +50,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         "maxConcurrentRequests",
         "requestsPerMinute",
         "localOnly",
+        "writeLogs",
     }:
         raise ValueError("invalid client limits")
     allowed = value.get("allowedModels")
@@ -65,6 +66,9 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         raise ValueError("invalid allowed tools")
     if "localOnly" in value and not isinstance(value["localOnly"], bool):
         raise ValueError("localOnly must be a boolean")
+    # C1: may send log records to an agent's ingress (POST /v1/logs).
+    if "writeLogs" in value and not isinstance(value["writeLogs"], bool):
+        raise ValueError("writeLogs must be a boolean")
     if allowed is not None and (
         not isinstance(allowed, list)
         or len(allowed) > 100
@@ -83,6 +87,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         **({"allowedTools": tools} if tools is not None else {}),
         "maxConcurrentRequests": concurrency,
         "requestsPerMinute": rate,
+        **({"writeLogs": True} if value.get("writeLogs") else {}),
     }
 
 

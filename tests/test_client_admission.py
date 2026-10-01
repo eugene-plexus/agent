@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from eugene_plexus_agent import _private_files
-from eugene_plexus_agent.client_admission import AdmissionRefusal
+from eugene_plexus_agent.client_admission import AdmissionRefusal, validate_limits
 from eugene_plexus_agent.client_keys import ClientKeyStore
 from tests.test_client_keys import _record
 
@@ -139,3 +139,26 @@ def test_a_bad_tool_scope_is_a_client_error(authed_client):
     )
     assert made.status_code in (200, 201), made.text
     assert made.json()["key"]["limits"]["allowedTools"] == ["web_search"]
+
+
+def test_write_logs_rides_on_the_admission_answer_and_is_off_by_default(tmp_path):
+    """C1: `writeLogs` is what the log ingress asks the authority about.
+    Absent (every key minted before C1) means a key may not send."""
+    path = tmp_path / "keys.json"
+    store = ClientKeyStore(path)
+    store.add(replace(_record(), limits={"writeLogs": True}))
+    store = ClientKeyStore(path)
+    store.load()
+    result = store.admit(key_id="abc", action="check", request_id="one", model=None)
+    assert result["limits"]["writeLogs"] is True
+    store.set_limits("abc", {"allowedModels": None})
+    result = store.admit(key_id="abc", action="check", request_id="two", model=None)
+    assert "writeLogs" not in result["limits"]
+
+
+def test_write_logs_must_be_a_boolean():
+    # Over HTTP the generated model reads it first, as it does localOnly;
+    # this guards what arrives any other way (a replicated or loaded record).
+    with pytest.raises(ValueError):
+        validate_limits({"writeLogs": 1})
+    assert validate_limits({"writeLogs": False}) == validate_limits({})
