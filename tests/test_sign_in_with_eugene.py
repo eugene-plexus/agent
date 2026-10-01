@@ -9,6 +9,7 @@ install or an uninstall does when the root refuses.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -180,12 +181,17 @@ def test_an_app_that_signs_in_is_registered_once_with_the_callers_credential(
 
 
 def test_the_port_a_callback_names_is_the_port_the_app_gets(tmp_path: Path) -> None:
+    from eugene_plexus_agent._generated.models import AppOrigin
+
     from .test_apps import _manager
 
     manager = _manager(tmp_path)
     reserved = manager.reserve_port("tiny")
     assert manager.reserve_port("tiny") == reserved
     assert manager.allocate_port() != reserved
+    asyncio.run(manager.installed_callback(_manifest(), AppOrigin.catalogue))
+    installed = manager.store.get("tiny")
+    assert installed is not None and installed.port == reserved
 
 
 def test_an_uninstall_whose_client_removal_fails_removes_nothing_else(
