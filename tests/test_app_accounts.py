@@ -521,3 +521,38 @@ def test_each_linux_app_gets_a_user_of_its_own_within_systemds_limit() -> None:
     assert app_accounts.dynamic_user("workbench") in app_accounts.account_name(
         "systemd", "workbench"
     )
+
+
+def test_a_stop_the_service_manager_refuses_raises_and_the_app_is_still_reported(
+    tmp_path: Path,
+) -> None:
+    class Unstoppable(FakeRunner):
+        def stop(self, app_id: str) -> None:
+            raise OSError("nothing answered the request to stop")
+
+    async def scenario() -> None:
+        runner = Unstoppable(tmp_path / "apps")
+        supervisor = _supervisor(runner, tmp_path)
+        supervisor.start(_planner(tmp_path))
+        await supervisor._starting["tiny"]
+        with pytest.raises(OSError, match="nothing answered"):
+            await supervisor.stop("tiny")
+        # Not "exited": the service is still running, so the page says so.
+        assert supervisor.is_running("tiny")
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())
+
+
+def test_removing_asks_the_service_manager_once(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runner = FakeRunner(tmp_path / "apps")
+        supervisor = _supervisor(runner, tmp_path)
+        supervisor.start(_planner(tmp_path))
+        await supervisor._starting["tiny"]
+        await supervisor.remove("tiny", purge=False)
+        assert runner.calls == ["prepare", "start", "remove purge=False"]
+        assert not supervisor.is_running("tiny")
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())

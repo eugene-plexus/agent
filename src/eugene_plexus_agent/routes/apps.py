@@ -357,7 +357,14 @@ async def stop(request: Request, app_id: str) -> App:
     record = _record_or_404(manager, app_id)
     record.enabled = False
     manager.store.put(record)
-    await manager.stop(app_id)
+    try:
+        await manager.stop(app_id)
+    except Exception as exc:
+        raise _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Could not stop it",
+            f"{record.manifest.name} is still running: {exc}",
+        ) from exc
     return manager.view(record)
 
 
@@ -371,7 +378,14 @@ async def restart(request: Request, app_id: str) -> App:
             "App is stopped",
             f"{record.manifest.name} is stopped. Start it instead.",
         )
-    await manager.restart(record)
+    try:
+        await manager.restart(record)
+    except Exception as exc:
+        raise _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Could not restart it",
+            f"{record.manifest.name} did not stop to be restarted: {exc}",
+        ) from exc
     return manager.view(record)
 
 

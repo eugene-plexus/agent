@@ -714,27 +714,35 @@ class OwnAccountSupervisor:
             self._errors[app_id] = f"could not start in an account of its own: {exc}"
             log.error("app %s could not start in its own account: %s", app_id, exc)
 
-    async def stop(self, app_id: str) -> None:
+    async def _settle_start(self, app_id: str) -> None:
         task = self._starting.pop(app_id, None)
         if task is not None and not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        known = self._planners.pop(app_id, None) is not None
+
+    def _forget(self, app_id: str) -> None:
+        self._planners.pop(app_id, None)
         self._reachable.pop(app_id, None)
         self._tokens.pop(app_id, None)
-        if known:
-            try:
-                await asyncio.to_thread(self.runner.stop, app_id)
-            except Exception as exc:
-                log.error("app %s did not stop cleanly: %s", app_id, exc)
+
+    async def stop(self, app_id: str) -> None:
+        """Stop the app's service. Raises when the service manager will
+        not, and keeps reporting the app as it is: a stop that failed is
+        not an app that stopped."""
+        await self._settle_start(app_id)
+        if app_id in self._planners:
+            await asyncio.to_thread(self.runner.stop, app_id)
+        self._forget(app_id)
 
     async def remove(self, app_id: str, *, purge: bool) -> None:
-        """Stop the app and remove its service. Raises when the service
-        stays: an uninstall that reported success while the service lived
-        on is what C1's first Windows run found."""
-        await self.stop(app_id)
+        """Stop the app and remove its service, in one request to the
+        service manager's side. Raises when the service stays: an uninstall
+        that reported success while the service lived on is what C1's first
+        Windows run found."""
+        await self._settle_start(app_id)
         await asyncio.to_thread(self.runner.remove, app_id, purge=purge)
+        self._forget(app_id)
 
     async def stop_all(self) -> None:
         """The agent is stopping. The apps are not."""
