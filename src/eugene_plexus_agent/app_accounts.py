@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import importlib.resources
 import json
 import logging
@@ -82,6 +83,8 @@ UNIT_FILE = Path("/etc/systemd/system/eugene-plexus-app@.service")
 CTL_PATH_UNIT = Path("/etc/systemd/system/eugene-plexus-apps-ctl.path")
 
 _POLL_SECONDS = 1.5
+#: The standard DELETE access right (winnt.h), for DeleteService.
+_DELETE = 0x00010000
 _CTL_TIMEOUT_SECONDS = 60.0
 _STOP_TIMEOUT_SECONDS = 45.0
 
@@ -157,7 +160,14 @@ def detect(mechanism: object | None = None) -> AccountSupport:
 def account_name(kind: str, app_id: str) -> str:
     if kind == "windows_service":
         return f"NT SERVICE\\{SERVICE_PREFIX}{app_id}"
-    return f"the dynamic user of {UNIT_TEMPLATE}{app_id}.service"
+    return f"{dynamic_user(app_id)} (the dynamic user of {UNIT_TEMPLATE}{app_id}.service)"
+
+
+def dynamic_user(app_id: str) -> str:
+    """The user `install.sh`'s helper gives one app's unit: `eapp-` and a
+    hash of the id, because systemd takes names of at most 31 characters
+    and an id may be 40. One per app, never the template's shared name."""
+    return "eapp-" + hashlib.sha256(app_id.encode()).hexdigest()[:12]
 
 
 # --------------------------------------------------------------------------- #
@@ -456,7 +466,9 @@ class WindowsServiceRunner:
         manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
         try:
             try:
-                handle = win32service.OpenService(manager, self._name(app_id), win32service.DELETE)
+                # DELETE is a standard right, not a service one: win32con has it,
+                # win32service does not (C1's first Windows run left the service).
+                handle = win32service.OpenService(manager, self._name(app_id), _DELETE)
             except pywintypes.error:
                 return
             try:
@@ -718,11 +730,11 @@ class OwnAccountSupervisor:
                 log.error("app %s did not stop cleanly: %s", app_id, exc)
 
     async def remove(self, app_id: str, *, purge: bool) -> None:
+        """Stop the app and remove its service. Raises when the service
+        stays: an uninstall that reported success while the service lived
+        on is what C1's first Windows run found."""
         await self.stop(app_id)
-        try:
-            await asyncio.to_thread(self.runner.remove, app_id, purge=purge)
-        except Exception as exc:
-            log.error("app %s's service could not be removed: %s", app_id, exc)
+        await asyncio.to_thread(self.runner.remove, app_id, purge=purge)
 
     async def stop_all(self) -> None:
         """The agent is stopping. The apps are not."""

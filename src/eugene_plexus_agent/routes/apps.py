@@ -218,7 +218,16 @@ async def uninstall(request: Request, app_id: str, purge: bool = False) -> Respo
             f"No app called {app_id!r} is installed on this node.",
         )
     await _revoke_key(request, manager, app_id)
-    await manager.uninstall(app_id, purge=purge)
+    try:
+        await manager.uninstall(app_id, purge=purge)
+    except Exception as exc:
+        log.error("uninstalling app %s failed after its key was revoked: %s", app_id, exc)
+        raise _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Uninstalled only in part",
+            f"Its key is off, so it can no longer reach the hub, but its service could not be "
+            f"removed: {exc}. It is still listed here; Uninstall again to retry.",
+        ) from exc
     log.info("uninstalled app %s%s", app_id, " and its data" if purge else "")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

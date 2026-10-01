@@ -487,3 +487,37 @@ def test_lines_wait_for_an_agent_that_is_down_and_say_what_was_lost(tmp_path: Pa
     assert len(forwarder._lines) == app_launcher.BUFFER_LINES
     batch = forwarder._take()
     assert "lines were dropped" in batch[0]
+
+
+def test_a_service_that_will_not_go_fails_the_uninstall(tmp_path: Path) -> None:
+    """C1's first Windows run: removal failed, was logged, and the uninstall
+    said it had worked while the service lived on."""
+
+    class Stuck(FakeRunner):
+        def remove(self, app_id: str, *, purge: bool) -> None:
+            raise OSError("DeleteService: access denied")
+
+    async def scenario() -> None:
+        supervisor = _supervisor(Stuck(tmp_path / "apps"), tmp_path)
+        supervisor.start(_planner(tmp_path))
+        await supervisor._starting["tiny"]
+        with pytest.raises(OSError, match="access denied"):
+            await supervisor.remove("tiny", purge=False)
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())
+
+
+def test_each_linux_app_gets_a_user_of_its_own_within_systemds_limit() -> None:
+    import hashlib
+
+    names = {app_accounts.dynamic_user(i) for i in ("probe-a", "probe-b", "workbench", "a" * 40)}
+    assert len(names) == 4
+    assert all(len(n) <= 31 and n.startswith("eapp-") for n in names)
+    # The same name install.sh's helper computes: sha256 of the id, hex.
+    assert app_accounts.dynamic_user("workbench") == (
+        "eapp-" + hashlib.sha256(b"workbench").hexdigest()[:12]
+    )
+    assert app_accounts.dynamic_user("workbench") in app_accounts.account_name(
+        "systemd", "workbench"
+    )
