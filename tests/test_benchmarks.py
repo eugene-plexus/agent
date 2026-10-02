@@ -92,3 +92,20 @@ def test_result_is_decode_at_requested_depth_with_real_samples():
     ]:
         with pytest.raises(ValueError):
             parse_point({**raw, field: bad}, [0, 1984, 3968], 128, 3)
+
+
+def test_a_benchmark_follows_the_three_flash_attention_states():
+    """agent#6: the benchmark runs what the launch would run."""
+
+    def flash(**flags):
+        help_text = HELP + " --cache-type-k --cache-type-v"
+        args, _ = benchmark_args(request(**flags), Path("bench"), "/models/a.gguf", help_text)
+        return args[args.index("--flash-attn") + 1] if "--flash-attn" in args else None
+
+    assert flash(flashAttention="on") == "on"
+    assert flash(flashAttention="off") == "off"
+    assert flash() is None
+    assert flash(flashAttention=True) == "on" and flash(flashAttention=False) is None
+    assert flash(flashAttention="off", cacheType="q8_0") == "on"
+    with pytest.raises(ValueError, match="on, off, or not set"):
+        flash(flashAttention="sometimes")

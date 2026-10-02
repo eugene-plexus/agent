@@ -25,6 +25,9 @@ from ._generated.models import (
     MeasurementRestartState,
 )
 from .child_env import child_environment
+from .engines.llama_cpp import (
+    flash_attention_argv,
+)
 
 # Called once when a job ends, however it ends: starts again what the job
 # stopped (measurement_node.restart_stopped) and returns what became of each.
@@ -88,9 +91,11 @@ def benchmark_args(
         )
     if type(flags.get("parallelSlots", 1)) is not int or flags.get("parallelSlots", 1) != 1:
         raise ValueError("llama-bench measures one sequence. Use a profile with one parallel slot.")
-    for key in ("flashAttention", "continuousBatching", "noMmap", "mlock"):
+    for key in ("continuousBatching", "noMmap", "mlock"):
         if key in flags and type(flags[key]) is not bool:
             raise ValueError(f"{key} must be a boolean.")
+    if flags.get("flashAttention") not in (None, True, False, "on", "off"):
+        raise ValueError("flashAttention must be on, off, or not set.")
     tokens = body.tokens or 128
     if tokens >= context:
         raise ValueError("Generated tokens must be fewer than the profile's context size.")
@@ -149,8 +154,9 @@ def benchmark_args(
     # The runtime adapter emits presence-only booleans: false leaves the
     # engine default alone. Do the same here instead of forcing a different mode.
     # A quantised cache needs flash attention, as the adapter also ensures.
-    if flags.get("flashAttention") or cache in ("q8_0", "q4_0"):
-        argv += ["--flash-attn", "on"]
+    flash = flash_attention_argv(flags)
+    if flash:
+        argv += flash
         required.add("--flash-attn")
     if flags.get("noMmap") or flags.get("mlock"):
         mode = (

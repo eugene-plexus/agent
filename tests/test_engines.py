@@ -151,6 +151,45 @@ def test_flash_attention_takes_a_value(adapter: LlamaCppAdapter, binary: Discove
     assert "false" not in off
 
 
+def _flash(argv: list[str]) -> str | None:
+    return argv[argv.index("--flash-attn") + 1] if "--flash-attn" in argv else None
+
+
+def test_flash_attention_is_on_off_or_the_engines_own_choice(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary
+) -> None:
+    """agent#6: three states, and an unticked box never meant off."""
+
+    def argv(**flags: object) -> list[str]:
+        return adapter.build_argv(_spec(flags=flags), binary, port=8090)
+
+    assert _flash(argv(flashAttention="on")) == "on"
+    assert _flash(argv(flashAttention="off")) == "off"
+    assert _flash(argv()) is None, "unset: llama.cpp decides (auto)"
+    # Profiles saved before three states: True sent on, False sent nothing.
+    assert _flash(argv(flashAttention=True)) == "on"
+    assert _flash(argv(flashAttention=False)) is None, "an old False is not off"
+
+
+def test_a_quantised_cache_turns_flash_attention_on_and_says_so(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary, caplog: pytest.LogCaptureFixture
+) -> None:
+    for choice in (None, "on", "off", False):
+        flags: dict[str, object] = {"cacheType": "q4_0"}
+        if choice is not None:
+            flags["flashAttention"] = choice
+        built = adapter.build_argv(_spec(flags=flags), binary, port=8090)
+        assert _flash(built) == "on" and built.count("--flash-attn") == 1, choice
+    assert "needs it" in caplog.text, "an overridden off is said, not silently ignored"
+
+
+def test_the_flash_attention_setting_says_what_unset_means(adapter: LlamaCppAdapter) -> None:
+    field = next(f for f in adapter.flag_schema().fields if f.key == "flashAttention")
+    assert field.enumValues == ["on", "off"]
+    assert field.default is None
+    assert "auto" in (field.unsetMeans or "")
+
+
 def test_boolean_switches_are_presence_only(
     adapter: LlamaCppAdapter, binary: DiscoveredBinary
 ) -> None:

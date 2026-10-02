@@ -669,3 +669,18 @@ def test_a_running_build_holds_launches(authed_client, app):
         assert response.status_code == 409 and "settings build" in response.text
     finally:
         del app.state.profile_builds
+
+
+def test_a_builds_trials_follow_the_profiles_flash_attention():
+    """agent#6: an f16 trial follows the profile; a quantised one needs it on."""
+    from eugene_plexus_agent.profile_builds import CacheType, cache_args
+
+    def flash(cache, choice):
+        args = cache_args(cache, choice)
+        return args[args.index("--flash-attn") + 1] if "--flash-attn" in args else None
+
+    assert flash(CacheType.f16, None) is None
+    assert flash(CacheType.f16, "off") == "off"
+    assert flash(CacheType.f16, "on") == "on"
+    assert flash(CacheType.q8_0, "off") == "on"
+    assert flash(CacheType.q4_0, None) == "on"

@@ -394,12 +394,13 @@ class LlamaCppAdapter(EngineAdapter):
                 # below, because the two collapse into one CLI value.
                 continue
             if field.key == CACHE_TYPE_KEY:
-                cache = flags.get(CACHE_TYPE_KEY)
-                argv += cache_type_argv(cache)
-                if cache not in (None, "f16") and not flags.get("flashAttention"):
-                    # A quantised V cache needs flash attention; `auto` may
-                    # leave it off on some backends, which fails at load.
-                    argv += ["--flash-attn", "on"]
+                argv += cache_type_argv(flags.get(CACHE_TYPE_KEY))
+                # A quantised V cache needs flash attention; `auto` may leave
+                # it off on some backends, which fails at load. One rule for
+                # the cache and the setting: flash_attention_argv (agent#6).
+                argv += flash_attention_argv(flags)
+                continue
+            if field.key == FLASH_ATTENTION_KEY:
                 continue
             if field.key not in flags:
                 continue
@@ -407,16 +408,7 @@ class LlamaCppAdapter(EngineAdapter):
             if value is None:
                 continue
             cli = _FLAG_CLI_NAMES[field.key]
-            if field.key == "flashAttention":
-                # Not a switch: `-fa` takes on|off|auto, and a bare one
-                # swallowed the next flag as its value -- "unknown value
-                # for --flash-attn: '--cache-type-k'", the crash the first
-                # profile a person built hit at launch (2026-10-01). The
-                # builder's own trials always said `on`. False leaves the
-                # engine's own default (auto) alone, as it always did.
-                if value:
-                    argv += [cli, "on"]
-            elif field.valueType == ConfigValueType.boolean:
+            if field.valueType == ConfigValueType.boolean:
                 # Presence-only switches (`--cont-batching`,
                 # `--no-mmproj-offload`): a false one is absent.
                 if value:
@@ -703,6 +695,41 @@ def cache_type_argv(value: object) -> list[str]:
     return ["--cache-type-k", str(value), "--cache-type-v", str(value)]
 
 
+FLASH_ATTENTION_KEY = "flashAttention"
+
+
+def flash_attention_choice(flags: dict[str, object]) -> str | None:
+    """`on`, `off`, or None for "the engine decides" (agent#6).
+
+    A profile saved before the setting had three states holds a boolean.
+    True always sent `on`, so it is `on`. False always sent nothing, which
+    left llama.cpp's own `auto` (on wherever supported), so it is None --
+    never `off`: reading an old False as off would turn flash attention off
+    in every existing profile.
+    """
+    value = flags.get(FLASH_ATTENTION_KEY)
+    if value is True or value == "on":
+        return "on"
+    if value == "off":
+        return "off"
+    return None
+
+
+def flash_attention_argv(flags: dict[str, object]) -> list[str]:
+    """What `--flash-attn` says, if anything. A quantised V cache needs it
+    on, whatever the profile says, so `off` there is overridden and logged."""
+    choice = flash_attention_choice(flags)
+    quantised = flags.get(CACHE_TYPE_KEY) not in (None, "f16")
+    if quantised:
+        if choice == "off":
+            log.warning(
+                "flash attention is set off, but an 8- or 4-bit memory precision needs it, "
+                "so it is turned on for this start"
+            )
+        return ["--flash-attn", "on"]
+    return ["--flash-attn", choice] if choice else []
+
+
 _FLAG_FIELDS: list[ConfigField] = [
     ConfigField(
         key="projectorPath",
@@ -816,13 +843,17 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="flashAttention",
         label="Flash attention",
         description=(
-            "Enable the fused attention kernel. Usually faster and lighter "
-            "on memory where the build and hardware support it; harmless to "
-            "leave off if you are unsure."
+            "The fused attention kernel: usually faster and lighter on memory "
+            "where the build and card support it. Left unset, llama.cpp "
+            "decides for itself (auto), which turns it on wherever it can. An "
+            "8-bit or 4-bit memory precision needs it, so it is on with those "
+            "whatever this says."
         ),
         category="performance",
-        valueType=ConfigValueType.boolean,
-        default=False,
+        valueType=ConfigValueType.enum,
+        enumValues=["on", "off"],
+        enumLabels=["On", "Off"],
+        unsetMeans="Not set: llama.cpp decides (auto), which turns it on wherever it can.",
         requiresRestart=True,
     ),
     ConfigField(

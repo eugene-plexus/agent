@@ -57,6 +57,12 @@ from ._generated.models import (
     ProfileBuildRequest,
 )
 from ._http import shared_internal_client
+from .engines.llama_cpp import (
+    CACHE_TYPE_KEY,
+    FLASH_ATTENTION_KEY,
+    flash_attention_argv,
+    flash_attention_choice,
+)
 
 log = logging.getLogger(__name__)
 
@@ -344,11 +350,13 @@ def passthrough_args(flags: dict[str, Any], *, bench: bool) -> list[str]:
     return out
 
 
-def cache_args(cache: CacheType, flash_attention: bool) -> list[str]:
+def cache_args(cache: CacheType, flash_attention: str | None) -> list[str]:
     args = ["--cache-type-k", cache.value, "--cache-type-v", cache.value]
-    if cache is not CacheType.f16 or flash_attention:
-        args += ["--flash-attn", "on"]
-    return args
+    # The launch's own rule (agent#6): a quantised cache needs it on, and an
+    # f16 trial follows the profile, so the build measures what will run.
+    return args + flash_attention_argv(
+        {CACHE_TYPE_KEY: cache.value, FLASH_ATTENTION_KEY: flash_attention}
+    )
 
 
 def validate_request(body: ProfileBuildRequest) -> dict[str, Any]:
@@ -630,7 +638,7 @@ class ProfileBuilds:
         job.detail = "Measuring the full-precision baseline on the evaluation text…"
         self._save()
         code, out, err = await self._child(
-            [*common, *cache_args(CacheType.f16, True), "--kl-divergence-base", str(base)], plan
+            [*common, *cache_args(CacheType.f16, "on"), "--kl-divergence-base", str(base)], plan
         )
         if short := too_short(out + err):
             need, have = short
@@ -649,7 +657,7 @@ class ProfileBuilds:
             code, out, err = await self._child(
                 [
                     *common,
-                    *cache_args(cache, True),
+                    *cache_args(cache, "on"),
                     "--kl-divergence-base",
                     str(base),
                     "--kl-divergence",
@@ -685,7 +693,7 @@ class ProfileBuilds:
                     str(plan.model),
                     "--ctx-size",
                     str(context),
-                    *cache_args(cache, bool(plan.flags.get("flashAttention"))),
+                    *cache_args(cache, flash_attention_choice(plan.flags)),
                     *(["--fit-target", str(plan.margin)] if plan.margin is not None else []),
                     *passthrough_args(plan.flags, bench=False),
                 ]
@@ -749,7 +757,7 @@ class ProfileBuilds:
                 str(REPETITIONS),
                 "--output",
                 "jsonl",
-                *cache_args(candidate.cacheType, bool(plan.flags.get("flashAttention"))),
+                *cache_args(candidate.cacheType, flash_attention_choice(plan.flags)),
                 *bench_placement(candidate.placement),
                 *passthrough_args(plan.flags, bench=True),
             ]
@@ -851,7 +859,7 @@ class ProfileBuilds:
             str(candidate.contextSize),
             "--parallel",
             "1",
-            *cache_args(candidate.cacheType, bool(plan.flags.get("flashAttention"))),
+            *cache_args(candidate.cacheType, flash_attention_choice(plan.flags)),
             *(["--fit-target", str(plan.margin)] if plan.margin is not None else []),
             *passthrough_args(plan.flags, bench=False),
         ]
