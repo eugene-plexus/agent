@@ -494,6 +494,12 @@ class LlamaCppAdapter(EngineAdapter):
             vision=modalities.get("vision") is True if isinstance(modalities, dict) else None,
         )
 
+    def companion_overrides(self, spec: RuntimeSpec) -> dict[str, object]:
+        """CB4: the driver pins slots exactly when the engine was started
+        for it (`--no-cache-idle-slots`), from one profile flag."""
+        flags = spec.flags or {}
+        return {"slotPinning": True} if flags.get(SLOT_PINNING_KEY) is True else {}
+
     def context_pool(
         self,
         capabilities: RuntimeCapabilities,
@@ -715,6 +721,9 @@ _CATEGORIES = {
     "sampling": "Serving",
 }
 
+#: CB4: keep each conversation in one engine slot (the driver pins it).
+SLOT_PINNING_KEY = "slotPinning"
+
 # Curated flags -> llama-server CLI names. Kept as a separate mapping from
 # the schema so the UI-facing key never has to look like a CLI flag, and
 # so an upstream rename touches one line.
@@ -733,6 +742,9 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     "tensorSplit": "--tensor-split",
     "flashAttention": "--flash-attn",
     "continuousBatching": "--cont-batching",
+    # CB4: the engine half of slot pinning; the companion's `slotPinning`
+    # is the other half, set from the same flag (`companion_overrides`).
+    SLOT_PINNING_KEY: "--no-cache-idle-slots",
     "memoryMargin": "--fit-target",
 }
 
@@ -959,6 +971,26 @@ _FLAG_FIELDS: list[ConfigField] = [
         category="performance",
         valueType=ConfigValueType.boolean,
         default=True,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=SLOT_PINNING_KEY,
+        label="Keep each conversation in one slot",
+        description=(
+            "Give each conversation its own slot and keep it there, instead "
+            "of llama.cpp's choice, which puts every conversation that starts "
+            "alike (two agent sessions in one project) in one slot so each "
+            "reads its history again. Only worth it when the context each "
+            "slot gets holds a whole conversation: measured, about 3 points "
+            "more of each prompt reused there, and up to 10 fewer where it "
+            "does not, because the slots keep their histories between turns. "
+            "Turns on the engine's --no-cache-idle-slots and the driver's "
+            "pinning together; a turn whose slot is busy waits for it, "
+            "because naming a busy slot can stall llama-server."
+        ),
+        category="performance",
+        valueType=ConfigValueType.boolean,
+        default=False,
         requiresRestart=True,
     ),
     ConfigField(

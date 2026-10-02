@@ -87,6 +87,9 @@ MANAGED_KEYS = (
     "modelId",
     "upstreamModelId",
     "decisionMaxConcurrent",
+    # CB4: set from the runtime's `slotPinning` flag, with the engine's
+    # `--no-cache-idle-slots`; never one without the other.
+    "slotPinning",
 )
 
 #: Handed to every companion at spawn, naming `MANAGED_KEYS`, so the driver
@@ -101,7 +104,7 @@ def _companion_env() -> dict[str, str]:
     return {MANAGED_KEYS_ENV: ",".join(MANAGED_KEYS)}
 
 
-"""The five fields the agent owns in a companion's config file.
+"""The six fields the agent owns in a companion's config file.
 
 **Everything else in that document belongs to the operator** (R2.5).
 The driver's own `PATCH /v1/config` writes into the same file -- that is
@@ -134,6 +137,7 @@ def render_config(
         # None unless the engine's overrides say otherwise, rendered
         # anyway for the same clearing rule as upstreamModelId.
         "decisionMaxConcurrent": None,
+        "slotPinning": None,
     }
     for key, value in (overrides or {}).items():
         if key not in MANAGED_KEYS:

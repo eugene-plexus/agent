@@ -12,10 +12,14 @@ on b11211 with a 1B at `-c 16384` (2026-10-02):
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from eugene_plexus_agent._generated.models import RuntimeCapabilities
+from eugene_plexus_agent._generated.models import Origin, RuntimeCapabilities, RuntimeSpec
+from eugene_plexus_agent.companions import render_config
 from eugene_plexus_agent.engines import LlamaCppAdapter
+from eugene_plexus_agent.engines.base import DiscoveredBinary
 
 BASE = ["llama-server", "-m", "model.gguf", "-c", "16384", "--port", "8081"]
 
@@ -44,3 +48,38 @@ def test_the_argv_says_whether_the_slots_share(extra, env, n_ctx, expected):
 
 def test_no_context_reported_is_no_pool():
     assert LlamaCppAdapter().context_pool(RuntimeCapabilities(), BASE, None) is None
+
+
+# --- CB4: slot pinning, the engine and the driver together -----------------------
+
+
+def _spec(flags: dict) -> RuntimeSpec:
+    return RuntimeSpec(name="r", engine="llama_cpp", modelPath="/m/model.gguf", flags=flags)
+
+
+def _argv(flags: dict) -> list[str]:
+    binary = DiscoveredBinary(path=Path("llama-server"), origin=Origin.path, version="b11211")
+    return LlamaCppAdapter().build_argv(_spec(flags), binary, 8081)
+
+
+def test_pinning_off_by_default_changes_nothing():
+    field = next(f for f in LlamaCppAdapter().flag_schema().fields if f.key == "slotPinning")
+    assert field.default is False
+    assert "--no-cache-idle-slots" not in _argv({})
+    assert LlamaCppAdapter().companion_overrides(_spec({})) == {}
+    assert render_config(runtime_name="r", alias="m")["slotPinning"] is None
+
+
+def test_pinning_on_starts_the_engine_and_the_driver_together():
+    """Pinned without `--no-cache-idle-slots`, each new task clears the
+    idle slots the driver points at (upstream #28139); the engine flag
+    without the driver's map pins nothing. One flag, both halves."""
+    assert "--no-cache-idle-slots" in _argv({"slotPinning": True})
+    overrides = LlamaCppAdapter().companion_overrides(_spec({"slotPinning": True}))
+    assert overrides == {"slotPinning": True}
+    assert render_config(runtime_name="r", alias="m", overrides=overrides)["slotPinning"] is True
+
+
+def test_pinning_off_explicitly_is_off_on_both():
+    assert "--no-cache-idle-slots" not in _argv({"slotPinning": False})
+    assert LlamaCppAdapter().companion_overrides(_spec({"slotPinning": False})) == {}
