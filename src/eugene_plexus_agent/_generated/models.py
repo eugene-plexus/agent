@@ -14,6 +14,7 @@ from pydantic import (
     Field,
     RootModel,
     SecretStr,
+    constr,
 )
 
 
@@ -2790,6 +2791,10 @@ class FolderReachSource(StrEnum):
     override = 'override'
 
 
+class Arg(RootModel[str]):
+    root: str = Field(..., max_length=512)
+
+
 class AppHubSurface(StrEnum):
     """
     A public hub surface an app's client key may be used on.
@@ -3689,9 +3694,11 @@ class AppManifest(BaseModel):
 
     **What an app owes the agent** is small: bind the port in
     `EUGENE_PLEXUS_APP_BIND_PORT` (on `EUGENE_PLEXUS_APP_BIND_HOST`
-    when set, loopback otherwise) and answer `GET /healthz` with a
-    2xx once it is serving — an app that never does reads `starting`
-    for as long as it runs. It finds its key in the file named by
+    when set, loopback otherwise) and answer `GET /healthz` (or its
+    `healthPath`) with a 2xx once it is serving — an app that never
+    does reads `starting` for as long as it runs. An app that reads
+    names of its own is told the same things through `environment`
+    and `args`. It finds its key in the file named by
     `EUGENE_PLEXUS_APP_KEY_FILE`, the gateway at
     `EUGENE_PLEXUS_APP_GATEWAY_URL` (absent when none could be
     found), keeps its state under `EUGENE_PLEXUS_APP_DATA_DIR`, and —
@@ -3722,7 +3729,7 @@ class AppManifest(BaseModel):
     )
     source: str = Field(
         ...,
-        description="What `uv pip install` is given, as `<package> @ <source>`: an\n`https://` archive URL — for a GitHub repo,\n`https://github.com/<owner>/<repo>/archive/<commit>.tar.gz` —\nor, for a custom entry, a directory on this node holding the\npackage (a developer's own checkout). The shipped catalogue\nuses archive URLs at pinned commits, the way the installers\npin the hub's own packages.\n",
+        description="What `uv pip install` is given, as `<package> @ <source>`: an\n`https://` archive URL — for a GitHub repo,\n`https://github.com/<owner>/<repo>/archive/<commit>.tar.gz` —\nor, for a custom entry, a directory on this node holding the\npackage (a developer's own checkout). The shipped catalogue\nuses archive URLs at pinned commits, the way the installers\npin the hub's own packages.\n\n**`pypi`** installs `<package>==<version>` from the Python\nPackage Index instead, for an app published there by its own\nproject (C4, Open WebUI). `version` must then be an exact\nrelease; what it depends on is resolved as the installers\nresolve the hub's own dependencies.\n",
         min_length=1,
     )
     version: str = Field(
@@ -3739,8 +3746,8 @@ class AppManifest(BaseModel):
     )
     entry: str = Field(
         ...,
-        description="The module run as `python -m <entry>` with the app's own\ninterpreter. The install imports it once before it counts as\ninstalled, so a package that installs and cannot start is a\nfailed install rather than a crash loop later.\n",
-        pattern='^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$',
+        description="The module run as `python -m <entry>` with the app's own\ninterpreter. The install imports it once before it counts as\ninstalled, so a package that installs and cannot start is a\nfailed install rather than a crash loop later.\n\n**`module:attribute`** names a console-script function instead,\ncalled the way its own script calls it, with `args` as its\narguments: an app that starts as `open-webui serve` and has no\n`python -m` form (C4). The install checks the attribute exists.\n",
+        pattern='^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*(:[A-Za-z_][A-Za-z0-9_]*)?$',
     )
     python: str | None = Field(
         '3.12',
@@ -3766,6 +3773,31 @@ class AppManifest(BaseModel):
         '/oidc/callback',
         description="Where on the app's own origin Eugene sends a person back after signing in.",
         pattern='^/[A-Za-z0-9._~/-]*$',
+    )
+    args: list[Arg] | None = Field(
+        None,
+        description='Arguments after the entry, with the placeholders `environment`\ndescribes. Empty for an app that reads `EUGENE_PLEXUS_APP_*`.\n',
+        max_length=32,
+    )
+    environment: dict[constr(pattern=r'^[A-Za-z_][A-Za-z0-9_]{0,127}$'), str] | None = (
+        Field(
+            None,
+            description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
+        )
+    )
+    healthPath: str | None = Field(
+        '/healthz',
+        description='Where the app answers 2xx once it is serving.',
+        pattern='^/[A-Za-z0-9._~/-]*$',
+    )
+    resetOnConnectionChange: str | None = Field(
+        None,
+        description="A variable set to `true` for one start, when the gateway's\naddress or the app's key differs from the last start's. For an\napp that copies its settings into its own database at its first\nstart and ignores the environment afterwards (Open WebUI's\n`RESET_CONFIG_ON_START`), so a rotated key is not silently\nignored. That start also clears what its admin set in it, and\nthe agent's log says why.\n",
+        pattern='^[A-Za-z_][A-Za-z0-9_]{0,127}$',
+    )
+    licenseUrl: AnyUrl | None = Field(
+        None,
+        description="Where the app's own licence is read, for an app under a licence\nof its own. Shown on the catalogue card beside the homepage.\nDisplay only.\n",
     )
     localActions: bool | None = Field(
         True,
