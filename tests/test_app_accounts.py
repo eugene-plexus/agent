@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import sys
 import threading
 import time
@@ -277,10 +278,22 @@ class FakeRunner:
         return self.apps_root / app_id / "admin_token"
 
 
+def _free_port() -> int:
+    """A port nothing answers on. Not 8190: that is the first app port, so
+    on a machine running a real app (Workbench, on the developer's own box
+    since 2026-10-01) the poll below found a healthy app there."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def _planner(tmp_path: Path) -> apps._AppPlanner:
     store = apps.AppStore(tmp_path / apps.APPS_FILE)
     record = apps.InstalledApp(
-        manifest=_manifest(), origin=AppOrigin.custom, port=8190, installed_at=datetime.now(UTC)
+        manifest=_manifest(),
+        origin=AppOrigin.custom,
+        port=_free_port(),
+        installed_at=datetime.now(UTC),
     )
     python = apps.venv_python(store.version_dir(record.id, record.version) / "venv")
     python.parent.mkdir(parents=True, exist_ok=True)

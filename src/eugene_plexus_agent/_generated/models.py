@@ -2348,83 +2348,27 @@ class FrameworkAccelerator(StrEnum):
     unknown = 'unknown'
 
 
-class RuntimeSpec(BaseModel):
+class RuntimeProfile(BaseModel):
     """
-    Declarative half of a Runtime — what the operator asked for.
-    Used for create and update bodies; observed fields are
-    server-owned and excluded.
+    The library profile this runtime was launched from, as the
+    console that declared it named it (2026-10-01). Recorded and
+    reported, never read: the flags are what the engine runs with,
+    and a profile edited or deleted later changes nothing here.
 
-    Note what is *not* here: a command line. The operator declares
-    intent (this engine, this model, these flags) and the adapter
-    builds the argv. Letting a topology entry carry raw argv would
-    make every engine "supported" while making none of them
-    knowable — no readiness probe, no flag validation, no version
-    story. The resolved argv is reported back on `Runtime.argv` for
-    debugging, which is the half of raw-argv access that is
-    genuinely useful.
+    Exists because two runtimes of one model on one machine, one
+    from each profile, were indistinguishable on the Inference
+    screen. A runtime's name is derived from the model and the
+    profile and cut to 60 characters, so a long profile name does
+    not survive in it -- "Built for Amish_Station" came out as
+    `…-built-for-amish-statio`.
 
     """
 
+    id: str = Field(
+        ..., description="The profile's id in the library, unique within its model."
+    )
     name: str = Field(
-        ...,
-        description='Operator-supplied label, unique per node. Referenced by\nan inference-driver on that node to say which runtime it\nfronts. Different nodes may use the same label; install-wide\nruntime identity is the pair (node, name).\n',
-        min_length=1,
-    )
-    engine: EngineKind
-    modelPath: str = Field(
-        ...,
-        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
-    )
-    modelAlias: str | None = Field(
-        None,
-        description="The model id this runtime serves under, and therefore what a\nclient asks the gateway for. Defaults to the model\nfilename with its extension stripped — plainly-named files\nmean the obvious name is already the right one, so this is\nan override, not a requirement.\n\n**The resolved value is always passed to the engine\nexplicitly, never left to the engine's own default.** vLLM's\ndefault served name is the `--model` argument verbatim, and\nwe launch models by absolute path because the user's files\nstay theirs — so leaving it unset would publish\n`/home/you/models/Qwen3-8B` as an OpenAI model id. That\nleaks the operator's directory layout to every API client\nand, worse, makes the routing key differ per host for the\nsame model, which breaks both multi-host placement and any\nfailover priority list that names a model. llama.cpp derives\nits default from the filename and would have been fine,\nwhich is exactly why this was invisible until a second\nengine existed.\n",
-    )
-    host: str | None = Field(
-        '127.0.0.1',
-        description="Address the engine binds. Defaults to loopback: an engine\nhas no auth of its own, so it must not be exposed directly.\nReaching a model from another machine is the gateway's job,\nand the gateway has auth.\n",
-    )
-    port: int | None = Field(
-        None,
-        description='Port the engine binds. Assigned from an ephemeral range when\nomitted — with N runtimes the operator should not have to\nhand out port numbers.\n',
-        ge=1,
-        le=65535,
-    )
-    autoStart: bool | None = Field(
-        True,
-        description='Whether the agent spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM.\n',
-    )
-    autoDriver: bool | None = Field(
-        True,
-        description='Whether the agent declares and supervises a companion\n`inference-driver` that follows this runtime by name, so\nthe model is routable the moment the engine is ready. The\ncompanion is `<name>-driver`; `Runtime.driver` reports it.\nSet false to front the runtime by hand — one hand-tuned\ndriver pointed at an engine is still a supported shape, it\nis just no longer the only one. Decided 2026-09-10 over a\ndeclared pool: one driver per backend is the rule the\ncontract has stated since M0, a runtime is a backend, and a\npool would need allocation state and give drivers names\nthat mean a different model every hour.\n',
-    )
-    idleUnloadSeconds: int | None = Field(
-        None,
-        description="Stop the engine after this many seconds with no request for\nits model through the gateway, releasing its GPU memory.\nAbsent or 0 means never, which is every existing\ndeclaration's behaviour unchanged.\n\n**The gateway decides; this agent executes.** Only the\ngateway sees demand, so it tracks the last request per\nruntime and calls `POST .../stop` with `reason: idle` when\nthis expires. A runtime with a request in flight is never\nstopped. Setting this also **opts the runtime into\neviction**: when a `startOnDemand` model will not fit, the\ngateway may stop the most-idle runtimes that carry a timeout\nto make room. A model that must stay resident sets none.\n",
-        ge=0,
-    )
-    startOnDemand: bool | None = Field(
-        False,
-        description="Start this runtime when a request arrives for its model and\nit is `stopped`. The gateway calls `POST .../start`, waits\nfor `ready` (bounded by its `swapWaitSeconds`), and serves\nthe request; the response says it did (`swapped_in`). With\n`autoStart: false` and `idleUnloadSeconds` set, this is\nllama-swap's model: declare five, load none, serve whichever\nis asked for, unload it when it goes quiet — several at\nonce when they fit.\n\nFalse by default so that a hand-pressed Stop stays stopped.\n",
-    )
-    flags: dict[str, Any] | None = Field(
-        None,
-        description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n',
-    )
-    extraArgs: list[str] | None = Field(
-        None,
-        description='Verbatim extra arguments, appended after everything the\nadapter generated. The escape hatch for the long tail of\nflags a curated surface will always miss.\n\nUnvalidated by definition, so the UI must present it as the\nadvanced option it is: a bad value here surfaces as an\nengine that refuses to start, and the resolved `argv` plus\nthe captured engine output are how it gets diagnosed.\n',
-    )
-    env: dict[str, str] | None = Field(
-        None,
-        description='Extra environment variables for the engine process. Needed\nmore often than for a component — accelerator selection\n(`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`) is how a\nruntime is pinned to one GPU, which is what makes two\nreplicas on two cards possible.\n',
-    )
-    workingDirectory: str | None = Field(
-        None,
-        description="Working directory for the engine process. Defaults to the\nbinary's own directory, which is what prebuilt llama.cpp\nreleases need to find their bundled shared libraries.\n",
-    )
-    binary: str | None = Field(
-        None,
-        description='Override the binary for this one runtime, ignoring whatever\nthe adapter discovered. For running one model on a custom\nbuild without disturbing the rest of the install.\n',
+        ..., description="The profile's name when the runtime was declared."
     )
 
 
@@ -3049,122 +2993,6 @@ class App(BaseModel):
     )
 
 
-class BenchmarkRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    modelId: str = Field(..., max_length=256, min_length=1)
-    profileId: str = Field(..., max_length=256, min_length=1)
-    profileName: str = Field(..., max_length=256, min_length=1)
-    runtime: RuntimeSpec
-    repetitions: int | None = Field(3, ge=1, le=5)
-    tokens: int | None = Field(128, ge=16, le=256)
-    stopRuntimes: list[str] | None = Field(
-        [],
-        description='The runtimes the operator agreed to stop for this job, as the\npreflight listed them. The job stops exactly these. A runtime\nrunning on the node that is NOT in this list refuses the job\nwith 409, so a model started between the question and the\nclick is never stopped without being asked about. Names in\nthe list that are already stopped are ignored.\n',
-    )
-    restartAfter: bool | None = Field(
-        True,
-        description="Start the runtimes this job stopped again when it ends —\ncompleted, failed, cancelled or timed out. Each restart goes\nthrough admission like an operator's Start and is reported on\nthe job's `restarts`; a refused or failed one is reported by\nname, never forced.\n",
-    )
-
-
-class Benchmark(BaseModel):
-    id: str
-    request: BenchmarkRequest
-    node: str
-    state: BenchmarkState
-    startedAt: AwareDatetime
-    finishedAt: AwareDatetime | None = None
-    progress: float = Field(..., ge=0.0, le=1.0)
-    detail: str
-    depths: list[Depth]
-    points: list[BenchmarkPoint]
-    binary: str | None = None
-    engineVersion: str | None = None
-    localPath: str | None = None
-    modelSizeBytes: int | None = Field(None, ge=0)
-    modelModifiedAt: AwareDatetime | None = None
-    command: list[str] | None = None
-    hardware: dict[str, str] | None = Field(
-        None,
-        description='CPU/GPU/backend identity reported by the benchmark executable.',
-    )
-    restarts: list[MeasurementRestart] | None = Field(
-        None,
-        description='The runtimes this job stopped, and what became of each afterwards.',
-    )
-
-
-class BenchmarkList(BaseModel):
-    benchmarks: list[Benchmark]
-
-
-class ProfileBuildRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    modelId: str = Field(..., max_length=256, min_length=1)
-    profileId: str | None = Field(
-        None,
-        description='The profile the build started from, if any. The build never writes a profile; the UI saves its result.',
-        max_length=256,
-    )
-    runtime: RuntimeSpec
-    accuracy: ProfileBuildAccuracy
-    memoryMarginMiB: int | None = Field(
-        None,
-        description="Graphics memory to leave free on every device, passed to fit\nas `--fit-target`. Null is llama.cpp's own default (1024 MiB).\n",
-        ge=0,
-        le=65536,
-    )
-    evaluationText: str | None = Field(
-        None,
-        description="The operator's own text for the quality measurement. Null\nuses the text bundled with the agent. It must yield at least\n8,192 tokens for this model (two 4,096-token chunks); a\nshorter text is refused with its token count. Not stored: the\nbuild keeps its SHA-256, and its token count when\nllama-perplexity reports one (it does when it refuses a text).\n",
-        max_length=2097152,
-    )
-    stopRuntimes: list[str] | None = Field(
-        [], description='Same rule as `BenchmarkRequest.stopRuntimes`.'
-    )
-    restartAfter: bool | None = Field(
-        True, description='Same rule as `BenchmarkRequest.restartAfter`.'
-    )
-
-
-class ProfileBuild(BaseModel):
-    id: str
-    node: str
-    modelId: str
-    profileId: str | None = None
-    runtime: RuntimeSpec
-    accuracy: ProfileBuildAccuracy
-    memoryMarginMiB: int | None = None
-    evaluation: ProfileBuildEvaluation
-    state: BenchmarkState
-    phase: ProfileBuildPhase
-    startedAt: AwareDatetime
-    finishedAt: AwareDatetime | None = None
-    progress: float = Field(..., ge=0.0, le=1.0)
-    detail: str
-    quality: list[CacheQuality]
-    allowedCacheTypes: list[CacheType] | None = None
-    candidates: list[BuildCandidate]
-    recommended: int | None = Field(
-        None,
-        description='Index into `candidates` of the default choice: the longest\ncontext on the frontier whose decode speed at the common depth\nis at least 80% of the fastest measured. Speeds within 3% of\neach other count as equal, so where every context places alike\nthe longest wins. Null when nothing was measured.\n',
-        ge=0,
-    )
-    engineVersion: str | None = None
-    localPath: str | None = None
-    modelSizeBytes: int | None = Field(None, ge=0)
-    hardware: dict[str, str] | None = None
-    restarts: list[MeasurementRestart]
-
-
-class ProfileBuildList(BaseModel):
-    builds: list[ProfileBuild]
-
-
 class Component(BaseModel):
     """
     Combined declarative + operational view of one supervised
@@ -3527,6 +3355,87 @@ class PythonEngine(BaseModel):
     accelerator: FrameworkAccelerator | None = None
 
 
+class RuntimeSpec(BaseModel):
+    """
+    Declarative half of a Runtime — what the operator asked for.
+    Used for create and update bodies; observed fields are
+    server-owned and excluded.
+
+    Note what is *not* here: a command line. The operator declares
+    intent (this engine, this model, these flags) and the adapter
+    builds the argv. Letting a topology entry carry raw argv would
+    make every engine "supported" while making none of them
+    knowable — no readiness probe, no flag validation, no version
+    story. The resolved argv is reported back on `Runtime.argv` for
+    debugging, which is the half of raw-argv access that is
+    genuinely useful.
+
+    """
+
+    name: str = Field(
+        ...,
+        description='Operator-supplied label, unique per node. Referenced by\nan inference-driver on that node to say which runtime it\nfronts. Different nodes may use the same label; install-wide\nruntime identity is the pair (node, name).\n',
+        min_length=1,
+    )
+    engine: EngineKind
+    modelPath: str = Field(
+        ...,
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
+    )
+    modelAlias: str | None = Field(
+        None,
+        description="The model id this runtime serves under, and therefore what a\nclient asks the gateway for. Defaults to the model\nfilename with its extension stripped — plainly-named files\nmean the obvious name is already the right one, so this is\nan override, not a requirement.\n\n**The resolved value is always passed to the engine\nexplicitly, never left to the engine's own default.** vLLM's\ndefault served name is the `--model` argument verbatim, and\nwe launch models by absolute path because the user's files\nstay theirs — so leaving it unset would publish\n`/home/you/models/Qwen3-8B` as an OpenAI model id. That\nleaks the operator's directory layout to every API client\nand, worse, makes the routing key differ per host for the\nsame model, which breaks both multi-host placement and any\nfailover priority list that names a model. llama.cpp derives\nits default from the filename and would have been fine,\nwhich is exactly why this was invisible until a second\nengine existed.\n",
+    )
+    host: str | None = Field(
+        '127.0.0.1',
+        description="Address the engine binds. Defaults to loopback: an engine\nhas no auth of its own, so it must not be exposed directly.\nReaching a model from another machine is the gateway's job,\nand the gateway has auth.\n",
+    )
+    port: int | None = Field(
+        None,
+        description='Port the engine binds. Assigned from an ephemeral range when\nomitted — with N runtimes the operator should not have to\nhand out port numbers.\n',
+        ge=1,
+        le=65535,
+    )
+    autoStart: bool | None = Field(
+        True,
+        description='Whether the agent spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM.\n',
+    )
+    autoDriver: bool | None = Field(
+        True,
+        description='Whether the agent declares and supervises a companion\n`inference-driver` that follows this runtime by name, so\nthe model is routable the moment the engine is ready. The\ncompanion is `<name>-driver`; `Runtime.driver` reports it.\nSet false to front the runtime by hand — one hand-tuned\ndriver pointed at an engine is still a supported shape, it\nis just no longer the only one. Decided 2026-09-10 over a\ndeclared pool: one driver per backend is the rule the\ncontract has stated since M0, a runtime is a backend, and a\npool would need allocation state and give drivers names\nthat mean a different model every hour.\n',
+    )
+    idleUnloadSeconds: int | None = Field(
+        None,
+        description="Stop the engine after this many seconds with no request for\nits model through the gateway, releasing its GPU memory.\nAbsent or 0 means never, which is every existing\ndeclaration's behaviour unchanged.\n\n**The gateway decides; this agent executes.** Only the\ngateway sees demand, so it tracks the last request per\nruntime and calls `POST .../stop` with `reason: idle` when\nthis expires. A runtime with a request in flight is never\nstopped. Setting this also **opts the runtime into\neviction**: when a `startOnDemand` model will not fit, the\ngateway may stop the most-idle runtimes that carry a timeout\nto make room. A model that must stay resident sets none.\n",
+        ge=0,
+    )
+    startOnDemand: bool | None = Field(
+        False,
+        description="Start this runtime when a request arrives for its model and\nit is `stopped`. The gateway calls `POST .../start`, waits\nfor `ready` (bounded by its `swapWaitSeconds`), and serves\nthe request; the response says it did (`swapped_in`). With\n`autoStart: false` and `idleUnloadSeconds` set, this is\nllama-swap's model: declare five, load none, serve whichever\nis asked for, unload it when it goes quiet — several at\nonce when they fit.\n\nFalse by default so that a hand-pressed Stop stays stopped.\n",
+    )
+    flags: dict[str, Any] | None = Field(
+        None,
+        description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n',
+    )
+    extraArgs: list[str] | None = Field(
+        None,
+        description='Verbatim extra arguments, appended after everything the\nadapter generated. The escape hatch for the long tail of\nflags a curated surface will always miss.\n\nUnvalidated by definition, so the UI must present it as the\nadvanced option it is: a bad value here surfaces as an\nengine that refuses to start, and the resolved `argv` plus\nthe captured engine output are how it gets diagnosed.\n',
+    )
+    env: dict[str, str] | None = Field(
+        None,
+        description='Extra environment variables for the engine process. Needed\nmore often than for a component — accelerator selection\n(`CUDA_VISIBLE_DEVICES`, `HIP_VISIBLE_DEVICES`) is how a\nruntime is pinned to one GPU, which is what makes two\nreplicas on two cards possible.\n',
+    )
+    workingDirectory: str | None = Field(
+        None,
+        description="Working directory for the engine process. Defaults to the\nbinary's own directory, which is what prebuilt llama.cpp\nreleases need to find their bundled shared libraries.\n",
+    )
+    binary: str | None = Field(
+        None,
+        description='Override the binary for this one runtime, ignoring whatever\nthe adapter discovered. For running one model on a custom\nbuild without disturbing the rest of the install.\n',
+    )
+    profile: RuntimeProfile | None = None
+
+
 class Runtime(BaseModel):
     """
     Combined declarative + operational view of one engine process.
@@ -3569,6 +3478,7 @@ class Runtime(BaseModel):
     env: dict[str, str] | None = None
     workingDirectory: str | None = None
     binary: str | None = None
+    profile: RuntimeProfile | None = None
     driver: str | None = Field(
         None,
         description="Name of the companion `inference-driver` component the agent\ndeclared for this runtime, when `autoDriver` is true. What\nthe gateway's routing table calls this backend, and the\nentry to read in `GET /v1/components` for its health. Absent\nwhen the operator fronts the runtime by hand.\n",
@@ -3892,6 +3802,122 @@ class AppCatalogue(BaseModel):
 
 class AppList(BaseModel):
     apps: list[App]
+
+
+class BenchmarkRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    modelId: str = Field(..., max_length=256, min_length=1)
+    profileId: str = Field(..., max_length=256, min_length=1)
+    profileName: str = Field(..., max_length=256, min_length=1)
+    runtime: RuntimeSpec
+    repetitions: int | None = Field(3, ge=1, le=5)
+    tokens: int | None = Field(128, ge=16, le=256)
+    stopRuntimes: list[str] | None = Field(
+        [],
+        description='The runtimes the operator agreed to stop for this job, as the\npreflight listed them. The job stops exactly these. A runtime\nrunning on the node that is NOT in this list refuses the job\nwith 409, so a model started between the question and the\nclick is never stopped without being asked about. Names in\nthe list that are already stopped are ignored.\n',
+    )
+    restartAfter: bool | None = Field(
+        True,
+        description="Start the runtimes this job stopped again when it ends —\ncompleted, failed, cancelled or timed out. Each restart goes\nthrough admission like an operator's Start and is reported on\nthe job's `restarts`; a refused or failed one is reported by\nname, never forced.\n",
+    )
+
+
+class Benchmark(BaseModel):
+    id: str
+    request: BenchmarkRequest
+    node: str
+    state: BenchmarkState
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str
+    depths: list[Depth]
+    points: list[BenchmarkPoint]
+    binary: str | None = None
+    engineVersion: str | None = None
+    localPath: str | None = None
+    modelSizeBytes: int | None = Field(None, ge=0)
+    modelModifiedAt: AwareDatetime | None = None
+    command: list[str] | None = None
+    hardware: dict[str, str] | None = Field(
+        None,
+        description='CPU/GPU/backend identity reported by the benchmark executable.',
+    )
+    restarts: list[MeasurementRestart] | None = Field(
+        None,
+        description='The runtimes this job stopped, and what became of each afterwards.',
+    )
+
+
+class BenchmarkList(BaseModel):
+    benchmarks: list[Benchmark]
+
+
+class ProfileBuildRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    modelId: str = Field(..., max_length=256, min_length=1)
+    profileId: str | None = Field(
+        None,
+        description='The profile the build started from, if any. The build never writes a profile; the UI saves its result.',
+        max_length=256,
+    )
+    runtime: RuntimeSpec
+    accuracy: ProfileBuildAccuracy
+    memoryMarginMiB: int | None = Field(
+        None,
+        description="Graphics memory to leave free on every device, passed to fit\nas `--fit-target`. Null is llama.cpp's own default (1024 MiB).\n",
+        ge=0,
+        le=65536,
+    )
+    evaluationText: str | None = Field(
+        None,
+        description="The operator's own text for the quality measurement. Null\nuses the text bundled with the agent. It must yield at least\n8,192 tokens for this model (two 4,096-token chunks); a\nshorter text is refused with its token count. Not stored: the\nbuild keeps its SHA-256, and its token count when\nllama-perplexity reports one (it does when it refuses a text).\n",
+        max_length=2097152,
+    )
+    stopRuntimes: list[str] | None = Field(
+        [], description='Same rule as `BenchmarkRequest.stopRuntimes`.'
+    )
+    restartAfter: bool | None = Field(
+        True, description='Same rule as `BenchmarkRequest.restartAfter`.'
+    )
+
+
+class ProfileBuild(BaseModel):
+    id: str
+    node: str
+    modelId: str
+    profileId: str | None = None
+    runtime: RuntimeSpec
+    accuracy: ProfileBuildAccuracy
+    memoryMarginMiB: int | None = None
+    evaluation: ProfileBuildEvaluation
+    state: BenchmarkState
+    phase: ProfileBuildPhase
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str
+    quality: list[CacheQuality]
+    allowedCacheTypes: list[CacheType] | None = None
+    candidates: list[BuildCandidate]
+    recommended: int | None = Field(
+        None,
+        description='Index into `candidates` of the default choice: the longest\ncontext on the frontier whose decode speed at the common depth\nis at least 80% of the fastest measured. Speeds within 3% of\neach other count as equal, so where every context places alike\nthe longest wins. Null when nothing was measured.\n',
+        ge=0,
+    )
+    engineVersion: str | None = None
+    localPath: str | None = None
+    modelSizeBytes: int | None = Field(None, ge=0)
+    hardware: dict[str, str] | None = None
+    restarts: list[MeasurementRestart]
+
+
+class ProfileBuildList(BaseModel):
+    builds: list[ProfileBuild]
 
 
 class ComponentList(BaseModel):

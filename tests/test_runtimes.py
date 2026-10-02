@@ -469,6 +469,27 @@ def test_runtimes_round_trip_through_the_yaml_file(
     assert specs[0].env == {"CUDA_VISIBLE_DEVICES": "1"}
 
 
+def test_the_profile_a_runtime_came_from_is_kept_and_reported(
+    authed_client: TestClient, settings: Any
+) -> None:
+    """Two runtimes of one model, one per profile, were indistinguishable
+    on the Inference screen (2026-10-01): the name is cut to 60 characters
+    and lost the profile's. The declaring console records which profile;
+    the agent keeps it across a restart and reports it on every read."""
+    profile = {"id": "p-7", "name": "Built for Amish_Station"}
+    created = authed_client.post("/v1/runtimes", json=_runtime(profile=profile))
+    assert created.status_code == 201, created.text
+    assert created.json()["profile"] == profile
+
+    listed = authed_client.get("/v1/runtimes").json()["runtimes"]
+    assert [r["profile"] for r in listed] == [profile]
+
+    reloaded = AgentState(settings.config_file)
+    reloaded.load()
+    [spec] = reloaded.list_runtime_specs()
+    assert spec.profile is not None and spec.profile.name == "Built for Amish_Station"
+
+
 def test_runtimes_and_components_are_separate_collections(
     authed_client: TestClient, settings: Any
 ) -> None:

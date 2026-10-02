@@ -407,9 +407,18 @@ class LlamaCppAdapter(EngineAdapter):
             if value is None:
                 continue
             cli = _FLAG_CLI_NAMES[field.key]
-            if field.valueType == ConfigValueType.boolean:
-                # llama-server's booleans are presence-only switches;
-                # passing `--flash-attn false` is not a thing.
+            if field.key == "flashAttention":
+                # Not a switch: `-fa` takes on|off|auto, and a bare one
+                # swallowed the next flag as its value -- "unknown value
+                # for --flash-attn: '--cache-type-k'", the crash the first
+                # profile a person built hit at launch (2026-10-01). The
+                # builder's own trials always said `on`. False leaves the
+                # engine's own default (auto) alone, as it always did.
+                if value:
+                    argv += [cli, "on"]
+            elif field.valueType == ConfigValueType.boolean:
+                # Presence-only switches (`--cont-batching`,
+                # `--no-mmproj-offload`): a false one is absent.
                 if value:
                     argv.append(cli)
             else:

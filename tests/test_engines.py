@@ -130,21 +130,37 @@ def test_new_memory_settings_say_what_unset_means(adapter: LlamaCppAdapter) -> N
     assert fields["cacheType"].enumValues == ["f16", "q8_0", "q4_0"]
 
 
-def test_boolean_flags_are_presence_only(
-    adapter: LlamaCppAdapter, binary: DiscoveredBinary
-) -> None:
-    """`--flash-attn false` is not a thing llama-server understands, so a
-    false boolean must be absent rather than passed with a value."""
-    on = adapter.build_argv(_spec(flags={"flashAttention": True}), binary, port=8090)
-    assert "--flash-attn" in on
-    # Nothing follows it, or the next token is another flag —
-    # never a value.
-    following = on[on.index("--flash-attn") + 1 :]
-    assert following == [] or following[0].startswith("--")
+def test_flash_attention_takes_a_value(adapter: LlamaCppAdapter, binary: DiscoveredBinary) -> None:
+    """`-fa` takes on|off|auto. This test used to require the opposite --
+    that nothing but another flag follow `--flash-attn` -- which locked in
+    the argv that crashed the first profile a person built (2026-10-01):
+    llama-server read the next flag as the value and refused to start.
+    Asserted with a flag after it, because that is the shape that broke."""
+    on = adapter.build_argv(
+        _spec(flags={"flashAttention": True, "cacheType": "q8_0"}), binary, port=8090
+    )
+    assert on[on.index("--flash-attn") + 1] == "on"
+    assert on.count("--flash-attn") == 1
 
+    alone = adapter.build_argv(_spec(flags={"flashAttention": True}), binary, port=8090)
+    assert alone[alone.index("--flash-attn") + 1] == "on"
+
+    # False leaves the engine's own default (auto) alone.
     off = adapter.build_argv(_spec(flags={"flashAttention": False}), binary, port=8090)
     assert "--flash-attn" not in off
     assert "false" not in off
+
+
+def test_boolean_switches_are_presence_only(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary
+) -> None:
+    """The switches that really are presence-only stay so."""
+    on = adapter.build_argv(_spec(flags={"continuousBatching": True}), binary, port=8090)
+    assert "--cont-batching" in on
+    following = on[on.index("--cont-batching") + 1 :]
+    assert following == [] or following[0].startswith("--")
+    off = adapter.build_argv(_spec(flags={"continuousBatching": False}), binary, port=8090)
+    assert "--cont-batching" not in off
 
 
 def test_unset_flags_are_absent_entirely(

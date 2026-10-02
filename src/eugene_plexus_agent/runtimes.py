@@ -844,6 +844,8 @@ class RuntimeSupervisor:
             env=spec.env,
             workingDirectory=spec.workingDirectory,
             binary=spec.binary,
+            # Recorded by whoever declared it, reported, never read.
+            profile=spec.profile,
             # Derived from the declaration: `autoDriver` means the agent
             # keeps a companion under this name (reconciled at boot).
             driver=companion_name(spec.name) if spec.autoDriver is not False else None,
