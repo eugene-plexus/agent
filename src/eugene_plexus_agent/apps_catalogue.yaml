@@ -1,8 +1,9 @@
 # The apps this agent release ships: a list of AppManifest entries
 # (specs openapi/agent.yaml). A new app in a later release is a new row
-# here -- the agent needs no new code for it. Each `source` is an archive
-# at a pinned commit and each `version` is that commit, the way the
-# installers pin the hub's own packages.
+# here -- the agent needs no new code for it. Each of our own apps' `source`
+# is an archive at a pinned commit and its `version` is that commit, the way
+# the installers pin the hub's own packages; an app published on the Python
+# Package Index by its own project is `source: pypi` at an exact release.
 #
 # A catalogue entry names a commit on the app's `dist` branch where it has
 # one: `main` at a named commit plus its built front end, which `main`
@@ -30,3 +31,66 @@
   # It runs nothing a model chooses on this machine, so it installs where
   # an app cannot have an account of its own too (C1).
   localActions: false
+
+# The first app here that we did not write (C4, specs
+# docs/design/c4-open-webui.md): installed unmodified from the Python
+# Package Index at an exact release, started as its console script starts
+# it, and told where things are through variables of its own. Its tools run
+# Python its admin pastes in, so it installs only where it gets an account
+# of its own.
+- id: open-webui
+  name: Open WebUI
+  summary: >-
+    A widely used chat interface, by a separate project, under its own
+    licence. Installed unmodified. About 1.8 GB on disk and up to 2 GB of
+    memory.
+  homepage: https://openwebui.com
+  licenseUrl: https://github.com/open-webui/open-webui/blob/v0.11.4/LICENSE
+  source: pypi
+  version: 0.11.4
+  package: open-webui
+  entry: open_webui:app
+  args: [serve, --host, "{bindHost}", --port, "{port}"]
+  python: "3.12"
+  ui: true
+  configTrio: false
+  uses: [inference]
+  signIn: true
+  signInCallbackPath: /oauth/oidc/callback
+  healthPath: /ready
+  localActions: true
+  resetOnConnectionChange: RESET_CONFIG_ON_START
+  environment:
+    DATA_DIR: "{dataDir}"
+    STATIC_DIR: "{dataDir}/static"
+    HF_HOME: "{dataDir}/hf"
+    WEBUI_SECRET_KEY: "{appSecret}"
+    WEBUI_URL: "{appUrl}"
+    CORS_ALLOW_ORIGIN: "{appUrl}"
+    OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
+    OPENAI_API_KEY: "{clientKey}"
+    ENABLE_OLLAMA_API: "false"
+    RAG_EMBEDDING_ENGINE: openai
+    AUDIO_STT_ENGINE: openai
+    OFFLINE_MODE: "true"
+    ENABLE_VERSION_UPDATE_CHECK: "false"
+    ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS: "false"
+    SCARF_NO_ANALYTICS: "true"
+    DO_NOT_TRACK: "true"
+    ANONYMIZED_TELEMETRY: "false"
+    ENABLE_SIGNUP: "false"
+    ENABLE_LOGIN_FORM: "false"
+    ENABLE_OAUTH_SIGNUP: "true"
+    OAUTH_PROVIDER_NAME: Eugene
+    OPENID_PROVIDER_URL: "{oidcIssuer}/.well-known/openid-configuration"
+    OAUTH_CLIENT_ID: "{oidcClientId}"
+    OAUTH_CLIENT_SECRET: "{oidcClientSecret}"
+    OAUTH_CODE_CHALLENGE_METHOD: S256
+    OAUTH_SCOPES: openid email profile
+    OAUTH_EMAIL_CLAIM: email
+    OAUTH_USERNAME_CLAIM: name
+    ENABLE_OAUTH_EMAIL_FALLBACK: "true"
+    ENABLE_OAUTH_ROLE_MANAGEMENT: "true"
+    OAUTH_ROLES_CLAIM: eugene_role
+    OAUTH_ADMIN_ROLES: operator
+    OAUTH_ALLOWED_ROLES: operator,member

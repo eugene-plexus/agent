@@ -44,7 +44,15 @@ from .._generated.models import (
 )
 from .._http import shared_internal_client
 from .._private_files import write_private
-from ..apps import AppInstallError, AppKey, AppManager, normalized, pip_requirement
+from ..apps import (
+    PYPI,
+    AppInstallError,
+    AppKey,
+    AppManager,
+    normalized,
+    pip_requirement,
+    validate_manifest,
+)
 from ..client_key_registry import registry
 from ..dependencies import require_operator_session
 from .auth import mint_client_key, revoke_client_key_at_authority
@@ -140,8 +148,12 @@ async def add_custom(request: Request, body: AppManifest) -> AppCatalogueEntry:
         requirement = pip_requirement(body)
     except ValueError as exc:
         raise _problem(422, "Unusable source", str(exc)) from exc
+    try:
+        validate_manifest(body)
+    except ValueError as exc:
+        raise _problem(422, "Unusable entry", str(exc)) from exc
     source = body.source.strip()
-    is_url = source.startswith(("https://", "http://", "file://"))
+    is_url = source == PYPI or source.startswith(("https://", "http://", "file://"))
     if not is_url and not await asyncio.to_thread(Path(source).is_dir):
         raise _problem(
             422,

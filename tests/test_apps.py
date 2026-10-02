@@ -263,8 +263,12 @@ def test_the_shipped_catalogue_parses() -> None:
 
 def test_every_shipped_app_is_pinned_to_an_archive_at_its_own_commit() -> None:
     """A version is the commit its archive was made at, so what installs is
-    what the entry names and an update is a different commit."""
+    what the entry names and an update is a different commit. An app from
+    the package index (C4) is pinned to one exact release instead."""
     for manifest in apps.load_catalogue():
+        if manifest.source == apps.PYPI:
+            assert apps.pip_requirement(manifest) == f"{manifest.package}=={manifest.version}"
+            continue
         assert re.fullmatch(r"[0-9a-f]{40}", manifest.version), manifest.id
         assert manifest.source == (
             f"https://github.com/eugene-plexus/{manifest.id}/archive/{manifest.version}.tar.gz"

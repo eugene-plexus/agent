@@ -9,6 +9,13 @@ program. It:
 
 * starts the app's command, with the environment the agent wrote into the
   app's `launch.json` and the secrets the service manager handed over;
+* fills in the placeholders of an app that is not ours (C4,
+  `c4-open-webui.md` §1): its `args` and the variables of its own in
+  `environment`. **The secrets among them are read here and nowhere
+  else**, from the files this account is given, so they never reach the
+  spec, the agent's log or the service definition. `render_start` is the
+  one implementation: the agent imports it for an app its own supervisor
+  runs, so the two ways an app runs cannot fill a placeholder two ways;
 * forwards every line the app prints to the agent's log ingress
   (`POST /v1/logs`, OTLP JSON) with the app's own client key, so the Logs
   page shows the app as it shows a child the agent runs itself;
@@ -29,8 +36,11 @@ Usage: `python -I -u app_launcher.py <launch.json>`
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import secrets
 import signal
 import subprocess
 import sys
@@ -115,6 +125,168 @@ def child_environment(spec: dict) -> dict[str, str]:
         env["EUGENE_PLEXUS_APP_OIDC_SECRET_FILE"] = spec["oidcSecretFile"]
     env["PYTHONUNBUFFERED"] = "1"
     return env
+
+
+# --------------------------------------------------------------------------- #
+# an app that is not ours: its arguments and its own variables (C4)
+# --------------------------------------------------------------------------- #
+
+#: What a manifest's `args` and `environment` may name, filled in at every
+#: start. The agent refuses a manifest naming anything else.
+PLACEHOLDERS = frozenset(
+    {
+        "bindHost",
+        "port",
+        "dataDir",
+        "gatewayUrl",
+        "appUrl",
+        "oidcIssuer",
+        "oidcClientId",
+        "clientKey",
+        "oidcClientSecret",
+        "appSecret",
+    }
+)
+#: Read by `render_start` from files, never carried in a spec: a value for
+#: one of these in the spec's `values` is ignored.
+SECRET_PLACEHOLDERS = frozenset({"clientKey", "oidcClientSecret", "appSecret"})
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+#: `{appSecret}`: made at the app's first start, the same at every start after.
+APP_SECRET_FILE = "app_secret"
+#: A hash of the gateway's address and the app's key at the last start, for
+#: `resetOnConnectionChange`. A hash, so the file holds no key.
+CONNECTION_FILE = "connection.sha256"
+
+
+def placeholders(text: str) -> list[str]:
+    """The names `text` asks to be filled in, in order."""
+    return _PLACEHOLDER.findall(text)
+
+
+def _fill(text: str, values: dict[str, str]) -> tuple[str, list[str]]:
+    """`text` filled in, and the placeholders that had no value this start."""
+    missing: list[str] = []
+
+    def one(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in PLACEHOLDERS:
+            raise ValueError(f"{{{name}}} is not a placeholder this launcher fills in")
+        value = values.get(name)
+        if value is None:
+            missing.append(name)
+            return ""
+        return value
+
+    return _PLACEHOLDER.sub(one, text), missing
+
+
+def _write_own(path: str, text: str) -> None:
+    """Written whole and readable by this account alone: an owner-only mode
+    on POSIX, the data directory's own grant on Windows."""
+    temp = path + ".tmp"
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    if not WINDOWS:
+        os.chmod(temp, 0o600)
+    os.replace(temp, path)
+
+
+def app_secret(data_dir: str) -> str:
+    """The app's own random secret (`{appSecret}`): made once, kept in its
+    data directory, and the same at every start after -- an app that signs
+    its sessions with it would sign everyone out at each restart otherwise."""
+    path = os.path.join(data_dir, APP_SECRET_FILE)
+    existing = _secret(path)
+    if existing:
+        return existing
+    os.makedirs(data_dir, exist_ok=True)
+    value = secrets.token_urlsafe(32)
+    _write_own(path, value)
+    return value
+
+
+def connection_changed(data_dir: str, gateway_url: str | None, client_key: str | None) -> bool:
+    """Whether the gateway's address or the app's key differs from the last
+    start's, recording this start's either way. A first start has nothing to
+    differ from, so it is not a change."""
+    digest = hashlib.sha256(f"{gateway_url or ''}\n{client_key or ''}".encode()).hexdigest()
+    path = os.path.join(data_dir, CONNECTION_FILE)
+    try:
+        previous = Path(path).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        previous = None
+    if previous != digest:
+        os.makedirs(data_dir, exist_ok=True)
+        _write_own(path, digest)
+    return previous is not None and previous != digest
+
+
+def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, str], list[str]]:
+    """One start's command and environment, and what is worth saying about it.
+
+    The command is `spec["argv"]` followed by the manifest's `args`; the
+    environment is `env` with the manifest's own variables on top. Every
+    placeholder is filled in from `spec["values"]` (what the agent may
+    write down), `spec["dataDir"]`, and the secrets read here from the
+    files the spec names. A variable whose placeholder has no value this
+    start -- no gateway found, no sign-in client -- is left unset rather
+    than set to half a value, and the returned lines say so; an argument
+    gets an empty string, so the arguments after it keep their places.
+
+    With `resetOnConnectionChange`, that variable is `true` for a start
+    whose connection differs from the last one's and absent otherwise,
+    even when the environment it inherits has it.
+    """
+    data = str(spec.get("dataDir") or "")
+    values = {
+        str(k): str(v)
+        for k, v in (spec.get("values") or {}).items()
+        if v is not None and k in PLACEHOLDERS and k not in SECRET_PLACEHOLDERS
+    }
+    if data:
+        values["dataDir"] = data
+    args = [str(a) for a in spec.get("args") or []]
+    environment = {str(k): str(v) for k, v in (spec.get("environment") or {}).items()}
+    reset = spec.get("resetOnConnectionChange")
+    wanted = {n for text in [*args, *environment.values()] for n in placeholders(text)}
+
+    key = _secret(spec.get("keyFile")) if "clientKey" in wanted or reset else None
+    if key:
+        values["clientKey"] = key
+    if "oidcClientSecret" in wanted:
+        oidc = _secret(spec.get("oidcSecretFile"))
+        if oidc:
+            values["oidcClientSecret"] = oidc
+    if "appSecret" in wanted and data:
+        values["appSecret"] = app_secret(data)
+
+    notes: list[str] = []
+    argv = [str(a) for a in spec["argv"]]
+    argv.extend(_fill(text, values)[0] for text in args)
+    out = dict(env)
+    for name, text in environment.items():
+        filled, missing = _fill(text, values)
+        if missing:
+            out.pop(name, None)
+            notes.append(
+                f"{name} is not set at this start: there is no value for "
+                + ", ".join(f"{{{m}}}" for m in missing)
+                + "."
+            )
+        else:
+            out[name] = filled
+    if reset:
+        out.pop(reset, None)
+        if data and connection_changed(data, values.get("gatewayUrl"), key):
+            out[reset] = "true"
+            notes.append(
+                "Eugene's connection details changed since the last start (the gateway's "
+                f"address or this app's key), so {reset}=true for this start: the app takes "
+                "the new ones, and settings changed inside it go back to their defaults."
+            )
+    return argv, out, notes
 
 
 # --------------------------------------------------------------------------- #
@@ -248,12 +420,12 @@ class Forwarder:
 # --------------------------------------------------------------------------- #
 
 
-def _spawn(spec: dict, env: dict[str, str]) -> subprocess.Popen:
+def _spawn(spec: dict, argv: list[str], env: dict[str, str]) -> subprocess.Popen:
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.CREATE_NEW_PROCESS_GROUP
     return subprocess.Popen(
-        spec["argv"],
+        argv,
         env=env,
         cwd=spec.get("dataDir") or None,
         stdin=subprocess.DEVNULL,
@@ -309,8 +481,11 @@ def run(spec: dict) -> int:
     forwarder = Forwarder(spec.get("ingress"), spec.get("keyFile"), spec.get("app", "app"))
     forwarder.start()
     try:
-        proc = _spawn(spec, child_environment(spec))
-    except OSError as exc:
+        argv, env, notes = render_start(spec, child_environment(spec))
+        for note in notes:
+            forwarder.add(f"[launcher] {note}")
+        proc = _spawn(spec, argv, env)
+    except (OSError, ValueError) as exc:
         forwarder.add(f"[launcher] could not start the app: {exc}")
         forwarder.close()
         return 1

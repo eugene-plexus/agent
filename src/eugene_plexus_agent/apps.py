@@ -12,7 +12,9 @@ client key, an address for the gateway, a port and a data directory.
 The rule is structural here rather than a promise -- `_AppPlanner`
 builds its environment from `child_environment()` with no component
 prefix, which strips every `EUGENE_PLEXUS_*` variable, and then adds
-only `EUGENE_PLEXUS_APP_*`.
+only `EUGENE_PLEXUS_APP_*` -- and, for an app that is not ours (C4), the
+variables of its own its manifest names, none of which may begin
+`EUGENE_PLEXUS_` (`validate_manifest`).
 
 **Each app runs from its own Python environment**, built by `uv` into
 `<config dir>/apps/<id>/versions/<version>/venv`. A trainer brings
@@ -43,6 +45,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import re
 import secrets
 import shutil
 import sys
@@ -57,7 +60,7 @@ import httpx
 import yaml
 from pydantic import AnyUrl, ValidationError
 
-from . import app_accounts, ports
+from . import app_accounts, app_launcher, ports
 from ._generated.models import (
     App,
     AppCatalogue,
@@ -103,6 +106,17 @@ APP_PORT_BASE = 8190
 APP_PORT_SPAN = 100
 
 ENV_PREFIX = "EUGENE_PLEXUS_APP"
+#: Variables of ours, which a manifest's `environment` may not name.
+OUR_PREFIX = "EUGENE_PLEXUS_"
+
+#: `source: pypi` installs `<package>==<version>` from the Python Package
+#: Index (C4): an app published there by its own project.
+PYPI = "pypi"
+#: A PEP 440 version that names one release, with no local segment (the
+#: index refuses those): `0.11.4`, `1.0rc1`, `2.0.post1`. Not a range, a
+#: name like `latest`, or a commit. (An epoch's `!` is outside the schema's
+#: version pattern, so it cannot arrive.)
+_EXACT_RELEASE = re.compile(r"\d+(\.\d+)*((a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?")
 
 _HEALTH_POLL_SECONDS = 1.5
 _OUTPUT_TAIL_LINES = 40
@@ -141,14 +155,25 @@ def find_uv(configured: str | None = None) -> Path | None:
 
 
 def pip_requirement(manifest: AppManifest) -> str:
-    """`<package> @ <url>`, the one form `uv pip install` is given.
+    """What `uv pip install` is given: `<package> @ <url>`, or for `source:
+    pypi`, `<package>==<version>`.
 
     A directory is turned into a `file://` URL because PEP 508 direct
     references are URLs; a relative path would resolve against whatever
     directory the agent happened to start in, so it is refused rather
-    than guessed at.
+    than guessed at. A `pypi` version that is not one exact release is
+    refused for the same reason: what installs must be what the entry
+    names, not whatever the index has today.
     """
     source = manifest.source.strip()
+    if source == PYPI:
+        if not _EXACT_RELEASE.fullmatch(manifest.version):
+            raise ValueError(
+                f"version {manifest.version!r} is not an exact release. A pypi entry installs "
+                f"{manifest.package}==<version>, so its version must be one release, such as "
+                "0.11.4."
+            )
+        return f"{manifest.package}=={manifest.version}"
     if source.startswith(("https://", "http://", "file://")):
         return f"{manifest.package} @ {source}"
     path = Path(source).expanduser()
@@ -171,26 +196,95 @@ def normalized(manifest: AppManifest) -> AppManifest:
     return manifest.model_copy(update={"uses": uses})
 
 
-def load_catalogue() -> list[AppManifest]:
+#: The schema's `environment` limits, which the generated model does not keep.
+_MAX_ENVIRONMENT = 64
+_MAX_ENVIRONMENT_VALUE = 2048
+
+
+def validate_manifest(manifest: AppManifest) -> None:
+    """Refuse what the schema lets through and a start could not honour,
+    naming it. Run on every shipped entry and every custom one (C4).
+
+    * a `pypi` entry whose version is not one exact release;
+    * a placeholder the launcher does not fill in, which would otherwise
+      surface as a crash at the app's first start rather than here;
+    * a secret placeholder in `args`: an argument is in the process list,
+      which every account on the machine can read, and in the agent's log
+      line for the spawn, so secrets travel in `environment` only;
+    * a variable of ours (`EUGENE_PLEXUS_*`, in either case, since Windows
+      does not tell `eugene_plexus_x` from `EUGENE_PLEXUS_X`) as one of the
+      app's own, which could point it at another app's key or override
+      what the agent hands it.
+    """
+    if manifest.source.strip() == PYPI:
+        pip_requirement(manifest)
+    args = [a.root for a in manifest.args or []]
+    environment = dict(manifest.environment or {})
+    if len(environment) > _MAX_ENVIRONMENT:
+        raise ValueError(f"environment has {len(environment)} variables; at most 64 are allowed")
+    for text in args:
+        for name in app_launcher.placeholders(text):
+            if name in app_launcher.SECRET_PLACEHOLDERS:
+                raise ValueError(
+                    f"the argument {text!r} names {{{name}}}, a secret. Arguments can be read by "
+                    "every account on this machine, so a secret goes in environment instead."
+                )
+    for name, text in [*(("args", a) for a in args), *environment.items()]:
+        if len(text) > _MAX_ENVIRONMENT_VALUE:
+            raise ValueError(f"{name} is longer than {_MAX_ENVIRONMENT_VALUE} characters")
+        for placeholder in app_launcher.placeholders(text):
+            if placeholder not in app_launcher.PLACEHOLDERS:
+                known = ", ".join(f"{{{p}}}" for p in sorted(app_launcher.PLACEHOLDERS))
+                raise ValueError(
+                    f"{name} names {{{placeholder}}}, which is not a placeholder. The "
+                    f"placeholders are {known}."
+                )
+    for name in [*environment, manifest.resetOnConnectionChange or ""]:
+        if name.upper().startswith(OUR_PREFIX):
+            raise ValueError(
+                f"{name} begins {OUR_PREFIX}, which names Eugene Plexus's own variables; an "
+                "app's own variables must be named otherwise."
+            )
+    reset = manifest.resetOnConnectionChange
+    if reset and reset in environment:
+        raise ValueError(
+            f"{reset} is both resetOnConnectionChange and in environment; the agent sets it, "
+            "so it cannot be given a value of its own."
+        )
+
+
+def load_catalogue(text: str | None = None) -> list[AppManifest]:
     """The apps this agent release ships, from its own package data.
 
     Never raises. A catalogue that will not parse is a packaging bug, and
     the answer to it is an empty catalogue and a log line -- not an agent
-    that will not start.
+    that will not start. One entry that will not validate costs that
+    entry, named in the log, and not the others.
     """
     try:
-        text = (
-            importlib.resources.files("eugene_plexus_agent")
-            .joinpath(CATALOGUE_RESOURCE)
-            .read_text(encoding="utf-8")
-        )
+        if text is None:
+            text = (
+                importlib.resources.files("eugene_plexus_agent")
+                .joinpath(CATALOGUE_RESOURCE)
+                .read_text(encoding="utf-8")
+            )
         raw = yaml.safe_load(text) or []
         if not isinstance(raw, list):
             raise ValueError("the catalogue must be a YAML list")
-        return [normalized(AppManifest.model_validate(item)) for item in raw]
-    except (OSError, ValueError, ValidationError) as exc:
+    except (OSError, ValueError) as exc:
         log.error("the shipped app catalogue could not be read (%s); offering none", exc)
         return []
+    out: list[AppManifest] = []
+    for item in raw:
+        try:
+            manifest = normalized(AppManifest.model_validate(item))
+            validate_manifest(manifest)
+        except (ValueError, ValidationError) as exc:
+            name = item.get("id") if isinstance(item, dict) else None
+            log.error("the shipped app catalogue entry %r is unusable (%s); not offered", name, exc)
+            continue
+        out.append(manifest)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -526,18 +620,46 @@ async def _run_tool(argv: list[str], *, env: dict[str, str]) -> tuple[int, str]:
     return code, "\n".join(line for line in tail if line)
 
 
-# Imports the entry point without running it. A package whose `-m` target
+# Finds the entry point without running it. A package whose `-m` target
 # is a package also needs a `__main__`, which is the case `find_spec` on
-# the package alone would wave through and the first spawn would not.
+# the package alone would wave through and the first spawn would not. A
+# `module:attribute` entry (C4) is imported, because whether the attribute
+# exists and can be called is only known once its module has run.
 _VERIFY_SNIPPET = (
-    "import importlib.util as u, sys\n"
-    "name = sys.argv[1]\n"
+    "import importlib, importlib.util as u, sys\n"
+    "name, _, attr = sys.argv[1].partition(':')\n"
+    "if attr:\n"
+    "    target = getattr(importlib.import_module(name), attr, None)\n"
+    "    if target is None:\n"
+    "        sys.exit(name + ' has no ' + attr + ' to call')\n"
+    "    if not callable(target):\n"
+    "        sys.exit(name + '.' + attr + ' cannot be called, so it cannot start the app')\n"
+    "    sys.exit(0)\n"
     "spec = u.find_spec(name)\n"
     "if spec is None:\n"
     "    sys.exit('no module named ' + name)\n"
     "if spec.submodule_search_locations is not None and u.find_spec(name + '.__main__') is None:\n"
     "    sys.exit(name + ' is a package with no __main__, so python -m cannot run it')\n"
 )
+
+# A `module:attribute` entry, called as the console script pip writes for it
+# calls it: `sys.argv` is the script's name and its arguments, and what it
+# returns is the exit code. The directory it runs in is taken off the path,
+# as a script's would be, so an app's data cannot shadow its own modules.
+# One line, because the spawn's argv is what the agent's log prints.
+_CALL_SNIPPET = (
+    "import importlib,sys;sys.path[:]=[p for p in sys.path if p];"
+    "m,_,a=sys.argv[1].partition(':');f=getattr(importlib.import_module(m),a);"
+    "sys.argv=sys.argv[2:];sys.exit(f())"
+)
+
+
+def entry_argv(python: Path, manifest: AppManifest) -> list[str]:
+    """How the app is started, before its `args`: `python -m <module>`, or
+    for `module:attribute`, a call to it named after its package."""
+    if ":" in manifest.entry:
+        return [str(python), "-c", _CALL_SNIPPET, manifest.entry, manifest.package]
+    return [str(python), "-m", manifest.entry]
 
 
 class AppInstaller:
@@ -726,12 +848,14 @@ class _AppPlanner:
         gateway_url: Callable[[], str | None],
         bind_host: Callable[[], str | None],
         oidc_issuer: Callable[[], str | None] = lambda: None,
+        app_url: Callable[[], str | None] = lambda: None,
     ) -> None:
         self.record = record
         self._store = store
         self._gateway_url = gateway_url
         self._bind_host = bind_host
         self._oidc_issuer = oidc_issuer
+        self._app_url = app_url
         self.admin_token: str | None = None
 
     @property
@@ -757,7 +881,69 @@ class _AppPlanner:
         )
         return False
 
+    @property
+    def health_url(self) -> str:
+        """Where either supervisor asks whether the app is serving: its
+        `healthPath` on its own port, on loopback."""
+        return f"http://127.0.0.1:{self.record.port}{self.record.manifest.healthPath or '/healthz'}"
+
     def plan(self) -> SpawnPlan:
+        """A start by the agent's own supervisor: `base_plan` with the
+        manifest's `args` and `environment` filled in by the launcher's own
+        `render_start`, so this path and the app's own account fill a
+        placeholder one way. Secrets reach the child's environment and
+        nothing else: never an argument (`validate_manifest`), never the log.
+        """
+        base = self.base_plan()
+        record = self.record
+        spec = {
+            "argv": base.argv,
+            **self.launch(),
+            "dataDir": str(self._store.data_dir(record.id)),
+            "keyFile": str(self._store.key_file(record.id)),
+            "oidcSecretFile": str(self._store.oidc_secret_file(record.id)),
+        }
+        try:
+            argv, env, notes = app_launcher.render_start(spec, base.env)
+        except (OSError, ValueError) as exc:
+            raise SpawnPlanError(f"could not fill in how {record.id} starts: {exc}") from exc
+        for note in notes:
+            log.warning("%s%s", self.log_prefix, note)
+        return SpawnPlan(argv=argv, env=env, cwd=base.cwd, port=base.port)
+
+    def launch(self) -> dict[str, Any]:
+        """The manifest's own start, not filled in: its `args` and
+        `environment` as written, the values that are not secret, and the
+        variable a changed connection sets. What the spec the agent writes
+        for an app's own account carries, so it holds no secret: the
+        launcher reads those from files, inside that account (C4)."""
+        manifest = self.record.manifest
+        values: dict[str, str] = {
+            "bindHost": self._bind_host() or "127.0.0.1",
+            "port": str(self.record.port),
+        }
+        gateway = self._gateway_url()
+        if gateway:
+            values["gatewayUrl"] = gateway
+        app_url = self._app_url()
+        if app_url:
+            values["appUrl"] = app_url
+        client_id = self._store.oidc_client(self.record.id)
+        issuer = self._oidc_issuer()
+        if manifest.signIn and client_id and issuer:
+            values["oidcIssuer"] = issuer
+            values["oidcClientId"] = client_id
+        return {
+            "args": [a.root for a in manifest.args or []],
+            "environment": dict(manifest.environment or {}),
+            "values": values,
+            "resetOnConnectionChange": manifest.resetOnConnectionChange,
+        }
+
+    def base_plan(self) -> SpawnPlan:
+        """What every start of this app has, before its manifest's `args`
+        and `environment`: the entry point and the `EUGENE_PLEXUS_APP_*`
+        variables. An app's own account is handed this and `launch()`."""
         record = self.record
         python = venv_python(self._store.version_dir(record.id, record.version) / "venv")
         if not python.is_file():
@@ -792,7 +978,7 @@ class _AppPlanner:
             env[f"{ENV_PREFIX}_OIDC_SECRET_FILE"] = str(self._store.oidc_secret_file(record.id))
         env["PYTHONUNBUFFERED"] = "1"
         return SpawnPlan(
-            argv=[str(python), "-m", record.manifest.entry],
+            argv=entry_argv(python, record.manifest),
             env=env,
             cwd=str(data),
             port=record.port,
@@ -812,16 +998,17 @@ class AppSupervisor:
 
     The spawn/watch/back-off loop is `SupervisedProcess`, shared with
     components and runtimes. What is separate is the planner and this
-    health poll, which reads `GET /healthz` on the app's own port -- an
-    app that never answers it reads `starting` for as long as it runs,
-    which is what the manifest's contract says it owes.
+    health poll, which reads `GET <healthPath>` (`/healthz` unless the
+    manifest says otherwise) on the app's own port -- an app that never
+    answers it reads `starting` for as long as it runs, which is what the
+    manifest's contract says it owes.
     """
 
     def __init__(self) -> None:
         self._processes: dict[str, SupervisedProcess] = {}
         self._planners: dict[str, _AppPlanner] = {}
         self._reachable: dict[str, bool] = {}
-        self._ports: dict[str, int] = {}
+        self._health: dict[str, str] = {}
         self._health_task: asyncio.Task[None] | None = None
         self._client: httpx.AsyncClient | None = None
 
@@ -832,7 +1019,7 @@ class AppSupervisor:
         process = SupervisedProcess(planner, log)
         self._processes[app_id] = process
         self._planners[app_id] = planner
-        self._ports[app_id] = planner.record.port
+        self._health[app_id] = planner.health_url
         self._reachable[app_id] = False
         process.start()
         if self._health_task is None:
@@ -842,7 +1029,7 @@ class AppSupervisor:
     async def stop(self, app_id: str) -> None:
         process = self._processes.pop(app_id, None)
         self._planners.pop(app_id, None)
-        self._ports.pop(app_id, None)
+        self._health.pop(app_id, None)
         self._reachable.pop(app_id, None)
         if process is not None:
             await process.stop()
@@ -880,7 +1067,7 @@ class AppSupervisor:
         self._processes.clear()
         self._planners.clear()
         self._reachable.clear()
-        self._ports.clear()
+        self._health.clear()
         if self._client is not None:
             with contextlib.suppress(BaseException):
                 await self._client.aclose()
@@ -890,19 +1077,19 @@ class AppSupervisor:
         try:
             while True:
                 await asyncio.gather(
-                    *(self._poll(app_id, port) for app_id, port in list(self._ports.items())),
+                    *(self._poll(app_id, url) for app_id, url in list(self._health.items())),
                     return_exceptions=True,
                 )
                 await asyncio.sleep(_HEALTH_POLL_SECONDS)
         except asyncio.CancelledError:
             return
 
-    async def _poll(self, app_id: str, port: int) -> None:
+    async def _poll(self, app_id: str, url: str) -> None:
         client = self._client
         if client is None:
             return
         try:
-            response = await client.get(f"http://127.0.0.1:{port}/healthz")
+            response = await client.get(url)
             ready = response.is_success
         except httpx.HTTPError:
             ready = False
@@ -1130,17 +1317,26 @@ class AppManager:
             self._reserved_ports[app_id] = self.allocate_port()
         return self._reserved_ports[app_id]
 
-    def sign_in_redirects(self, app_id: str, path: str) -> list[str]:
-        """Every address a browser may open this app at, with its callback:
-        this node's advertised host, and loopback for a browser on it."""
+    def _origins(self, app_id: str) -> list[str]:
+        """Every address a browser may open this app at, first the one the
+        console opens: this node's advertised host, then loopback."""
         port = self.reserve_port(app_id)
         hosts = [self._advertise_host() or "127.0.0.1", "127.0.0.1", "localhost"]
         out = []
         for host in dict.fromkeys(hosts):
             if ":" in host and not host.startswith("["):
                 host = f"[{host}]"
-            out.append(f"http://{host}:{port}{path}")
+            out.append(f"http://{host}:{port}")
         return out
+
+    def sign_in_redirects(self, app_id: str, path: str) -> list[str]:
+        """Every address a browser may open this app at, with its callback."""
+        return [origin + path for origin in self._origins(app_id)]
+
+    def app_url(self, app_id: str) -> str:
+        """`{appUrl}` (C4): the address the console opens the app at, with
+        no path -- the first of its sign-in addresses."""
+        return self._origins(app_id)[0]
 
     def oidc_issuer(self) -> str | None:
         return self._oidc_issuer()
@@ -1171,6 +1367,7 @@ class AppManager:
             gateway_url=lambda: self._gateway.get(record.id),
             bind_host=self._bind_host,
             oidc_issuer=self._oidc_issuer,
+            app_url=lambda: self.app_url(record.id),
         )
         self.supervisor.start(planner)
 

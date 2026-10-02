@@ -52,7 +52,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -90,6 +90,13 @@ _POLL_SECONDS = 1.5
 _DELETE = 0x00010000
 _CTL_TIMEOUT_SECONDS = 60.0
 _STOP_TIMEOUT_SECONDS = 45.0
+#: How long one grant may take. A grant on an app's directory is carried to
+#: every file inside it, and its environment is most of them: Workbench's is
+#: a few thousand files, Open WebUI's 245 packages and 1.8 GB (C4), with an
+#: antivirus scanner looking at each change. Two minutes was sized for the
+#: first and is a start that fails on a slow disk for the second; fifteen is
+#: a wait no grant should reach, and a hung icacls still ends.
+_GRANT_TIMEOUT_SECONDS = 900.0
 
 
 @dataclass(frozen=True)
@@ -223,6 +230,9 @@ class LaunchPlan:
     admin_token: str
     port: int
     bind_host: str | None
+    #: The manifest's own start, not filled in (`_AppPlanner.launch`): what
+    #: the launcher fills in inside the account. Holds no secret.
+    launch: dict = field(default_factory=dict)
 
 
 #: Variables the launcher is given in `launch.json`. Everything else comes
@@ -244,6 +254,7 @@ def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
     ):
         env.pop(name, None)
     spec: dict = {
+        **plan.launch,
         "app": plan.app_id,
         "argv": plan.argv,
         "env": env,
@@ -286,7 +297,11 @@ class Runner(Protocol):
 
 def _icacls(path: Path, *args: str) -> None:
     out = subprocess.run(
-        ["icacls", str(path), *args], capture_output=True, text=True, check=False, timeout=120
+        ["icacls", str(path), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_GRANT_TIMEOUT_SECONDS,
     )
     if out.returncode != 0:
         raise OSError(f"icacls {path} {' '.join(args)} failed: {(out.stdout + out.stderr).strip()}")
@@ -640,7 +655,7 @@ class OwnAccountSupervisor:
     """`AppSupervisor`'s interface, for apps the service manager runs.
 
     It starts and stops through the runner, polls the service manager and
-    the app's `/healthz`, and reports in the same five fields. What it does
+    the app's `healthPath`, and reports in the same five fields. What it does
     not do is stop apps when the agent stops: they are the service
     manager's, and an agent restart is not an app restart.
     """
@@ -694,7 +709,9 @@ class OwnAccountSupervisor:
     async def _start(self, planner: _AppPlanner) -> None:
         app_id = planner.record.id
         try:
-            spawn = planner.plan()
+            # Not `plan()`: that fills in the app's secrets, which only the
+            # launcher does here, inside the app's account (C4).
+            spawn = planner.base_plan()
             plan = LaunchPlan(
                 app_id=app_id,
                 argv=list(spawn.argv),
@@ -704,6 +721,7 @@ class OwnAccountSupervisor:
                 admin_token=planner.admin_token or secrets.token_urlsafe(32),
                 port=planner.record.port,
                 bind_host=spawn.env.get("EUGENE_PLEXUS_APP_BIND_HOST"),
+                launch=planner.launch(),
             )
             self._hosts[app_id] = plan.bind_host or "127.0.0.1"
             current = await asyncio.to_thread(self.runner.state, app_id)
@@ -838,7 +856,7 @@ class OwnAccountSupervisor:
         client = self._client
         if client is not None:
             try:
-                response = await client.get(f"http://127.0.0.1:{planner.record.port}/healthz")
+                response = await client.get(planner.health_url)
                 ready = response.is_success
             except httpx.HTTPError:
                 ready = False
