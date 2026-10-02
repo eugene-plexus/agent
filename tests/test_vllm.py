@@ -171,6 +171,18 @@ def test_served_model_name_is_always_passed(adapter: VllmAdapter, binary: Discov
     assert explicit[explicit.index("--served-model-name") + 1] == "qwen"
 
 
+def test_vllm_is_asked_to_say_how_much_of_a_prompt_it_reused(
+    adapter: VllmAdapter, binary: DiscoveredBinary
+) -> None:
+    """PC5: vLLM caches prefixes by default and reports the cached count on
+    chat completions only with this flag (measured on 0.29.0), and chat
+    completions is what the driver speaks. Before the operator's own
+    `extraArgs`, which stay last so they can still override anything."""
+    argv = adapter.build_argv(_spec(extraArgs=["--max-num-seqs", "4"]), binary, port=8090)
+    assert "--enable-prompt-tokens-details" in argv
+    assert argv.index("--enable-prompt-tokens-details") < argv.index("--max-num-seqs")
+
+
 def test_curated_flags_map_to_the_v0_29_0_cli_names(
     adapter: VllmAdapter, binary: DiscoveredBinary
 ) -> None:

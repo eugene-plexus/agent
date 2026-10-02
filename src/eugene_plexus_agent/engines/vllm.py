@@ -251,6 +251,15 @@ class VllmAdapter(EngineAdapter):
         alias = spec.modelAlias or default_model_alias(spec.modelPath)
         argv += ["--served-model-name", alias]
 
+        # Always, too (PC5, 2026-10-02). vLLM caches prompt prefixes by
+        # default but says how much it reused, on chat completions, only
+        # with this flag: measured on 0.29.0, two requests sharing a 5,136-
+        # token prefix reported `prompt_tokens_details: None` without it and
+        # `cached_tokens: 5136` with it. The driver speaks chat completions,
+        # so without it Eugene could show no vLLM cache at all. It changes
+        # what is reported, never what is computed.
+        argv.append("--enable-prompt-tokens-details")
+
         flags = spec.flags or {}
         for field in self.flag_schema().fields:
             if field.key not in flags:
