@@ -398,6 +398,21 @@ class EngineAdapter(abc.ABC):
         """
         return {}
 
+    def context_pool(
+        self,
+        capabilities: RuntimeCapabilities,
+        argv: list[str],
+        env: dict[str, str] | None,
+    ) -> int | None:
+        """The context this runtime's slots SHARE, or None (CB3).
+
+        Only an engine whose slots draw on one pool can have prompts in
+        flight outgrow it together; the gateway budgets against this.
+        None is the honest default: an engine that does not say, or one
+        whose slots each have their own context.
+        """
+        return None
+
     def upstream_model_id(self, spec: RuntimeSpec) -> str | None:
         """What a companion driver must send this engine, when that is
         not the public alias — or None for an engine launched WITH the

@@ -2611,6 +2611,11 @@ class RuntimeCapabilities(BaseModel):
         description='Concurrent requests this runtime can serve. The unit of\ncapacity the gateway divides work across, so a single\nruntime with several slots and several runtimes with one\neach are the same kind of thing to the layer above.\n',
         ge=1,
     )
+    contextPoolTokens: int | None = Field(
+        None,
+        description="The context, in tokens, that this runtime's slots **share**:\nthe prompts and answers in flight on it at once must fit in\nit together, or the engine refuses the next request or cuts\nthe streams it is decoding. Present only when the slots share\none pool; absent when each slot has its own `contextLength`,\nand absent for an engine this agent did not launch, because\nonly the argv says which (CB3).\n\nFor llama.cpp the agent reads it from `/props` and its own\nargv: `parallelSlots` unset is llama-server's automatic\nslots, one unified pool of `n_ctx`; an explicit `--parallel\nN` gives each slot `n_ctx` of its own unless `--kv-unified`\nis passed too. `/props` has no unified flag. The gateway\nbudgets the prompts it sends a runtime against this, so a\nturn waits for room rather than overflowing the pool.\n",
+        ge=1,
+    )
     embeddings: bool | None = Field(
         None, description='Whether this runtime was started in embedding mode.'
     )

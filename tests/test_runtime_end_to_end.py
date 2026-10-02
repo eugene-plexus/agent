@@ -200,6 +200,9 @@ async def test_runtime_goes_starting_then_loading_then_ready(fake_engine: Path) 
         assert runtime.capabilities is not None
         assert runtime.capabilities.contextLength == 4096
         assert runtime.capabilities.parallelSlots == 2
+        # CB3: launched with automatic slots, which share one pool of
+        # n_ctx -- known only from the argv, never from /props.
+        assert runtime.capabilities.contextPoolTokens == 4096
         # The resolved command line is reported for debugging.
         assert runtime.argv is not None
         assert str(port) in runtime.argv

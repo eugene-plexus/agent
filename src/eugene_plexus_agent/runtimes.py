@@ -753,6 +753,13 @@ class RuntimeSupervisor:
         engine_version: str | None = None
         if isinstance(readiness, Ready):
             capabilities = readiness.capabilities
+            # CB3: whether the slots share their context is in the argv
+            # this process was launched with, not in anything it reports.
+            adapter = adapter_for(spec.engine)
+            if capabilities is not None and adapter is not None and sp is not None and sp.last_argv:
+                pool = adapter.context_pool(capabilities, list(sp.last_argv), spec.env)
+                if pool is not None:
+                    capabilities = capabilities.model_copy(update={"contextPoolTokens": pool})
         if planner is not None and planner.binary is not None:
             engine_version = planner.binary.version
 

@@ -494,6 +494,53 @@ class LlamaCppAdapter(EngineAdapter):
             vision=modalities.get("vision") is True if isinstance(modalities, dict) else None,
         )
 
+    def context_pool(
+        self,
+        capabilities: RuntimeCapabilities,
+        argv: list[str],
+        env: dict[str, str] | None,
+    ) -> int | None:
+        """The context llama-server's slots share, from `/props` and our argv.
+
+        **`/props` cannot say whether the pool is unified** (b11211's props
+        builder has no such field), and the argv can. Measured on b11211
+        with `-c 16384`: automatic slots report `n_ctx` 16384 over 4 slots
+        with `kv_unified = 'true'`; `--parallel 4` reports 4096 each,
+        divided; `--parallel 4 --kv-unified` reports 16384, shared. So:
+        slots unset (or `-1`, auto) share `n_ctx`; an explicit count
+        divides it unless `--kv-unified` is passed; `--no-kv-unified`
+        divides it whatever the count. The last flag wins, as in
+        llama.cpp's own parser, and an argv flag beats its environment
+        variable.
+
+        `--kv-unified-per-slot` caps each slot inside a shared pool and
+        `/props` then reports the cap, not the pool, so the pool is
+        unknown and this says None rather than guess.
+        """
+        context = capabilities.contextLength
+        if not context:
+            return None
+        env = env or {}
+        parallel: str | None = env.get("LLAMA_ARG_N_PARALLEL")
+        unified: bool | None = _env_bool(env.get("LLAMA_ARG_KV_UNIFIED"))
+        if env.get("LLAMA_ARG_KV_UNIFIED_PER_SLOT"):
+            return None
+        tokens = iter(argv)
+        for token in tokens:
+            name, _, inline = token.partition("=")
+            if name in ("-np", "--parallel"):
+                parallel = inline or next(tokens, None)
+            elif name in ("-kvu", "--kv-unified"):
+                unified = True
+            elif name in ("-no-kvu", "--no-kv-unified"):
+                unified = False
+            elif name == "--kv-unified-per-slot":
+                return None
+        automatic = parallel is None or parallel.strip() == "-1"
+        if unified is None:
+            unified = automatic
+        return context if unified else None
+
     # --- configuring ------------------------------------------------------
 
     def flag_schema(self) -> ConfigSchema:
@@ -502,6 +549,18 @@ class LlamaCppAdapter(EngineAdapter):
             categories=_CATEGORIES,
             fields=_FLAG_FIELDS,
         )
+
+
+def _env_bool(value: str | None) -> bool | None:
+    """llama.cpp's reading of a boolean `LLAMA_ARG_*` variable, or None."""
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in ("1", "true", "on", "enabled"):
+        return True
+    if lowered in ("0", "false", "off", "disabled"):
+        return False
+    return None
 
 
 def _status_text(response: httpx.Response) -> str | None:
