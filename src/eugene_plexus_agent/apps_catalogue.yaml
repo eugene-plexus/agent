@@ -14,12 +14,12 @@
 - id: workbench
   name: Workbench
   summary: >-
-    Chat with the models this install serves, and search the web while you
-    do. Signs people in with Eugene: the owner with the passphrase, a small
+    Chat with the models this install serves, search the web and use shared
+    MCP tools with approval for each call. Signs people in with Eugene: the owner with the passphrase, a small
     business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/5ed00016be126055d362c0732f4b995f36866c56.tar.gz
-  version: 5ed00016be126055d362c0732f4b995f36866c56
+  source: https://github.com/eugene-plexus/workbench/archive/34666b6fb1d3665afcb4d7cab03e09201c7cd8ce.tar.gz
+  version: 34666b6fb1d3665afcb4d7cab03e09201c7cd8ce
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
@@ -28,8 +28,8 @@
   uses: [inference]
   signIn: true
   signInCallbackPath: /oidc/callback
-  # It runs nothing a model chooses on this machine, so it installs where
-  # an app cannot have an account of its own too (C1).
+  # C5a connects to HTTP MCP servers; it starts no local tool processes.
+  # C5b must require app-account isolation before adding stdio servers.
   localActions: false
 
 # The first app here that we did not write (C4, specs
