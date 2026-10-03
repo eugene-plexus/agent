@@ -193,6 +193,35 @@ def _write_config(path: Path, managed: dict[str, Any]) -> bool:
     return changed
 
 
+def _seed_config(path: Path, seeds: dict[str, str]) -> bool:
+    """Fill `seeds` into the companion's file where those fields are empty.
+
+    True iff something was written, which is a change the driver reads at
+    startup. Never replaces a value: an operator's own, or one the driver
+    has since sealed into an envelope, stands. Written the way
+    `_write_config` writes, owner-only and atomically, because what is
+    seeded here is a key.
+    """
+    if not seeds:
+        return False
+    document = _read_config(path) if path.exists() else {}
+    missing = {key: value for key, value in seeds.items() if not document.get(key)}
+    if not missing:
+        return False
+    document.update(missing)
+    write_private(path, yaml.safe_dump(document, sort_keys=True, default_flow_style=False))
+    log.info("companion %s: %s filled from its runtime", path.stem, ", ".join(sorted(missing)))
+    return True
+
+
+def companion_secrets(spec: RuntimeSpec) -> dict[str, str]:
+    """The engine's fill-if-empty fields for its companion (Kev's key)."""
+    adapter = adapter_for(spec.engine)
+    if adapter is None:
+        return {}
+    return dict(adapter.companion_secrets(spec))
+
+
 def resolved_alias(spec: RuntimeSpec) -> str:
     return spec.modelAlias or default_model_alias(spec.modelPath)
 
@@ -251,6 +280,9 @@ async def ensure_companion(
             overrides=companion_overrides(spec),
         ),
     )
+    # After the managed keys: a seeded key is read at startup like them,
+    # so filling one is a change that restarts the driver.
+    changed = _seed_config(path, companion_secrets(spec)) or changed
 
     if existing is None:
         entry = ComponentEntry(

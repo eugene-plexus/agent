@@ -571,3 +571,28 @@ async def test_late_ready_probe_cannot_belong_to_a_replacement(
     finally:
         release.set()
         await probe
+
+
+async def test_the_probe_carries_the_headers_the_adapter_asks_for(
+    controlled_runtime: _RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kev started with `KEV_API_KEY` answers `/v1/models` only with the
+    bearer (kev-1.0). The adapter knows which key the spawn gave it; the
+    supervisor is what has to hand it to the probe, so this drives the
+    supervisor rather than the adapter (drift audit 2026-10-03)."""
+    harness = controlled_runtime
+    await harness.next_process()
+    received: list[dict[str, str] | None] = []
+
+    async def probe(
+        _base: str, *, established: bool = False, headers: dict[str, str] | None = None
+    ) -> Ready:
+        received.append(headers)
+        return Ready()
+
+    monkeypatch.setattr(harness.adapter, "probe_readiness", probe)
+    monkeypatch.setattr(
+        harness.adapter, "readiness_headers", lambda spec: {"Authorization": "Bearer k"}
+    )
+    await harness.supervisor._probe_one(harness.spec)
+    assert received == [{"Authorization": "Bearer k"}]

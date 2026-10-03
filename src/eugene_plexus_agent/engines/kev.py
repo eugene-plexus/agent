@@ -5,23 +5,37 @@ System One questions with structured probabilities, and its companion
 driver serves `POST /v1/decide` instead of completions. Every claim here
 is pinned to `kev/serve.py` at commit `1c35199` and to a live kev-0.8b
 run on WSL CPU, 2026-09-22 (specs `docs/design/decision-models.md` is
-the ledger):
+the ledger). **The pin stays; upstream has moved.** `kev-1.0` (tagged
+2026-10-01) changed four of these, read in source by the drift audit of
+2026-10-03, and each bullet says where it holds:
 
   * The launch is `<python> -m kev.serve --run <checkpoint> --port <p>`.
-    The flags are exactly `--run`, `--fallback` and `--port`; there is
-    **no `--host`** — upstream hardcodes the bind to `127.0.0.1`, which
-    is precisely the posture Eugene wants, because the gateway is the
-    authenticated front door.
+    At the pin the flags are exactly `--run`, `--fallback` and `--port`;
+    there is **no `--host`** and the bind is hardcoded to `127.0.0.1`,
+    which is precisely the posture Eugene wants, because the gateway is
+    the authenticated front door. `kev-1.0` adds `--host` (default
+    `127.0.0.1`); the launch still passes none.
   * **The model loads BEFORE the server binds** (`ck.load(...)` precedes
-    the uvicorn call in `main`), so this is vLLM's readiness shape:
-    alive-and-refusing IS loading, and only the supervisor can say so.
+    the uvicorn call in `main`, at the pin and at `kev-1.0`), so this is
+    vLLM's readiness shape: alive-and-refusing IS loading, and only the
+    supervisor can say so.
   * There is **no health endpoint**. `GET /v1/models` answers once
-    serving, with `{models: [{id, aliases, run, base, ...}]}` (measured).
-  * The server holds ONE request at a time (a lock; no cross-caller
-    batching), so the companion driver is told `decisionMaxConcurrent: 1`
-    and the gateway never over-admits it.
-  * The request's `model` field is echoed unvalidated (measured), so the
-    public alias travels as-is and no upstream translation is needed.
+    serving: at the pin `{models: [{id, aliases, run, base, ...}]}`
+    (measured), at `kev-1.0` `{models: [{name, description, ...}]}` with
+    no `id`. The probe reads only the status, so either serves it.
+  * **At the pin** the server holds ONE request at a time (a lock; no
+    cross-caller batching), so the companion driver is told
+    `decisionMaxConcurrent: 1` and the gateway never over-admits it.
+    `kev-1.0` batches up to 64 requests on a model thread instead; the
+    ceiling is right for the pin and only conservative for that.
+  * **At `kev-1.0`, `KEV_API_KEY` puts bearer auth on `/v1/*`** (401
+    without it); the pin has no key. A key in the runtime's `env`, or
+    inherited from the agent's, is sent by the readiness probe
+    (`readiness_headers`) and given to the companion when its `apiKey`
+    is empty (`companion_secrets`).
+  * The request's `model` field is echoed unvalidated (measured at the
+    pin), so the public alias travels as-is and no upstream translation
+    is needed.
 
 **The environment is the operator's, like vLLM's and mlx-lm's** — a
 `uv sync --extra serve` inside a checkout of the pinned commit, never
@@ -54,6 +68,7 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimeSpec,
 )
+from ..child_env import child_environment
 from .base import (
     DiscoveredBinary,
     EngineAdapter,
@@ -69,8 +84,10 @@ log = logging.getLogger(__name__)
 
 _PROBE_TIMEOUT_SECONDS = 5.0
 
-#: The commit every claim was read against and the recipe pins. Kev has
-#: no versioned releases at the pin date; a commit is the honest pin.
+#: The commit every claim was read against and the recipe pins. Kev had
+#: no versioned releases at the pin date (2026-09-22), so a commit was the
+#: honest pin; `kev-1.0` was tagged 2026-10-01 and differs (module
+#: docstring), and the pin has not moved to it.
 UPSTREAM_COMMIT_PINNED = "1c351992ba3df4a0a0f2ae03051b25466a2c7bcb"
 
 INSTALL_DOCS_URL = "https://github.com/jaredpalmer/kev"
@@ -183,9 +200,11 @@ class KevAdapter(EngineAdapter):
                 "directories (adapter + head.pt + tokenizer + provenance); the base "
                 "model they apply to is downloaded separately on the first launch, "
                 "which is why a first start can take minutes and why an offline node "
-                "needs the base pre-downloaded. The server binds loopback only, by "
-                "upstream's own design: Eugene's gateway is the front door. Verified "
-                "on Linux/WSL CPU; CUDA, ROCm and Metal need their own evidence."
+                "needs the base pre-downloaded. At this commit the server binds "
+                "loopback only, by upstream's own design: Eugene's gateway is the front "
+                "door. Verified on Linux/WSL CPU; CUDA, ROCm and Metal need their own "
+                "evidence. This is the pinned commit, not `kev-1.0`, which changed the "
+                "model list and the request handling the adapter was verified against."
             ),
         )
 
@@ -194,10 +213,12 @@ class KevAdapter(EngineAdapter):
     def build_argv(self, spec: RuntimeSpec, binary: DiscoveredBinary, port: int) -> list[str]:
         """`<python> -m kev.serve --run <checkpoint> --port <p>`.
 
-        Exactly the pinned flags and no `--host`: upstream binds
-        loopback unconditionally, so a spec host other than loopback
+        Exactly the pinned flags and no `--host`: at the pin upstream
+        binds loopback unconditionally, so a spec host other than loopback
         cannot be honoured — `validate_spec`'s launch policy is where a
-        non-loopback host is refused for this engine.
+        non-loopback host is refused for this engine. (`kev-1.0` has a
+        `--host`; the pin does not, and passing it would end the pinned
+        server at its argument parser.)
 
         No alias flag either, and none is needed: the server echoes the
         request's `model` unvalidated (measured), so the public alias
@@ -234,6 +255,23 @@ class KevAdapter(EngineAdapter):
         """
         return {"provider": "systemone_custom", "decisionMaxConcurrent": 1}
 
+    def companion_secrets(self, spec: RuntimeSpec) -> dict[str, str]:
+        """The key this Kev was started with, for a companion that has none.
+
+        A Kev started with `KEV_API_KEY` (from `kev-1.0`) refuses the
+        companion's decisions without the bearer, and the driver sends its
+        `apiKey` as one. Filled only where the companion's `apiKey` is
+        empty: an operator's own value, or one the driver has sealed,
+        stands.
+        """
+        key = api_key(spec)
+        return {"apiKey": key} if key else {}
+
+    def readiness_headers(self, spec: RuntimeSpec) -> dict[str, str]:
+        """The bearer a Kev started with `KEV_API_KEY` requires on `/v1/*`."""
+        key = api_key(spec)
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
     def default_env(self, spec: RuntimeSpec, binary: DiscoveredBinary) -> dict[str, str]:
         """Nothing, so far honestly.
 
@@ -263,7 +301,13 @@ class KevAdapter(EngineAdapter):
 
     # --- observing --------------------------------------------------------
 
-    async def probe_readiness(self, base_url: str, *, established: bool = False) -> Readiness:
+    async def probe_readiness(
+        self,
+        base_url: str,
+        *,
+        established: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> Readiness:
         """`GET /v1/models` — the only thing this server answers about
         itself, and it answers only once serving (the load precedes the
         bind, so there is no loading window to narrate). A refused
@@ -273,11 +317,23 @@ class KevAdapter(EngineAdapter):
         del established  # one cheap read; nothing to downgrade to
         url = base_url.rstrip("/")
         try:
-            response = await _probe_client().get(f"{url}/v1/models", timeout=_PROBE_TIMEOUT_SECONDS)
+            response = await _probe_client().get(
+                f"{url}/v1/models", timeout=_PROBE_TIMEOUT_SECONDS, headers=headers
+            )
         except (httpx.ConnectError, httpx.ConnectTimeout) as e:
             return NotAnswering(detail=str(e), reached=False)
         except httpx.HTTPError as e:
             return NotAnswering(detail=str(e), reached=True)
+        if response.status_code == 401:
+            return NotAnswering(
+                detail=(
+                    "/v1/models returned 401: this Kev requires an API key (it was started "
+                    "with KEV_API_KEY) and the probe's did not match. Set KEV_API_KEY in "
+                    "this runtime's env -- the agent sends the key the runtime is started "
+                    "with -- or remove it from the environment Kev inherits."
+                ),
+                reached=True,
+            )
         if not response.is_success:
             return NotAnswering(detail=f"/v1/models returned {response.status_code}", reached=True)
         return Ready(capabilities=_capabilities_from_models(response))
@@ -290,6 +346,25 @@ class KevAdapter(EngineAdapter):
             categories={"model": "Model loading"},
             fields=_FLAG_FIELDS,
         )
+
+
+#: The variable `kev-1.0`'s server reads its bearer key from.
+API_KEY_VARIABLE = "KEV_API_KEY"
+
+
+def api_key(spec: RuntimeSpec) -> str | None:
+    """The `KEV_API_KEY` a launch of `spec` gives Kev, or None.
+
+    The spawn's own precedence (`runtimes.py`): the agent's environment,
+    then the runtime's `env` on top. A runtime that names the variable
+    decides, even with an empty value, which Kev reads as no key.
+    """
+    env = spec.env or {}
+    if API_KEY_VARIABLE in env:
+        value = str(env[API_KEY_VARIABLE] or "")
+    else:
+        value = child_environment().get(API_KEY_VARIABLE, "")
+    return value or None
 
 
 def _capabilities_from_models(response: httpx.Response) -> RuntimeCapabilities | None:

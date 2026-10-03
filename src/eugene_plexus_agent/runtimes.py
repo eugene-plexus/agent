@@ -955,7 +955,15 @@ class RuntimeSupervisor:
         started_at = sp.last_restart
         base = f"http://{spec.host or '127.0.0.1'}:{spec.port}"
         established = started_at is not None and self._proved_ready.get(spec.name) == started_at
-        outcome = await adapter.probe_readiness(base, established=established)
+        # A credential the engine was started with (Kev's `KEV_API_KEY`):
+        # passed only when there is one, so every other engine's probe
+        # is called exactly as before.
+        headers = adapter.readiness_headers(spec)
+        outcome = await (
+            adapter.probe_readiness(base, established=established, headers=headers)
+            if headers
+            else adapter.probe_readiness(base, established=established)
+        )
         if (
             self._processes.get(spec.name) is not sp
             or sp.last_restart != started_at

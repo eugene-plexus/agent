@@ -350,7 +350,13 @@ class MlxAdapter(EngineAdapter):
 
     # --- observing --------------------------------------------------------
 
-    async def probe_readiness(self, base_url: str, *, established: bool = False) -> Readiness:
+    async def probe_readiness(
+        self,
+        base_url: str,
+        *,
+        established: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> Readiness:
         """Two questions, because one of them is not answerable — until
         it has been answered once.
 

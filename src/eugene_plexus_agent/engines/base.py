@@ -398,6 +398,25 @@ class EngineAdapter(abc.ABC):
         """
         return {}
 
+    def companion_secrets(self, spec: RuntimeSpec) -> dict[str, str]:
+        """Companion-config fields to fill **only where they are empty**.
+
+        Not managed keys: the agent never overwrites or clears them, so
+        an operator's own value -- or one the driver has since sealed --
+        stands. Kev is why this exists: a Kev started with `KEV_API_KEY`
+        refuses the companion's requests without that bearer.
+        """
+        return {}
+
+    def readiness_headers(self, spec: RuntimeSpec) -> dict[str, str]:
+        """Headers the readiness probe must send to this runtime.
+
+        Nothing, for every engine but one: a Kev started with
+        `KEV_API_KEY` refuses `/v1/*` without its bearer. The supervisor
+        passes these to `probe_readiness` only when there are some.
+        """
+        return {}
+
     def context_pool(
         self,
         capabilities: RuntimeCapabilities,
@@ -449,8 +468,18 @@ class EngineAdapter(abc.ABC):
     # --- observing --------------------------------------------------------
 
     @abc.abstractmethod
-    async def probe_readiness(self, base_url: str, *, established: bool = False) -> Readiness:
+    async def probe_readiness(
+        self,
+        base_url: str,
+        *,
+        established: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> Readiness:
         """Ask a running engine whether it is serving yet.
+
+        `headers` are this runtime's `readiness_headers`. Only an adapter
+        whose `readiness_headers` can return any reads them (Kev); the
+        others accept and ignore them, since nothing would be in them.
 
         A *network* observation only. It must not try to infer whether
         the process is alive — it cannot — and it must keep a short
