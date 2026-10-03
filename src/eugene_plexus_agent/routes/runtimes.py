@@ -45,6 +45,7 @@ from ..admission import (
     RunningRuntime,
     admission_split,
     check_admission,
+    reservation_bytes,
 )
 from ..companions import (
     CompanionConflict,
@@ -307,7 +308,13 @@ def _ledger(request: Request) -> ReservationLedger:
     return ledger
 
 
-def _reserve(request: Request, spec: RuntimeSpec, admission: Admission | None) -> None:
+def _reserve(
+    request: Request,
+    spec: RuntimeSpec,
+    admission: Admission | None,
+    *,
+    engine_places: bool = False,
+) -> None:
     """Promise the memory a launch we just scheduled is about to take.
 
     Called at the point of committing to a start and nowhere else, so a
@@ -315,15 +322,23 @@ def _reserve(request: Request, spec: RuntimeSpec, admission: Admission | None) -
     nothing behind. `requiredBytes` is absent when nothing could be
     measured -- an `unknown` fit, a file that could not be sized -- and
     a promise of an unknown quantity is not a promise.
+
+    **The promise is what the engine will take, which is not always what
+    admission measured** (`reservation_bytes`): a llama.cpp launch that
+    leaves its context to the engine fills the card to its margin.
+    `engine_places` is the answer `_measure_launch` already read off the
+    build, carried here rather than asked again so nothing is awaited
+    between the start being scheduled and the promise being recorded.
     """
     if admission is None or not admission.requiredBytes:
         return
+    size = reservation_bytes(spec, admission, engine_places=engine_places)
     _ledger(request).reserve(
         spec.name,
         device_index=admission.device.index if admission.device is not None else None,
         device_kind=admission.device.kind.value if admission.device is not None else None,
-        size_bytes=admission.requiredBytes,
-        shares=admission_split(spec, admission, _ledger(request).entries()),
+        size_bytes=size,
+        shares=admission_split(spec, admission, _ledger(request).entries(), size=size),
     )
 
 
@@ -341,6 +356,15 @@ def engine_places(spec: RuntimeSpec, get_config) -> bool:  # type: ignore[no-unt
 
 
 async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
+    """Measure `spec` here, now. The dry run's question, and every caller
+    that does not go on to reserve."""
+    admission, _ = await _measure_launch(request, spec)
+    return admission
+
+
+async def _measure_launch(request: Request, spec: RuntimeSpec) -> tuple[Admission, bool]:
+    """`_admission_for`, plus whether this spec's llama-server places the
+    model by itself -- which `_reserve` needs, and which is read once."""
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     consulted = await refresh_library_folders(request)
@@ -364,7 +388,8 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
     ledger.reconcile(other.name for other, status in observed if status in PENDING_STATUSES)
     identity = getattr(request.app.state, "node_identity", None)
     node_name = identity.record.name if identity is not None and identity.record.enrolled else None
-    return await check_admission(
+    places = await asyncio.to_thread(engine_places, spec, state.get_config)
+    admission = await check_admission(
         spec,
         snapshot=snapshot,
         library=await library_client_for(request),
@@ -378,8 +403,9 @@ async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
         # So admission asks about the file a launch would actually open,
         # including this node's own copy when it holds one.
         copy_settings=supervisor.copy_settings() if supervisor is not None else None,
-        engine_places=await asyncio.to_thread(engine_places, spec, state.get_config),
+        engine_places=places,
     )
+    return admission, places
 
 
 # --------------------------------------------------------------------------- #
@@ -633,8 +659,9 @@ async def create_runtime(
     # still reserved. Before that, a forced launch was invisible to the
     # next admission.
     admission: Admission | None = None
+    places = False
     if body.autoStart is not False:
-        admission = await _admission_for(request, body)
+        admission, places = await _measure_launch(request, body)
         if admission.decision is AdmissionDecision.refuse and not force:
             raise _refused(admission)
 
@@ -669,7 +696,7 @@ async def create_runtime(
         # Last, and only once the start is actually scheduled: a
         # declaration that 409'd or 400'd above never promised anything,
         # so there is no failure path here that needs a release.
-        _reserve(request, spec, admission)
+        _reserve(request, spec, admission, engine_places=places)
     return _compose(spec, supervisor)
 
 
@@ -851,19 +878,20 @@ async def start_runtime(
     supervisor = _supervisor(request)
     already = supervisor is not None and supervisor.is_running(name)
     admission: Admission | None = None
+    places = False
     if not already:
         # Where a runtime declared with `autoStart: false` meets
         # admission — it was not measured at declaration because it was
         # not being launched then. Measured under `force` too, because
         # the reservation comes off this number.
-        admission = await _admission_for(request, spec)
+        admission, places = await _measure_launch(request, spec)
         if admission.decision is AdmissionDecision.refuse and not force:
             raise _refused(admission)
     if supervisor is not None and not already:
         # `autoStart: false` means "don't start at boot", not "never
         # start" — an explicit start overrides it for this session.
         supervisor.add_and_start(spec.model_copy(update={"autoStart": True}))
-        _reserve(request, spec, admission)
+        _reserve(request, spec, admission, engine_places=places)
     return RestartResult(
         # `scheduled` reports whether this call caused a start, so an
         # idempotent second press is distinguishable from the first.

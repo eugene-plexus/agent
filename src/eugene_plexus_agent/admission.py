@@ -688,7 +688,11 @@ def place(
 
 
 def admission_split(
-    spec: RuntimeSpec, admission: Admission, reservations: Sequence[Reservation] = ()
+    spec: RuntimeSpec,
+    admission: Admission,
+    reservations: Sequence[Reservation] = (),
+    *,
+    size: int | None = None,
 ) -> list[tuple[str, int, int]]:
     """A split launch's promise, divided the way its weights will be.
 
@@ -697,9 +701,12 @@ def admission_split(
     verdict divided the model by. A first version divided by free memory
     alone, and a test of two equal cards, one spoken for, caught it
     promising half of a new launch to the card that had no room.
+
+    `size` is the promise being divided, when it is not what admission
+    measured (`reservation_bytes`).
     """
     devices = admission.devices or []
-    required = admission.requiredBytes or 0
+    required = size if size is not None else (admission.requiredBytes or 0)
     if len(devices) < 2 or required <= 0:
         return []
 
@@ -724,6 +731,67 @@ def admission_split(
         for d, p in zip(devices, shares, strict=True)
         if d.index is not None and p > 0
     ]
+
+
+# llama.cpp's `--fit-target` default: the memory its fit leaves free on
+# every device (`-fitt`, "default: 1024" MiB, b11375's help).
+DEFAULT_FIT_MARGIN_BYTES = 1024 * 1024**2
+
+_CONTEXT_ARGS = ("-c", "--ctx-size")
+
+
+def reservation_bytes(spec: RuntimeSpec, admission: Admission, *, engine_places: bool) -> int:
+    """What the ledger promises for a launch admission just measured.
+
+    **What the engine will take, which is what admission measured except
+    in one case** (drift audit 2026-10-03, settings never lie): a
+    llama.cpp launch that leaves `contextSize` unset on a build whose fit
+    is on. llama.cpp does not run that at the context admission assumed;
+    `common/fit.cpp` (b11375) starts at the model's trained context and
+    shrinks it only until every card is full to `--fit-target`. So:
+
+    * sized at the model's own context (the library answered, `metadata`):
+      that, or the cards' room less the margin when that is smaller;
+    * sized at an ASSUMED context (`file_size`, `ASSUMED_CONTEXT_LENGTH`):
+      the cards' room less the margin -- what the fit fills for any model
+      whose trained context is larger than the assumption, which is every
+      current one. The ledger counted 8,192 tokens of a card the engine
+      had filled.
+
+    The room is what admission reported free less what other launches
+    already hold. Over-counting for a model with a tiny trained context
+    lasts one load and refuses rather than admits, the direction the
+    ledger already accepts (`reservations.py`).
+    """
+    required = admission.requiredBytes or 0
+    if required <= 0 or admission.freeBytes is None:
+        return required
+    if not _engine_sizes_context(spec, engine_places=engine_places):
+        return required
+    cards = len(admission.devices) if admission.devices else 1
+    margin = _fit_margin_bytes(spec) * cards
+    room = max(admission.freeBytes - (admission.reservedBytes or 0) - margin, 0)
+    if admission.basis is AdmissionBasis.metadata:
+        return min(required, room)
+    return room
+
+
+def _engine_sizes_context(spec: RuntimeSpec, *, engine_places: bool) -> bool:
+    """Whether llama.cpp, not the profile, decides this launch's context."""
+    if spec.engine is not EngineKind.llama_cpp or not engine_places or fit_disabled(spec):
+        return False
+    if (spec.flags or {}).get("contextSize") is not None:
+        return False
+    args = [a.strip() for a in (spec.extraArgs or [])]
+    return not any(a in _CONTEXT_ARGS or a.startswith("--ctx-size=") for a in args)
+
+
+def _fit_margin_bytes(spec: RuntimeSpec) -> int:
+    """`memoryMargin` (MiB, `--fit-target`), or llama.cpp's own default."""
+    margin = (spec.flags or {}).get("memoryMargin")
+    if isinstance(margin, int) and not isinstance(margin, bool) and margin >= 0:
+        return margin * 1024**2
+    return DEFAULT_FIT_MARGIN_BYTES
 
 
 def wants_full_offload(spec: RuntimeSpec, *, engine_places: bool = False) -> bool:

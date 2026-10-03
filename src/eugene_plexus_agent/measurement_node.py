@@ -120,7 +120,7 @@ async def restart_stopped(
     import contextlib
 
     from .node_work import launch_lock
-    from .routes.runtimes import _admission_for, _reserve, _supervisor
+    from .routes.runtimes import _measure_launch, _reserve, _supervisor
 
     results: list[MeasurementRestart] = []
     if not names:
@@ -154,12 +154,12 @@ async def restart_stopped(
                 if supervisor.is_running(name):
                     results.append(_result(name, "restarted", "It was already running again."))
                     continue
-                admission = await _admission_for(request, spec)
+                admission, places = await _measure_launch(request, spec)
                 if admission.decision is AdmissionDecision.refuse:
                     results.append(_result(name, "refused", admission.reason or "Memory refused."))
                     continue
                 supervisor.add_and_start(spec.model_copy(update={"autoStart": True}))
-                _reserve(request, spec, admission)
+                _reserve(request, spec, admission, engine_places=places)
                 results.append(_result(name, "restarted", "Started again."))
             except Exception as exc:
                 log.exception("Could not restart runtime %r after a measurement", name)

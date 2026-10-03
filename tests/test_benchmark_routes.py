@@ -91,8 +91,18 @@ def test_launch_race_is_serialized_in_both_directions(
         await release.wait()
         return await original_admission(*args)
 
+    original_measure = runtimes._measure_launch
+
+    async def slow_measure(*args):
+        entered.set()
+        await release.wait()
+        return await original_measure(*args)
+
     monkeypatch.setattr(benchmarks, "_admission_for", slow_admission)
     monkeypatch.setattr(runtimes, "_admission_for", slow_admission)
+    # A launch measures through `_measure_launch` since it began carrying
+    # `engine_places` to the reservation (2026-10-03); hold it there too.
+    monkeypatch.setattr(runtimes, "_measure_launch", slow_measure)
     monkeypatch.setattr(
         benchmarks, "prepare_binary", lambda *a: (Path(sys.executable), "fixture", "fixture")
     )
