@@ -490,7 +490,12 @@ class GitHubReleases:
         ):
             return self._cached or []
 
-        url = f"https://api.github.com/repos/{self._repo}/releases?per_page=30"
+        # GitHub's largest page. llama.cpp publishes about twenty builds a
+        # day (measured 2026-10-03: the newest hundred spanned 114.9 hours),
+        # so this is about 4.8 days -- and a pinned install, the rollback
+        # for a regression, can only name a build in this list. At 30 it
+        # was about 34 hours.
+        url = f"https://api.github.com/repos/{self._repo}/releases?per_page=100"
         try:
             raw = self._fetch(url)
         except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:

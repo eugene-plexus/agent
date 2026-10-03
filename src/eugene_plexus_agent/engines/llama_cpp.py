@@ -112,10 +112,14 @@ _CUDA_VARIANT_RE = re.compile(
 )
 
 # How many builds back `plan_latest` looks for one that carries this host's
-# assets. Upstream publishes several a day and an incomplete upload lasts
-# under an hour, so eight is about a day; a host that finds nothing in a
-# day is told the newest build's own reason.
-FALLBACK_BUILDS = 8
+# assets: about a day of upstream's cadence, so an upload still in progress
+# (under an hour) and a CI job failing one variant for a day both still find
+# the last build that has it. A host that finds nothing in a day is told the
+# newest build's own reason. **Measured 2026-10-03: 20.9 builds a day** (the
+# newest hundred spanned 114.9 hours; whole days of 18, 27, 19 and 19). It
+# was 8 when upstream published "several a day", which is about nine hours
+# now. Re-measure if upstream's cadence changes again.
+FALLBACK_BUILDS = 24
 
 
 class LlamaCppAdapter(EngineAdapter):
