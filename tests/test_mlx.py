@@ -11,10 +11,11 @@ The three behaviors unique to this adapter, each with its own section:
   * readiness costs a token — but only ONCE per process. `established`
     downgrades the probe to a plain /health read, and the first Ready is
     always paid for with a real generation.
-  * upstream main's 503 `unavailable` /health reads as Loading, so the
-    next release pin gets the cheap probe for free — while any other
-    non-200 stays NotAnswering (a 503 from something that is not
-    mlx_lm.server must not be promoted to a load that never ends).
+  * a 503 `unavailable` /health is a DEAD engine (mlx-lm 0.32.0: the
+    generation thread died; it answers 200 while loading), reached and
+    not loading, with the captured output named -- and any other non-200
+    stays a generic NotAnswering (a 503 from something that is not
+    mlx_lm.server must not be diagnosed as one).
   * the model-name blocker: `upstream_model_id()` hands the companion
     the `default_model` sentinel and the alias never reaches the argv.
 """
@@ -326,13 +327,22 @@ async def test_connection_refused_is_not_answering_and_not_reached(
     assert outcome.reached is False
 
 
-async def test_upstream_mains_unavailable_health_reads_as_loading(
+async def test_an_unavailable_health_is_a_dead_engine_not_a_load(
     adapter: MlxAdapter,
 ) -> None:
-    """Unreleased upstream (c69d128) answers 503 unavailable while
-    loading. Reading it now means the next release pin gets the cheap
-    probe with no adapter change — and it must short-circuit BEFORE the
-    token probe, or the load would cost a queued generation anyway."""
+    """**Amended 2026-10-03, not added to.** This was
+    `test_upstream_mains_unavailable_health_reads_as_loading`: unreleased
+    upstream (c69d128) answered 503 `unavailable` while loading, and the
+    test read it as `Loading` ahead of a release. The release went the
+    other way. In mlx-lm 0.32.0 (PR ml-explore/mlx-lm#1791)
+    `handle_health_check` answers 503 `{"status": "unavailable"}` exactly
+    when `generation_available()` is false -- the generation thread died
+    (`_run_generate` caught it, `_generation_failed`), most often on a
+    model that failed to load -- and 200 while loading. Read as a load,
+    a failed one would sit at `loading` for the whole 600 s budget.
+
+    It is reached and not loading, with the place to look named, and it
+    still short-circuits before the token probe."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/health", "must not fall through to generation"
@@ -340,7 +350,28 @@ async def test_upstream_mains_unavailable_health_reads_as_loading(
 
     _patch_client(handler)
     outcome = await adapter.probe_readiness("http://127.0.0.1:8101")
-    assert isinstance(outcome, Loading)
+    assert isinstance(outcome, NotAnswering)
+    assert outcome.reached is True
+    detail = outcome.detail or ""
+    assert "generation thread" in detail
+    assert "captured" in detail and "output" in detail
+
+
+async def test_an_unavailable_health_is_dead_after_residency_too(adapter: MlxAdapter) -> None:
+    """Once residency is proved the probe is a plain /health read, and a
+    generation thread that dies afterwards is the one failure that read
+    can now see -- 0.31.3 answered 200 whatever happened to it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"status": "unavailable"})
+
+    _patch_client(handler)
+    outcome = await adapter.probe_readiness("http://127.0.0.1:8101", established=True)
+    assert isinstance(outcome, NotAnswering)
+    assert outcome.reached is True
+    assert not isinstance(
+        interpret_readiness(adapter, outcome, process_alive=True, elapsed_seconds=5.0), Loading
+    )
 
 
 async def test_a_strange_503_is_not_promoted_to_loading(adapter: MlxAdapter) -> None:

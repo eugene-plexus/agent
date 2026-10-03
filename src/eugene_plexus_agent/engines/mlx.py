@@ -43,11 +43,16 @@ the same blindness llama.cpp's narrated health has. The alternative was
 a per-runtime forward pass every two seconds on a unified-memory
 machine, forever.
 
-**Upstream `main` has since taught `/health` to answer 503
-`{"status": "unavailable"}` while loading** (inspected at `c69d128`;
-unreleased). This probe reads that shape as `Loading`, so the day a
-release carries it the probe gets cheap during loads too, with no
-change here.
+**mlx-lm 0.32.0 taught `/health` to answer 503 `{"status":
+"unavailable"}` -- when the generation thread has DIED** (PR
+ml-explore/mlx-lm#1791: `handle_health_check` reads
+`generation_available()`, false once `_run_generate` caught an exception
+or the thread is gone), and 200 while the model loads. Unreleased `main`
+had once answered that shape while loading (inspected at `c69d128`), and
+this probe read it as `Loading` in anticipation; the release went the
+other way, so it is read as a dead engine now: reached, not loading, with
+the captured output named. At 0.31.3 `/health` never answers 503, so the
+reading is harmless there.
 
 **The model-name blocker is closed one layer down.** `mlx_lm.server`
 has no flag to serve a chosen name; the only ids it resolves are
@@ -351,9 +356,12 @@ class MlxAdapter(EngineAdapter):
           * `/health` unreachable → `NotAnswering(reached=False)`. The
             server binds almost immediately, so this window is short and
             genuinely means "nothing there yet".
-          * `/health` answers 503 `unavailable` → `Loading`. That is
-            upstream main's (unreleased) narrated load; reading it here
-            means a future pin gets the cheap probe with no change.
+          * `/health` answers 503 `unavailable` → `NotAnswering(reached=
+            True)`. From mlx-lm 0.32.0 that is the generation thread
+            dead -- most often a model that failed to load -- and while
+            loading it answers 200. Read as a load (what unreleased
+            `main` once meant by it), a failed load would sit at
+            `loading` for the whole startup budget.
           * `/health` answers ok and `established` → `Ready`: this same
             process already generated a token once, and a resident model
             stays resident for the life of the process.
@@ -375,14 +383,19 @@ class MlxAdapter(EngineAdapter):
             return NotAnswering(detail=str(e), reached=True)
 
         if health.status_code == 503 and _says_unavailable(health):
-            return Loading(
+            return NotAnswering(
                 detail=(
-                    '/health reports the model is still loading (503 {"status": "unavailable"}).'
-                )
+                    '/health answered 503 {"status": "unavailable"}: mlx_lm.server\'s '
+                    "generation thread has stopped, so it will not answer requests -- most "
+                    "often because the model failed to load. The reason is in the captured "
+                    "engine output; restart the runtime once it is fixed."
+                ),
+                reached=True,
             )
         if not health.is_success:
-            # v0.31.3 only ever writes 200 here, so anything else is a
-            # server we do not recognise rather than a state we can read.
+            # Neither release writes anything else here, so anything else
+            # is a server we do not recognise rather than a state we can
+            # read.
             return NotAnswering(detail=f"/health returned {health.status_code}", reached=True)
 
         if established:
@@ -467,12 +480,14 @@ def _uv_for_recipe() -> str:
 
 
 def _says_unavailable(health: httpx.Response) -> bool:
-    """Whether a non-200 /health is upstream main's narrated load.
+    """Whether a non-200 /health is mlx_lm.server saying it cannot generate.
 
-    Upstream main answers `503 {"status": "unavailable"}` until the
-    model is resident. Parsed defensively: a 503 from something that is
-    not mlx_lm.server at all must stay `NotAnswering`, not be promoted
-    to a load that never ends.
+    mlx-lm 0.32.0 answers `503 {"status": "unavailable"}` once its
+    generation thread has died (PR #1791). Parsed defensively: a 503
+    from something that is not mlx_lm.server at all -- a proxy, a stale
+    process on the port -- carries no such body and gets the generic
+    reading instead of a diagnosis that would send someone to the wrong
+    log.
     """
     try:
         body = health.json()
