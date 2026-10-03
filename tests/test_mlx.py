@@ -2,7 +2,8 @@
 
 Written the way the vLLM suite is written, and for the same reason
 doubled: this engine has never met a real host, so every claim is pinned
-to upstream source (mlx-lm v0.31.3, re-read at the tag 2026-09-22) and
+to upstream source (mlx-lm v0.31.3, re-read at the tag 2026-09-22, and
+v0.32.0, read 2026-10-03) and
 the fixtures are labeled simulated. What only a Mac can prove is listed
 in docs/design/mlx-engine.md, not asserted here.
 
@@ -66,7 +67,7 @@ def binary(tmp_path: Path) -> DiscoveredBinary:
     exe = tmp_path / "eugene-mlx" / "bin" / "mlx_lm.server"
     exe.parent.mkdir(parents=True)
     exe.write_text(f"#!{tmp_path}/eugene-mlx/bin/python3.12\n", encoding="utf-8")
-    return DiscoveredBinary(path=exe, origin=Origin.configured, version="0.31.3")
+    return DiscoveredBinary(path=exe, origin=Origin.configured, version="0.32.0")
 
 
 def _spec(**overrides: Any) -> RuntimeSpec:
@@ -457,6 +458,18 @@ def test_llama_cpp_narrated_loads_stay_unflagged() -> None:
 # --------------------------------------------------------------------------- #
 # discovery and installation
 # --------------------------------------------------------------------------- #
+
+
+def test_the_pinned_release_honours_the_adapter_path() -> None:
+    """`adapterPath` is a curated flag, and before mlx-lm 0.32.0 it did
+    nothing: `ModelProvider.load` remapped `default_model` to the model's
+    path BEFORE looking the adapter up, so `_adapter_map` was asked about
+    the wrong key and `--adapter-path` was dropped without a word
+    (ml-explore/mlx-lm#1248). 0.32.0 looks the adapter up first (read in
+    `server.py` at the tag, 2026-10-03). A pin below it ships a setting
+    that is shown and not in effect."""
+    major, minor, *_ = (int(part) for part in UPSTREAM_VERSION_PINNED.split("."))
+    assert (major, minor) >= (0, 32), UPSTREAM_VERSION_PINNED
 
 
 def test_manual_install_pins_the_verified_release() -> None:

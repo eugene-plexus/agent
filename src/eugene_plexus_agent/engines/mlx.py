@@ -5,8 +5,11 @@ The third engine, and the first written **without a host to run it on**
 Apple-silicon-only — `setup.py`: `mlx>=…; platform_system == 'Darwin'`).
 Every claim below was read off upstream source and cited to the function
 that makes it true, first against mlx-lm v0.31.3 on 2026-09-11 for the
-branch version, and **re-verified against the `v0.31.3` tag on
-2026-09-22 for this port** — still the newest release that day. M4's
+branch version, **re-verified against the `v0.31.3` tag on 2026-09-22
+for this port**, and **re-read at `v0.32.0` on 2026-10-03 for the pin
+it carries now** (the console script, every curated flag and its
+default, the `default_model` sentinel and the load on the generation
+thread unchanged; `/health` changed, below). M4's
 lesson was that the vLLM adapter needed no change on first contact
 *because* each claim had been read off upstream first; this leans on
 that method entirely. **Not experimental since A4 (2026-09-30)**: the
@@ -117,9 +120,14 @@ _GENERATE_TIMEOUT_SECONDS = 8.0
 
 # The release this adapter's every claim was read against, and the
 # version the install recipe pins. Bump only after re-reading
-# `mlx_lm/server.py` at the new tag — upstream main has already changed
-# health handling once since the claims were first recorded.
-UPSTREAM_VERSION_PINNED = "0.31.3"
+# `mlx_lm/server.py` at the new tag — upstream has changed health
+# handling twice since the claims were first recorded. **0.32.0 since
+# 2026-10-03**: at 0.31.3 `--adapter-path` was dropped without a word
+# (ml-explore/mlx-lm#1248 -- `ModelProvider.load` remapped the model
+# before looking its adapter up), so `adapterPath` was a setting shown
+# and not in effect; and 0.32.0's `/health` says when the generation
+# thread has died, which `probe_readiness` reads.
+UPSTREAM_VERSION_PINNED = "0.32.0"
 
 # Upstream's own sentinel, not ours. `APIHandler` reads
 # `self.body.get("model", "default_model")`, and `ModelProvider.__init__`
@@ -271,7 +279,8 @@ class MlxAdapter(EngineAdapter):
         """`mlx_lm.server --model <path> --host <h> --port <p> [flags]`.
 
         Every name here is an `add_argument` in `server.py`'s `main()`
-        at v0.31.3, re-read at the tag on 2026-09-22.
+        at v0.31.3 and at v0.32.0 (re-read at the tags on 2026-09-22 and
+        2026-10-03).
 
         **There is no `--served-model-name`, and the alias therefore
         does not appear on this command line at all.** The base class
@@ -571,7 +580,8 @@ _CATEGORIES = {
 
 # Curated flags -> `mlx_lm.server` CLI names. Every name checked against
 # `mlx_lm/server.py` `main()` at v0.31.3 (re-read at the tag
-# 2026-09-22), where each is an `add_argument`. Kept as a separate
+# 2026-09-22) and v0.32.0 (2026-10-03), where each is an `add_argument`
+# with the default its description names. Kept as a separate
 # mapping from the schema so the UI-facing key never has to look like a
 # CLI flag, and so an upstream rename touches one line.
 _FLAG_CLI_NAMES: dict[str, str] = {
@@ -699,7 +709,9 @@ _FLAG_FIELDS: list[ConfigField] = [
         label="Adapter path",
         description=(
             "Path to trained LoRA adapter weights and config, applied on top of the "
-            "base model at load."
+            "base model at load. Needs mlx-lm 0.32.0 or newer: 0.31.3 and older "
+            "ignore it without a word (mlx-lm #1248), so an environment installed "
+            "before 2026-10-03 has to be upgraded for it to take effect."
         ),
         category="model",
         valueType=ConfigValueType.string,
