@@ -1187,10 +1187,15 @@ def per_request_context(context_length: int | None, parallel_slots: int | None) 
 def slot_division_note(context_length: int | None, parallel_slots: int | None) -> str | None:
     """One sentence, only when the division actually happens.
 
-    `None` at one slot on purpose. The default is one slot, so a
-    sentence about division on every launch would appear on almost all
-    of them and train people to skip the reason — which is the surface
-    that has to carry a refusal's arithmetic.
+    `None` at one slot on purpose, and `None` unset because nothing is
+    divided there either: llama-server's automatic slots (`-np -1`, four
+    of them) share one unified pool, so a request alone can use the whole
+    context (`tools/server/server.cpp` at b11375). This said *the default
+    is one slot*, which was the profile field's claim and never
+    llama-server's (drift audit 2026-10-03); the arithmetic was right for
+    the wrong reason. A sentence on every launch that left slots alone
+    would appear on almost all of them and train people to skip the
+    reason — which is the surface that has to carry a refusal's arithmetic.
     """
     if context_length is None or not parallel_slots or parallel_slots < 2:
         return None

@@ -872,18 +872,27 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="parallelSlots",
         label="Parallel slots",
         description=(
-            "Concurrent requests this runtime serves. The slots divide "
-            "the context size between them rather than each getting "
-            "their own, so 4 slots at 32k gives every request 8k and "
-            "costs exactly what 1 slot at 32k costs — raise this and "
+            "Concurrent requests this runtime serves. A number set here "
+            "divides the context size between the slots rather than each "
+            "getting their own, so 4 slots at 32k gives every request 8k "
+            "and costs exactly what 1 slot at 32k costs — raise this and "
             "raise context together if each request needs the same room "
-            "as before. This is also the unit of capacity the gateway "
-            "divides work across."
+            "as before. Left unset, llama.cpp runs 4 slots that share one "
+            "pool of the whole context instead: a request alone can use "
+            "all of it, and requests running at once share it. This is "
+            "also the unit of capacity the gateway divides work across."
         ),
         category="performance",
         valueType=ConfigValueType.integer,
-        default=1,
         minimum=1,
+        # Not `default=1`: an unset value rendered as one slot while
+        # llama-server's `-np` defaults to -1, automatic -- 4 slots and a
+        # unified pool (`tools/server/server.cpp` at b11375), which is how
+        # `context_pool` reads it too (drift audit 2026-10-03).
+        unsetMeans=(
+            "Not set: llama.cpp decides (automatic), which is 4 slots that share one "
+            "pool of the whole context, so a request alone can use all of it."
+        ),
         requiresRestart=True,
     ),
     ConfigField(

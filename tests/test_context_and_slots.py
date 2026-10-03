@@ -114,6 +114,40 @@ def test_parallel_slots_does_not_claim_memory_multiplies() -> None:
     assert "divide" in text or "divided" in text or "share" in text or "shares" in text
 
 
+def test_unset_parallel_slots_shows_llama_servers_own_choice() -> None:
+    """Settings never lie (drift audit 2026-10-03). The field declared
+    `default=1`, so an unset one rendered as one slot, while llama-server's
+    `-np` defaults to -1, automatic: four slots sharing ONE pool of the
+    context (`tools/server/server.cpp` at b11375: `n_parallel = 4` and
+    `kv_unified = true`), which is also what `context_pool` reads unset
+    as. Unset has to say so, not stand in for a choice nobody made."""
+    field = next(
+        f for f in llama_cpp.LlamaCppAdapter().flag_schema().fields if f.key == "parallelSlots"
+    )
+    assert field.default is None
+    assert field.unsetMeans is not None
+    said = field.unsetMeans.lower()
+    assert "4" in said or "four" in said
+    assert "share" in said
+    assert "1 slot" not in said and "one slot" not in said
+
+
+async def test_unset_slots_are_one_shared_window_not_one_slot(tmp_path: Path) -> None:
+    """What admission says for unset slots is what llama-server does: the
+    automatic slots share one pool, so a single request can use all of it
+    and nothing is divided. Pinned beside the field so the two cannot
+    drift apart again."""
+    assert admission.per_request_context(32768, None) == 32768
+    assert admission.slot_division_note(32768, None) is None
+    result = await check_admission(
+        _spec(_model(tmp_path, 2 * GIB), flags={"contextSize": 32768}),
+        snapshot=fake_devices(free=24 * GIB, total=32 * GIB),
+        library=None,
+        running=[],
+    )
+    assert "divide" not in result.reason
+
+
 # -- the arithmetic, which was already right --------------------------------
 
 
@@ -165,8 +199,9 @@ def test_the_admission_reason_names_the_divided_window(tmp_path: Path) -> None:
 
 
 def test_one_slot_says_nothing_extra() -> None:
-    """The default is one slot, and a sentence about division on every
-    single-slot launch is noise that trains people to skip the reason."""
+    """One slot divides nothing, and neither do llama-server's automatic
+    slots when none is set (one shared pool); a sentence about division
+    on every such launch is noise that trains people to skip the reason."""
     assert admission.slot_division_note(32768, 1) is None
     assert admission.slot_division_note(32768, None) is None
     assert admission.slot_division_note(None, 4) is None

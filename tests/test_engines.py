@@ -211,8 +211,8 @@ def test_unset_flags_are_absent_entirely(
     argv = adapter.build_argv(_spec(), binary, port=8090)
     assert "--ctx-size" not in argv
     assert "--n-gpu-layers" not in argv
-    # `parallelSlots` has a schema default of 1, which is UI guidance —
-    # it must not leak into argv when the operator left it alone.
+    # `parallelSlots` unset is llama-server's own automatic slots; nothing
+    # of ours may leak into argv when the operator left it alone.
     assert "--parallel" not in argv
 
 
