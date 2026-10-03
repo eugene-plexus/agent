@@ -412,7 +412,8 @@ class ReasoningEffort(StrEnum):
     `reasoning_effort` (P2c, 2026-09-28). Measured on
     `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
     `low`, 275 at `high`. A setting, so it routes only to a model
-    that lists it (A2).
+    that lists it (A2). `max` was added 2026-10-03: GPT-6 and
+    OpenRouter accept it, and a caller sending it was refused here.
 
     """
 
@@ -422,6 +423,7 @@ class ReasoningEffort(StrEnum):
     medium = 'medium'
     high = 'high'
     xhigh = 'xhigh'
+    max = 'max'
 
 
 class Verbosity(StrEnum):
@@ -3712,6 +3714,13 @@ class AppManifest(BaseModel):
     with Eugene (C2) using `EUGENE_PLEXUS_APP_OIDC_ISSUER`,
     `EUGENE_PLEXUS_APP_OIDC_CLIENT_ID` and the secret in the file
     named by `EUGENE_PLEXUS_APP_OIDC_SECRET_FILE`.
+
+    When the service manager gives the app its own OS account, the
+    launcher sets `EUGENE_PLEXUS_APP_ACCOUNT_KIND` to `windows_service`
+    or `systemd`. It is absent on other installs and older launchers;
+    apps must refuse local model-selected processes without this signal.
+    It describes account isolation from Eugene, not isolation between
+    people using the same app. It is not a user-configurable setting.
 
     """
 

@@ -256,6 +256,7 @@ def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
     spec: dict = {
         **plan.launch,
         "app": plan.app_id,
+        "accountKind": kind,
         "argv": plan.argv,
         "env": env,
         "ingress": ingress,

@@ -105,6 +105,10 @@ def child_environment(spec: dict) -> dict[str, str]:
     for name in ("CREDENTIALS_DIRECTORY", "STATE_DIRECTORY", "INVOCATION_ID", "NOTIFY_SOCKET"):
         env.pop(name, None)
     env.update({str(k): str(v) for k, v in (spec.get("env") or {}).items()})
+    # This is a launch fact, never an ambient variable or manifest override.
+    env.pop("EUGENE_PLEXUS_APP_ACCOUNT_KIND", None)
+    if spec.get("accountKind") in {"windows_service", "systemd"}:
+        env["EUGENE_PLEXUS_APP_ACCOUNT_KIND"] = spec["accountKind"]
     data = spec.get("dataDir")
     if data:
         env["EUGENE_PLEXUS_APP_DATA_DIR"] = data

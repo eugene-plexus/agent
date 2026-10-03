@@ -240,6 +240,18 @@ def test_the_launcher_fills_in_what_systemd_hands_over(
     assert "CREDENTIALS_DIRECTORY" not in env and "STATE_DIRECTORY" not in env
 
 
+def test_account_signal_comes_from_service_plan_not_ambient_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = "EUGENE_PLEXUS_APP_ACCOUNT_KIND"
+    monkeypatch.setenv(name, "windows_service")
+    assert name not in app_launcher.child_environment({"env": {name: "systemd"}})
+    for kind in ("windows_service", "systemd"):
+        spec = app_accounts.launch_spec(_plan(tmp_path), kind=kind, ingress="x")
+        assert app_launcher.child_environment(spec)[name] == kind
+    assert name not in _planner(tmp_path).plan().env
+
+
 # --------------------------------------------------------------------- #
 # the supervisor
 # --------------------------------------------------------------------- #
