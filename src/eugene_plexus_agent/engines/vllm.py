@@ -34,6 +34,7 @@ import httpx
 
 from .._generated.models import (
     Accelerator,
+    Arch,
     ConfigField,
     ConfigSchema,
     ConfigValueType,
@@ -517,13 +518,97 @@ def _capabilities_from_models(body: object) -> RuntimeCapabilities | None:
 # --------------------------------------------------------------------------- #
 
 
+#: The release the recipes below name wherever one has to be named (a wheel
+#: or a versioned index). The curated flags were checked against 0.29.0 and
+#: re-read at 0.30.0 by the drift audit of 2026-10-03, which is also the day
+#: every URL here was HEAD-requested and every command resolved with
+#: `uv pip compile` for Linux and Python 3.12.
+RECIPE_VERSION = "0.30.0"
+_ROCM_VARIANT = "rocm723"
+_CPU_TAG = "2_39"
+_RELEASES = "https://github.com/vllm-project/vllm/releases/download"
+
+
+def _cpu_wheel(version: str, tag: str, machine: str) -> str:
+    return f"{_RELEASES}/v{version}/vllm-{version}+cpu-cp38-abi3-manylinux_{tag}_{machine}.whl"
+
+
+def _cuda_install(driver: str | None, machine: str) -> ManualInstall:
+    """PyPI's wheel for a CUDA 13 driver, the `+cu129` wheel for a CUDA 12 one.
+
+    **PyPI's wheel is CUDA 13.0** (`VLLM_MAIN_CUDA_VERSION = "13.0"` in
+    `vllm/envs.py` at v0.30.0, with `[cu13]` extras; the release's
+    alternative wheel is `+cu129`), so it needs a driver from the R580
+    branch. This said 12.9, which is what upstream's install page still
+    says. For the `+cu129` wheel upstream documents `--extra-index-url
+    https://download.pytorch.org/whl/cu129`, which does NOT resolve under
+    uv's default index strategy (that index's `packaging` is older than
+    flashinfer needs; measured 2026-10-03); `--torch-backend=cu129` sends
+    only PyTorch there, and resolved.
+    """
+    major: int | None = None
+    if driver:
+        try:
+            major = int(driver.partition(".")[0])
+        except ValueError:
+            major = None
+    cu129 = (
+        f'uv pip install "{_RELEASES}/v{RECIPE_VERSION}/vllm-{RECIPE_VERSION}+cu129-cp38-abi3-'
+        f'manylinux_2_28_{machine}.whl" --torch-backend=cu129'
+    )
+    if major is not None and major < 12:
+        return ManualInstall(
+            docsUrl=GPU_INSTALL_DOCS_URL,
+            notes=(
+                f"This machine's NVIDIA driver supports CUDA up to {driver}, and vLLM's "
+                "wheels are built for CUDA 12.9 and 13.0. Update the NVIDIA driver, then "
+                "install vLLM. " + _THEN_CONFIGURE
+            ),
+        )
+    if major == 12:
+        return ManualInstall(
+            command=cu129,
+            docsUrl=GPU_INSTALL_DOCS_URL,
+            notes=(
+                _VENV_FIRST + f"This machine's driver supports CUDA {driver}, and the wheel "
+                "on PyPI is built for CUDA 13.0, so this is vLLM "
+                f"{RECIPE_VERSION}'s CUDA 12.9 wheel from its GitHub release, with the "
+                "matching PyTorch. Blackwell GPUs need CUDA 12.8 or newer. A driver from "
+                "the R580 branch or newer can take PyPI's wheel instead: "
+                "`uv pip install vllm --torch-backend=auto`. " + _THEN_CONFIGURE
+            ),
+        )
+    return ManualInstall(
+        command="uv pip install vllm --torch-backend=auto",
+        docsUrl=GPU_INSTALL_DOCS_URL,
+        notes=(
+            _VENV_FIRST + "The wheel on PyPI is built against CUDA 13.0 and bundles "
+            "PyTorch, so it needs an NVIDIA driver from the R580 branch or newer (one "
+            "whose nvidia-smi reports CUDA 13.0 or above); `--torch-backend=auto` picks "
+            "the PyTorch build matching the installed driver. "
+            + (
+                ""
+                if major is not None
+                else "This machine's driver did not report its CUDA version. "
+            )
+            + f"For a CUDA 12 driver use the +cu129 wheel instead: `{cu129}`. "
+            + _THEN_CONFIGURE
+        ),
+    )
+
+
 def manual_install_for(host: HostAccelerator) -> ManualInstall:
     """Upstream's install command for this host, verbatim.
 
     Commands and constraints come from
     `docs/getting_started/installation/{gpu.cuda,gpu.rocm,gpu.xpu,gpu.apple,cpu.*}.inc.md`
-    at v0.29.0. Where upstream names no single command — Windows, Apple
-    silicon, an unrecognised host — `command` is omitted and `notes`
+    at v0.29.0, **corrected 2026-10-03 against what v0.30.0 actually
+    publishes**, where the page and the release disagree (CUDA 13.0 on
+    PyPI, ROCm 7.2.3 and glibc 2.39, the XPU wheel's triton shim, the CPU
+    wheel's glibc tag): every URL was HEAD-requested and every command
+    resolved with `uv pip compile` that day. Where upstream names no
+    single command — Windows, Apple silicon, an unrecognised host, a
+    driver too old for any wheel — `command` is omitted and `notes`
     carries the way in.
     """
     if host.os is Os.windows:
@@ -557,59 +642,65 @@ def manual_install_for(host: HostAccelerator) -> ManualInstall:
 
     # Linux.
     accelerator = host.accelerator or Accelerator.none
+    machine = "aarch64" if host.arch is Arch.arm64 else "x86_64"
     if accelerator is Accelerator.cuda:
-        return ManualInstall(
-            command="uv pip install vllm --torch-backend=auto",
-            docsUrl=GPU_INSTALL_DOCS_URL,
-            notes=(
-                _VENV_FIRST + "The default wheel is built against CUDA 12.9 and bundles "
-                "PyTorch; `--torch-backend=auto` picks the PyTorch build matching the "
-                "installed driver, so no CUDA version needs choosing by hand. Blackwell "
-                "GPUs need CUDA 12.8 or newer. " + _THEN_CONFIGURE
-            ),
-        )
+        return _cuda_install(host.acceleratorVersion, machine)
     if accelerator is Accelerator.rocm:
         return ManualInstall(
-            command="uv pip install vllm --extra-index-url https://wheels.vllm.ai/rocm/ --upgrade",
+            command=(
+                f"uv pip install vllm=={RECIPE_VERSION} --extra-index-url "
+                f"https://wheels.vllm.ai/rocm/{RECIPE_VERSION}/{_ROCM_VARIANT}"
+            ),
             docsUrl=GPU_INSTALL_DOCS_URL,
             notes=(
-                _VENV_FIRST + "ROCm wheels exist for Python 3.12 only — on any other "
-                "version the installer silently falls back to the CUDA wheel, which "
-                "fails on AMD GPUs with a missing libcudart. Needs ROCm 6.3 or newer; "
-                "prebuilt wheels are for ROCm 7.0 and 7.2.1. Use uv rather than pip: "
-                "pip merges the custom index with PyPI and picks the wrong wheel. "
+                _VENV_FIRST + f"That index holds vLLM {RECIPE_VERSION} built for ROCm 7.2.3 "
+                f"(`+{_ROCM_VARIANT}`), for Python 3.12 only and x86_64 manylinux_2_39, so "
+                "glibc 2.39 or newer (Ubuntu 24.04 or newer). With uv, another Python stops "
+                "with *no wheels with a matching Python* and an older glibc with *no wheels "
+                "with a matching platform tag*; pip instead merges the index with PyPI and "
+                "installs the CUDA wheel, which fails on AMD GPUs with a missing libcudart, so "
+                "use uv. The unversioned index, "
+                "https://wheels.vllm.ai/rocm/vllm, serves whichever release is newest, which "
+                f"can be ahead of the {RECIPE_VERSION} this adapter was checked against. "
                 + _THEN_CONFIGURE
             ),
         )
     if accelerator is Accelerator.sycl:
         return ManualInstall(
             command=(
-                "uv pip install vllm --extra-index-url https://wheels.vllm.ai/nightly/xpu "
+                f'uv pip install "vllm=={RECIPE_VERSION}+xpu" '
+                f"--extra-index-url https://wheels.vllm.ai/{RECIPE_VERSION}/xpu "
+                "--extra-index-url https://wheels.vllm.ai/xpu "
                 "--extra-index-url https://download.pytorch.org/whl/xpu "
                 "--index-strategy unsafe-best-match"
             ),
             docsUrl=GPU_INSTALL_DOCS_URL,
             notes=(
-                _VENV_FIRST + "Intel XPU wheels are nightly builds on a custom index plus a "
-                "second index for PyTorch XPU, and need Python 3.12. " + _THEN_CONFIGURE
+                _VENV_FIRST + f"vLLM {RECIPE_VERSION}'s Intel XPU wheel, from that release's "
+                "own index, for Python 3.12 and x86_64 only. The second index carries the "
+                "`triton==3.7.2+xpu` shim the wheel requires (the release's index has only "
+                "3.8.0); without it the resolver falls back to the CUDA wheel, which is why "
+                "the command names `+xpu`: a missing shim fails here instead. The third is "
+                "PyTorch's XPU build. " + _THEN_CONFIGURE
             ),
         )
     if accelerator is Accelerator.none:
-        arch = "aarch64" if (host.arch is not None and host.arch.value == "arm64") else "x86_64"
         return ManualInstall(
-            command=(
-                "uv pip install https://github.com/vllm-project/vllm/releases/download/"
-                "v${VLLM_VERSION}/vllm-${VLLM_VERSION}+cpu-cp38-abi3-manylinux_2_34_"
-                f"{arch}.whl --torch-backend cpu"
-            ),
+            command=f'uv pip install "{_cpu_wheel(RECIPE_VERSION, _CPU_TAG, machine)}" '
+            "--torch-backend cpu",
             docsUrl=CPU_INSTALL_DOCS_URL,
             notes=(
-                _VENV_FIRST + "Set VLLM_VERSION to a release tag from "
-                "https://github.com/vllm-project/vllm/releases (this adapter was checked "
-                "against 0.29.0). CPU wheels exist since 0.17.0 for x86 with AVX512/AVX2 "
-                "and since 0.11.2 for Arm. On x86, upstream says to add Intel OpenMP to "
-                "LD_PRELOAD before running. No GPU was detected on this host, so this is "
-                "the CPU build — expect it to be slow. " + _THEN_CONFIGURE
+                _VENV_FIRST + f"vLLM {RECIPE_VERSION}'s CPU wheel is manylinux_2_39, so it "
+                "needs glibc 2.39 or newer (Ubuntu 24.04 or newer). On an older glibc use "
+                f"0.29.0's, which is manylinux_2_34: "
+                f"{_cpu_wheel('0.29.0', '2_34', machine)} (same command). The tag changes "
+                "between releases -- 2_34 at 0.29.0, 2_39 at 0.30.0 (vllm#58270), and 2_34 "
+                "again in 0.31.0, tagged but not published on 2026-10-03 (vllm#58515) -- so "
+                "read a release's assets before naming another version. CPU wheels exist "
+                "since 0.17.0 for x86 with AVX512/AVX2 and since "
+                "0.11.2 for Arm. On x86, upstream says to add Intel OpenMP to LD_PRELOAD "
+                "before running. No GPU was detected on this host, so this is the CPU build "
+                "- expect it to be slow. " + _THEN_CONFIGURE
             ),
         )
     # An accelerator this adapter has no upstream command for (`metal` on
