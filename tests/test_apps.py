@@ -281,7 +281,7 @@ def test_workbench_signs_people_in_and_runs_nothing_a_model_chooses() -> None:
     (workbench,) = [m for m in apps.load_catalogue() if m.id == "workbench"]
     assert workbench.signIn is True and workbench.signInCallbackPath == "/oidc/callback"
     assert workbench.configTrio is True and workbench.ui is True
-    assert workbench.localActions is False
+    assert workbench.localActions is True
     assert workbench.entry == "eugene_plexus_workbench"
 
 
