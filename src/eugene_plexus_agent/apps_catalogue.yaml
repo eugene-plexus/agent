@@ -19,8 +19,8 @@
     servers in Workbench's own OS account. Signs people in with Eugene:
     the owner with the passphrase, a small business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/8a4a6a6400a7bad4f4b0b8c4ab9221fa47cc8f4d.tar.gz
-  version: 8a4a6a6400a7bad4f4b0b8c4ab9221fa47cc8f4d
+  source: https://github.com/eugene-plexus/workbench/archive/1e935c07852f01533450ed580065f6084c86f9d2.tar.gz
+  version: 1e935c07852f01533450ed580065f6084c86f9d2
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
