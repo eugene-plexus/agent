@@ -16,11 +16,12 @@
   summary: >-
     Chat with the models this install serves, search the web and use shared
     MCP tools with approval for each call. The owner can also run local MCP
-    servers in Workbench's own OS account. Signs people in with Eugene:
+    servers in Workbench's own OS account and grant folders to named people
+    for approved file operations. Signs people in with Eugene:
     the owner with the passphrase, a small business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/1e935c07852f01533450ed580065f6084c86f9d2.tar.gz
-  version: 1e935c07852f01533450ed580065f6084c86f9d2
+  source: https://github.com/eugene-plexus/workbench/archive/251a0b955d2c951fcc9008346291598998ac2594.tar.gz
+  version: 251a0b955d2c951fcc9008346291598998ac2594
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
