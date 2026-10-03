@@ -30,6 +30,7 @@ from .._generated.models import (
     Secondary,
 )
 from ..child_env import child_environment
+from . import gpu_probe
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -109,6 +110,11 @@ _CUDART_RE = re.compile(r"^cudart-llama-(?:b\d+-)?bin-(?P<variant>.+)\.(?:zip|ta
 # CUDA build the installed driver can actually load.
 _CUDA_VARIANT_RE = re.compile(
     r"^(?P<platform>win|ubuntu)-cuda-(?P<major>\d+)\.(?P<minor>\d+)-(?P<arch>x64|arm64)$"
+)
+
+# `win-rocm-10.0-x64` or `ubuntu-rocm-10.0-x64` -> ('10', '0'); see `_rocm_variant`.
+_ROCM_VARIANT_RE = re.compile(
+    r"^(?P<platform>win|ubuntu)-rocm-(?P<major>\d+)\.(?P<minor>\d+)-(?P<arch>x64|arm64)$"
 )
 
 # How many builds back `plan_latest` looks for one that carries this host's
@@ -1123,14 +1129,22 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
     if host.os is Os.windows:
         if accelerator is Accelerator.cuda:
             cuda = _cuda_variant(host, release)
-            if isinstance(cuda, str) and host.secondary is Secondary.vulkan:
+            if (
+                isinstance(cuda, str)
+                and host.secondary is Secondary.vulkan
+                and gpu_probe.combinable_with_cuda(host.os.value, host.arch.value)
+            ):
                 # A discrete AMD or Intel card beside the NVIDIA one:
                 # the CUDA build with the Vulkan backend added, so both
-                # are used (HostAccelerator.secondary).
+                # are used (HostAccelerator.secondary). **Windows x64
+                # only, by the same rule detection uses** (drift audit
+                # 2026-10-03): upstream publishes no `win-vulkan-arm64`,
+                # so on arm64 this asked for a build that does not exist
+                # and the plan failed on it.
                 return f"{cuda}{VULKAN_SUFFIX}"
             return cuda
         if accelerator is Accelerator.rocm:
-            return f"win-rocm-10.0-{host.arch.value}"
+            return _rocm_variant(host.arch, release, "win")
         if accelerator is Accelerator.vulkan:
             # **The build every non-NVIDIA Windows GPU gets** (review
             # §6.1 #11). One asset covers AMD and Intel, needs no vendor
@@ -1152,7 +1166,7 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
     if accelerator is Accelerator.cuda:
         return _cuda_variant(host, release)
     if accelerator is Accelerator.rocm:
-        return f"ubuntu-rocm-10.0-{host.arch.value}"
+        return _rocm_variant(host.arch, release, "ubuntu")
     if accelerator is Accelerator.sycl and host.arch is Arch.x64:
         return "ubuntu-sycl-fp16-x64"
     if accelerator is Accelerator.vulkan:
@@ -1163,7 +1177,51 @@ def _variant_for(host: HostAccelerator, release: Release) -> str | Unavailable:
     return f"ubuntu-{host.arch.value}" if host.arch is Arch.arm64 else "ubuntu-x64"
 
 
-_PLATFORM_PREFIX = {Os.windows: "win-", Os.linux: "ubuntu-", Os.macos: "macos-"}
+def _rocm_variant(arch: Arch, release: Release, platform: str) -> str | Unavailable:
+    """The ROCm build `release` publishes for this platform, by its own name.
+
+    **Read off the asset names, like the CUDA versions** (drift audit
+    2026-10-03). This was the constant `rocm-10.0`, while upstream bakes
+    the version its CI was given into the name (`ROCM_VERSION_SHORT` in
+    `release.yml`), so the day it moved, every AMD host would have read
+    "not installable" for a build that was there. Upstream publishes one
+    ROCm version per platform; if it ever publishes several, the newest is
+    taken -- compared as numbers, so 10.0 is above 9.4 -- and a host whose
+    own ROCm is older may not load it, which the expert's `variant` menu
+    answers.
+    """
+    found = [
+        ((int(m.group("major")), int(m.group("minor"))), variant)
+        for variant in _published_variants(release)
+        if (m := _ROCM_VARIANT_RE.match(variant))
+        and m.group("platform") == platform
+        and m.group("arch") == arch.value
+    ]
+    if found:
+        return max(found)[1]
+    platform_name = "Windows" if platform == "win" else "Linux"
+    return Unavailable(
+        reason=(
+            f"release {release.version} publishes no {platform_name} ROCm build for "
+            f"{arch.value}. Published variants: "
+            f"{', '.join(_published_variants(release)) or '(none)'}."
+        ),
+        # A release mid-upload looks like this; the one before it may not.
+        release_bound=True,
+    )
+
+
+# The prefixes a server build for each OS carries. **Linux has two**:
+# `ubuntu-` for the generic builds and `linux-` for
+# `linux-arm64-snapdragon` (OpenCL on Adreno plus Hexagon, built in
+# Qualcomm's own toolchain container), which the expert's menu never
+# offered because it listed `ubuntu-` alone (drift audit 2026-10-03).
+# `android-` is not Linux for this purpose.
+_PLATFORM_PREFIXES: dict[Os, tuple[str, ...]] = {
+    Os.windows: ("win-",),
+    Os.linux: ("ubuntu-", "linux-"),
+    Os.macos: ("macos-",),
+}
 
 _BACKEND_PINS = ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
 
@@ -1199,10 +1257,13 @@ def alternatives(host: HostAccelerator, release: Release) -> list[str]:
     """
     if host.os is None or host.arch is None:
         return []
-    prefix = _PLATFORM_PREFIX[host.os]
-    suffix = f"-{host.arch.value}"
+    prefixes = _PLATFORM_PREFIXES[host.os]
+    # The architecture is a dash-separated word of the name, usually the
+    # last one -- `linux-arm64-snapdragon` puts it second.
     offered = [
-        v for v in _published_variants(release) if v.startswith(prefix) and v.endswith(suffix)
+        v
+        for v in _published_variants(release)
+        if v.startswith(prefixes) and host.arch.value in v.split("-")
     ]
     vulkan = f"win-vulkan-{host.arch.value}"
     if host.os is Os.windows and vulkan in offered:
@@ -1224,8 +1285,8 @@ def _chosen_variant(
         return requested
     platform_name = host.os.value if host.os is not None else "this operating system"
     arch_name = host.arch.value if host.arch is not None else "this CPU"
-    prefix = _PLATFORM_PREFIX.get(host.os) if host.os is not None else None
-    fits_host = bool(prefix and requested.startswith(prefix) and host.arch is not None)
+    prefixes = _PLATFORM_PREFIXES.get(host.os) if host.os is not None else None
+    fits_host = bool(prefixes and requested.startswith(prefixes) and host.arch is not None)
     return Unavailable(
         reason=(
             f"{requested!r} is not a build release {release.version} publishes for "
