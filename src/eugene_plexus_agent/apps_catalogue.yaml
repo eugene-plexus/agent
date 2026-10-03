@@ -15,11 +15,11 @@
   name: Workbench
   summary: >-
     Chat with the models this install serves, search the web and use shared
-    MCP tools with approval for each call. Signs people in with Eugene: the owner with the passphrase, a small
-    business with an account for each person.
+    MCP tools with approval for each call. Signs people in with Eugene:
+    the owner with the passphrase, a small business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/34666b6fb1d3665afcb4d7cab03e09201c7cd8ce.tar.gz
-  version: 34666b6fb1d3665afcb4d7cab03e09201c7cd8ce
+  source: https://github.com/eugene-plexus/workbench/archive/8d7002dc4253956cde129a3cbe7b751a91d584c6.tar.gz
+  version: 8d7002dc4253956cde129a3cbe7b751a91d584c6
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
