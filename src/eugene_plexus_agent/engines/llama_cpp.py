@@ -317,6 +317,9 @@ class LlamaCppAdapter(EngineAdapter):
             assets=assets + plugin_assets,
             binary_name=self.binary_name,
             plugins=frozenset(a.name for a in plugin_assets),
+            # The CUDA runtime goes beside the server, wherever its
+            # archive put it: `libggml-cuda.so` looks for it by `$ORIGIN`.
+            runtimes=frozenset(a.name for a in assets if _CUDART_RE.match(a.name)),
         )
 
     # --- diagnosing -------------------------------------------------------

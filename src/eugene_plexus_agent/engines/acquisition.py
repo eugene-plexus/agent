@@ -140,6 +140,20 @@ class AcquisitionPlan:
     #: two backends compiled against different cores in one process is a
     #: crash nobody could diagnose.
     plugins: frozenset[str] = frozenset()
+    #: Names of assets carrying libraries the server loads from ITS OWN
+    #: folder: the CUDA runtime (`cudart-llama-…`). Each is unpacked on
+    #: its own and its files are put in the folder that holds the server
+    #: binary, however the archive wraps them. **The Linux tarball wraps
+    #: them in a folder of their own** (`cudart-llama-bNNNN-bin-ubuntu-
+    #: cuda-13.4-x64/`) beside the server's `llama-bNNNN/`, and
+    #: `libggml-cuda.so` finds `libcudart.so.13` only through its RUNPATH,
+    #: `$ORIGIN` -- so unpacked side by side, the CUDA backend could not
+    #: load and llama.cpp ran on the processor without a word (drift
+    #: audit 2026-10-03, reproduced at b11375). Upstream's release
+    #: workflow says the same: extract it "next to the binaries ($ORIGIN
+    #: rpath)". The Windows zips have no inner folder, so there the files
+    #: land where they always did.
+    runtimes: frozenset[str] = frozenset()
 
     @property
     def total_bytes(self) -> int:
@@ -800,17 +814,25 @@ class EngineInstaller:
 
         progress.state = State.extracting
         plugins = [a for a in archives if a.name in plan.plugins]
+        runtimes: list[Path] = []
         for archive in archives:
             if archive in plugins:
                 continue
             progress.message = f"extracting {archive.name}"
-            _extract(archive, staging)
+            if archive.name in plan.runtimes:
+                # Unpacked on its own, and moved beside the server once
+                # the server has been found (below).
+                side = staging / f"{_RUNTIME_SIDE}{len(runtimes)}"
+                _extract(archive, side)
+                runtimes.append(side)
+            else:
+                _extract(archive, staging)
             # The archive itself is dead weight once unpacked, and these are
             # hundreds of megabytes.
             archive.unlink(missing_ok=True)
         for index, archive in enumerate(plugins):
             progress.message = f"adding the backend in {archive.name}"
-            side = staging / f".plugin-{index}"
+            side = staging / f"{_PLUGIN_SIDE}{index}"
             _extract(archive, side)
             archive.unlink(missing_ok=True)
             _merge_backend(side, staging, archive.name)
@@ -823,6 +845,10 @@ class EngineInstaller:
                 f"upstream may have changed its layout"
             )
         _make_executable(binary)
+        for side in runtimes:
+            progress.message = f"putting the libraries in {side.name} beside {binary.name}"
+            _place_runtime(side, binary.parent)
+            _remove_quietly(side)
 
         final = self._store.build_dir(plan.version)
         _remove_quietly(final)
@@ -910,10 +936,45 @@ def _merge_backend(side: Path, build: Path, archive_name: str) -> None:
     log.info("added %s from %s", ", ".join(added), archive_name)
 
 
+def _place_runtime(side: Path, server_dir: Path) -> None:
+    """Put every file of an unpacked runtime archive in the server's folder.
+
+    `_single_root` takes off the one folder the Linux cudart tarball wraps
+    its libraries in; the Windows zip has none, so its files are taken as
+    they are. Relative paths below that root are kept. A file the build
+    already has is replaced, which is what unpacking the runtime over the
+    build did before this existed -- the runtime archive is the CUDA
+    runtime this build was compiled against, and upstream ships it for
+    exactly that.
+    """
+    root = _single_root(side)
+    placed: list[str] = []
+    for source in sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink()):
+        relative = source.relative_to(root)
+        target = server_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        shutil.copy2(source, target)
+        placed.append(str(relative))
+    if not placed:
+        raise AcquisitionError(f"{side.name}: the CUDA runtime archive was empty")
+    log.info("put %s beside the server in %s", ", ".join(placed), server_dir)
+
+
+# Where an archive that is not unpacked over the build waits, inside the
+# staging directory, until its files are moved. Dot-prefixed so nothing in
+# an upstream archive can collide with it, and ignored by `_single_root`.
+_PLUGIN_SIDE = ".plugin-"
+_RUNTIME_SIDE = ".runtime-"
+
+
 def _single_root(directory: Path) -> Path:
     """The directory itself, or its one subdirectory when an archive wraps
     everything in one (the Linux tarballs do: `llama-b11211/`)."""
-    entries = [p for p in directory.iterdir() if not p.name.startswith(".plugin-")]
+    entries = [
+        p for p in directory.iterdir() if not p.name.startswith((_PLUGIN_SIDE, _RUNTIME_SIDE))
+    ]
     if len(entries) == 1 and entries[0].is_dir():
         return entries[0]
     return directory
