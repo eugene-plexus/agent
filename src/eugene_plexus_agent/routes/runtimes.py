@@ -67,6 +67,7 @@ from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, rules_from_config
 from ..node_work import runtime_launch
 from ..reservations import ReservationLedger
+from ..runtime_context import RuntimeContext
 from ..runtimes import (
     RuntimeSupervisor,
     _configured_binary,
@@ -131,11 +132,11 @@ def _refused(admission: Admission) -> HTTPException:
     )
 
 
-def _supervisor(request: Request) -> RuntimeSupervisor | None:
+def _supervisor(request: RuntimeContext) -> RuntimeSupervisor | None:
     return getattr(request.app.state, "runtime_supervisor", None)
 
 
-def _component_supervisor(request: Request):  # type: ignore[no-untyped-def]
+def _component_supervisor(request: RuntimeContext):  # type: ignore[no-untyped-def]
     return getattr(request.app.state, "supervisor", None)
 
 
@@ -152,7 +153,7 @@ def _compose(spec: RuntimeSpec, supervisor: RuntimeSupervisor | None) -> Runtime
 # --------------------------------------------------------------------------- #
 
 
-async def library_client_for(request: Request) -> LibraryFitClient | None:
+async def library_client_for(request: RuntimeContext) -> LibraryFitClient | None:
     """The library this agent can ask, if any.
 
     The one in this agent's own topology when there is one. Otherwise --
@@ -229,13 +230,13 @@ async def library_client_for(request: Request) -> LibraryFitClient | None:
     )
 
 
-def folder_cache_for(request: Request) -> library_folders.LibraryFolderCache | None:
+def folder_cache_for(request: RuntimeContext) -> library_folders.LibraryFolderCache | None:
     """This node's copy of the Library's folders, when the app has one."""
     cache = getattr(request.app.state, "library_folders", None)
     return cache if isinstance(cache, library_folders.LibraryFolderCache) else None
 
 
-def effective_rules_for(request: Request) -> list[PathRule]:
+def effective_rules_for(request: RuntimeContext) -> list[PathRule]:
     """This node's `pathMappings` overrides, then the Library folders'
     mounts for this host -- the rules a spawn uses (2026-09-14)."""
     state: AgentState = request.app.state.agent_state
@@ -246,7 +247,7 @@ def effective_rules_for(request: Request) -> list[PathRule]:
     )
 
 
-async def refresh_library_folders(request: Request) -> bool:
+async def refresh_library_folders(request: RuntimeContext) -> bool:
     """Read the library's folders into this node's copy, once per request.
 
     Once per request rather than in a background loop, which is why it
@@ -267,7 +268,7 @@ async def refresh_library_folders(request: Request) -> bool:
     return answered
 
 
-def require_library_folder(request: Request, model_path: str) -> None:
+def require_library_folder(request: RuntimeContext, model_path: str) -> None:
     """A node runs only what the Library catalogues (2026-09-14).
 
     400 when `model_path` lies under none of the Library's folders. When
@@ -293,7 +294,7 @@ def require_library_folder(request: Request, model_path: str) -> None:
         )
 
 
-def _ledger(request: Request) -> ReservationLedger:
+def _ledger(request: RuntimeContext) -> ReservationLedger:
     """This node's record of memory promised to launches in flight.
 
     On `app.state` rather than inside the supervisor because the routes
@@ -309,7 +310,7 @@ def _ledger(request: Request) -> ReservationLedger:
 
 
 def _reserve(
-    request: Request,
+    request: RuntimeContext,
     spec: RuntimeSpec,
     admission: Admission | None,
     *,
@@ -355,14 +356,14 @@ def engine_places(spec: RuntimeSpec, get_config) -> bool:  # type: ignore[no-unt
     return places_by_itself(adapter, spec, _configured_binary(adapter, get_config))
 
 
-async def _admission_for(request: Request, spec: RuntimeSpec) -> Admission:
+async def _admission_for(request: RuntimeContext, spec: RuntimeSpec) -> Admission:
     """Measure `spec` here, now. The dry run's question, and every caller
     that does not go on to reserve."""
     admission, _ = await _measure_launch(request, spec)
     return admission
 
 
-async def _measure_launch(request: Request, spec: RuntimeSpec) -> tuple[Admission, bool]:
+async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[Admission, bool]:
     """`_admission_for`, plus whether this spec's llama-server places the
     model by itself -- which `_reserve` needs, and which is read once."""
     state: AgentState = request.app.state.agent_state
@@ -612,6 +613,12 @@ async def create_runtime(
     request: Request,
     body: RuntimeSpec,
     force: bool = Query(default=False),
+) -> Runtime:
+    return await declare_runtime(request, body, force=force)
+
+
+async def declare_runtime(
+    request: RuntimeContext, body: RuntimeSpec, *, force: bool = False
 ) -> Runtime:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
@@ -870,6 +877,12 @@ async def start_runtime(
     request: Request,
     name: str,
     force: bool = Query(default=False),
+) -> RestartResult:
+    return await start_declared_runtime(request, name, force=force)
+
+
+async def start_declared_runtime(
+    request: RuntimeContext, name: str, *, force: bool = False
 ) -> RestartResult:
     state: AgentState = request.app.state.agent_state
     spec = state.get_runtime_spec(name)

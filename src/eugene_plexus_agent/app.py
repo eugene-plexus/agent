@@ -412,9 +412,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         update_task = asyncio.create_task(
             update_routes.checker_for(app).run_forever(install_info.describe), name="update-check"
         )
+    from .run_worker import RunWorker
+
+    run_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(RunWorker(app).run_forever(), name="run-operations")
+    )
     try:
         yield
     finally:
+        if run_task is not None:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
         bundle_task.cancel()
         await asyncio.gather(bundle_task, return_exceptions=True)
         if update_task is not None:

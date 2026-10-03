@@ -231,6 +231,14 @@ class LibraryFitClient:
     def base_url(self) -> str:
         return self._base
 
+    async def operation_request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Authenticated, fresh-token transport for assigned durable run work."""
+        response = await self._client().request(
+            method, f"{self._base}{path}", headers=self._headers, **kwargs
+        )
+        response.raise_for_status()
+        return response.json() if response.content else None
+
     async def list_models(self) -> list[dict[str, Any]] | None:
         """Every model the library knows, raw -- for the mapping check
         behind `POST /v1/config/test`. None when it could not answer."""

@@ -102,6 +102,7 @@ from .._http import internal_client
 from ..auth_state import AuthState
 from ..dependencies import revoked_session_problem
 from ..node_identity import local_agent_url
+from ..runtime_context import RuntimeContext
 from ..settings import Settings
 from ..state import AgentState
 
@@ -262,7 +263,7 @@ def resolve_local(request: Request, target: str) -> str | None:
     return None
 
 
-def install_topology(request: Request) -> install_proxy.InstallTopology:
+def install_topology(request: RuntimeContext) -> install_proxy.InstallTopology:
     """The shared install-wide lookup cache, created on first use.
 
     Injectable the same way the upstream client is, so a test can seed a

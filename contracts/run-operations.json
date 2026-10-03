@@ -1,0 +1,2665 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Eugene Plexus durable run protocol",
+    "version": "1.0.0",
+    "description": "Library owns the durable intent. Only its assigned agent may claim, checkpoint, or create the run profile. Operator sessions alone submit, answer, cancel and dismiss. Claims expire after 120 seconds. Cancellation prevents subsequent stages; a side effect already started is reconciled, not rolled back. No credentials are persisted."
+  },
+  "paths": {
+    "/v1/run-operations": {
+      "get": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "List Operations",
+        "operationId": "list_operations_v1_run_operations_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationList"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/run-operations/assigned": {
+      "get": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Assigned",
+        "operationId": "assigned_v1_run_operations_assigned_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationList"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}": {
+      "put": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Submit",
+        "operationId": "submit_v1_run_operations__id__put",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,100}$",
+              "title": "Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Intent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Get Operation",
+        "operationId": "get_operation_v1_run_operations__id__get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Dismiss",
+        "operationId": "dismiss_v1_run_operations__id__delete",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}/answer": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Answer",
+        "operationId": "answer_v1_run_operations__id__answer_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Answer"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}/cancel": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Cancel",
+        "operationId": "cancel_v1_run_operations__id__cancel_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}/claim": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Claim",
+        "operationId": "claim_v1_run_operations__id__claim_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClaimedOperation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}/checkpoint": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Checkpoint",
+        "operationId": "checkpoint_v1_run_operations__id__checkpoint_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Checkpoint"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}/profile": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Profile",
+        "operationId": "profile_v1_run_operations__id__profile_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProfileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Answer": {
+        "properties": {
+          "answer": {
+            "type": "string",
+            "enum": [
+              "install",
+              "skip"
+            ],
+            "title": "Answer"
+          }
+        },
+        "type": "object",
+        "required": [
+          "answer"
+        ],
+        "title": "Answer"
+      },
+      "Checkpoint": {
+        "properties": {
+          "lease": {
+            "type": "string",
+            "title": "Lease"
+          },
+          "step": {
+            "type": "string",
+            "pattern": "^(checking|awaiting-install|installing|settings|launching|loading|ready|skipped|failed)$",
+            "title": "Step"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime"
+          },
+          "runtimeStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtimestatus"
+          },
+          "install": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Install"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "failedStep": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failedstep"
+          },
+          "loadingSince": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loadingsince"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "lease",
+          "step"
+        ],
+        "title": "Checkpoint"
+      },
+      "ClaimedOperation": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "intent": {
+            "$ref": "#/components/schemas/Intent"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LibraryModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "step": {
+            "type": "string",
+            "enum": [
+              "downloading",
+              "checking",
+              "awaiting-install",
+              "installing",
+              "settings",
+              "launching",
+              "loading",
+              "ready",
+              "skipped",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Step"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime"
+          },
+          "runtimeStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtimestatus"
+          },
+          "download": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Download"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "install": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Install"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "failedStep": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failedstep"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "install",
+                  "skip"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "startedAt": {
+            "type": "integer",
+            "title": "Startedat"
+          },
+          "finishedAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finishedat"
+          },
+          "loadingSince": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loadingsince"
+          },
+          "dismissed": {
+            "type": "boolean",
+            "title": "Dismissed",
+            "default": false
+          },
+          "lease": {
+            "type": "string",
+            "title": "Lease"
+          },
+          "leaseUntil": {
+            "type": "number",
+            "title": "Leaseuntil"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "node",
+          "intent",
+          "model",
+          "step",
+          "startedAt",
+          "lease",
+          "leaseUntil"
+        ],
+        "title": "ClaimedOperation"
+      },
+      "Download": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DownloadState"
+          },
+          "repo": {
+            "type": "string",
+            "title": "Repo"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision"
+          },
+          "resolvedCommit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolvedcommit",
+            "description": "The commit this download is pinned to. A resume that finds\nupstream serving a different digest for the same path\nreports it here rather than appending new bytes to old ones.\n"
+          },
+          "root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Root"
+          },
+          "destinationDirectory": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Destinationdirectory",
+            "description": "Absolute directory the files will land in, resolved **before\nthe first byte moves** so the operator can see where their\nmodel is going while there is still time to change it.\n"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/DownloadFile"
+            },
+            "type": "array",
+            "title": "Files"
+          },
+          "bytesTotal": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytestotal"
+          },
+          "bytesDownloaded": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytesdownloaded"
+          },
+          "bytesPerSecond": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytespersecond",
+            "description": "Recent rate, not an average over the whole job."
+          },
+          "etaSeconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Etaseconds"
+          },
+          "runWhenReady": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runwhenready",
+            "description": "The operator asked for this model to be run when it lands.\nRecorded, never acted on here \u2014 see `DownloadSpec`. Cleared\nby `POST /v1/downloads/{id}/claim`, so a finished download\nwhose flag is still set is one nobody has picked up yet.\n"
+          },
+          "attempts": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attempts",
+            "description": "How many times the transfer has been (re)started, including\nautomatic retries. Visible because a 40 GB fetch over a\ndomestic link will meet transient failures, and the\ndifference between a flaky connection and a dead one is\nthis number moving.\n"
+          },
+          "modelId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modelid",
+            "description": "The library entry this download became, filled in after the\npost-completion scan of the destination directory. This is\nwhat closes discovery \u2192 download \u2192 library \u2192 profile \u2192\nlaunch without the UI polling for a model to appear.\n"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Startedat"
+          },
+          "finishedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finishedat"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "errorCode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Errorcode",
+            "description": "Upstream's own error code when it gave one \u2014 `GatedRepo` is\nthe one that will actually happen, and it means \"accept the\nlicence on the model page\" rather than anything the operator\ncan fix here. Carried through so the UI can say that instead\nof surfacing a bare 401.\n"
+          },
+          "restartedFromZero": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restartedfromzero",
+            "description": "True when a resume found the remote file had changed and\ndiscarded the partial. Surfaced rather than silent: the\noperator is about to re-spend bandwidth they already spent,\nand the reason is that upstream requantized under the same\nfilename.\n"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message",
+            "description": "What the current phase is doing, for the progress dialog."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "state",
+          "repo",
+          "files"
+        ],
+        "title": "Download",
+        "description": "One transfer job over N files. Records persist after they finish;\n`DELETE` forgets one."
+      },
+      "DownloadFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "Repo-relative source path."
+          },
+          "destinationPath": {
+            "type": "string",
+            "title": "Destinationpath",
+            "description": "Absolute path this file will occupy when it is done. While\nit is in flight the bytes live at this path plus `.part`.\n"
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sizebytes"
+          },
+          "bytesDownloaded": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytesdownloaded"
+          },
+          "state": {
+            "$ref": "#/components/schemas/DownloadState"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256",
+            "description": "Expected content digest, when upstream published one."
+          },
+          "verified": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified",
+            "description": "Whether the finished file matched its digest. Verification\nhappens **before** the `.part` is renamed into place, so a\nfile that exists at `destinationPath` was verified \u2014 and one\nthat failed stays a `.part` with the record in `failed`,\nnever silently retried into the same bytes.\n"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelFileRole"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "destinationPath",
+          "state"
+        ],
+        "title": "DownloadFile"
+      },
+      "DownloadSpec": {
+        "properties": {
+          "repo": {
+            "type": "string",
+            "title": "Repo",
+            "description": "Upstream repo id."
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision",
+            "description": "Resolved to a commit at start and pinned for the life of\nthe download, so a resume days later fetches the same bytes\nit began with.\n",
+            "default": "main"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Files",
+            "description": "Repo-relative paths. Every shard of a split candidate, the\nprojector if the operator wants vision, and for safetensors\nthe sidecars as well as the weights. Take these from\n`CatalogueCandidate.files` and `CatalogueModel.projectors`.\n"
+          },
+          "root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Root",
+            "description": "Which configured model root to write under. Must be one of\nthem \u2014 this component will not write outside the\ndirectories the operator nominated. Defaults to the first,\nwhich is what the `path_list` config type has promised\nsince M2.\n"
+          },
+          "subdirectory": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subdirectory",
+            "description": "Relative destination under `root`, overriding the configured\nlayout. Path traversal is rejected; the result must stay\ninside the root.\n"
+          },
+          "runWhenReady": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runwhenready",
+            "description": "The operator asked for this model to be **run** when it\nlands, not merely fetched.\n\n**This component records it and never acts on it.** The\nlibrary does not launch anything \u2014 a launch is a profile, an\nengine and a runtime on some node's agent, and which node is\na question the library has no business answering. What this\nfield buys is that the *intent* outlives the browser tab\nthat expressed it: a 16 GB download takes long enough that\nthe person will close the laptop lid, and a console opening\nlater can see that a download was started in order to run\nsomething and carry on from there.\n\nExactly one console should carry on, which is what\n`POST /v1/downloads/{id}/claim` is for.\n",
+            "default": false
+          },
+          "filename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filename",
+            "description": "Override the written name of the **single-file** case. Rarely\nwanted: the upstream name is what the operator recognises,\nwhat the library will call it, and what\n`Runtime.modelAlias` defaults to \u2014 plainly-named files are\nthe point. Rejected when `files` holds more than one entry,\nbecause renaming one shard of a set breaks the set.\n"
+          }
+        },
+        "type": "object",
+        "required": [
+          "repo",
+          "files"
+        ],
+        "title": "DownloadSpec",
+        "description": "What to fetch and where to put it. The file list is explicit\nrather than inferred from the repo: \"download the model\" has to\nmean something exact by the time it reaches the transfer loop,\nand the catalogue detail response has already grouped the repo\ninto candidates whose `files` can be passed straight through."
+      },
+      "DownloadState": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "resolving",
+          "downloading",
+          "verifying",
+          "done",
+          "failed",
+          "paused",
+          "cancelled"
+        ],
+        "title": "DownloadState",
+        "description": "Named phases rather than a percentage, following M1's engine\ninstall for the same reason: the phases fail differently and the\noperator needs to know which one they are in. A stall in\n`downloading` is the network, a stall in `verifying` is the\ndisk, and `verifying` *failing* is the one that means the bytes\nare wrong.\n\n* `queued` \u2014 accepted, waiting on `maxConcurrentDownloads`.\n* `resolving` \u2014 asking upstream for the commit, sizes and\n  digests. Where a gated repo's 401 surfaces.\n* `paused` \u2014 operator-stopped; the `.part` is kept and shows up\n  in the next scan as `incomplete_download`.\n* `cancelled` \u2014 operator-abandoned; the `.part` is removed.\n* `failed` \u2014 the retry budget is spent. `resume` runs the same\n  loop again."
+      },
+      "EngineKind": {
+        "type": "string",
+        "enum": [
+          "llama_cpp",
+          "vllm",
+          "mlx",
+          "kev"
+        ],
+        "title": "EngineKind",
+        "description": "Which engine adapter constructs the argv and interprets\nreadiness. Deliberately a closed enum rather than a free string:\nan engine is supported exactly when an adapter exists for it,\nand without an adapter there is nothing that knows how to start\nit or tell when it is ready.\n\n`kev` drives upstream `python -m kev.serve` and loads Kev\ndecision checkpoints (`kev_checkpoint` format) \u2014 a decision\nmodel, not a chat model: its server speaks the System One\nprotocol and its companion driver serves `POST /v1/decide`,\nnever completions. Like vLLM it loads the model *before*\nbinding its port (read off `kev/serve.py` at the pinned commit\nand observed live 2026-09-22), so alive-and-refusing is\n`loading`; unlike every other engine it handles one request at\na time, which its driver advertises as a concurrency limit.\nIts bind is hardcoded to loopback upstream, which is the\nposture Eugene wants: the gateway is the authenticated front\ndoor.\n\n`llama_cpp` drives upstream `llama-server` and loads GGUF.\n`vllm` drives upstream `vllm serve` and loads safetensors.\n`mlx` drives upstream `mlx_lm.server` and loads MLX-format\nsafetensors, on Apple silicon only \u2014 experimental until a\nphysical Mac run is recorded. We never ship an engine \u2014 every\none of them is an upstream project we wrap and track.\n\nThey differ in far more than argv, and that is why readiness\nis per-adapter rather than one shared TCP check:\n`llama-server` answers `/health` while it loads and reports that\nit is loading, whereas vLLM binds its port *before* loading the\nmodel and refuses connections until the model is in memory \u2014 so\nfor minutes it is indistinguishable, over the network alone,\nfrom a process that died. `mlx_lm.server` is a third mechanism\nagain and the most awkward: it serves HTTP immediately, and at\nthe pinned release its `/health` answers a hardcoded\n`{\"status\": \"ok\"}` while the model is still loading on another\nthread, so **no read-only probe can tell loading from ready**.\nIts adapter proves residency by asking for one token, once per\nprocess, and only then treats the health endpoint as evidence.\n(Upstream `main` has since taught `/health` to answer 503\n`unavailable` while loading; the adapter reads that as loading\ntoo, so a future pin gets the cheap probe for free.) They\ndiffer in acquisition too: a llama.cpp build is fetched and\nverified by us, while vLLM and mlx-lm are Python packages the\noperator installs themselves. See `EngineAcquisition.policy`.\n\nLives here rather than on the agent because two components\nreference it: the agent's engines and runtimes, and a\nlibrary `ModelProfile`, which names the engine its launch flags\nare written for."
+      },
+      "GgufDetail": {
+        "properties": {
+          "quantization": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quantization",
+            "description": "Human-readable quant tier, e.g. `\"Q4_K_M\"`. The vocabulary\nthe operator's question is actually phrased in \u2014 \"Q3_K_S vs\n2Q_K_M? No one knows\" \u2014 and M3's guidance hangs off it.\n"
+          },
+          "fileType": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filetype",
+            "description": "Raw `general.file_type` enum value, reported alongside the\nlabel rather than instead of it. It **does** distinguish the\nK-quant mixtures (verified: 14 is `Q4_K_S`, 15 is `Q4_K_M`),\nso the label is machine-read rather than guessed from a\nfilename.\n\nReported raw because the quant families churn \u2014 imatrix\nvariants, MXFP4, whatever is next \u2014 and a reader will meet\nvalues it does not know. The rule for those is to surface\nthe number and the filename-derived label, never to map an\nunrecognised value onto a plausible neighbour: guidance\nbuilt on a guess is worse than no guidance.\n"
+          },
+          "quantizationDisagrees": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quantizationdisagrees",
+            "description": "True when the label derived from `fileType` and the label in\nthe filename are not the same. Both are then reported and\nneither is silently preferred, because either one can be the\nwrong one \u2014 a requantized file keeps its old name more often\nthan a metadata field is wrong, but not always.\n"
+          },
+          "ggufVersion": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ggufversion",
+            "description": "GGUF container version (3 for everything current)."
+          },
+          "shardCount": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shardcount",
+            "description": "Number of `\u2026-0000N-of-0000M.gguf` parts. 1 for a plain file.\nOnly the first is on the launch line; the rest are `shard`\nfiles.\n"
+          },
+          "vocabSize": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vocabsize",
+            "description": "Token count. Worth reporting for its own sake and because it\nexplains the scan cost: the tokenizer lives in the KV block,\nso a 248k-token vocab means ~10.9 MB of metadata to walk\npast before the quant can be read.\n"
+          },
+          "expertBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expertbytes",
+            "description": "Bytes of mixture-of-experts expert tensors (names carrying\n`_exps`), summed from the tensor table that follows the KV\nblock: names, shapes and offsets, never a weight. 0 for a\ndense model. Null when the table was not read (a scan from\nbefore 2026-09-30, or a header cut short).\n\nThe number that tells a MoE model from a dense one of the\nsame size: on Qwen3-30B-A3B Q4_K_M it is 16.35 GiB of 17.28,\nand everything else is 0.93 GiB, so a small card holds all of\nthat plus the cache and llama.cpp moves only experts to system\nmemory (`docs/design/moe-aware-fit.md` \u00a70).\n"
+          },
+          "projectorPath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Projectorpath",
+            "description": "Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause \"this model can see\" is a fact the browser should\nshow and a profile should be able to override.\n"
+          },
+          "recommendedSampling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RecommendedSampling"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "metadata": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Metadata",
+            "description": "Selected raw KV pairs, verbatim, minus the tokenizer arrays.\nAn escape hatch for the long tail \u2014 architecture-prefixed\nkeys grow with upstream, and a reader that only ever exposes\nthe fields it was written to understand goes blind on every\nmodel newer than itself.\n"
+          }
+        },
+        "type": "object",
+        "title": "GgufDetail",
+        "description": "GGUF-specific metadata, read from the file's KV block. Present\niff `format` is `gguf`."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "Intent": {
+        "properties": {
+          "node": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "modelId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modelid"
+          },
+          "download": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DownloadSpec"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "downloadId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Downloadid"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "Intent"
+      },
+      "KevCheckpointDetail": {
+        "properties": {
+          "baseModel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Basemodel",
+            "description": "The base weights the adapter applies to, as\n`adapter_config.json` names them (e.g.\n`Qwen/Qwen3.5-0.8B-Base`). The half of the model this\ndirectory does NOT contain.\n"
+          },
+          "repoId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repoid",
+            "description": "HuggingFace repo this came from, when the layout says so."
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision",
+            "description": "Snapshot revision, when the checkpoint sits in a HF cache."
+          }
+        },
+        "type": "object",
+        "title": "KevCheckpointDetail",
+        "description": "Kev-checkpoint-specific metadata. Present iff `format` is\n`kev_checkpoint`. The point of recording it is\nreproducibility: a checkpoint is only half a runnable model \u2014\nthe loader downloads the named base separately \u2014 so an operator\nrestoring a node offline needs to know exactly which base\nweights, at which revision, the launch will ask for. The\nadapter, decision head, tokenizer and calibration/provenance\nfiles are all in `files` with their roles; the license rides the\ncheckpoint's own metadata on disk."
+      },
+      "LibraryModel": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id",
+            "description": "Stable handle for this model: the first 16 hex characters of\nthe SHA-256 of its normalized absolute path. Normalized\nmeans absolute, canonical separators, case-folded on\nWindows, and **symlinks left unresolved**.\n\nDerived rather than random so it survives restarts, since\nprofiles are keyed to it. **Opaque to callers** \u2014 the\nnormalization rules are fiddly enough that a client deriving\nit independently would sooner or later compute a handle the\nserver does not recognise and get an unexplained 404. Use\n`GET /v1/models?path=` instead.\n\nNot content addressing: no byte of the model is read to\nproduce it. Hashing 40 GB on every scan is not on the table,\nand a content-derived identity would change when nothing the\noperator did changed.\n"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "Absolute path, verbatim, in the operator's own layout \u2014 the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors. This is what goes on a runtime's\n`modelPath`.\n\n**A path on the host this library runs on** \u2014 inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n"
+          },
+          "root": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Root",
+            "description": "The configured root this model was found under. Two roots\ncan hold the same filename, so this is how the UI\ndisambiguates two entries that otherwise read alike \u2014 and\nhow it tells the operator which drive to go plug back in.\n"
+          },
+          "format": {
+            "$ref": "#/components/schemas/ModelFormat"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name",
+            "description": "The filename with its extension stripped, or the directory\nname for safetensors. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to \u2014 so\nplainly-named files mean the obvious name is already the\nright one.\n"
+          },
+          "displayName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Displayname",
+            "description": "The model's self-declared name from its metadata\n(`general.name` for GGUF), when it has one and it differs\nfrom `name`. Shown as a subtitle, never as the identity:\nmetadata names are frequently the training-run name and\ncollide across quants of one model.\n"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ModelStatus"
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sizebytes",
+            "description": "Total size of every file belonging to this model \u2014 all\nshards, and the projector when there is one. The number\nthat answers \"will this fit on the drive I am copying it\nto\", which is why it is a sum rather than the weights file\nalone.\n"
+          },
+          "fileCount": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filecount",
+            "description": "How many files make up this model. 1 for a plain single-file GGUF."
+          },
+          "architecture": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Architecture",
+            "description": "Model architecture as the file declares it \u2014 `general.architecture`\nfor GGUF, `model_type` from `config.json` for safetensors.\nFree-form on purpose: new architectures ship constantly and\nan enum here would reject models that work fine.\n"
+          },
+          "contextLength": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextlength",
+            "description": "Context length the **model** declares. Not what an engine\nwill serve \u2014 that depends on the launch flags and available\nmemory, and is reported by the agent as\n`RuntimeCapabilities.contextLength`. Both numbers are real\nand a UI that shows only this one tells a comfortable lie.\n"
+          },
+          "parameters": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parameters",
+            "description": "Exact parameter count, when the format gives one. Safetensors\nheaders do (summed tensor shapes, from an ~11 KB read);\n**GGUF does not** \u2014 see `sizeLabel`. Optional because for\nmost local models it is genuinely unavailable, and a schema\nthat required it would be unfillable for every GGUF in\nexistence.\n"
+          },
+          "sizeLabel": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sizelabel",
+            "description": "The author's own size label, e.g. `\"27B\"`\n(`general.size_label`). A display string, not a number, and\nnot always present or accurate \u2014 it is what the person who\nuploaded the file typed. For GGUF it is usually the only\nanswer available to \"how big is this model\".\n"
+          },
+          "capabilities": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "files": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/ModelFile"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files",
+            "description": "Every file that belongs to this model, with its role. This\nis what makes a sharded model legible as one thing, and what\nshows the operator that the 900 MB projector next to their\nmodel is accounted for rather than missed.\n"
+          },
+          "gguf": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GgufDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "safetensors": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SafetensorsDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kev": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/KevCheckpointDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "profileCount": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profilecount",
+            "description": "How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n"
+          },
+          "firstSeenAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Firstseenat",
+            "description": "When a scan first found this model."
+          },
+          "lastSeenAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastseenat",
+            "description": "When a scan last found it on disk. For a `missing` entry\nthis is when it was last there, which is the only clue to\nwhat happened.\n"
+          },
+          "modifiedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Modifiedat",
+            "description": "Filesystem mtime of the weights. Part of the incremental-rescan key."
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error",
+            "description": "Why this entry is `unreadable` \u2014 a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "path",
+          "format",
+          "name",
+          "status"
+        ],
+        "title": "LibraryModel",
+        "description": "One launchable model on this host.\n\nThe format-independent facts are here; exactly one of `gguf` or\n`safetensors` carries the rest. That split is not tidiness \u2014 a\nquant tier is a GGUF concept and an exact parameter count is a\nsafetensors one, and flattening both into one object would\nproduce a schema half of whose fields are null for any given\nmodel."
+      },
+      "MlxQuantization": {
+        "properties": {
+          "bits": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bits",
+            "description": "Bits per weight, as the block declares it (e.g. 4)."
+          },
+          "groupSize": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Groupsize",
+            "description": "Quantization group size (`group_size`), when declared."
+          }
+        },
+        "type": "object",
+        "title": "MlxQuantization",
+        "description": "Present when the directory's `config.json` carries an MLX-style\ntop-level `quantization` block \u2014 the marker `mlx_lm.convert`\nwrites and the one signal that distinguishes an MLX-converted\ndirectory from a vanilla HF safetensors export (which spells\nits quantization `quantization_config`, a different key).\nLoad-bearing for engine choice, because **safetensors alone\ndoes not prove MLX compatibility** and an MLX-quantized\ndirectory packs its weights as integer tensors that no other\nengine here can load.\n\nOne honest caveat, recorded rather than papered over: an\n*unquantized* MLX conversion carries no such block and reads as\na plain safetensors directory \u2014 absence means unknown, not\nincompatible. `parameters` for an MLX-quantized directory is the\nmodel's parameter count, recovered from the packed storage (each\nquantized module holds its `scales` times its group size); it\nis absent when a group size cannot be read. Until A4\n(2026-09-30) it counted packed storage elements instead, which\nread a 0.6B model as 93M."
+      },
+      "ModelCapabilities": {
+        "properties": {
+          "chat": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chat",
+            "description": "Text generation \u2014 the default assumption for a causal model.\nFalse for an embedding model.\n"
+          },
+          "embedding": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Embedding",
+            "description": "The model is a dedicated embedding model (a pooling type in\nits metadata, or non-causal attention). Load-bearing rather\nthan informational: llama-server's own help says\n`--embedding` is \"for use only with dedicated embedding\nmodels\", and launching one of these as a chat model does not\nfail \u2014 it starts, serves, and returns nonsense.\n"
+          },
+          "vision": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vision",
+            "description": "A vision projector was found for this model, so it can take\nimages. See `GgufDetail.projectorPath`.\n"
+          },
+          "chatTemplate": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chattemplate",
+            "description": "The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n"
+          },
+          "decision": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decision",
+            "description": "A decision model: it answers typed questions with structured\nprobabilities through `POST /v1/systemone`, and it does not\nchat \u2014 `chat` is false whenever this is true, and offering\nit a conversation fails clearly instead of producing prose.\nTrue for a `kev_checkpoint`.\n"
+          }
+        },
+        "type": "object",
+        "title": "ModelCapabilities",
+        "description": "What the model's own metadata says it can do. Distinct from the\nagent's `RuntimeCapabilities`, which is read back off a\n*running* engine: this is a property of the file, available\nbefore anything is launched, and it is what the launch flags\nhave to be chosen from."
+      },
+      "ModelFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "Absolute path."
+          },
+          "role": {
+            "$ref": "#/components/schemas/ModelFileRole"
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sizebytes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "role"
+        ],
+        "title": "ModelFile",
+        "description": "One file belonging to a model, and what part it plays."
+      },
+      "ModelFileRole": {
+        "type": "string",
+        "enum": [
+          "weights",
+          "shard",
+          "projector",
+          "config",
+          "tokenizer",
+          "index",
+          "other"
+        ],
+        "title": "ModelFileRole",
+        "description": "* `weights` \u2014 the file named on the launch line. Exactly one per\n  model: the single `.gguf`, the first shard of a split one, or\n  the primary safetensors file.\n* `shard` \u2014 the second through Nth part of a split model.\n* `projector` \u2014 a vision projector (`general.type: mmproj`),\n  which is why it is a role here and not a model of its own.\n* `config` / `tokenizer` / `index` \u2014 safetensors sidecars.\n* `other` \u2014 present in the model's directory, counted in\n  `sizeBytes`, not classified."
+      },
+      "ModelFormat": {
+        "type": "string",
+        "enum": [
+          "gguf",
+          "safetensors",
+          "kev_checkpoint"
+        ],
+        "title": "ModelFormat",
+        "description": "On-disk format of a model. A dimension of the data model rather\nthan an assumption (locked 2026-09-08), and the differences are\nload-bearing rather than cosmetic.\n\n* `gguf` \u2014 a single file, quantized, carrying its own metadata\n  and tokenizer. Large models may be **split** into\n  `\u2026-00001-of-0000N.gguf` shards, of which only the first is\n  named on a launch line. A multimodal GGUF ships its vision\n  projector as a separate file in the same directory, which is\n  not itself a model.\n* `safetensors` \u2014 a directory: `config.json` plus one or more\n  weight files plus tokenizer files. Unquantized in practice,\n  so **no quant tier** \u2014 a safetensors model is sized, not\n  tiered, and the quant fields exist only on the GGUF side.\n* `kev_checkpoint` \u2014 a directory holding a rank-limited LoRA\n  adapter (`adapter_config.json` + `adapter_model.safetensors`),\n  a pointer/decision head (`head.pt`), tokenizer files and\n  calibration/provenance artifacts (`provenance.json`), loaded\n  by Kev's own loader on top of a separately downloaded base\n  model named in the adapter config. Measured off the published\n  `jaredpalmer/kev-0.8b` checkpoint on 2026-09-22. **Not an\n  ordinary adapter**: a plain LoRA directory is skipped by the\n  scanner on purpose, and the decision head is what makes this\n  one a launchable model instead. Decision-only \u2014\n  `ModelCapabilities.decision`, never `chat`.\n\nShared because it appears on both sides of a join: a library\nentry declares what a model *is*, and\n`EngineDescriptor.modelFormats` declares what an engine can\n*load*. Nothing can serve a safetensors model until the vLLM\nadapter lands, and that answer comes from the engine's\ndescriptor rather than from anything the library knows."
+      },
+      "ModelProfile": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id",
+            "description": "Server-assigned profile id, unique within the model."
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "default": {
+            "type": "boolean",
+            "title": "Default"
+          },
+          "maxTokens": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Maxtokens"
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 2.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          },
+          "topP": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topp"
+          },
+          "engine": {
+            "$ref": "#/components/schemas/EngineKind"
+          },
+          "flags": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flags"
+          },
+          "extraArgs": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extraargs"
+          },
+          "env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Env"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          },
+          "builtBy": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProfileBuiltBy"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The settings builder's record, when it wrote this profile. Kept by a replace that omits it."
+          },
+          "createdAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Createdat"
+          },
+          "updatedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updatedat"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "default",
+          "engine"
+        ],
+        "title": "ModelProfile",
+        "description": "A saved profile, as stored: the spec plus server-owned\nidentifiers and timestamps."
+      },
+      "ModelStatus": {
+        "type": "string",
+        "enum": [
+          "present",
+          "missing",
+          "unreadable"
+        ],
+        "title": "ModelStatus",
+        "description": "* `present` \u2014 found on disk and readable.\n* `missing` \u2014 not found by the last scan, but profiles are\n  saved against it, so the entry survives. **Moving a model\n  produces this**, plus a new entry at the new path: nothing\n  guesses that a file which vanished from one root and appeared\n  in another is the same file, because a wrong guess silently\n  applies one model's tuning to another. The profiles stay here\n  to be copied across by hand.\n* `unreadable` \u2014 the files are there and something about them\n  did not work. `error` says what."
+      },
+      "Operation": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "intent": {
+            "$ref": "#/components/schemas/Intent"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LibraryModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "step": {
+            "type": "string",
+            "enum": [
+              "downloading",
+              "checking",
+              "awaiting-install",
+              "installing",
+              "settings",
+              "launching",
+              "loading",
+              "ready",
+              "skipped",
+              "failed",
+              "cancelled"
+            ],
+            "title": "Step"
+          },
+          "engine": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engine"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime"
+          },
+          "runtimeStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtimestatus"
+          },
+          "download": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Download"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "install": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Install"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ModelProfile"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "failedStep": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failedstep"
+          },
+          "answer": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "install",
+                  "skip"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Answer"
+          },
+          "startedAt": {
+            "type": "integer",
+            "title": "Startedat"
+          },
+          "finishedAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finishedat"
+          },
+          "loadingSince": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Loadingsince"
+          },
+          "dismissed": {
+            "type": "boolean",
+            "title": "Dismissed",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "node",
+          "intent",
+          "model",
+          "step",
+          "startedAt"
+        ],
+        "title": "Operation",
+        "description": "HTTP view; the journal envelope has its own version and schema."
+      },
+      "OperationList": {
+        "properties": {
+          "operations": {
+            "items": {
+              "$ref": "#/components/schemas/Operation"
+            },
+            "type": "array",
+            "title": "Operations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "operations"
+        ],
+        "title": "OperationList"
+      },
+      "ProfileBuiltAccuracy": {
+        "type": "string",
+        "enum": [
+          "max",
+          "high",
+          "medium",
+          "low"
+        ],
+        "title": "ProfileBuiltAccuracy",
+        "description": "The accuracy level the build was asked for; the agent's `ProfileBuildAccuracy`."
+      },
+      "ProfileBuiltBy": {
+        "properties": {
+          "buildId": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Buildid",
+            "description": "The agent's `ProfileBuild.id`."
+          },
+          "node": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Node",
+            "description": "The machine it was measured on."
+          },
+          "accuracy": {
+            "$ref": "#/components/schemas/ProfileBuiltAccuracy"
+          },
+          "builtAt": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Builtat"
+          },
+          "engineVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Engineversion",
+            "description": "The llama.cpp build it was measured with."
+          },
+          "flags": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Flags",
+            "description": "The flags the builder set, as it set them: `contextSize`,\n`cacheType`, `flashAttention` when the cache is quantised,\nand `memoryMargin` when a margin was asked for. `gpuLayers`\nis never among them: placement is llama.cpp's at every launch.\n"
+          },
+          "decodeTokensPerSecond": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decodetokenspersecond",
+            "description": "Measured decode speed with an empty context."
+          },
+          "deepDepth": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deepdepth",
+            "description": "The context depth of the second measurement (2,048 for every candidate)."
+          },
+          "deepDecodeTokensPerSecond": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deepdecodetokenspersecond"
+          },
+          "graphicsMemoryBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Graphicsmemorybytes",
+            "description": "Graphics memory used when the result was loaded to confirm it, where the machine can measure it."
+          },
+          "sameTopTokenPercent": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 100.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sametoptokenpercent",
+            "description": "How often the chosen cache picks the same next token as the\nf16 cache on the evaluation text. Null when the f16 cache was\nchosen, since nothing that changes answers was set.\n"
+          },
+          "evaluationSource": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProfileBuiltEvaluationSource"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Which text the quality measurement used; null when none was made."
+          }
+        },
+        "type": "object",
+        "required": [
+          "buildId",
+          "node",
+          "accuracy",
+          "builtAt",
+          "flags"
+        ],
+        "title": "ProfileBuiltBy",
+        "description": "What the settings builder set on a profile, and what it measured,\non which machine. The UI compares `flags` with the profile's own\nflags to say which settings the builder set and whether any has\nbeen edited since; once one has, the measured numbers no longer\ndescribe the profile and are labelled so."
+      },
+      "ProfileBuiltEvaluationSource": {
+        "type": "string",
+        "enum": [
+          "bundled",
+          "custom"
+        ],
+        "title": "ProfileBuiltEvaluationSource",
+        "description": "The agent's `EvaluationTextSource`. A custom text is identified by the build, never stored."
+      },
+      "ProfileRequest": {
+        "properties": {
+          "lease": {
+            "type": "string",
+            "title": "Lease"
+          },
+          "engine": {
+            "type": "string",
+            "title": "Engine"
+          },
+          "contextSize": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextsize"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "lease",
+          "engine"
+        ],
+        "title": "ProfileRequest"
+      },
+      "RecommendedSampling": {
+        "properties": {
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Temperature"
+          },
+          "topK": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topk"
+          },
+          "topP": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topp"
+          }
+        },
+        "type": "object",
+        "title": "RecommendedSampling",
+        "description": "Sampling parameters the model's author put in the file\n(`general.sampling.*` in GGUF). **Reported, never applied.**\n\nThe locked rule is that the gateway owns every\nLLM-output-affecting parameter and no component substitutes a\nlocal default; that rule is unchanged. But the file having an\nopinion is real information, and dropping it means the operator\nhas to go read the model card to find out. Whether anything can\nadopt these with one click is a gateway decision, not a library\none."
+      },
+      "SafetensorsDetail": {
+        "properties": {
+          "mlxQuantization": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MlxQuantization"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dtype": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dtype",
+            "description": "Dominant tensor dtype as the header declares it, e.g.\n`\"BF16\"`, `\"F16\"`, `\"F32\"`. The nearest thing to a quant\ntier here, and it is a precision rather than a scheme.\n"
+          },
+          "shardCount": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shardcount",
+            "description": "Number of `model-0000N-of-0000M.safetensors` files. Unlike\nGGUF, all of them are loaded together and none is \"the\"\nfile \u2014 the directory is the model.\n"
+          },
+          "repoId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repoid",
+            "description": "HuggingFace repo this came from, e.g.\n`\"sentence-transformers/all-MiniLM-L6-v2\"`, when the layout\nsays so (a `models--<org>--<name>` cache directory, or\n`config.json` naming it).\n"
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision",
+            "description": "Snapshot revision, when the model sits in a HuggingFace\ncache. Those caches hold **one directory per revision**, so\nwithout this two snapshots of one model are two\nindistinguishable entries. The revision named by the\ncache's own `refs/main` is the current one; the others are\nreported as skipped older revisions rather than as models.\n"
+          },
+          "configPath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configpath",
+            "description": "Absolute path to `config.json`, the file that made this a model."
+          }
+        },
+        "type": "object",
+        "title": "SafetensorsDetail",
+        "description": "Safetensors-specific metadata. Present iff `format` is\n`safetensors`. **No quant tier** \u2014 a safetensors model is\nsized, not tiered. The one exception to \"no quant fields\" is\n`mlxQuantization` below, which is a conversion marker rather\nthan a tier: it says which loader the directory was prepared\nfor, not how good the weights are."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  }
+}
