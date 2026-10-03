@@ -118,9 +118,16 @@ def test_a_current_card_still_gets_its_drivers_own_major() -> None:
 
 
 def test_turing_is_the_first_card_a_13x_build_serves() -> None:
-    """7.5 is the boundary, inclusive. Volta (7.0) is below it."""
-    assert _plan("13.0", "7.5").variant == "ubuntu-cuda-13.3-x64"
-    assert _plan("13.0", "7.0").variant == "ubuntu-cuda-12.8-x64"
+    """7.5 is the boundary, inclusive. Volta (7.0) is below it.
+
+    **Amended 2026-10-03, not added to.** This asked with a 13.0 driver
+    and asserted Turing got the 13.3 build -- whose only code for 7.5 is
+    PTX (`75-virtual`), which a 13.0 driver cannot compile because it is
+    from a newer toolkit than the driver (`test_newer_minor_needs_finished
+    _code.py`). The boundary is asked about with a driver at the build's
+    own minor now, where the PTX compiles and only rule 0 decides."""
+    assert _plan("13.3", "7.5").variant == "ubuntu-cuda-13.3-x64"
+    assert _plan("13.3", "7.0").variant == "ubuntu-cuda-12.8-x64"
 
 
 def test_a_newer_driver_takes_an_older_major_when_its_own_is_not_published() -> None:

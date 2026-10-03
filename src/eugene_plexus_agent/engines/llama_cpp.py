@@ -1254,11 +1254,17 @@ def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
        within the same major -- the highest such minor. A 12.4 build on a
        12.8 driver is the ordinary case and needs no caveat.
     2. **Otherwise take the lowest published minor above the driver's,
-       still within the same major.** CUDA's minor-version compatibility
-       guarantees that an application built with any 13.x toolkit runs
-       on any driver of the 13.x family, minus PTX JIT for newer PTX and
-       minus APIs the older driver lacks; llama.cpp ships SASS for the
-       shipping architectures, so neither bites. **Verified live
+       still within the same major -- when the card has finished code
+       in it.** CUDA's minor-version compatibility guarantees that an
+       application built with any 13.x toolkit runs on any driver of the
+       13.x family, minus PTX JIT for newer PTX and minus APIs the older
+       driver lacks. **The PTX exclusion bites** (corrected 2026-10-03;
+       this said it did not): upstream's builds carry finished code only
+       for 8.6, 8.9, 12.0 and 12.1 and PTX for the rest
+       (`_FINISHED_CODE`), so a Turing, A100 or H100 on a 13.0 driver
+       would be handed a 13.4 build it cannot load. Such a card takes
+       rule 3 instead, and with no older major is refused with the fix.
+       An unknown capability takes the newer minor, as before. **Verified live
        2026-09-15:** the day upstream stopped publishing `win-cuda-13.3`
        and shipped `win-cuda-13.4-x64` instead (every build from b10983
        on), the b10990 13.4 build loaded a 1.8 GB Q8 on an RTX 5090
@@ -1405,18 +1411,67 @@ def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
         )
 
     newer = min(same_major, key=lambda t: (t[0], t[1]))
-    log.info(
-        "llama.cpp: release %s publishes no CUDA %s build at or below this driver's "
-        "%s; taking the %s.%s build under CUDA minor-version compatibility (same "
-        "major, newer minor). If the engine fails to start, this is the first "
-        "thing to know.",
-        release.version,
-        driver_major,
-        driver,
-        newer[0],
-        newer[1],
+    # Rule 2's condition. **An unknown capability keeps the behaviour this
+    # had before the condition existed** (take the newer minor): with no
+    # `compute_cap` there is nothing to decide on, and refusing would turn
+    # every such host away for a fact we could not read. A machine with
+    # several cards is decided by its LOWEST (the contract's
+    # `computeCapability`), so a lowest card with finished code beside a
+    # higher one without it -- a 4090 (8.9) beside an H100 (9.0) -- is not
+    # seen here and still gets the newer minor.
+    if capability is None or has_finished_code(capability, (newer[0], newer[1])):
+        log.info(
+            "llama.cpp: release %s publishes no CUDA %s build at or below this driver's "
+            "%s; taking the %s.%s build under CUDA minor-version compatibility (same "
+            "major, newer minor)%s. If the engine fails to start, this is the first "
+            "thing to know.",
+            release.version,
+            driver_major,
+            driver,
+            newer[0],
+            newer[1],
+            ", which carries finished code for this card"
+            if capability is not None
+            else "; the card's compute capability is unknown, so whether that build "
+            "carries finished code for it could not be checked",
+        )
+        return newer[2]
+
+    # The card has only PTX in the newer build, and a driver cannot compile
+    # PTX from a toolkit newer than itself -- the one exclusion of
+    # minor-version compatibility. The older major's build runs instead:
+    # its PTX is older than the driver.
+    cc = host.computeCapability
+    older = [t for t in runnable if t[0] < driver_major]
+    if older:
+        chosen = max(older, key=lambda t: (t[0], t[1]))
+        log.info(
+            "llama.cpp: taking the CUDA %s.%s build on a driver that supports %s: the "
+            "release's CUDA %s build is %s.%s, newer than the driver, and has only PTX "
+            "for this card (compute capability %s), which this driver cannot compile. "
+            "A driver runs builds from older CUDA majors.",
+            chosen[0],
+            chosen[1],
+            driver,
+            driver_major,
+            newer[0],
+            newer[1],
+            cc,
+        )
+        return chosen[2]
+    return Unavailable(
+        reason=(
+            f"this machine's NVIDIA card (compute capability {cc}) has no finished code in "
+            f"release {release.version}'s CUDA {newer[0]}.{newer[1]} build, only PTX, and a "
+            f"driver that supports CUDA {driver} cannot compile PTX from a newer CUDA. No "
+            f"older CUDA build is published to fall back on. Update the NVIDIA driver to "
+            f"one that supports CUDA {newer[0]}.{newer[1]} or newer, or set `binary` on the "
+            f"runtime to a build compiled for this card."
+        ),
+        # A release whose older-major asset is still uploading looks like
+        # this too, and the one before it may carry it.
+        release_bound=True,
     )
-    return newer[2]
 
 
 def _published_variants(release: Release) -> list[str]:
@@ -1465,6 +1520,50 @@ def _lowest_capability(major: int) -> tuple[int, int]:
     if major > newest:
         return _CUDA_LOWEST_CAPABILITY[newest]
     return (0, 0)
+
+
+# The architectures upstream's published CUDA builds carry FINISHED code
+# (SASS) for, with the toolkit version that adds each. Upstream's release
+# workflow passes no `CMAKE_CUDA_ARCHITECTURES` ("use the broad default arch
+# set ... so the release binary covers many GPUs"), so the default list in
+# `ggml/src/ggml-cuda/CMakeLists.txt` is what ships. Read at b11375
+# (2026-10-03):
+#
+#     75-virtual 80-virtual 86-real          always
+#     89-real 90-virtual                     CUDA >= 11.8
+#     120a-real                              CUDA >= 12.8
+#     121a-real                              CUDA >= 12.9
+#     50-virtual 61-virtual 70-virtual       CUDA < 13
+#
+# `-virtual` is PTX, compiled by the DRIVER at load -- and a driver cannot
+# compile PTX from a toolkit newer than itself, which is the one thing
+# NVIDIA's minor-version compatibility excludes. So these rows are what
+# decide whether a newer minor than the driver's is safe for a card.
+#
+# Each row: (architecture, arch-specific, toolkit that adds it). A plain
+# `-real` cubin for X.Y runs on X.Z for any Z >= Y; an `a` (arch-specific)
+# one runs on X.Y alone. Re-read the CMakeLists when upstream publishes a
+# new CUDA major, as for `_CUDA_LOWEST_CAPABILITY` above.
+_FINISHED_CODE: tuple[tuple[tuple[int, int], bool, tuple[int, int]], ...] = (
+    ((8, 6), False, (0, 0)),
+    ((8, 9), False, (11, 8)),
+    ((12, 0), True, (12, 8)),
+    ((12, 1), True, (12, 9)),
+)
+
+
+def has_finished_code(capability: tuple[int, int], build: tuple[int, int]) -> bool:
+    """Whether a published CUDA `build` (major, minor) carries finished
+    machine code for a card of `capability`, rather than only PTX."""
+    for arch, specific, since in _FINISHED_CODE:
+        if build < since:
+            continue
+        if specific:
+            if capability == arch:
+                return True
+        elif capability[0] == arch[0] and capability[1] >= arch[1]:
+            return True
+    return False
 
 
 def _parse_capability(value: str | None) -> tuple[int, int] | None:
