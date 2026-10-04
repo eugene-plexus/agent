@@ -265,3 +265,103 @@ async def test_old_or_misconfigured_workbench_never_inherits_public_route(tmp_pa
         for _ in range(4):
             await entry._sync(admin, backend)
     assert published == [False, True, False]
+
+
+def automatic(**overrides):
+    base = {
+        "acme": {"email": "operator@example.org", "accept_terms": True},
+        "console": {"origin": "https://eugene.example.org", "networks": ["192.168.1.0/24"]},
+        "workbench": {"origin": "https://workbench.example.org", "networks": ["0.0.0.0/0"]},
+    }
+    return EntryConfig.model_validate({**base, **overrides})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"internal_ca": True},
+        {"acme": {"email": "operator@example.org", "accept_terms": False}},
+        {"acme": {"email": "no-address", "accept_terms": True}},
+        {"console": {"origin": "https://eugene.home.arpa", "networks": ["192.168.1.0/24"]}},
+        {
+            "console": {
+                "origin": "https://eugene.example.org:8443",
+                "networks": ["192.168.1.0/24"],
+            },
+            "workbench": {
+                "origin": "https://workbench.example.org:8443",
+                "networks": ["0.0.0.0/0"],
+            },
+        },
+        {"proxy": {"addresses": ["172.30.0.2"], "transport": "https"}},
+    ],
+)
+def test_automatic_certificates_need_explicit_terms_public_names_and_port_443(changes):
+    with pytest.raises(ValidationError):
+        automatic(**changes)
+
+
+@pytest.mark.parametrize(
+    "addresses", [["0.0.0.0/0"], ["172.30.0.0/24"], ["::/0"], ["0.0.0.0"], ["224.0.0.1"], []]
+)
+def test_proxy_trust_cannot_cover_a_network(addresses):
+    with pytest.raises(ValidationError):
+        config(internal_ca=False, proxy={"addresses": addresses})
+
+
+def test_certificate_modes_keep_destinations_private_and_acme_has_no_http_listener(tmp_path):
+    document = caddy_config(automatic(), tmp_path, "secret", {"agent": 8079})
+    issuer = document["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]
+    assert issuer["ca"] == "https://acme-v02.api.letsencrypt.org/directory"
+    assert issuer["challenges"] == {
+        "http": {"disabled": True},
+        "tls-alpn": {"alternate_port": 8443},
+    }
+    proxy = config(
+        internal_ca=False,
+        proxy={"addresses": ["172.30.0.2"]},
+        trusted_ca="/data/organisation-ca.pem",
+    )
+    document = caddy_config(proxy, tmp_path, "secret", {"agent": 8079})
+    server = document["apps"]["http"]["servers"]["entry"]
+    assert server["automatic_https"] == {"disable": True}
+    assert "tls" not in document["apps"] and "tls_connection_policies" not in server
+    assert server["trusted_proxies_strict"] == 1
+    assert server["trusted_proxies"]["ranges"] == ["172.30.0.2/32"]
+
+
+def test_setup_preview_requires_an_operator(client):
+    reply = client.post("/v1/entrypoint/preview", json={"configuration": {}})
+    assert reply.status_code in (401, 403)
+
+
+def test_setup_preview_is_non_mutating_and_explains_unverified_reachability(
+    authed_client, app, monkeypatch
+):
+    import subprocess
+
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **kw: pytest.fail("preview spawned a process")
+    )
+    reply = authed_client.post(
+        "/v1/entrypoint/preview",
+        json={"configuration": automatic().model_dump(mode="json", exclude_none=True)},
+    )
+    assert reply.status_code == 200, reply.text
+    assert app.state.entrypoint_config is None
+    assert "not been tested" in reply.json()["instructions"][0]
+    assert any("port 80 is not required" in step for step in reply.json()["instructions"])
+    bad = authed_client.post(
+        "/v1/entrypoint/preview", json={"configuration": {"proxy": {"addresses": ["0.0.0.0/0"]}}}
+    )
+    assert bad.status_code == 400 and "individual proxy IPs" in bad.text
+
+
+def test_setup_preview_preserves_linux_certificate_paths_on_any_os(authed_client):
+    body = config().model_dump(mode="json", exclude_none=True)
+    body.update(
+        internal_ca=False, certificate="/data/tls/chain.pem", private_key="/data/tls/key.pem"
+    )
+    reply = authed_client.post("/v1/entrypoint/preview", json={"configuration": body})
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["configuration"]["certificate"] == "/data/tls/chain.pem"

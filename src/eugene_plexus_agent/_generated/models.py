@@ -2804,6 +2804,16 @@ class FolderReachSource(StrEnum):
     override = 'override'
 
 
+class EntryPointPreviewRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    configuration: dict[str, Any] = Field(
+        ...,
+        description='Startup JSON, strictly validated by the entry point implementation.',
+    )
+
+
 class PublicEntryPoint(BaseModel):
     """
     Explicit external HTTPS origins for this node's optional single-port
@@ -3707,6 +3717,15 @@ class LibraryFolderStatus(BaseModel):
         None,
         description='What is wrong, in a sentence, when something is: the path\nis missing, not a directory, or models the library lists\nare not where the rule says. Absent when nothing is.\n',
     )
+
+
+class EntryPointPreview(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    configuration: dict[str, Any]
+    publicUrls: PublicEntryPoint
+    instructions: list[str]
 
 
 class AppManifest(BaseModel):

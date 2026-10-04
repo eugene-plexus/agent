@@ -58,6 +58,7 @@ from .routes import benchmarks as benchmark_routes
 from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import directories as directories_routes
+from .routes import entrypoint as entrypoint_routes
 from .routes import health as health_routes
 from .routes import log_ingress as log_ingress_routes
 from .routes import logs as logs_routes
@@ -772,6 +773,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # v0.2 protected routes — bearer session token required.
     protected_dependencies = [Depends(require_operator_session)]
     app.include_router(config_routes.router, dependencies=protected_dependencies)
+    app.include_router(entrypoint_routes.router)
     # The picker behind every path field (M11). Declares operator-only on
     # its one route; it lists what the operator could already type.
     app.include_router(directories_routes.router)

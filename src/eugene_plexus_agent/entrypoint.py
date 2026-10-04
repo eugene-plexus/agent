@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -16,8 +17,8 @@ import os
 import re
 import secrets
 import subprocess
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import certifi
@@ -108,6 +109,40 @@ class Service(BaseModel):
         return str(urlsplit(self.origin).hostname)
 
 
+class AutomaticCertificates(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    email: str
+    accept_terms: bool
+    staging: bool = False
+
+    @field_validator("email")
+    @classmethod
+    def valid_email(cls, value: str) -> str:
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            raise ValueError("provide a contact email for certificate management")
+        return value
+
+
+class TrustedProxy(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    addresses: list[str] = Field(min_length=1, max_length=32)
+    transport: Literal["http", "https"] = "http"
+
+    @field_validator("addresses")
+    @classmethod
+    def exact_addresses(cls, values: list[str]) -> list[str]:
+        result = []
+        for value in values:
+            network = ipaddress.ip_network(value, strict=True)
+            if network.num_addresses != 1:
+                raise ValueError("trust individual proxy IPs, not an entire network")
+            address = network.network_address
+            if address.is_unspecified or address.is_multicast:
+                raise ValueError("use a unicast proxy address")
+            result.append(str(network))
+        return list(dict.fromkeys(result))
+
+
 class EntryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     listen_port: int = Field(default=8443, ge=1024, le=65535)
@@ -119,6 +154,12 @@ class EntryConfig(BaseModel):
     private_key: Path | None = None
     trusted_ca: Path | None = None
     internal_ca: bool = False
+    acme: AutomaticCertificates | None = None
+    proxy: TrustedProxy | None = None
+
+    @property
+    def private_http(self) -> bool:
+        return self.proxy is not None and self.proxy.transport == "http"
 
     @model_validator(mode="after")
     def distinct_services(self) -> EntryConfig:
@@ -130,13 +171,48 @@ class EntryConfig(BaseModel):
         for service in (self.console, self.nodes):
             if service and any(ipaddress.ip_network(n).prefixlen == 0 for n in service.networks):
                 raise ValueError("console and node administration require specific source networks")
-        if self.internal_ca:
+        if self.private_http:
+            if self.internal_ca or self.certificate or self.private_key or self.acme:
+                raise ValueError("private HTTP uses the trusted proxy's certificates only")
+        elif self.acme:
+            if (
+                self.proxy
+                or self.internal_ca
+                or self.certificate
+                or self.private_key
+                or self.trusted_ca
+            ):
+                raise ValueError("automatic public certificates require direct HTTPS mode")
+            if not self.acme.accept_terms:
+                raise ValueError("accept the Let's Encrypt subscriber agreement to enable ACME")
+            for service in services:
+                if urlsplit(service.origin).port not in (None, 443):
+                    raise ValueError("automatic certificates require public HTTPS port 443")
+                if service.host.endswith(
+                    (
+                        ".local",
+                        ".internal",
+                        ".home.arpa",
+                        ".localhost",
+                        ".test",
+                        ".invalid",
+                        ".example",
+                    )
+                ):
+                    raise ValueError(
+                        "automatic public certificates need names in a domain you control"
+                    )
+        elif self.internal_ca:
             if self.certificate or self.private_key:
                 raise ValueError("choose either internal_ca or certificate/private_key")
         elif not self.certificate or not self.private_key:
             raise ValueError(
-                "provide certificate and private_key, or explicitly enable internal_ca"
+                "choose automatic certificates, a trusted HTTP proxy, "
+                "internal_ca, or certificate/private_key"
             )
+        for item in (self.certificate, self.private_key, self.trusted_ca):
+            if item and not (item.is_absolute() or PurePosixPath(item.as_posix()).is_absolute()):
+                raise ValueError("certificate paths must be absolute container paths")
         return self
 
     def services(self) -> list[Service]:
@@ -165,8 +241,33 @@ def caddy_config(
     """Generate structured configuration; never interpolate a Caddyfile or shell."""
     routes: list[dict[str, Any]] = []
 
+    if config.proxy:
+        # A trusted hop is not itself a trusted user. In particular, missing
+        # or invalid XFF must not fall back to the proxy's privileged LAN IP.
+        for refused in (
+            {"not": [{"remote_ip": {"ranges": config.proxy.addresses}}]},
+            {"client_ip": {"ranges": config.proxy.addresses}},
+            {"not": [{"expression": "{http.request.header.X-Forwarded-Proto} == 'https'"}]},
+        ):
+            routes.append(
+                {
+                    "match": [refused],
+                    "handle": [
+                        {
+                            "handler": "static_response",
+                            "status_code": 403,
+                            "body": "A trusted HTTPS proxy and verified client IP are required.",
+                        }
+                    ],
+                    "terminal": True,
+                }
+            )
+
     def route(service: Service, target: str, paths: list[str] | None = None) -> None:
-        match: dict[str, Any] = {"host": [service.host], "remote_ip": {"ranges": service.networks}}
+        match: dict[str, Any] = {
+            "host": [service.host],
+            "client_ip" if config.proxy else "remote_ip": {"ranges": service.networks},
+        }
         if paths:
             match["path"] = paths
         port = ports.get(target)
@@ -185,7 +286,9 @@ def caddy_config(
             headers = {"Host": [urlsplit(service.origin).netloc]}
             if target == "agent":
                 headers[TOKEN_HEADER] = [token]
-                headers[CLIENT_HEADER] = ["{http.request.remote.host}"]
+                headers[CLIENT_HEADER] = [
+                    "{http.vars.client_ip}" if config.proxy else "{http.request.remote.host}"
+                ]
             # Caddy applies delete after set. Metadata we replace must not
             # also be deleted; Set replaces every caller-supplied value.
             remove = [name for name in STRIP_HEADERS if name not in headers]
@@ -222,7 +325,31 @@ def caddy_config(
     tls: dict[str, Any] = {}
     if config.internal_ca:
         tls["automation"] = {"policies": [{"subjects": hosts, "issuers": [{"module": "internal"}]}]}
-    else:
+    elif config.acme:
+        authority = (
+            "https://acme-staging-v02.api.letsencrypt.org/directory"
+            if config.acme.staging
+            else "https://acme-v02.api.letsencrypt.org/directory"
+        )
+        tls["automation"] = {
+            "policies": [
+                {
+                    "subjects": hosts,
+                    "issuers": [
+                        {
+                            "module": "acme",
+                            "ca": authority,
+                            "email": config.acme.email,
+                            "challenges": {
+                                "http": {"disabled": True},
+                                "tls-alpn": {"alternate_port": config.listen_port},
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    elif not config.private_http:
         tls["certificates"] = {
             "load_files": [
                 {
@@ -231,7 +358,7 @@ def caddy_config(
                 }
             ]
         }
-    return {
+    document: dict[str, Any] = {
         "admin": {"listen": "unix/" + str(directory / "admin.sock"), "config": {"persist": False}},
         "storage": {"module": "file_system", "root": str(directory / "tls")},
         # HTTP error logs can include request URIs (OIDC codes/state). Keep
@@ -259,7 +386,7 @@ def caddy_config(
                         "max_header_bytes": 32768,
                         "automatic_https": {
                             "disable_redirects": True,
-                            "disable_certificates": not config.internal_ca,
+                            "disable_certificates": not (config.internal_ca or config.acme),
                         },
                         "tls_connection_policies": [{"match": {"sni": hosts}}],
                         "routes": routes,
@@ -268,6 +395,24 @@ def caddy_config(
             },
         },
     }
+    server = document["apps"]["http"]["servers"]["entry"]
+    if config.proxy:
+        server.update(
+            {
+                "trusted_proxies": {"source": "static", "ranges": config.proxy.addresses},
+                "trusted_proxies_strict": 1,
+                "client_ip_headers": ["X-Forwarded-For"],
+            }
+        )
+    if config.private_http:
+        server.pop("tls_connection_policies")
+        server.pop("strict_sni_host")
+        server["automatic_https"] = {"disable": True}
+        server["protocols"] = ["h1"]
+        document["apps"].pop("tls")
+    if not config.internal_ca:
+        document["apps"].pop("pki")
+    return document
 
 
 class ProxyMetadata:
@@ -315,6 +460,7 @@ class EntryPoint:
         self._lock = asyncio.Lock()
         self._admin: httpx.AsyncClient | None = None
         self._applied: dict[str, int | None] | None = None
+        self._applied_certificates: str | None = None
         self._blocked_workbench = False
         if app.state.apps:
             app.state.apps.before_stop = self.before_stop
@@ -388,6 +534,7 @@ class EntryPoint:
         from .child_env import child_environment
 
         current = self.ports()
+        certificates = await asyncio.to_thread(self.certificate_fingerprint)
         if current["workbench"] is not None:
             # Older builds cannot enforce HTTPS origin isolation. Probe the
             # new process before publishing it after an update or rollback.
@@ -415,12 +562,26 @@ class EntryPoint:
                 env=child_environment(),
             )
             self._applied = current
+            self._applied_certificates = certificates
             log.info("HTTPS entry point starting on port %d", self.config.listen_port)
-        elif self._applied != current:
-            answer = await client.post("http://localhost/load", json=document)
+        elif self._applied != current or self._applied_certificates != certificates:
+            answer = await client.post(
+                "http://localhost/load",
+                json=document,
+                headers={"Cache-Control": "must-revalidate"},
+            )
             answer.raise_for_status()
             self._applied = current
+            self._applied_certificates = certificates
             log.info("HTTPS entry point updated its local service routes")
+
+    def certificate_fingerprint(self) -> str | None:
+        if not self.config.certificate or not self.config.private_key:
+            return None
+        digest = hashlib.sha256()
+        for path in (self.config.certificate, self.config.private_key):
+            digest.update(path.read_bytes())
+        return digest.hexdigest()
 
     async def run(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
