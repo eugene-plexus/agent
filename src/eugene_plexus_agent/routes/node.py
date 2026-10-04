@@ -137,7 +137,9 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
     trust = request.app.state.auth_state.trust
     bundle = trust.bundle if record.enrolled else None
     token_public = tokens.public_b64(trust.signer().key) if record.token_private_key else None
+    entry = getattr(request.app.state, "entrypoint_config", None)
     return NodeIdentity(
+        entrypoint=entry.public_urls() if entry else None,
         enrolled=record.enrolled,
         name=record.name if record.enrolled else None,
         publicKey=record.public_key,

@@ -149,6 +149,11 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # `--unattended` comes first because a TTY is not the same thing as
     # someone watching one: a Windows scheduled task has both handles as
     # a console and nobody in front of it. See this module's docstring.
+    if settings.entrypoint_config:
+        from .entrypoint import EntryConfig
+
+        EntryConfig.load(settings.entrypoint_config)
+        settings.bind_host = "127.0.0.1"
     refuse_quarantined(settings.config_file)
     if not unattended and is_fresh_boot(settings) and has_tty():
         request = ask(settings)

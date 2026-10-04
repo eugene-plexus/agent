@@ -20,8 +20,8 @@
     for approved file operations. Signs people in with Eugene:
     the owner with the passphrase, a small business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/32aa0cd270d678b4478fa8857e2f38ebb2c80980.tar.gz
-  version: 32aa0cd270d678b4478fa8857e2f38ebb2c80980
+  source: https://github.com/eugene-plexus/workbench/archive/c438850ac5b2a0a2752298bae07b63541ee1690d.tar.gz
+  version: c438850ac5b2a0a2752298bae07b63541ee1690d
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"

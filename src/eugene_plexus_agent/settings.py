@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import PrivateAttr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,7 +53,12 @@ class Settings(BaseSettings):
     bootstrap: the agent must know where to look before it is unlocked,
     which is before any config it could read is open."""
 
-    @field_validator("passphrase_file", mode="before")
+    entrypoint_config: Path | None = None
+    """Opt-in container HTTPS entry point; invalid configuration fails closed."""
+    entrypoint_binary: str = "caddy"
+    _entrypoint_console_origin: str | None = PrivateAttr(default=None)
+
+    @field_validator("passphrase_file", "entrypoint_config", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
         """A blank variable is an unset one, and says so.

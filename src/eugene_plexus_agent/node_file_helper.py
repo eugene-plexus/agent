@@ -269,7 +269,9 @@ class NodeFileHelper:
         if root != self._root:
             if self._root_client is not None:
                 await self._root_client.aclose()
-            self._root_client = client_for(root, timeout=15.0, follow_redirects=False)
+            self._root_client = client_for(
+                root, timeout=15.0, follow_redirects=False, trust_env=False
+            )
             self._root = root
         assert self._root_client is not None
         headers = {

@@ -327,9 +327,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ingress_url=lambda: f"http://127.0.0.1:{int(settings.bind_port)}/v1/logs",
                 # C2: where an app on this machine signs people in -- this
                 # agent's /oidc, at the address a browser opens the app at.
-                oidc_issuer=lambda: _oidc_issuer(
-                    _app_advertise_host(state, identity), int(settings.bind_port)
+                oidc_issuer=lambda: (
+                    _oidc_issuer(_app_advertise_host(state, identity), int(settings.bind_port))
+                    if app.state.entrypoint_config is None
+                    else (app.state.entrypoint_config.console.origin + "/oidc")
                 ),
+                public_origin=lambda app_id: (
+                    app.state.entrypoint_config.workbench.origin
+                    if app.state.entrypoint_config and app_id == "workbench"
+                    else None
+                ),
+                oidc_backchannel=(
+                    f"http://127.0.0.1:{int(settings.bind_port)}/oidc"
+                    if app.state.entrypoint_config
+                    else None
+                ),
+                private_apps=bool(app.state.entrypoint_config),
             )
     app_manager: apps.AppManager | None = app.state.apps
 
@@ -430,9 +443,25 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.safe_mode
         else asyncio.create_task(NodeFileHelper(app).run(), name="node-file-helper")
     )
+    from .entrypoint import EntryPoint
+
+    entry_task = None
+    if app.state.entrypoint_config:
+        entry_task = asyncio.create_task(
+            EntryPoint(
+                app,
+                app.state.entrypoint_config,
+                settings.config_file.resolve().parent / "entrypoint",
+                app.state.entrypoint_token,
+            ).run(),
+            name="https-entrypoint",
+        )
     try:
         yield
     finally:
+        if entry_task is not None:
+            entry_task.cancel()
+            await asyncio.gather(entry_task, return_exceptions=True)
         if helper_task is not None:
             helper_task.cancel()
             await asyncio.gather(helper_task, return_exceptions=True)
@@ -693,6 +722,11 @@ def shared_child_env(
     env = {
         "AGENT_URL": node_identity.local_agent_url(settings.bind_host, int(settings.bind_port)),
     }
+    if settings.entrypoint_config:
+        env["BIND_HOST"] = "127.0.0.1"
+        if settings._entrypoint_console_origin:
+            env["AGENT_PUBLIC_ORIGIN"] = settings._entrypoint_console_origin
+        return env
     advertise = node_identity.effective_advertise_url(
         state.get_config("advertiseUrl"), identity.record.advertise_url
     )
@@ -727,6 +761,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # the outermost layer and covers the two above's own answers too --
     # a refused host name is still a page a browser renders.
     response_headers.install(app)
+    from . import entrypoint
+
+    entrypoint.install(app)
 
     # Public routes (no auth required).
     app.include_router(health_routes.router)

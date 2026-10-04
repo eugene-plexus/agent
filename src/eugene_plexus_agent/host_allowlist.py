@@ -349,6 +349,9 @@ def policy_for(app: Any) -> HostPolicy | None:
     if state is None:
         return None
     names, allow_any = parse_allowed_hosts(state.get_config("allowedHosts"))
+    entry = getattr(app.state, "entrypoint_config", None)
+    if entry:
+        names = names | {entry.console.host}
     identity = getattr(app.state, "node_identity", None)
     record = getattr(identity, "record", None)
     advertise = node_identity.effective_advertise_url(

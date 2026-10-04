@@ -854,6 +854,8 @@ class _AppPlanner:
         bind_host: Callable[[], str | None],
         oidc_issuer: Callable[[], str | None] = lambda: None,
         app_url: Callable[[], str | None] = lambda: None,
+        public_origin: str | None = None,
+        oidc_backchannel: str | None = None,
     ) -> None:
         self.record = record
         self._store = store
@@ -861,6 +863,8 @@ class _AppPlanner:
         self._bind_host = bind_host
         self._oidc_issuer = oidc_issuer
         self._app_url = app_url
+        self._public_origin = public_origin
+        self._oidc_backchannel = oidc_backchannel
         self.admin_token: str | None = None
 
     @property
@@ -967,6 +971,10 @@ class _AppPlanner:
         env[f"{ENV_PREFIX}_DATA_DIR"] = str(data)
         env[f"{ENV_PREFIX}_KEY_FILE"] = str(self._store.key_file(record.id))
         env[f"{ENV_PREFIX}_ADMIN_TOKEN"] = self.admin_token
+        if self._public_origin:
+            env[f"{ENV_PREFIX}_PUBLIC_ORIGIN"] = self._public_origin
+        if self._oidc_backchannel:
+            env[f"{ENV_PREFIX}_OIDC_BACKCHANNEL"] = self._oidc_backchannel
         host = self._bind_host()
         if host:
             env[f"{ENV_PREFIX}_BIND_HOST"] = host
@@ -1137,10 +1145,23 @@ class AppManager:
         ingress_url: Callable[[], str] | None = None,
         accounts: app_accounts.AccountSupport | None = None,
         oidc_issuer: Callable[[], str | None] | None = None,
+        public_origin: Callable[[str], str | None] | None = None,
+        oidc_backchannel: str | None = None,
+        private_apps: bool = False,
     ) -> None:
         self.store = store
         self._oidc_issuer = oidc_issuer or (lambda: None)
+        self._public_origin = public_origin or (lambda app_id: None)
+        self._oidc_backchannel = oidc_backchannel
+        self._private_apps = private_apps
+        self.before_stop: Callable[[str], Awaitable[None]] | None = None
+        self.after_start: Callable[[str], None] | None = None
         self._reserved_ports: dict[str, int] = {}
+        # A published port stays assigned for this process's lifetime, even
+        # after uninstall. A proxy reload cannot race a different app taking it.
+        self._published_ports = {
+            record.id: record.port for record in store.installed() if self._public_origin(record.id)
+        }
         self.catalogue = {m.id: m for m in catalogue}
         self._get_config = get_config
         self._bind_host = bind_host
@@ -1256,6 +1277,11 @@ class AppManager:
     def ui_url(self, record: InstalledApp) -> str | None:
         if not record.manifest.ui:
             return None
+        origin = self._public_origin(record.id)
+        if origin:
+            return origin + "/"
+        if self._private_apps:
+            return None
         host = self._advertise_host() or "127.0.0.1"
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
@@ -1267,6 +1293,12 @@ class AppManager:
             status = ComponentStatus.exited
         key = self.store.key(record.id)
         detail = self._detail.get(record.id)
+        if self._private_apps and record.manifest.ui and not self._public_origin(record.id):
+            detail = "This app has no published address in single-port mode."
+        if record.manifest.signIn and not self.sign_in_registration_current(record.manifest):
+            detail = (
+                "Restart this app in Eugene to apply its changed sign-in address. Chats are kept."
+            )
         if key is not None and not self.store.key_file(record.id).is_file():
             detail = (
                 "Its key file is missing, so it cannot reach the hub. Uninstall and install it "
@@ -1321,6 +1353,13 @@ class AppManager:
         """The port this app will have: its own if installed, otherwise one
         set aside now, so its sign-in callback can be registered before
         the install finishes (C2) and the install then takes the same one."""
+        if self._public_origin(app_id):
+            if app_id not in self._published_ports:
+                installed = self.store.get(app_id)
+                self._published_ports[app_id] = (
+                    installed.port if installed else self.allocate_port()
+                )
+            return self._published_ports[app_id]
         existing = self.store.get(app_id)
         if existing is not None:
             return existing.port
@@ -1331,6 +1370,9 @@ class AppManager:
     def _origins(self, app_id: str) -> list[str]:
         """Every address a browser may open this app at, first the one the
         console opens: this node's advertised host, then loopback."""
+        origin = self._public_origin(app_id)
+        if origin:
+            return [origin]
         port = self.reserve_port(app_id)
         hosts = [self._advertise_host() or "127.0.0.1", "127.0.0.1", "localhost"]
         out = []
@@ -1344,6 +1386,18 @@ class AppManager:
         """Every address a browser may open this app at, with its callback."""
         return [origin + path for origin in self._origins(app_id)]
 
+    def sign_in_registration_current(self, manifest: AppManifest) -> bool:
+        redirects = self.sign_in_redirects(
+            manifest.id, manifest.signInCallbackPath or "/oidc/callback"
+        )
+        stamp = self.store.oidc_secret_file(manifest.id).with_suffix(".redirects.json")
+        previous = None
+        with contextlib.suppress(OSError, ValueError):
+            previous = json.loads(stamp.read_text(encoding="utf-8"))
+        return previous == redirects or (
+            previous is None and not redirects[0].startswith("https://")
+        )
+
     def app_url(self, app_id: str) -> str:
         """`{appUrl}` (C4): the address the console opens the app at, with
         no path -- the first of its sign-in addresses."""
@@ -1353,7 +1407,11 @@ class AppManager:
         return self._oidc_issuer()
 
     def allocate_port(self) -> int:
-        taken = self.store.taken_ports() | set(self._reserved_ports.values())
+        taken = (
+            self.store.taken_ports()
+            | set(self._reserved_ports.values())
+            | set(self._published_ports.values())
+        )
         for candidate in range(APP_PORT_BASE, APP_PORT_BASE + APP_PORT_SPAN):
             if candidate in taken:
                 continue
@@ -1379,14 +1437,20 @@ class AppManager:
             bind_host=(lambda: "127.0.0.1") if record.id == "node-files" else self._bind_host,
             oidc_issuer=self._oidc_issuer,
             app_url=lambda: self.app_url(record.id),
+            public_origin=self._public_origin(record.id),
+            oidc_backchannel=self._oidc_backchannel if record.id == "workbench" else None,
         )
         self.supervisor.start(planner)
+        if self.after_start:
+            self.after_start(record.id)
 
     async def stop(self, app_id: str) -> None:
+        if self.before_stop:
+            await self.before_stop(app_id)
         await self.supervisor.stop(app_id)
 
     async def restart(self, record: InstalledApp) -> None:
-        await self.supervisor.stop(record.id)
+        await self.stop(record.id)
         await self.start(record)
 
     async def start_enabled(self) -> None:
@@ -1410,7 +1474,11 @@ class AppManager:
                 record = InstalledApp(
                     manifest=manifest,
                     origin=origin,
-                    port=self._reserved_ports.pop(manifest.id, 0) or self.allocate_port(),
+                    port=(
+                        self.reserve_port(manifest.id)
+                        if self._public_origin(manifest.id)
+                        else self._reserved_ports.pop(manifest.id, 0) or self.allocate_port()
+                    ),
                     installed_at=datetime.now(UTC),
                 )
             else:
@@ -1434,6 +1502,8 @@ class AppManager:
 
     async def uninstall(self, app_id: str, *, purge: bool) -> None:
         await self.installer.cancel(app_id)
+        if self.before_stop:
+            await self.before_stop(app_id)
         if isinstance(self.supervisor, app_accounts.OwnAccountSupervisor):
             # Its service and its account go with it.
             await self.supervisor.remove(app_id, purge=purge)

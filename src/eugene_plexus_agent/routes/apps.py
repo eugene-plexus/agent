@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -275,7 +276,19 @@ async def _ensure_sign_in(request: Request, manager: AppManager, manifest: AppMa
         if not secret_file.exists():
             write_private(secret_file, "")
         return
-    if store.oidc_client(manifest.id) and secret_file.is_file() and secret_file.stat().st_size:
+    redirects = manager.sign_in_redirects(
+        manifest.id, manifest.signInCallbackPath or "/oidc/callback"
+    )
+    stamp = secret_file.with_suffix(".redirects.json")
+    # Old direct-port installs have no stamp. Do not rotate those merely
+    # because the agent was upgraded; do rotate when entering HTTPS mode.
+    current = manager.sign_in_registration_current(manifest)
+    if (
+        store.oidc_client(manifest.id)
+        and secret_file.is_file()
+        and secret_file.stat().st_size
+        and current
+    ):
         return
     await _drop_sign_in(request, manager, manifest.id)
     node = manager.node_name() or "this-node"
@@ -285,14 +298,13 @@ async def _ensure_sign_in(request: Request, manager: AppManager, manifest: AppMa
         authorization=request.headers.get("authorization"),
         body={
             "name": manifest.name,
-            "redirectUris": manager.sign_in_redirects(
-                manifest.id, manifest.signInCallbackPath or "/oidc/callback"
-            ),
+            "redirectUris": redirects,
             "owner": f"app:{manifest.id}@{node}",
         },
     )
     write_private(secret_file, created["clientSecret"])
     store.put_oidc_client(manifest.id, created["client"]["clientId"])
+    write_private(stamp, json.dumps(redirects))
     log.info("registered app %s to sign people in with Eugene", manifest.id)
 
 
@@ -435,6 +447,7 @@ async def start(request: Request, app_id: str) -> App:
     record.enabled = True
     manager.store.put(record)
     if not manager.supervisor.is_running(app_id):
+        await _ensure_sign_in(request, manager, record.manifest)
         await manager.start(record)
     return manager.view(record)
 
@@ -468,6 +481,7 @@ async def restart(request: Request, app_id: str) -> App:
             "App is stopped",
             f"{record.manifest.name} is stopped. Start it instead.",
         )
+    await _ensure_sign_in(request, manager, record.manifest)
     try:
         await manager.restart(record)
     except Exception as exc:

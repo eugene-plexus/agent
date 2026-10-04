@@ -194,6 +194,42 @@ def test_the_port_a_callback_names_is_the_port_the_app_gets(tmp_path: Path) -> N
     assert installed is not None and installed.port == reserved
 
 
+def test_origin_migration_rotates_exact_callbacks_only_with_the_operator(
+    authed_client: TestClient,
+    installing: tuple[apps.AppManager, FakeRegistry],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = installing
+    record = _record(_manifest(signIn=True))
+    manager.store.put(record)
+    manager.store.put_oidc_client("tiny", "c-old")
+    apps_routes.write_private(manager.store.oidc_secret_file("tiny"), "old-secret")
+    saved = manager.store.data_dir("tiny") / "chat-data"
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text("keep my chats")
+    manager._public_origin = lambda app_id: "https://workbench.home.arpa:8443"
+
+    async def restart(_record):
+        return None
+
+    monkeypatch.setattr(manager, "restart", restart)
+    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
+    assert [call[:2] for call in fake.calls] == [
+        ("DELETE", "/v1/oidc/clients/c-old"),
+        ("POST", "/v1/oidc/clients"),
+    ]
+    assert fake.calls[-1][3]["redirectUris"] == ["https://workbench.home.arpa:8443/oidc/callback"]
+    assert all(call[2] == authed_client.headers["Authorization"] for call in fake.calls)
+    assert saved.read_text() == "keep my chats"
+    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
+    assert len(fake.calls) == 2
+    # Returning to direct ports is an explicit migration too.
+    manager._public_origin = lambda app_id: None
+    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
+    assert len(fake.calls) == 4
+    assert all(uri.startswith("http://") for uri in fake.calls[-1][3]["redirectUris"])
+
+
 def test_an_uninstall_whose_client_removal_fails_removes_nothing_else(
     authed_client: TestClient,
     installing: tuple[apps.AppManager, FakeRegistry],

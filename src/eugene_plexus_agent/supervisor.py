@@ -452,6 +452,10 @@ class _ComponentPlanner:
 
         if spawn.env:
             env.update({k: str(v) for k, v in spawn.env.items()})
+        # The opt-in HTTPS entry point must keep backends private, including
+        # a legacy per-component bind override saved before migration.
+        if self._shared_child_env and self._shared_child_env().get("BIND_HOST") == "127.0.0.1":
+            env[f"{prefix}_BIND_HOST"] = "127.0.0.1"
 
         # Force unbuffered Python output. Without this, redirecting the
         # child's stdout to a pipe makes Python switch to block-buffered

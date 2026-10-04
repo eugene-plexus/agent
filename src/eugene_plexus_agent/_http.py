@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import ipaddress
+import os
 import ssl
 import threading
 from typing import Any
@@ -68,7 +69,11 @@ def ssl_context() -> ssl.SSLContext:
     if _CONTEXT is None:
         with _LOCK:
             if _CONTEXT is None:
-                _CONTEXT = httpx.create_ssl_context()
+                # Internal HTTPS nodes may use an organisation's CA or the
+                # container entry point's local CA, installed in OS trust.
+                # Keep proxy routing disabled separately from certificate trust.
+                _CONTEXT = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                _extra_roots(_CONTEXT)
     return _CONTEXT
 
 
@@ -95,7 +100,15 @@ def egress_ssl_context() -> ssl.SSLContext:
         with _LOCK:
             if _EGRESS_CONTEXT is None:
                 _EGRESS_CONTEXT = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                _extra_roots(_EGRESS_CONTEXT)
     return _EGRESS_CONTEXT
+
+
+def _extra_roots(context: ssl.SSLContext) -> None:
+    """Preserve explicit CA-bundle configuration without trusting proxy env."""
+    cafile, capath = os.environ.get("SSL_CERT_FILE"), os.environ.get("SSL_CERT_DIR")
+    if cafile or capath:
+        context.load_verify_locations(cafile=cafile, capath=capath)
 
 
 def is_internal(url: str) -> bool:

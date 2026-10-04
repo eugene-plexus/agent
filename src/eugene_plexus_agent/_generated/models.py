@@ -2804,6 +2804,21 @@ class FolderReachSource(StrEnum):
     override = 'override'
 
 
+class PublicEntryPoint(BaseModel):
+    """
+    Explicit external HTTPS origins for this node's optional single-port
+    container entry point. An absent optional service is not published.
+    These addresses select services, never users or permissions. Backend
+    listener addresses and this node's own controlUrl remain unchanged.
+
+    """
+
+    consoleUrl: AnyUrl
+    workbenchUrl: AnyUrl
+    inferenceUrl: AnyUrl | None = None
+    nodesUrl: AnyUrl | None = None
+
+
 class Arg(RootModel[str]):
     root: str = Field(..., max_length=512)
 
@@ -4388,6 +4403,7 @@ class NodeIdentity(BaseModel):
 
     """
 
+    entrypoint: PublicEntryPoint | None = None
     enrolled: bool = Field(
         ...,
         description='False on a fresh agent, and not an error state — supervision\nworks without a trust relationship, which is what lets the\nagent on the control host boot first and start the control\nroot.\n',

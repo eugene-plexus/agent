@@ -25,6 +25,7 @@ carry.
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, Request
@@ -67,7 +68,7 @@ def _root_url(request: Request) -> str | None:
 def _client(request: Request, root: str) -> httpx.AsyncClient:
     client = getattr(request.app.state, "oidc_forward_client", None)
     if client is None or client.is_closed:
-        client = client_for(root, timeout=30.0, follow_redirects=False)
+        client = client_for(root, timeout=30.0, follow_redirects=False, trust_env=False)
         request.app.state.oidc_forward_client = client
     return client
 
@@ -87,6 +88,10 @@ async def forward(request: Request, path: str) -> Response:
     headers = {k: v for k, v in request.headers.items() if k.lower() in _PASSED_ON}
     headers[FORWARDED_HOST_HEADER] = request.headers.get("host") or request.url.netloc
     headers[FORWARDED_PROTO_HEADER] = request.url.scheme
+    entry = getattr(request.app.state, "entrypoint_config", None)
+    if entry:
+        headers[FORWARDED_HOST_HEADER] = urlsplit(entry.console.origin).netloc
+        headers[FORWARDED_PROTO_HEADER] = "https"
     headers[FORWARDED_FOR_HEADER] = request.client.host if request.client else "unknown"
     try:
         headers[NODE_TOKEN_HEADER] = request.app.state.auth_state.trust.agent_token("control")
