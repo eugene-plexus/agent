@@ -123,6 +123,16 @@ async def list_apps(request: Request) -> AppList:
     return AppList(apps=_apps(request).views())
 
 
+def _not_node_capability(app_id: str) -> None:
+    if app_id == "node-files":
+        raise _problem(
+            409,
+            "Managed node capability",
+            "Manage file support in People > Files on your machines. "
+            "The node helper is installed and updated with Eugene.",
+        )
+
+
 @router.get("/v1/app-catalogue", response_model=AppCatalogue, response_model_exclude_none=True)
 async def get_catalogue(request: Request) -> AppCatalogue:
     return _apps(request).as_catalogue(enrolled=_enrolled(request))
@@ -135,6 +145,7 @@ async def get_catalogue(request: Request) -> AppCatalogue:
     status_code=status.HTTP_201_CREATED,
 )
 async def add_custom(request: Request, body: AppManifest) -> AppCatalogueEntry:
+    _not_node_capability(body.id)
     manager = _apps(request)
     if not _custom_allowed(request):
         raise _problem(status.HTTP_403_FORBIDDEN, "Custom apps are off", _CUSTOM_OFF)
@@ -224,6 +235,9 @@ async def _revoke_key(request: Request, manager: AppManager, app_id: str) -> Non
 @router.delete("/v1/apps/{app_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def uninstall(request: Request, app_id: str, purge: bool = False) -> Response:
     manager = _apps(request)
+    record = manager.store.get(app_id)
+    if record is None or record.manifest.entry == "eugene_plexus_node_helper":
+        _not_node_capability(app_id)
     if manager.store.get(app_id) is None and manager.store.key(app_id) is None:
         raise _problem(
             status.HTTP_404_NOT_FOUND,
@@ -336,6 +350,7 @@ async def _ensure_key(request: Request, manager: AppManager, app_id: str) -> Non
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def install(request: Request, app_id: str) -> AppInstall:
+    _not_node_capability(app_id)
     manager = _apps(request)
     found = manager.manifest(app_id)
     if found is None:
@@ -401,6 +416,7 @@ async def get_install(request: Request, app_id: str) -> AppInstall:
     "/v1/apps/{app_id}/install", response_model=AppInstall, response_model_exclude_none=True
 )
 async def cancel_install(request: Request, app_id: str) -> AppInstall:
+    _not_node_capability(app_id)
     manager = _apps(request)
     if not manager.installer.running(app_id):
         raise _problem(
@@ -413,6 +429,7 @@ async def cancel_install(request: Request, app_id: str) -> AppInstall:
 
 @router.post("/v1/apps/{app_id}/start", response_model=App, response_model_exclude_none=True)
 async def start(request: Request, app_id: str) -> App:
+    _not_node_capability(app_id)
     manager = _apps(request)
     record = _record_or_404(manager, app_id)
     record.enabled = True
@@ -424,6 +441,7 @@ async def start(request: Request, app_id: str) -> App:
 
 @router.post("/v1/apps/{app_id}/stop", response_model=App, response_model_exclude_none=True)
 async def stop(request: Request, app_id: str) -> App:
+    _not_node_capability(app_id)
     manager = _apps(request)
     record = _record_or_404(manager, app_id)
     record.enabled = False
@@ -441,6 +459,7 @@ async def stop(request: Request, app_id: str) -> App:
 
 @router.post("/v1/apps/{app_id}/restart", response_model=App, response_model_exclude_none=True)
 async def restart(request: Request, app_id: str) -> App:
+    _not_node_capability(app_id)
     manager = _apps(request)
     record = _record_or_404(manager, app_id)
     if not record.enabled:

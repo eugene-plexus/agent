@@ -419,9 +419,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.safe_mode
         else asyncio.create_task(RunWorker(app).run_forever(), name="run-operations")
     )
+    from .node_file_helper import NodeFileHelper
+
+    helper_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(NodeFileHelper(app).run(), name="node-file-helper")
+    )
     try:
         yield
     finally:
+        if helper_task is not None:
+            helper_task.cancel()
+            await asyncio.gather(helper_task, return_exceptions=True)
         if run_task is not None:
             run_task.cancel()
             await asyncio.gather(run_task, return_exceptions=True)

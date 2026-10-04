@@ -30,9 +30,10 @@
   uses: [inference]
   signIn: true
   signInCallbackPath: /oidc/callback
-  # C5b runs owner-selected local MCP servers: an app account is required.
-  # Workbench also checks the launcher's account signal before any start.
-  localActions: true
+  # Central Workbench can run without local actions. Its local MCP/file paths
+  # enforce the app-account boundary themselves; enrolled node helpers have
+  # their own isolated workers. This allows hosting Workbench in Docker/macOS.
+  localActions: false
 
 # The first app here that we did not write (C4, specs
 # docs/design/c4-open-webui.md): installed unmodified from the Python

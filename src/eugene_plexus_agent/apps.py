@@ -1209,7 +1209,9 @@ class AppManager:
             (AppOrigin.custom, self.store.custom()),
         ):
             for manifest in manifests:
-                if manifest.id in seen:
+                if manifest.id in seen or (
+                    manifest.id == "node-files" and manifest.entry == "eugene_plexus_node_helper"
+                ):
                     continue
                 seen.add(manifest.id)
                 record = self.store.get(manifest.id)
@@ -1302,7 +1304,11 @@ class AppManager:
         return "the agent's own account"
 
     def views(self) -> list[App]:
-        return [self.view(r) for r in self.store.installed()]
+        return [
+            self.view(r)
+            for r in self.store.installed()
+            if r.id != "node-files" or r.manifest.entry != "eugene_plexus_node_helper"
+        ]
 
     # --- ports ----------------------------------------------------------
 
@@ -1358,14 +1364,14 @@ class AppManager:
         """Resolve the gateway now, then spawn. Resolved per start rather
         than once, because the gateway can move and a restart is when an
         operator expects an app to notice."""
-        url, detail = await self._resolve_gateway()
+        url, detail = await self._resolve_gateway() if record.manifest.uses else (None, None)
         self._gateway[record.id] = url
         self._detail[record.id] = detail
         planner = _AppPlanner(
             record,
             store=self.store,
             gateway_url=lambda: self._gateway.get(record.id),
-            bind_host=self._bind_host,
+            bind_host=(lambda: "127.0.0.1") if record.id == "node-files" else self._bind_host,
             oidc_issuer=self._oidc_issuer,
             app_url=lambda: self.app_url(record.id),
         )
