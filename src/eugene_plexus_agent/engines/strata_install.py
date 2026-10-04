@@ -88,7 +88,7 @@ def _run_command(argv: list[str], progress: _Progress, cwd: Path) -> None:
             env=env,
             stdout=output,
             stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:
             deadline = time.perf_counter() + 1200
@@ -106,7 +106,7 @@ def _run_command(argv: list[str], progress: _Progress, cwd: Path) -> None:
                         ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                         check=False,
                     )
                 else:
