@@ -139,6 +139,25 @@ def _manager(tmp_path: Path, **kw: Any) -> apps.AppManager:
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.parametrize("bind_host", ["127.0.0.1", "0.0.0.0"])
+def test_apps_honor_the_node_listener_but_file_helpers_stay_private(
+    app: FastAPI, bind_host: str
+) -> None:
+    app.state.settings.bind_host = bind_host
+    with TestClient(app):
+        manager = app.state.apps
+        supervisor = FakeAppSupervisor()
+        manager.supervisor = supervisor
+        for ident in ("tiny", "node-files"):
+            record = _record(_manifest(id=ident, uses=[]))
+            _fake_python(manager.store, record)
+            asyncio.run(manager.start(record))
+            env = supervisor.planners[ident].base_plan().env
+            assert env["EUGENE_PLEXUS_APP_BIND_HOST"] == (
+                "127.0.0.1" if ident == "node-files" else bind_host
+            )
+
+
 def test_an_app_is_handed_no_hub_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

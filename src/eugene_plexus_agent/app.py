@@ -315,7 +315,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 store=app_store,
                 catalogue=apps.load_catalogue(),
                 get_config=state.get_config,
-                bind_host=lambda: shared_child_env(settings, state, identity).get("BIND_HOST"),
+                # The container explicitly binds the agent to all interfaces;
+                # apps must honor that even before a LAN address is advertised.
+                bind_host=lambda: shared_child_env(settings, state, identity).get(
+                    "BIND_HOST", settings.bind_host
+                ),
                 advertise_host=lambda: _app_advertise_host(state, identity),
                 node_name=lambda: identity.record.name if identity.record.enrolled else None,
                 resolve_gateway=lambda: resolve_gateway_for_apps(app),
