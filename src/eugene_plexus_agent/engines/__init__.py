@@ -22,6 +22,7 @@ from .base import (
 from .kev import KevAdapter
 from .llama_cpp import LlamaCppAdapter
 from .mlx import MlxAdapter
+from .strata import StrataAdapter
 from .vllm import VllmAdapter
 
 ADAPTERS: dict[EngineKind, EngineAdapter] = {
@@ -29,6 +30,7 @@ ADAPTERS: dict[EngineKind, EngineAdapter] = {
     EngineKind.vllm: VllmAdapter(),
     EngineKind.mlx: MlxAdapter(),
     EngineKind.kev: KevAdapter(),
+    EngineKind.strata: StrataAdapter(),
 }
 
 

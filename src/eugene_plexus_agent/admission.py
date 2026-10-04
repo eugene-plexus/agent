@@ -1012,6 +1012,19 @@ async def check_admission(
             folders_unread=folders_unread,
         )
 
+    if spec.engine is EngineKind.strata:
+        return Admission(
+            decision=AdmissionDecision.admit,
+            fit=AdmissionFit.unknown,
+            basis=AdmissionBasis.file_size,
+            blockers=[],
+            reason="Prepared Strata config found; memory requirements are unknown.",
+            warning=(
+                "Experimental engine: check RAM/VRAM availability before starting. "
+                "Config size is not model size."
+            ),
+        )
+
     if not targets:
         return Admission(
             decision=AdmissionDecision.admit,

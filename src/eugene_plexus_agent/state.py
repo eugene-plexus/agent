@@ -251,6 +251,18 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.file_path,
     ),
     ConfigField(
+        key="strataServer",
+        label="Strata server (experimental)",
+        description=(
+            "Optional path to serve/server.py in your own Strata installation. "
+            "It needs an isolated .venv and engine/strata.exe alongside it. "
+            "Leave empty to use Eugene's managed build. Borrowed installations "
+            "are never removed by Uninstall engine."
+        ),
+        category="engines",
+        valueType=ConfigValueType.file_path,
+    ),
+    ConfigField(
         key="kevPython",
         label="Kev interpreter",
         description=(

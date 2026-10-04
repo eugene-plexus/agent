@@ -61,10 +61,12 @@ from ..dependencies import (
     require_operator_session,
 )
 from ..engines.acquisition import AcquisitionError, Unavailable
+from ..engines.base import EngineUnavailableError
 from ..engines.devices import detect_devices
 from ..engines.llama_cpp import LlamaCppAdapter, places_by_itself
+from ..engines.strata import StrataAdapter
 from ..install_proxy import lookup_authorization
-from ..model_paths import PathRule, rules_from_config
+from ..model_paths import PathRule, resolve_model_path, rules_from_config
 from ..node_work import runtime_launch
 from ..reservations import ReservationLedger
 from ..runtime_context import RuntimeContext
@@ -77,6 +79,7 @@ from ..runtimes import (
     validate_spec,
 )
 from ..state import AgentState
+from ..supervisor import SpawnPlanError
 from .proxy import install_topology
 
 log = logging.getLogger(__name__)
@@ -406,6 +409,23 @@ async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[A
         copy_settings=supervisor.copy_settings() if supervisor is not None else None,
         engine_places=places,
     )
+    if spec.engine is EngineKind.strata and admission.decision is AdmissionDecision.admit:
+        rules = effective_rules_for(request)
+
+        def preflight() -> None:
+            adapter = StrataAdapter()
+            binary = adapter.resolve_binary(
+                spec, configured=_configured_binary(adapter, state.get_config)
+            )
+            local = resolve_model_path(spec.modelPath, rules).local_path
+            adapter.prepare_config(spec.model_copy(update={"modelPath": local}), binary)
+
+        try:
+            await asyncio.to_thread(preflight)
+        except (EngineUnavailableError, SpawnPlanError) as exc:
+            admission = admission.model_copy(
+                update={"decision": AdmissionDecision.refuse, "reason": str(exc)}
+            )
     return admission, places
 
 
@@ -568,6 +588,42 @@ async def cancel_engine_install(engine: str) -> EngineInstall:
 # --------------------------------------------------------------------------- #
 # Runtimes
 # --------------------------------------------------------------------------- #
+
+
+@router.post(
+    "/v1/engines/{engine}/uninstall", status_code=204, tags=["engines"], dependencies=_write_auth
+)
+async def uninstall_engine(request: Request, engine: str) -> Response:
+    from ..engines import adapter_for
+
+    kind = _engine_kind(engine)
+    installer = installer_for(kind)
+    state: AgentState = request.app.state.agent_state
+    supervisor = _supervisor(request)
+    active = [
+        s.name
+        for s in state.list_runtime_specs()
+        if s.engine is kind and supervisor is not None and supervisor.is_running(s.name)
+    ]
+    if (installer is not None and installer.running) or active:
+        raise _problem(
+            code=409,
+            slug="engine-in-use",
+            title="Engine is in use",
+            detail="Finish or cancel installation and stop its runtimes first. "
+            + ", ".join(active),
+        )
+    adapter = adapter_for(kind)
+    assert adapter is not None
+    try:
+        # Synchronous intentionally: no start/install request can interleave
+        # between the in-use check and removal on this agent's event loop.
+        adapter.managed_store().remove_builds()
+    except (AcquisitionError, OSError) as exc:
+        raise _problem(
+            code=409, slug="engine-removal-failed", title="Engine removal failed", detail=str(exc)
+        ) from exc
+    return Response(status_code=204)
 
 
 @router.get("/v1/runtimes", response_model=RuntimeList, tags=["runtimes"], dependencies=_read_auth)

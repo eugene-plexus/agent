@@ -52,11 +52,12 @@ def test_engines_lists_every_adapter_with_its_flag_schema(authed_client: TestCli
     response = authed_client.get("/v1/engines")
     assert response.status_code == 200
     engines = response.json()["engines"]
-    assert [e["engine"] for e in engines] == ["llama_cpp", "vllm", "mlx", "kev"]
+    assert [e["engine"] for e in engines] == ["llama_cpp", "vllm", "mlx", "kev", "strata"]
 
     for engine in engines:
         assert engine["flagSchema"]["component"] == f"engine:{engine['engine']}"
-        assert engine["flagSchema"]["fields"], "the form needs fields"
+        if engine["engine"] != "strata":
+            assert engine["flagSchema"]["fields"], "the form needs fields"
         # available depends on the dev machine; the contract is that a
         # false answer explains itself.
         if not engine["available"]:
@@ -98,6 +99,9 @@ def test_model_formats_do_not_depend_on_availability(authed_client: TestClient) 
     binary installed still needs to know what it would be able to
     load."""
     for engine in authed_client.get("/v1/engines").json()["engines"]:
+        if engine["engine"] == "strata":
+            assert engine["modelFormats"] == []  # prepared configs, not arbitrary GGUFs
+            continue
         assert engine["modelFormats"], f"{engine['engine']} declared no formats"
 
 

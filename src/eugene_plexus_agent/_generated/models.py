@@ -594,6 +594,11 @@ class EngineKind(StrEnum):
     and without an adapter there is nothing that knows how to start
     it or tell when it is ready.
 
+    `strata` is experimental. It launches Strata's Python HTTP
+    server and native engine together, using a prepared Strata JSON
+    configuration as `RuntimeSpec.modelPath`. It does not accept an
+    arbitrary GGUF or prepare model weights automatically.
+
     `kev` drives upstream `python -m kev.serve` and loads Kev
     decision checkpoints (`kev_checkpoint` format) — a decision
     model, not a chat model: its server speaks the System One
@@ -645,6 +650,7 @@ class EngineKind(StrEnum):
     vllm = 'vllm'
     mlx = 'mlx'
     kev = 'kev'
+    strata = 'strata'
 
 
 class ModelFormat(StrEnum):
@@ -3392,7 +3398,7 @@ class RuntimeSpec(BaseModel):
     engine: EngineKind
     modelPath: str = Field(
         ...,
-        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor `strata`, this is a prepared Strata JSON configuration\nin a Library folder on the target node. It references the\nexisting weights, pack, tokenizer and optional MTP assets.\nIt is not copied into the node's model cache. The adapter\nwrites a private launch config and preserves this original.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
     )
     modelAlias: str | None = Field(
         None,
@@ -4314,11 +4320,11 @@ class EngineDescriptor(BaseModel):
     )
     modelFormats: list[ModelFormat] = Field(
         ...,
-        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n",
+        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`strata` lists no catalogue model formats: it requires a\nprepared JSON configuration and is offered through the\nexperimental prepared-model form, not arbitrary GGUF launch.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n",
     )
     experimental: bool | None = Field(
         False,
-        description="True while this engine's integration has never been proved\non the hardware it targets — `mlx` until a physical Apple\nsilicon run is recorded. A property of the *integration*,\nnot of this host, and reported so the UI can badge the\noption instead of hardcoding a list that goes stale the day\nthe evidence lands. Experimental does not mean hidden: on\nappropriate hardware the engine is offered, badged; on the\nwrong hardware `acquisition.manualInstall.notes` explains\nwhy there is no install command.\n",
+        description='Limited integration and support, including niche engines\nwhose capabilities and upstream interfaces change quickly.\nIndependent of hardware test status: a successful hardware\ntest does not automatically remove this designation.\nExperimental engines remain visible on supported hosts.\n',
     )
     binaryPath: str | None = Field(
         None, description='Absolute path to the binary the adapter would spawn.'

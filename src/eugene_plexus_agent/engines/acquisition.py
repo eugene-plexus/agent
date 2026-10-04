@@ -35,6 +35,7 @@ import socket
 import ssl
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -610,7 +611,49 @@ class ManagedStore:
         return self._dir
 
     def build_dir(self, version: str) -> Path:
+        if not version or Path(version).name != version or version in {".", ".."}:
+            raise AcquisitionError("invalid engine build name")
         return self._dir / version
+
+    def remove_builds(self) -> None:
+        """Remove receipt-owned builds only, never borrowed installs or models."""
+        root = self._dir.parent.resolve()
+        if not self._dir.resolve().is_relative_to(root):
+            raise AcquisitionError("engine store resolves outside its configured root")
+        if not self._dir.exists():
+            return
+        directories: list[Path] = []
+        for directory in self._dir.iterdir():
+            receipt = directory / self.METADATA_NAME
+            if not directory.is_dir() or not receipt.is_file():
+                continue
+            try:
+                meta = json.loads(receipt.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(meta, dict) or not meta.get("binary") or not meta.get("version"):
+                continue
+            if (
+                directory.is_symlink()
+                or directory.is_junction()
+                or not directory.resolve().is_relative_to(self._dir.resolve())
+                or not (directory / str(meta["binary"]))
+                .resolve()
+                .is_relative_to(directory.resolve())
+            ):
+                raise AcquisitionError("managed build resolves outside its engine store")
+            directories.append(directory)
+        for directory in directories:
+            # Keep the receipt recoverable if Windows refuses a still-open
+            # library halfway through removal. Repeating Uninstall can finish.
+            receipt = directory / self.METADATA_NAME
+            saved = receipt.read_bytes()
+            try:
+                shutil.rmtree(directory)
+            except OSError:
+                if directory.is_dir():
+                    receipt.write_bytes(saved)
+                raise
 
     def list_builds(self) -> list[InstalledBuild]:
         """Complete builds, newest install first."""
@@ -640,8 +683,10 @@ class ManagedStore:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
+        if not isinstance(meta, dict):
+            return None
         binary = directory / str(meta.get("binary") or "")
-        if not binary.is_file():
+        if not binary.is_file() or not binary.resolve().is_relative_to(directory.resolve()):
             return None
         return InstalledBuild(
             version=str(meta.get("version") or directory.name),
@@ -707,6 +752,12 @@ class _Progress:
     error: str | None = None
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    committed: bool = False
+
+    def check_cancelled(self) -> None:
+        if self.cancelled.is_set():
+            raise AcquisitionError("installation cancelled")
 
     def snapshot(self) -> EngineInstall:
         return EngineInstall(
@@ -754,6 +805,7 @@ class EngineInstaller:
     def start(self, plan: AcquisitionPlan) -> EngineInstall:
         if self.running:
             raise AcquisitionError(f"an install is already running for {self._engine.value}")
+        self._store.build_dir(plan.version)  # reject unsafe names before scheduling a worker
         progress = _Progress(
             engine=self._engine,
             state=State.downloading,
@@ -770,11 +822,17 @@ class EngineInstaller:
 
     async def cancel(self) -> EngineInstall | None:
         if self._task is not None and not self._task.done():
-            self._task.cancel()
+            if self._progress is not None:
+                self._progress.cancelled.set()
             # The task records its own outcome in `_progress` before it
             # unwinds, so whatever comes out here is already reported.
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._task
+                await asyncio.shield(self._task)
+            if self._progress is not None and self._progress.finished_at is None:
+                # Cancellation can arrive before _run executes its first line.
+                self._progress.state = State.cancelled
+                self._progress.message = "cancelled"
+                self._progress.finished_at = datetime.now(UTC)
         return self.snapshot()
 
     async def aclose(self) -> None:
@@ -784,29 +842,42 @@ class EngineInstaller:
 
     async def _run(self, plan: AcquisitionPlan, progress: _Progress) -> None:
         staging = self._store.build_dir(f".staging-{plan.version}")
+        worker = asyncio.create_task(asyncio.to_thread(self._install, plan, progress, staging))
         try:
-            await asyncio.to_thread(self._install, plan, progress, staging)
-            progress.state = State.done
-            progress.message = f"installed {plan.version}"
+            await asyncio.shield(worker)
+            if progress.cancelled.is_set() and not progress.committed:
+                progress.state = State.cancelled
+                progress.message = "cancelled"
+            else:
+                progress.state = State.done
+                progress.message = f"installed {plan.version}"
         except asyncio.CancelledError:
-            progress.state = State.cancelled
-            progress.message = "cancelled"
+            progress.cancelled.set()
+            # Cancelling to_thread does not stop its OS thread. Wait until it
+            # notices before deleting files or accepting another installation.
+            with contextlib.suppress(Exception):
+                await worker
+            progress.state = State.done if progress.committed else State.cancelled
+            progress.message = f"installed {plan.version}" if progress.committed else "cancelled"
             _remove_quietly(staging)
             raise
         except Exception as e:
             log.warning("engine install failed: %s", e)
-            progress.state = State.failed
-            progress.error = str(e)
+            progress.state = State.cancelled if progress.cancelled.is_set() else State.failed
+            progress.message = "cancelled" if progress.cancelled.is_set() else progress.message
+            progress.error = None if progress.cancelled.is_set() else str(e)
             _remove_quietly(staging)
         finally:
             progress.finished_at = datetime.now(UTC)
 
     def _install(self, plan: AcquisitionPlan, progress: _Progress, staging: Path) -> None:
+        progress.check_cancelled()
         _remove_quietly(staging)
         staging.mkdir(parents=True, exist_ok=True)
 
         archives: list[Path] = []
         for asset in plan.assets:
+            progress.check_cancelled()
             progress.state = State.downloading
             progress.message = f"downloading {asset.name}"
             archive = staging / asset.name
@@ -856,12 +927,14 @@ class EngineInstaller:
             _remove_quietly(side)
 
         final = self._store.build_dir(plan.version)
+        progress.check_cancelled()
         _remove_quietly(final)
         # The rename is the commit point: until it lands, nothing outside
         # this function can see a half-installed build.
         staging.replace(final)
         binary = final / binary.relative_to(staging)
         self._store.write_metadata(final, version=plan.version, variant=plan.variant, binary=binary)
+        progress.committed = True
         self._store.prune()
 
 
@@ -875,6 +948,7 @@ def _download(asset: ReleaseAsset, target: Path, progress: _Progress) -> None:
             target.open("wb") as out,
         ):
             while True:
+                progress.check_cancelled()
                 chunk = response.read(_DOWNLOAD_CHUNK)
                 if not chunk:
                     break

@@ -1004,7 +1004,12 @@ def installer_for(kind: EngineKind) -> EngineInstaller | None:
         return None
     existing = _INSTALLERS.get(kind)
     if existing is None:
-        existing = EngineInstaller(adapter.managed_store(), kind)
+        if kind is EngineKind.strata:
+            from .engines.strata_install import StrataInstaller
+
+            existing = StrataInstaller(adapter.managed_store(), kind)
+        else:
+            existing = EngineInstaller(adapter.managed_store(), kind)
         _INSTALLERS[kind] = existing
     return existing
 
@@ -1060,6 +1065,10 @@ def plan_for(
     """
     detected = host if host is not None else detect_host()
     adapter = adapter_for(kind)
+    if kind is EngineKind.strata:
+        from .engines.strata_install import plan
+
+        return plan(detected, version, variant)
     if adapter is not None and adapter.install_policy is Policy.manual:
         return Unavailable(reason=_manual_reason(adapter, adapter.manual_install(detected)))
     if not isinstance(adapter, LlamaCppAdapter):
@@ -1150,7 +1159,7 @@ def _acquisition_for(kind: EngineKind, host: HostAccelerator) -> EngineAcquisiti
         variant=plan.variant,
         alternatives=llama_alternatives(detected, planned) if planned is not None else [],
         detected=detected,
-        latestVersion=latest.version if latest else None,
+        latestVersion=latest.version if latest else plan.version,
         latestPublishedAt=latest.published_at if latest else None,
         checkedAt=checked_at,
     )
@@ -1256,6 +1265,21 @@ def validate_spec(spec: RuntimeSpec, get_config: ConfigGetter | None = None) -> 
     adapter = adapter_for(spec.engine)
     if adapter is None:
         return f"no adapter for engine {spec.engine.value!r}"
+    if spec.engine is EngineKind.strata:
+        if spec.startOnDemand or spec.idleUnloadSeconds:
+            return (
+                "Strata requires explicit start/stop: memory fit and automatic eviction "
+                "are not supported yet"
+            )
+        if spec.host not in (None, "localhost", "127.0.0.1"):
+            return "Strata binds to loopback only; reach it through the gateway"
+        if spec.extraArgs or spec.workingDirectory:
+            return (
+                "Strata uses a prepared model config; extraArgs and workingDirectory "
+                "are not supported"
+            )
+        if Path(spec.modelPath).suffix.lower() != ".json":
+            return "Strata modelPath must name a prepared Strata JSON config, not a GGUF"
     if spec.engine is EngineKind.kev and spec.host not in (None, "127.0.0.1", "localhost"):
         # Upstream hardcodes the bind to loopback (no --host flag at the
         # pinned commit), so honouring this host is not in our power and

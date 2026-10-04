@@ -9,10 +9,13 @@ It supervises processes; it does not perform inference or route model requests.
 - **Component supervision:** starts and monitors `gateway`, `inference-driver`,
 	`library`, and `control` processes. Safe mode keeps configuration repair reachable.
 - **Engine lifecycle:** constructs argv, probes readiness, and captures logs for
-	upstream llama.cpp and user-installed vLLM. A live engine loading weights is
+	llama.cpp, vLLM, MLX, Kev, and experimental Strata. A live engine loading weights is
 	reported as `loading`, not confused with a crashed process.
-- **Engine acquisition:** downloads and verifies supported llama.cpp binaries.
-	vLLM installation is operator-managed; MLX has no adapter yet.
+- **Engine acquisition:** verifies supported llama.cpp binaries and a pinned
+  Strata Windows NVIDIA recipe with isolated Python/CUDA dependencies. Managed
+  builds can be uninstalled without deleting models or borrowed installations.
+  vLLM, MLX and Kev installations remain operator-managed. Strata uses prepared
+  model configurations; see the [experimental engine guide](https://github.com/eugene-plexus/specs/blob/main/docs/deployment/experimental-engines.md).
 - **Runtime admission:** estimates memory demand against live hardware and refuses
 	an oversized launch with the arithmetic. A dry run and explicit force override
 	are available; unknown capacity does not refuse a launch.

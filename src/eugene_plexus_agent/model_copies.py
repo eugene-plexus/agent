@@ -188,6 +188,10 @@ def plan_for(
     that is **already inside the copy directory**. Without it, a restart
     after a copy would plan to copy the copy onto itself.
     """
+    if declared.lower().endswith(".json"):
+        # Prepared engine configurations refer to other model assets. Copying
+        # only this tiny file would break relative paths and misreport progress.
+        return None
     if not settings.usable:
         return None
     assert settings.directory is not None
