@@ -800,6 +800,36 @@ def test_update_before_any_check_is_refused_with_a_reason(
     assert r.status_code == 409 and "Check for updates" in r.json()["detail"]["detail"]
 
 
+def test_update_rechecks_and_never_starts_the_cached_edge_target(authed_client, monkeypatch):
+    web = _edge_web([_run("CI", SPECS_OK)])
+    _checked(authed_client, _install(SHA), web, monkeypatch)
+    authed_client.post("/v1/node/update/check")
+    latest = "f" * 40
+    web.pages.update(_edge_web([_run("CI", latest)]).pages)
+    started = []
+    monkeypatch.setattr(
+        update_apply, "start", lambda **kwargs: started.append(kwargs["target"].ref)
+    )
+    response = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
+    assert response.status_code == 409
+    assert "Nothing was installed" in response.json()["detail"]["detail"]
+    assert started == []
+    assert authed_client.get("/v1/node").json()["update"]["newest"]["ref"] == latest
+
+
+def test_update_does_not_use_last_good_target_when_final_check_fails(authed_client, monkeypatch):
+    web = _edge_web([_run("CI", SPECS_OK)])
+    _checked(authed_client, _install(SHA), web, monkeypatch)
+    authed_client.post("/v1/node/update/check")
+    web.pages[f"{updates.API}/actions/runs?branch=main&event=push&per_page=60"] = OSError("offline")
+    started = []
+    monkeypatch.setattr(update_apply, "start", lambda **kwargs: started.append(True))
+    response = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
+    assert response.status_code == 503
+    assert "Nothing was installed" in response.json()["detail"]["detail"]
+    assert started == []
+
+
 def test_a_container_is_refused_with_its_steps(authed_client: TestClient, monkeypatch) -> None:
     _checked(authed_client, _container("unraid"), _edge_web([_run("CI", SPECS_OK)]), monkeypatch)
     authed_client.post("/v1/node/update/check")

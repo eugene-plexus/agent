@@ -152,6 +152,33 @@ async def update_now(request: Request, body: UpdateRequest) -> UpdateRun:
             f"The newest on {target.channel.value} is now {target.release or target.ref[:12]}. "
             "Check again and look before updating.",
         )
+    # The periodic result may be six hours old. Never start an installer
+    # from it: the console refreshes on confirmation, and direct clients
+    # get the same final check here. A failed read must not fall back to
+    # the last successful check that the status page is allowed to keep.
+    fresh = await checker(request).check(install)
+    if fresh.error or fresh.newest is None:
+        raise _problem(
+            503,
+            "update-check-failed",
+            "The newest version could not be checked",
+            f"{fresh.error or 'The channel returned no update target.'} "
+            "Nothing was installed. Try Update again when the channel can be reached.",
+        )
+    target = fresh.newest
+    if target.ref != body.target:
+        raise _problem(
+            409,
+            "update-target-moved",
+            "That is not the newest version any more",
+            f"The newest on {target.channel.value} is now {target.release or target.ref[:12]}. "
+            "Nothing was installed. Choose Update again to use the newest version.",
+        )
+    view = await asyncio.to_thread(_view, request, install)
+    if view.running is not None:
+        raise _problem(
+            409, "update-running", "An update is already running", "Wait for it to finish."
+        )
     if not view.available:
         name = target.release or target.ref[:12]
         if view.ahead:
