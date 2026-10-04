@@ -772,7 +772,12 @@ class AppInstaller:
         # account is granted those and never the agent's; and copied, not
         # linked from uv's cache, so a grant on a venv's files is a grant on
         # those files and nothing that shares their inode.
-        env["UV_PYTHON_INSTALL_DIR"] = str(target.parent.parent.parent / app_accounts.APP_PYTHONS)
+        app_root = target.parent.parent.parent.resolve()
+        env["UV_PYTHON_INSTALL_DIR"] = str(app_root / app_accounts.APP_PYTHONS)
+        # NAS containers may have no passwd entry or writable home. Keep
+        # installation caches on the same writable volume as app environments,
+        # rather than uv's home-derived default (/.cache/uv on Unraid).
+        env["UV_CACHE_DIR"] = str(app_root / ".cache" / "uv")
         env["UV_LINK_MODE"] = "copy"
 
         progress.state = State1.creating

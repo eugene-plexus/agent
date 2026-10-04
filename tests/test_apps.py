@@ -559,6 +559,14 @@ def test_a_real_install_runs_carries_no_credential_and_refuses_what_cannot_start
     uv = _real_uv()
     assert uv is not None
     monkeypatch.setenv("EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN", "leaked")
+    # NAS containers can run under an arbitrary uid with no writable home.
+    # Even an inherited cache setting must not move managed app builds off
+    # their writable installation volume. A file cannot be used as a cache.
+    blocked_cache = tmp_path / "not-a-cache-directory"
+    blocked_cache.write_text("keep", encoding="utf-8")
+    monkeypatch.setenv("UV_CACHE_DIR", str(blocked_cache))
+    if sys.platform != "win32":
+        monkeypatch.setenv("HOME", "/")
 
     async def scenario() -> None:
         store = apps.AppStore(tmp_path / apps.APPS_FILE)
@@ -604,6 +612,8 @@ def test_a_real_install_runs_carries_no_credential_and_refuses_what_cannot_start
             outcome = await installer.wait("tiny")
             assert outcome is not None and outcome.state.value == "done", outcome
             assert (store.version_dir("tiny", "v1") / apps.INSTALL_METADATA).is_file()
+            assert (store.root / ".cache" / "uv").is_dir()
+            assert blocked_cache.read_text(encoding="utf-8") == "keep"
 
             for _ in range(150):
                 if manager.view(store.get("tiny")).status == ComponentStatus.running:  # type: ignore[arg-type]
