@@ -97,11 +97,16 @@ def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> 
         ) from exc
     # An operator session that arrived through the HTTPS entry point keeps a
     # configuration applied from Settings; without one it goes back
-    # (`entrypoint_setup`).
+    # (`entrypoint_setup`). A console kept on its own port has not moved, so
+    # any operator session there shows the console still answers.
+    entry = getattr(request.app.state, "entrypoint_config", None)
     if (
         claims.is_session
-        and getattr(request.state, "via_entrypoint", False)
         and getattr(request.app.state, "entrypoint_confirm_by", None) is not None
+        and (
+            getattr(request.state, "via_entrypoint", False)
+            or (entry is not None and entry.console_direct)
+        )
     ):
         from .entrypoint_setup import confirm
 

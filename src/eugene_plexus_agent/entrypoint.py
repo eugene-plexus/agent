@@ -84,7 +84,9 @@ _INFERENCE_PATHS = [
 class Service(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     origin: str
-    networks: list[str] = Field(min_length=1)
+    # Required for every name that serves something; only a console kept on
+    # its own port may leave it empty (`EntryConfig.console_direct`).
+    networks: list[str] = Field(default_factory=list)
 
     @field_validator("origin")
     @classmethod
@@ -167,6 +169,12 @@ class EntryConfig(BaseModel):
     acme: AutomaticCertificates | None = None
     proxy: TrustedProxy | None = None
     public_console: bool = False
+    console_direct: bool = False
+    """The console stays on its own port, as before; this setup serves Workbench,
+    and the console's name only Workbench's sign-in (Troy, 2026-10-05: the safest
+    setup, Workbench through the proxy and the console at home, should not need a
+    hosts-file entry). Workbench's sign-in still needs an HTTPS name that every
+    browser can reach, so the console's name stays, for `/oidc` alone."""
     """The owner chose to let the console answer any network, risks read
     (Troy, 2026-10-05: behind Cloudflare every visitor is a Cloudflare
     address, so a home-only console refuses its owner at home). Without it a
@@ -186,6 +194,14 @@ class EntryConfig(BaseModel):
         everything = lambda service: any(  # noqa: E731
             ipaddress.ip_network(n).prefixlen == 0 for n in service.networks
         )
+        for service in services:
+            if not service.networks and not (service is self.console and self.console_direct):
+                raise ValueError(f"{service.host} needs at least one source network")
+        if self.console_direct and self.public_console:
+            raise ValueError(
+                "a console on its own port is not served by this setup, so it cannot be "
+                "opened to any network through it"
+            )
         if self.nodes and everything(self.nodes):
             raise ValueError("node connections require specific source networks")
         if everything(self.console) and not self.public_console:
@@ -405,6 +421,7 @@ def prepare(settings: Any) -> EntryConfig | None:
     if config is not None:
         settings._entrypoint_console_origin = config.console.origin
         settings._entrypoint_nodes = config.nodes is not None
+        settings._entrypoint_console_direct = config.console_direct
     return config
 
 
@@ -504,7 +521,25 @@ def caddy_config(
     # Public sign-in does not grant access to the adjacent console/API routes.
     sign_in = config.console.model_copy(update={"networks": config.workbench.networks})
     route(sign_in, "agent", ["/oidc/*"])
-    route(config.console, "agent")
+    if config.console_direct:
+        # The console is on its own port; its name signs people in to
+        # Workbench and says where the console is, and nothing else.
+        routes.append(
+            {
+                "match": [{"host": [config.console.host]}],
+                "handle": [
+                    _refusal(
+                        403,
+                        "Eugene's console is not served on {http.request.host}: it stays on "
+                        "its own port on your network. This name is only for signing in to "
+                        "Workbench.\n",
+                    )
+                ],
+                "terminal": True,
+            }
+        )
+    else:
+        route(config.console, "agent")
     route(config.workbench, "workbench")
     if config.inference:
         route(config.inference, "gateway", _INFERENCE_PATHS)

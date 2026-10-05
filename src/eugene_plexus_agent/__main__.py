@@ -156,7 +156,9 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # is logged once logging exists, below; a broken one stops here, in one
     # sentence -- unless it was just applied from Settings, which goes back.
     try:
-        if prepare(settings) is not None:
+        prepared = prepare(settings)
+        # A console kept on its own port keeps this agent's direct bind.
+        if prepared is not None and not prepared.console_direct:
             settings.bind_host = "127.0.0.1"
     except EntryPointConfigError as exc:
         raise SystemExit(f"agent: {exc}") from None

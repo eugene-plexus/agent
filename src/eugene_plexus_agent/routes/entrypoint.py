@@ -50,7 +50,15 @@ def _normalized(config: EntryConfig) -> dict[str, object]:
 
 
 def _steps(config: EntryConfig) -> list[str]:
-    hosts = ", ".join(service.host for service in config.services())
+    hosts = ", ".join(
+        service.host
+        + (
+            " (sign-in for Workbench only)"
+            if config.console_direct and service is config.console
+            else ""
+        )
+        for service in config.services()
+    )
     nodes_note = (
         "Enrolled machines reach this one at the nodes name now: update each one's saved "
         "controlUrl to it, keeping its keys and identity."
@@ -127,12 +135,25 @@ def _steps(config: EntryConfig) -> list[str]:
             "and your passphrase is all that stops them. Use a long passphrase used nowhere "
             "else, and watch Logs for failed sign-ins."
         )
+    if config.console_direct:
+        steps.append(
+            "The console stays on its own port (8079 in the container), as now: keep that "
+            "port published, and open the console there."
+        )
+        apply = (
+            "Apply from this page: Eugene saves it and restarts, and this page comes back in a "
+            "few seconds. Sign in to the console again within 15 minutes, or Eugene goes back "
+            "to how it was."
+        )
+    else:
+        apply = (
+            "Apply from this page: Eugene saves it and restarts. Then open "
+            + config.console.origin
+            + " and sign in within 15 minutes, or Eugene goes back to how it was."
+        )
     steps += [
         nodes_note,
-        "Apply from this page: Eugene saves it and restarts. Then open "
-        + config.console.origin
-        + " and sign in within 15 minutes, or Eugene goes back to how it was. Workbench's "
-        "sign-in address follows by itself; its chats and sign-ins are kept.",
+        apply + " Workbench's sign-in address follows by itself; its chats and sign-ins are kept.",
     ]
     return steps
 

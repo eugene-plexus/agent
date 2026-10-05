@@ -469,3 +469,78 @@ def test_the_preview_says_what_a_public_console_risks(authed_client: TestClient)
         json={"configuration": {**body, "public_console": False}},
     )
     assert refused.status_code == 400 and "public_console" in refused.text
+
+
+# --------------------------------------------------------------------------- #
+# the console on its own port, Workbench behind the proxy (2026-10-05)
+# --------------------------------------------------------------------------- #
+
+
+def direct_config(**changes: Any) -> EntryConfig:
+    return proxy_config(
+        console_direct=True,
+        console={"origin": "https://eugene.example.org", "networks": []},
+        **changes,
+    )
+
+
+def test_a_console_on_its_own_port_needs_no_networks_and_cannot_be_public(tmp_path):
+    assert direct_config().console_direct is True
+    with pytest.raises(ValueError, match="needs at least one source network"):
+        proxy_config(console={"origin": "https://eugene.example.org", "networks": []})
+    with pytest.raises(ValueError, match="cannot be opened to any network"):
+        direct_config(public_console=True)
+    with pytest.raises(ValueError, match="needs at least one source network"):
+        direct_config(workbench={"origin": "https://workbench.example.org", "networks": []})
+
+
+def test_its_name_serves_only_workbench_sign_in(tmp_path):
+    document = caddy_config(direct_config(), tmp_path, "secret", {"agent": 8079})
+    routes = document["apps"]["http"]["servers"]["entry"]["routes"]
+    on_console = [
+        r for r in routes if r.get("match", [{}])[0].get("host") == ["eugene.example.org"]
+    ]
+    sign_in, refusal = on_console
+    assert sign_in["match"][0]["path"] == ["/oidc/*"]
+    assert sign_in["match"][0]["client_ip"]["ranges"] == ["0.0.0.0/0"]  # Workbench's networks
+    assert sign_in["handle"][-1]["upstreams"] == [{"dial": "127.0.0.1:8079"}]
+    assert refusal["handle"][0]["status_code"] == 403
+    assert "stays on its own port" in refusal["handle"][0]["body"]
+    assert refusal.get("terminal") is True
+
+
+def test_any_operator_session_confirms_a_console_that_did_not_move(
+    authed_client: TestClient, app: FastAPI, settings: Settings
+):
+    from eugene_plexus_agent.dependencies import _SESSION, verify_bearer
+
+    entrypoint_setup.save_applied(settings, as_text(direct_config()))
+    app.state.entrypoint_config = direct_config()
+    app.state.entrypoint_confirm_by = datetime.now(UTC) + timedelta(minutes=5)
+    try:
+        token = authed_client.headers["Authorization"].split(" ", 1)[1]
+        direct = SimpleNamespace(app=app, state=SimpleNamespace())
+        verify_bearer(direct, token, classes=_SESSION)  # type: ignore[arg-type]
+        assert entrypoint_setup.pending(settings) is None
+    finally:
+        app.state.entrypoint_config = None
+
+
+async def test_nobody_signing_in_to_a_console_on_its_own_port_says_so_plainly(tmp_path):
+    settings, app = _approving(tmp_path, datetime.now(UTC) - timedelta(seconds=1))
+    app.state.entrypoint_config = direct_config()
+    await entrypoint_setup.watch_approval(app)
+    await asyncio.sleep(0.05)
+    reason = entrypoint_setup.reverted(settings) or ""
+    assert "nobody signed in to the console within 15 minutes" in reason
+
+
+def test_the_preview_says_the_console_stays_where_it_is(authed_client: TestClient):
+    reply = authed_client.post(
+        "/v1/entrypoint/preview", json={"configuration": as_json(direct_config())}
+    )
+    assert reply.status_code == 200, reply.text
+    steps = reply.json()["instructions"]
+    assert any("eugene.example.org (sign-in for Workbench only)" in step for step in steps)
+    assert any("The console stays on its own port" in step for step in steps)
+    assert any("this page comes back in a few seconds" in step for step in steps)

@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     _entrypoint_nodes: bool = PrivateAttr(default=False)
     """The entry point serves the node hostname; otherwise the control root
     keeps its direct port, so enrolled machines need no change."""
+    _entrypoint_console_direct: bool = PrivateAttr(default=False)
+    """The console stays on this agent's own port; only Workbench is behind the
+    entry point, so this agent keeps its direct bind."""
     _entrypoint_seen: bool = PrivateAttr(default=False)
     _entrypoint_prepared: bool = PrivateAttr(default=False)
     _entrypoint_ready: Any = PrivateAttr(default=None)

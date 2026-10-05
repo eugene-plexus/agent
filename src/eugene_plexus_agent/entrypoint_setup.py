@@ -231,9 +231,10 @@ async def watch_approval(app: Any) -> None:
         return
     entry = app.state.entrypoint_config
     minutes = max(1, round(settings.entrypoint_confirm_seconds / 60))
+    where = "" if entry.console_direct else f" through {entry.console.origin}"
     revert(
         settings,
-        f"nobody signed in to the console through {entry.console.origin} within "
+        f"nobody signed in to the console{where} within "
         f"{minutes} minute{'s' if minutes != 1 else ''} of it starting. Check the proxy "
         "or DNS settings, then apply it again.",
     )
