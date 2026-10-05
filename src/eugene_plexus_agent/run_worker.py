@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from ._generated.models import RuntimeSpec
 from .admission import LibraryFitClient
 from .engines.devices import detect_devices
-from .node_work import launch_guard
+from .node_work import is_job_site, launch_guard
 from .routes import runtimes as actions
 from .runtime_context import NodeContext
 from .runtimes import describe_engines, installer_for
@@ -322,6 +322,9 @@ class RunWorker:
     async def run_forever(self) -> None:
         while True:
             await asyncio.sleep(2)
+            if is_job_site(self.app):
+                # No inference work reaches a job site (remote-nodes.md §3.2).
+                continue
             try:
                 identity = getattr(self.app.state, "node_identity", None)
                 node = (

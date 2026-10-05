@@ -319,6 +319,11 @@ class IdentityRecord:
     epoch: int | None = None
     advertise_url: str | None = None
     enrolled_at: str | None = None
+    job_site: bool | None = None
+    """True when this machine joined as a Job Site (remote-nodes.md §3.2): it
+    connects out and nothing connects to it, it announces no address, runs no
+    inference work, and pins its root's identity key (`root_tls`). None, and
+    absent from `node.yaml`, on every other node."""
 
     @property
     def enrolled(self) -> bool:
@@ -339,6 +344,7 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("epoch", "epoch"),
     ("advertiseUrl", "advertise_url"),
     ("enrolledAt", "enrolled_at"),
+    ("jobSite", "job_site"),
 )
 
 
@@ -376,6 +382,8 @@ class NodeIdentityStore:
                     values[attr] = int(value) if isinstance(value, int) else None
                 elif attr == "advertise_sequence":
                     values[attr] = int(value) if isinstance(value, int) else 0
+                elif attr == "job_site":
+                    values[attr] = True if value is True else None
                 else:
                     values[attr] = (
                         str(value) if isinstance(value, str | int) and value != "" else None
@@ -448,10 +456,12 @@ class NodeIdentityStore:
         control_public_key: str,
         recovery_public_key: str | None,
         advertise_url: str | None,
+        job_site: bool = False,
     ) -> IdentityRecord:
         with self._lock:
             self._record = replace(
                 self._record,
+                job_site=True if job_site else None,
                 name=name,
                 control_url=control_url.rstrip("/"),
                 epoch=epoch,
@@ -522,6 +532,7 @@ class NodeIdentityStore:
                 advertise_url=None,
                 advertise_sequence=0,
                 enrolled_at=None,
+                job_site=None,
             )
             self._write_locked()
             return self._record

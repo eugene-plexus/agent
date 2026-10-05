@@ -76,6 +76,10 @@ class JoinRequest:
     name: str | None = None
     advertise_url: str | None = None
     force: bool = False
+    root_key: str | None = None
+    owner: tuple[str, str] | None = None
+    """A Job Site's owner confirming at this machine: their sign-in name and
+    password, read here and sent once, never kept (remote-nodes.md §3.3)."""
 
 
 def has_tty() -> bool:
@@ -331,10 +335,15 @@ async def _join(
 ) -> EnrollmentOutcome:
     from .engines.devices import detect_devices
 
-    advertise = await resolve_advertise_url(
-        configured=request.advertise_url or state.get_config("advertiseUrl"),
-        control_url=request.control_url,
-        bind_port=int(settings.bind_port),
+    # A Job Site has no address: nothing connects to it, so none is derived.
+    advertise = (
+        None
+        if request.owner is not None
+        else await resolve_advertise_url(
+            configured=request.advertise_url or state.get_config("advertiseUrl"),
+            control_url=request.control_url,
+            bind_port=int(settings.bind_port),
+        )
     )
     snapshot = await asyncio.to_thread(detect_devices)
     return await perform_enrollment(
@@ -344,6 +353,8 @@ async def _join(
         name=request.name,
         advertise_url=advertise,
         devices=[d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
+        root_key=request.root_key,
+        owner=request.owner,
     )
 
 

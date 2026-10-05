@@ -94,6 +94,9 @@ class NodeFileHelper:
         self._error: str | None = None
         self._attempt_version: str | None = None
         self._retry_at = 0.0
+        self._site_owner: str | None = None
+        """A job site's owner, as the root last said: the one person who may
+        register its folders (remote-nodes.md §3.3)."""
 
     @property
     def manager(self) -> AppManager | None:
@@ -216,7 +219,12 @@ class NodeFileHelper:
         ):
             raise ValueError("This operation does not belong to this enrolled node or has expired.")
         if command.get("tool") == "inspect":
-            if command.get("subject") != "operator":
+            if getattr(identity, "job_site", None):
+                # A job site's folders are registered by its owner, and by
+                # nobody else, Eugene's owner included (J11).
+                if not self._site_owner or command.get("subject") != self._site_owner:
+                    raise ValueError("Only this machine's owner may register a folder.")
+            elif command.get("subject") != "operator":
                 raise ValueError("Only an operator may register a folder.")
             return
         grant = command.get("folder") or {}
@@ -266,37 +274,58 @@ class NodeFileHelper:
             await asyncio.sleep(2)
             return
         root = str(identity.control_url).rstrip("/")
-        if root != self._root:
-            if self._root_client is not None:
-                await self._root_client.aclose()
-            self._root_client = client_for(
-                root, timeout=15.0, follow_redirects=False, trust_env=False
-            )
-            self._root = root
-        assert self._root_client is not None
+        link = getattr(self.app.state, "root_link", None)
+        if getattr(identity, "job_site", None) and link is not None:
+            # A job site reaches its root pinned (J7a) and, off its own
+            # network, through the system's proxy.
+            post = self._through(link)
+        else:
+            if root != self._root:
+                if self._root_client is not None:
+                    await self._root_client.aclose()
+                # The proxy rule is per address (`client_for`): a root on
+                # this network is dialled direct, one off it through the
+                # system's proxy, which a forcing network needs (§3.1).
+                self._root_client = client_for(root, timeout=15.0, follow_redirects=False)
+                self._root = root
+            assert self._root_client is not None
+            post = self._direct(self._root_client, root)
         headers = {
             "Authorization": "Bearer " + self.app.state.auth_state.trust.agent_token("control")
         }
-        response = await self._root_client.post(
-            root + "/v1/node-helpers/poll", json=self.report(), headers=headers
-        )
+        response = await post("/v1/node-helpers/poll", json=self.report(), headers=headers)
         response.raise_for_status()
         value = response.json()
         config = value["configuration"]
+        owner = value.get("siteOwner")
+        self._site_owner = owner if isinstance(owner, str) and owner else None
         await self.reconcile(config)
         ident = value.get("operation")
         if ident:
             # Claim immediately before execution: the root rechecks all permissions.
-            claim = await self._root_client.post(
-                root + f"/v1/node-helpers/operations/{ident}/claim", headers=headers
-            )
+            claim = await post(f"/v1/node-helpers/operations/{ident}/claim", headers=headers)
             claim.raise_for_status()
             outcome = await self.perform(claim.json(), config)
             # Never retry execution if the result acknowledgement is lost.
-            answer = await self._root_client.post(
-                root + f"/v1/node-helpers/operations/{ident}/result", json=outcome, headers=headers
+            answer = await post(
+                f"/v1/node-helpers/operations/{ident}/result", json=outcome, headers=headers
             )
             answer.raise_for_status()
+
+    @staticmethod
+    def _direct(client: httpx.AsyncClient, root: str) -> Any:
+        async def post(path: str, **kwargs: Any) -> httpx.Response:
+            return await client.post(root + path, **kwargs)
+
+        return post
+
+    @staticmethod
+    def _through(link: Any) -> Any:
+        async def post(path: str, **kwargs: Any) -> httpx.Response:
+            response: httpx.Response = await link.request("POST", path, **kwargs)
+            return response
+
+        return post
 
     async def run(self) -> None:
         try:

@@ -1127,12 +1127,18 @@ class TrustGrant(StrEnum):
     * `gateway`: given to a node by the operator's join token, never
       claimed by the node. Service tokens with `sub: gateway` to
       other machines and to `control`.
+    * `files`: a Job Site's token key, **instead of** `node`, never
+      beside it (`docs/design/remote-nodes.md` §3.2). Service tokens
+      with `sub: agent` to `control`, and to **its own machine**.
+      Nothing else: a site that joined with a leaked token reaches no
+      other machine and no other component, on any network.
 
     """
 
     authority = 'authority'
     node = 'node'
     gateway = 'gateway'
+    files = 'files'
 
 
 class TrustKey(BaseModel):
@@ -2827,6 +2833,10 @@ class PublicEntryPoint(BaseModel):
     workbenchUrl: AnyUrl
     inferenceUrl: AnyUrl | None = None
     nodesUrl: AnyUrl | None = None
+    publicNodes: bool | None = Field(
+        None,
+        description="The nodes name also answers machines on any network, for the\nnode paths only (`public_nodes`, J3,\n`docs/design/remote-nodes.md` §3.1): joining as a Job Site,\nthe trust bundle with a node's token, the signed TLS key list,\nand the file helper's poll, claim and result. Every other path\non that name is refused with a sentence naming the console.\nThe networks listed for the name keep the whole control API,\nas before. Set only with an acknowledgement of the risks.\n",
+    )
 
 
 class Arg(RootModel[str]):
@@ -4460,6 +4470,10 @@ class NodeIdentity(BaseModel):
     """
 
     entrypoint: PublicEntryPoint | None = None
+    jobSite: bool | None = Field(
+        None,
+        description='True when this machine joined as a Job Site\n(`docs/design/remote-nodes.md` §3.2): it connects out to the\nroot and nothing connects to it, it announces no address, and\nit runs no inference work. Declaring a runtime, installing an\nengine, starting a benchmark or a profile build here answers\n409. Its files are managed by its owner, from Workbench.\n',
+    )
     enrolled: bool = Field(
         ...,
         description='False on a fresh agent, and not an error state — supervision\nworks without a trust relationship, which is what lets the\nagent on the control host boot first and start the control\nroot.\n',

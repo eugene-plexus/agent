@@ -41,6 +41,21 @@ from ._private_files import write_private
 log = logging.getLogger(__name__)
 TOKEN_HEADER = "x-eugene-entry-token"
 CLIENT_HEADER = "x-eugene-entry-client"
+ENTRY_HEADER = "X-Eugene-Plexus-Entry"
+PUBLIC_NODES = "public-nodes"
+"""Set on a request the public node route carries to the control root, and
+stripped from every other request: the root then lets only a job site join
+and gives the trust bundle only to a member's token (J3)."""
+PUBLIC_NODE_PATHS: dict[str, list[str]] = {
+    # The node paths, and nothing else (remote-nodes.md §3.1, J3, J7a).
+    "POST": [
+        "/v1/nodes/enroll",
+        "/v1/node-helpers/poll",
+        "/v1/node-helpers/operations/*/claim",
+        "/v1/node-helpers/operations/*/result",
+    ],
+    "GET": ["/v1/trust/bundle", "/v1/trust/tls"],
+}
 STRIP_HEADERS = [
     "Forwarded",
     "X-Forwarded-For",
@@ -55,6 +70,7 @@ STRIP_HEADERS = [
     "X-Eugene-Plexus-Forwarded-For",
     TOKEN_HEADER,
     CLIENT_HEADER,
+    ENTRY_HEADER,
 ]
 _HOST = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 _INFERENCE_PATHS = [
@@ -94,6 +110,7 @@ class Service(BaseModel):
         if any(char.isspace() for char in value):
             raise ValueError("origin cannot contain whitespace")
         parsed = urlsplit(value)
+        hostname = parsed.hostname or ""
         if (
             parsed.scheme != "https"
             or parsed.username is not None
@@ -101,7 +118,7 @@ class Service(BaseModel):
             or parsed.path not in ("", "/")
             or parsed.query
             or parsed.fragment
-            or not _HOST.fullmatch(parsed.hostname or "")
+            or not (_HOST.fullmatch(hostname) or _address(hostname))
             or parsed.netloc != parsed.netloc.lower()
             or "\\" in value
         ):
@@ -109,7 +126,8 @@ class Service(BaseModel):
         port = parsed.port if parsed.port is not None else 443
         if port == 0:
             raise ValueError("origin must name a nonzero port")
-        return f"https://{parsed.hostname}" + (f":{port}" if port != 443 else "")
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        return f"https://{host}" + (f":{port}" if port != 443 else "")
 
     @field_validator("networks")
     @classmethod
@@ -119,6 +137,19 @@ class Service(BaseModel):
     @property
     def host(self) -> str:
         return str(urlsplit(self.origin).hostname)
+
+    @property
+    def is_address(self) -> bool:
+        """A bare address rather than a name (J7: the nodes name may be one)."""
+        return _address(self.host)
+
+
+def _address(host: str) -> bool:
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return not (address.is_unspecified or address.is_multicast or address.is_loopback)
 
 
 class AutomaticCertificates(BaseModel):
@@ -169,6 +200,11 @@ class EntryConfig(BaseModel):
     acme: AutomaticCertificates | None = None
     proxy: TrustedProxy | None = None
     public_console: bool = False
+    public_nodes: bool = False
+    """The nodes name also answers any network, for the node paths only
+    (`PUBLIC_NODE_PATHS`), with the risks read (J3, Troy 2026-10-05): job sites
+    join and poll through it from anywhere, and nothing else does. The
+    networks listed for the name keep the whole control API."""
     console_direct: bool = False
     """The console stays on its own port, as before; this setup serves Workbench,
     and the console's name only Workbench's sign-in (Troy, 2026-10-05: the safest
@@ -203,7 +239,18 @@ class EntryConfig(BaseModel):
                 "opened to any network through it"
             )
         if self.nodes and everything(self.nodes):
-            raise ValueError("node connections require specific source networks")
+            raise ValueError(
+                "node connections require specific source networks; to let job sites join "
+                "from anywhere, set public_nodes (Settings, Container access setup)"
+            )
+        if self.public_nodes and not self.nodes:
+            raise ValueError("public_nodes needs a nodes name")
+        for service in services:
+            if service.is_address and service is not self.nodes:
+                raise ValueError(
+                    f"{service.host} is an address: only the nodes name may be one, because "
+                    "browsers need a name for the console and Workbench"
+                )
         if everything(self.console) and not self.public_console:
             raise ValueError(
                 "the console answers any network only with public_console: true "
@@ -226,6 +273,8 @@ class EntryConfig(BaseModel):
             for service in services:
                 if urlsplit(service.origin).port not in (None, 443):
                     raise ValueError("automatic certificates require public HTTPS port 443")
+                if service.is_address:
+                    raise ValueError("automatic public certificates need names, not addresses")
                 if service.host.endswith(
                     (
                         ".local",
@@ -256,12 +305,16 @@ class EntryConfig(BaseModel):
     def services(self) -> list[Service]:
         return [s for s in (self.console, self.workbench, self.inference, self.nodes) if s]
 
-    def public_urls(self) -> dict[str, str]:
-        result = {"consoleUrl": self.console.origin, "workbenchUrl": self.workbench.origin}
+    def public_urls(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "consoleUrl": self.console.origin,
+            "workbenchUrl": self.workbench.origin,
+        }
         if self.inference:
             result["inferenceUrl"] = self.inference.origin
         if self.nodes:
             result["nodesUrl"] = self.nodes.origin
+            result["publicNodes"] = self.public_nodes
         return result
 
     @classmethod
@@ -421,6 +474,14 @@ def prepare(settings: Any) -> EntryConfig | None:
     if config is not None:
         settings._entrypoint_console_origin = config.console.origin
         settings._entrypoint_nodes = config.nodes is not None
+        if config.nodes is not None:
+            settings._entrypoint_nodes_origin = config.nodes.origin
+            settings._entrypoint_nodes_public = config.public_nodes
+            # Where the root reads the key its nodes name presents (J7a):
+            # the proxy here, on loopback, unless an outside one holds it.
+            settings._entrypoint_nodes_probe = (
+                None if config.private_http else f"127.0.0.1:{config.listen_port}"
+            )
         settings._entrypoint_console_direct = config.console_direct
     return config
 
@@ -448,6 +509,35 @@ def caddy_config(
 ) -> dict[str, Any]:
     """Generate structured configuration; never interpolate a Caddyfile or shell."""
     routes: list[dict[str, Any]] = []
+    address = config.nodes.host if config.nodes is not None and config.nodes.is_address else None
+    if address and not config.private_http:
+        # **Strict SNI, by route** (J7: a bare address for the nodes name).
+        # A client sends no SNI for an address, and Caddy's server-wide check
+        # would answer every such request 421. So the server check is off and
+        # this route makes the same one, except for requests to that address
+        # with no SNI: a TLS session made for one name is never used for
+        # another, which is what the server check is for.
+        routes.append(
+            {
+                "match": [
+                    {
+                        "expression": (
+                            "{http.request.tls.server_name} != {http.request.host} && "
+                            "!({http.request.tls.server_name} == '' && "
+                            f"{{http.request.host}} == '{address}')"
+                        )
+                    }
+                ],
+                "handle": [
+                    _refusal(
+                        421,
+                        "Eugene refused this request: the name its TLS connection was made "
+                        "for is not the name it asks for.\n",
+                    )
+                ],
+                "terminal": True,
+            }
+        )
     peer = "{http.request.remote.host}"
     visitor = "{http.vars.client_ip}" if config.proxy else peer
 
@@ -545,6 +635,8 @@ def caddy_config(
         route(config.inference, "gateway", _INFERENCE_PATHS)
     if config.nodes:
         route(config.nodes, "control")
+        if config.public_nodes:
+            routes.extend(_public_node_routes(config, ports.get("control")))
     # Refuse known but disallowed hosts/paths; never a catch-all upstream.
     # Through Cloudflare every visitor arrives as a Cloudflare address, so a
     # name for your own network refuses you even at home: say so, by name.
@@ -648,7 +740,7 @@ def caddy_config(
                     "entry": {
                         "listen": [f":{config.listen_port}"],
                         "protocols": ["h1", "h2"],
-                        "strict_sni_host": True,
+                        "strict_sni_host": address is None,
                         "read_header_timeout": "10s",
                         "read_timeout": "60s",
                         "idle_timeout": "2m",
@@ -657,7 +749,7 @@ def caddy_config(
                             "disable_redirects": True,
                             "disable_certificates": not (config.internal_ca or config.acme),
                         },
-                        "tls_connection_policies": [{"match": {"sni": hosts}}],
+                        "tls_connection_policies": _connection_policies(config, hosts),
                         "routes": routes,
                     }
                 }
@@ -682,6 +774,73 @@ def caddy_config(
     if not config.internal_ca:
         document["apps"].pop("pki")
     return document
+
+
+def _public_node_routes(config: EntryConfig, port: int | None) -> list[dict[str, Any]]:
+    """The node paths from any network, marked for the root; then a sentence.
+
+    After the name's own networks, which keep the whole control API. Every
+    other path on this name, from anywhere else, is refused here, and names
+    where the console is (J3)."""
+    assert config.nodes is not None
+    nodes = config.nodes
+    console = (
+        "on its own port, on your network"
+        if config.console_direct
+        else f"at {config.console.origin}"
+    )
+    refusal = _refusal(
+        403,
+        f"This name serves machines only. Eugene's console is {console}.\n",
+    )
+    if port is None:
+        handlers: list[dict[str, Any]] = [
+            {
+                "handler": "static_response",
+                "status_code": 503,
+                "body": "This service is unavailable. Open Eugene to update or start it.",
+            }
+        ]
+    else:
+        if not 1 <= port <= 65535 or port == config.listen_port:
+            raise ValueError("invalid local upstream port")
+        headers = {"Host": [urlsplit(nodes.origin).netloc], ENTRY_HEADER: [PUBLIC_NODES]}
+        handlers = [
+            {"handler": "request_body", "max_size": 1024 * 1024},
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": f"127.0.0.1:{port}"}],
+                "headers": {
+                    "request": {
+                        "delete": [name for name in STRIP_HEADERS if name not in headers],
+                        "set": headers,
+                    }
+                },
+                "transport": {"protocol": "http", "dial_timeout": "5s"},
+                "flush_interval": -1,
+            },
+        ]
+    return [
+        {
+            "match": [
+                {"host": [nodes.host], "method": [method], "path": paths}
+                for method, paths in PUBLIC_NODE_PATHS.items()
+            ],
+            "handle": handlers,
+            "terminal": True,
+        },
+        {"match": [{"host": [nodes.host]}], "handle": [refusal], "terminal": True},
+    ]
+
+
+def _connection_policies(config: EntryConfig, hosts: list[str]) -> list[dict[str, Any]]:
+    """By name; and for a nodes name that is a bare address (J7), the one a
+    client sends no name for: TLS carries no address in SNI, so the
+    certificate for that address is chosen by `default_sni`."""
+    policies: list[dict[str, Any]] = [{"match": {"sni": hosts}}]
+    if config.nodes is not None and config.nodes.is_address:
+        policies.append({"default_sni": config.nodes.host})
+    return policies
 
 
 class ProxyMetadata:

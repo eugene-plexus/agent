@@ -31,7 +31,7 @@ from ..measurement_node import (
     unlisted,
 )
 from ..model_copies import resolve_local_path, settings_from_config
-from ..node_work import launch_lock
+from ..node_work import launch_lock, refuse_on_job_site
 from ..runtimes import _configured_binary, validate_spec
 from .runtimes import (
     _admission_for,
@@ -174,6 +174,7 @@ async def preflight_benchmark(body: BenchmarkRequest, request: Request) -> Measu
 
 @router.post("/v1/benchmarks", response_model=Benchmark, status_code=202)
 async def start_benchmark(body: BenchmarkRequest, request: Request) -> Benchmark:
+    refuse_on_job_site(request)
     async with launch_lock(request):
         manager = manager_for(request)
         if kind := active_measurement(request.app):

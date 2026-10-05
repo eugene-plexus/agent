@@ -57,8 +57,12 @@ class Worker:
             if not isinstance(args, dict) or not isinstance(args.get("path"), str):
                 raise folder_io.FolderError("A file operation needs a text path.")
             if tool == "inspect":
-                if command.get("subject") != "operator" or set(args) != {"path"}:
-                    raise folder_io.FolderError("Only the operator can register a folder.")
+                # Who may register is the agent's to decide, and it knows:
+                # the operator on an ordinary node, the owner on a job site
+                # (remote-nodes.md section 3.3). Here a registration names
+                # someone and asks about one path, nothing more.
+                if not isinstance(command.get("subject"), str) or set(args) != {"path"}:
+                    raise folder_io.FolderError("A folder is registered for a named person.")
                 path = folder_io.check_root_path(args["path"], self.protected)
                 return {"path": path, "identity": folder_io.inspect(path, self.protected)}
             folder = command.get("folder")

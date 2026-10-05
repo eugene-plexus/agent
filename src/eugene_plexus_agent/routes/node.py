@@ -141,6 +141,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
     return NodeIdentity(
         entrypoint=entry.public_urls() if entry else None,
         enrolled=record.enrolled,
+        jobSite=bool(record.job_site and record.enrolled),
         name=record.name if record.enrolled else None,
         publicKey=record.public_key,
         controlUrl=record.control_url if record.enrolled else None,  # type: ignore[arg-type]
@@ -354,6 +355,9 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
         )
 
     store.unenroll()
+    link = getattr(request.app.state, "root_link", None)
+    if link is not None:
+        link.pins.forget()
     auth.trust.forget()
     auth.trust.become_standalone()
     log.warning(

@@ -256,3 +256,48 @@ async def test_unsupported_helper_never_installs_and_managed_helper_is_not_an_ap
             assert "People" in response.text
     finally:
         await relay._worker.aclose()
+
+
+@pytest.mark.parametrize("job_site", [False, True])
+def test_only_the_right_person_registers_a_folder(
+    app: FastAPI, tmp_path: Path, job_site: bool
+) -> None:
+    """On an ordinary node the operator registers folders; on a job site its
+    owner does, as the root last said, and the operator does not (J11)."""
+    relay = NodeFileHelper(app)
+    app.state.node_identity = SimpleNamespace(
+        record=SimpleNamespace(
+            enrolled=True, name="desk", signing_public_key="key", job_site=job_site or None
+        )
+    )
+    config = {"node": "desk", "nodeKey": "key", "enrolledAt": "e1", "enabled": True, "folders": []}
+    inspect = {
+        "node": "desk",
+        "nodeKey": "key",
+        "enrolledAt": "e1",
+        "expiresAt": time.time() + 20,
+        "tool": "inspect",
+        "arguments": {"path": str(tmp_path)},
+    }
+    relay._site_owner = "p-ada" if job_site else None
+    allowed, refused = ("p-ada", "operator") if job_site else ("operator", "p-ada")
+    relay.validate({**inspect, "subject": allowed}, config)
+    with pytest.raises(ValueError, match="register"):
+        relay.validate({**inspect, "subject": refused}, config)
+    if job_site:
+        relay._site_owner = None
+        with pytest.raises(ValueError, match="owner"):
+            relay.validate({**inspect, "subject": "p-ada"}, config)
+
+
+def test_a_registration_names_someone_at_the_worker(worker: Worker, tmp_path: Path) -> None:
+    inspect = {
+        "id": "inspect-site",
+        "expiresAt": time.time() + 20,
+        "subject": "p-ada",
+        "tool": "inspect",
+        "arguments": {"path": str(tmp_path)},
+    }
+    assert worker.execute(inspect)["identity"]
+    with pytest.raises(folder_io.FolderError):
+        worker.execute({**inspect, "id": "no-one", "subject": None})
