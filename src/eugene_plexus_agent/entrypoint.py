@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -251,8 +252,23 @@ class EntryPointConfigError(ValueError):
     """The configuration file exists and cannot be used. Stops the agent."""
 
 
+def _explain(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        return "; ".join(
+            (".".join(str(part) for part in error["loc"]) + ": " if error["loc"] else "")
+            + error["msg"]
+            for error in exc.errors(include_input=False, include_context=False)
+        )
+    return str(exc)
+
+
 def resolve(settings: Any) -> EntryConfig | None:
     """The configuration to run with, and what a missing file means.
+
+    **Which file.** `EUGENE_PLEXUS_AGENT_ENTRYPOINT_CONFIG` when it is set;
+    otherwise `entrypoint.json` beside `agent.yaml`, read only where the
+    bundled proxy exists (2026-10-05: Settings writes that file, so the
+    variable is no longer a step). Its presence is the opt-in.
 
     **A missing file falls back to the direct ports** (Troy, 2026-10-04,
     on the first live NAS migration). The variable set and the file absent
@@ -266,16 +282,27 @@ def resolve(settings: Any) -> EntryConfig | None:
     **A file that exists and cannot be used still stops the agent**, with one
     sentence instead of a traceback. Someone is part-way through configuring
     it, and quietly running the old mode would hide a mistake in a file that
-    decides who can reach the console.
+    decides who can reach the console. (One applied from Settings and not
+    yet confirmed goes back instead: `prepare`.)
     """
-    path = settings.entrypoint_config
+    from . import entrypoint_setup
+
+    if not settings._entrypoint_seen:
+        settings._entrypoint_seen = True
+        settings._entrypoint_named = settings.entrypoint_config
+    path = settings._entrypoint_named
     if path is None:
-        return None
+        candidate = entrypoint_setup.default_path(settings)
+        if not candidate.is_file() or entrypoint_setup.unavailable_reason(settings):
+            settings.entrypoint_config = None
+            return None
+        path = candidate
+    settings.entrypoint_config = path
     try:
         return EntryConfig.load(path)
     except FileNotFoundError:
         settings.entrypoint_config = None
-        settings._entrypoint_fallback = (
+        settings._entrypoint_fallback = entrypoint_setup.missing_file_sentence(settings, path) or (
             f"{ENV_VARIABLE} names {path}, which does not exist, so the HTTPS entry "
             "point is off and Eugene is serving on its direct ports, as it did before "
             "the variable was set. To use one HTTPS port, save the configuration from "
@@ -283,14 +310,8 @@ def resolve(settings: Any) -> EntryConfig | None:
             "To stay on the direct ports, remove the variable."
         )
         return None
-    except ValidationError as exc:
-        reason = "; ".join(
-            (".".join(str(part) for part in error["loc"]) + ": " if error["loc"] else "")
-            + error["msg"]
-            for error in exc.errors(include_input=False, include_context=False)
-        )
     except (OSError, ValueError) as exc:
-        reason = str(exc)
+        reason = _explain(exc)
     raise EntryPointConfigError(
         f"the HTTPS entry point configuration at {path} cannot be used: {reason}. "
         "Eugene does not start with a broken file, so it never opens ports you meant "
@@ -300,33 +321,132 @@ def resolve(settings: Any) -> EntryConfig | None:
     )
 
 
+def validate_with_proxy(settings: Any, config: EntryConfig, directory: Path) -> None:
+    """Have the bundled proxy check `config`, the way it will run it.
+
+    Also how the local CA is provisioned before children build their SSL
+    contexts: `caddy validate` provisions without opening listeners.
+    """
+    from .child_env import child_environment
+
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    path = directory / "caddy.json"
+    write_private(
+        path,
+        json.dumps(
+            caddy_config(config, directory, "validate-" + "0" * 32, {"agent": settings.bind_port})
+        ),
+    )
+    try:
+        checked = subprocess.run(
+            [settings.entrypoint_binary, "validate", "--config", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=child_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"the bundled proxy could not check it: {exc}") from exc
+    if checked.returncode:
+        raise ValueError("the bundled proxy refused it: " + checked.stderr[-2000:].strip())
+
+
+def prepare(settings: Any) -> EntryConfig | None:
+    """`resolve`, checked by the proxy, and going back if a just-applied file fails.
+
+    Once per process: `build_server` calls it before deciding the bind host,
+    and `install` again when the app is built.
+    """
+    from . import entrypoint_setup
+
+    if settings._entrypoint_prepared:
+        ready: EntryConfig | None = settings._entrypoint_ready
+        return ready
+    try:
+        config = resolve(settings)
+        if config is not None:
+            reason = entrypoint_setup.unavailable_reason(settings)
+            if reason:
+                raise EntryPointConfigError(
+                    f"the HTTPS entry point at {settings.entrypoint_config} cannot run here: "
+                    f"{reason} Remove {ENV_VARIABLE}."
+                )
+            try:
+                validate_with_proxy(settings, config, entrypoint_setup.state_dir(settings))
+            except ValueError as exc:
+                raise EntryPointConfigError(
+                    f"the HTTPS entry point configuration at {settings.entrypoint_config} "
+                    f"cannot be used: {exc}. Fix it in Settings, Container access setup, or "
+                    f"remove {ENV_VARIABLE} to go back to the direct ports."
+                ) from exc
+    except EntryPointConfigError as exc:
+        if entrypoint_setup.pending(settings) is None:
+            raise
+        entrypoint_setup.revert(
+            settings, f"the configuration applied from Settings did not start: {exc}"
+        )
+        settings.entrypoint_config = settings._entrypoint_named
+        return prepare(settings)
+    settings._entrypoint_prepared = True
+    settings._entrypoint_ready = config
+    if config is not None:
+        settings._entrypoint_console_origin = config.console.origin
+        settings._entrypoint_nodes = config.nodes is not None
+    return config
+
+
+_SETUP = "Settings, Container access setup"
+_PLAIN = {
+    "Content-Type": ["text/plain; charset=utf-8"],
+    "X-Content-Type-Options": ["nosniff"],
+    "Cache-Control": ["no-store"],
+}
+
+
+def _refusal(status: int, body: str) -> dict[str, Any]:
+    """A refusal that says which check failed and what Eugene saw (agent #7).
+
+    Plain text, never HTML: the host named in it is the caller's own header.
+    It names only what the caller sent or is: never a trusted address, an
+    allowed network or another hostname.
+    """
+    return {"handler": "static_response", "status_code": status, "headers": _PLAIN, "body": body}
+
+
 def caddy_config(
     config: EntryConfig, directory: Path, token: str, ports: dict[str, int | None]
 ) -> dict[str, Any]:
     """Generate structured configuration; never interpolate a Caddyfile or shell."""
     routes: list[dict[str, Any]] = []
+    peer = "{http.request.remote.host}"
+    visitor = "{http.vars.client_ip}" if config.proxy else peer
 
     if config.proxy:
         # A trusted hop is not itself a trusted user. In particular, missing
         # or invalid XFF must not fall back to the proxy's privileged LAN IP.
-        for refused in (
-            {"not": [{"remote_ip": {"ranges": config.proxy.addresses}}]},
-            {"client_ip": {"ranges": config.proxy.addresses}},
-            {"not": [{"expression": "{http.request.header.X-Forwarded-Proto} == 'https'"}]},
+        # Each check has its own answer: the first live install could not
+        # tell which of the three it was failing (2026-10-04).
+        for refused, body in (
+            (
+                {"not": [{"remote_ip": {"ranges": config.proxy.addresses}}]},
+                f"Eugene refused this request: it came from {peer}, which is not a proxy "
+                f"Eugene trusts. If that is your reverse proxy, enter {peer} as its address "
+                f"in {_SETUP}.\n",
+            ),
+            (
+                {"client_ip": {"ranges": config.proxy.addresses}},
+                f"Eugene refused this request: your proxy at {peer} did not say who the "
+                "visitor is. It must add the visitor's address to X-Forwarded-For.\n",
+            ),
+            (
+                {"not": [{"expression": "{http.request.header.X-Forwarded-Proto} == 'https'"}]},
+                f"Eugene refused this request: your proxy at {peer} did not mark it as HTTPS "
+                "(X-Forwarded-Proto: https), and Eugene is only served over HTTPS. Behind "
+                "Cloudflare, set SSL/TLS to Full or Full (strict).\n",
+            ),
         ):
-            routes.append(
-                {
-                    "match": [refused],
-                    "handle": [
-                        {
-                            "handler": "static_response",
-                            "status_code": 403,
-                            "body": "A trusted HTTPS proxy and verified client IP are required.",
-                        }
-                    ],
-                    "terminal": True,
-                }
-            )
+            routes.append({"match": [refused], "handle": [_refusal(403, body)], "terminal": True})
 
     def route(service: Service, target: str, paths: list[str] | None = None) -> None:
         match: dict[str, Any] = {
@@ -379,13 +499,50 @@ def caddy_config(
     if config.nodes:
         route(config.nodes, "control")
     # Refuse known but disallowed hosts/paths; never a catch-all upstream.
+    # Through Cloudflare every visitor arrives as a Cloudflare address, so a
+    # name for your own network refuses you even at home: say so, by name.
+    known = [s.host for s in config.services()]
     routes.append(
         {
-            "match": [{"host": [s.host for s in config.services()]}],
-            "handle": [{"handler": "static_response", "status_code": 403}],
+            "match": [{"host": known, "header": {"Cf-Ray": ["*"]}}],
+            "handle": [
+                _refusal(
+                    403,
+                    "Eugene refused this request: it came through Cloudflare, so Eugene sees "
+                    f"Cloudflare's address ({visitor}), not yours, and "
+                    "{http.request.host} only answers the networks set for it. To reach it "
+                    "from home, point {http.request.host} at your own proxy in your local DNS, "
+                    "so the request skips Cloudflare.\n",
+                )
+            ],
+            "terminal": True,
         }
     )
-    routes.append({"handle": [{"handler": "static_response", "status_code": 421}]})
+    routes.append(
+        {
+            "match": [{"host": known}],
+            "handle": [
+                _refusal(
+                    403,
+                    "Eugene refused this request: {http.request.host} does not answer "
+                    f"{visitor} for this address. Each name answers only the networks, and "
+                    f"for inference only the paths, set for it in {_SETUP}.\n",
+                )
+            ],
+            "terminal": True,
+        }
+    )
+    routes.append(
+        {
+            "handle": [
+                _refusal(
+                    421,
+                    "Eugene is not set up to answer for {http.request.host}. The names it "
+                    f"answers for are set in {_SETUP}.\n",
+                )
+            ]
+        }
+    )
     hosts = [s.host for s in config.services()]
     tls: dict[str, Any] = {}
     if config.internal_ca:
@@ -503,7 +660,10 @@ class ProxyMetadata:
                 )
                 if trusted:
                     address = str(ipaddress.ip_address(clients[0].decode("ascii")))
-                    scope = dict(scope, scheme="https", client=(address, 0))
+                    # `via_entrypoint`: an operator session on such a request
+                    # confirms a configuration applied from Settings.
+                    state = {**scope.get("state", {}), "via_entrypoint": True}
+                    scope = dict(scope, scheme="https", client=(address, 0), state=state)
             except (ValueError, UnicodeError):
                 trusted = False
             if supplied and not trusted:
@@ -674,49 +834,31 @@ class EntryPoint:
 
 
 def install(app: Any) -> None:
+    from . import entrypoint_setup
+
     settings = app.state.settings
     named = settings.entrypoint_config
-    config = resolve(settings)
-    if named is not None and config is None:
-        # `build_server` normally resolves first and says this itself; an app
+    config = prepare(settings)
+    if named is not None and config is None and settings._entrypoint_fallback:
+        # `build_server` normally prepares first and says this itself; an app
         # built without it (the Windows service, tests) says it here.
         log.warning("%s", settings._entrypoint_fallback)
     app.state.entrypoint_config = config
     app.state.entrypoint_token = secrets.token_urlsafe(32) if config else None
+    app.state.entrypoint_confirm_by = (
+        datetime.now(UTC) + timedelta(seconds=settings.entrypoint_confirm_seconds)
+        if config is not None and entrypoint_setup.pending(settings) is not None
+        else None
+    )
     if config:
-        settings._entrypoint_console_origin = config.console.origin
         if os.name != "posix":
             raise ValueError("the managed HTTPS entry point is supported in Linux containers")
-        # Provision the local CA before children construct their cached SSL
-        # contexts. Caddy validate provisions config without opening listeners.
-        # All artifacts stay in this installation; no OS trust is modified.
+        # The local CA was provisioned by `prepare`, before children construct
+        # their cached SSL contexts. All artifacts stay in this installation;
+        # no OS trust is modified.
         from ._http import egress_ssl_context, ssl_context
-        from .child_env import child_environment
 
-        directory = settings.config_file.resolve().parent / "entrypoint"
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        directory.chmod(0o700)
-        path = directory / "caddy.json"
-        write_private(
-            path,
-            json.dumps(
-                caddy_config(
-                    config,
-                    directory,
-                    app.state.entrypoint_token,
-                    {"agent": settings.bind_port},
-                )
-            ),
-        )
-        checked = subprocess.run(
-            [settings.entrypoint_binary, "validate", "--config", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=child_environment(),
-        )
-        if checked.returncode:
-            raise ValueError("HTTPS entry point configuration failed: " + checked.stderr[-2000:])
+        directory = entrypoint_setup.state_dir(settings)
         ca = (
             (directory / "tls/pki/authorities/local/root.crt")
             if config.internal_ca

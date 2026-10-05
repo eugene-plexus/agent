@@ -194,40 +194,172 @@ def test_the_port_a_callback_names_is_the_port_the_app_gets(tmp_path: Path) -> N
     assert installed is not None and installed.port == reserved
 
 
-def test_origin_migration_rotates_exact_callbacks_only_with_the_operator(
-    authed_client: TestClient,
-    installing: tuple[apps.AppManager, FakeRegistry],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    manager, fake = installing
-    record = _record(_manifest(signIn=True))
-    manager.store.put(record)
+def _moved_app(manager: apps.AppManager) -> Path:
+    """An app that signs in, registered at a direct-port address, now on HTTPS."""
+    manager.store.put(_record(_manifest(signIn=True)))
     manager.store.put_oidc_client("tiny", "c-old")
     apps_routes.write_private(manager.store.oidc_secret_file("tiny"), "old-secret")
     saved = manager.store.data_dir("tiny") / "chat-data"
     saved.parent.mkdir(parents=True, exist_ok=True)
     saved.write_text("keep my chats")
     manager._public_origin = lambda app_id: "https://workbench.home.arpa:8443"
+    return saved
+
+
+HTTPS_CALLBACK = ["https://workbench.home.arpa:8443/oidc/callback"]
+
+
+def test_a_restart_moves_the_return_address_and_keeps_the_client(
+    authed_client: TestClient,
+    installing: tuple[apps.AppManager, FakeRegistry],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """2026-10-05: the client follows the app's address; it is not replaced,
+    so its sign-ins carry on. (Before, a Restart deleted and re-made it.)"""
+    manager, fake = installing
+    saved = _moved_app(manager)
 
     async def restart(_record):
         return None
 
     monkeypatch.setattr(manager, "restart", restart)
     assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
+    assert fake.calls == [
+        (
+            "PUT",
+            "/v1/oidc/clients/c-old/redirect-uris",
+            authed_client.headers["Authorization"],
+            {"redirectUris": HTTPS_CALLBACK},
+        )
+    ]
+    assert manager.store.oidc_client("tiny") == "c-old"
+    assert manager.store.oidc_secret_file("tiny").read_text() == "old-secret"
+    assert saved.read_text() == "keep my chats"
+    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
+    assert len(fake.calls) == 1
+    # Returning to direct ports moves it back the same way.
+    manager._public_origin = lambda app_id: None
+    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
+    assert len(fake.calls) == 2 and fake.calls[-1][0] == "PUT"
+    assert all(uri.startswith("http://") for uri in fake.calls[-1][3]["redirectUris"])
+
+
+def test_a_restart_registers_again_only_a_client_the_root_lost(
+    authed_client: TestClient,
+    installing: tuple[apps.AppManager, FakeRegistry],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = installing
+    _moved_app(manager)
+
+    async def restart(_record):
+        return None
+
+    monkeypatch.setattr(manager, "restart", restart)
+    lost = HTTPException(404, detail="no such app")
+    real = fake.forward
+
+    async def forward(method: str, path: str, **kw: Any) -> Any:
+        if method == "PUT":
+            fake.calls.append((method, path, kw.get("authorization"), kw.get("body")))
+            raise lost
+        return await real(method, path, **kw)
+
+    monkeypatch.setattr(fake, "forward", forward)
+    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
     assert [call[:2] for call in fake.calls] == [
+        ("PUT", "/v1/oidc/clients/c-old/redirect-uris"),
         ("DELETE", "/v1/oidc/clients/c-old"),
         ("POST", "/v1/oidc/clients"),
     ]
-    assert fake.calls[-1][3]["redirectUris"] == ["https://workbench.home.arpa:8443/oidc/callback"]
-    assert all(call[2] == authed_client.headers["Authorization"] for call in fake.calls)
+    assert fake.calls[-1][3]["redirectUris"] == HTTPS_CALLBACK
+    assert manager.store.oidc_client("tiny") == "c-made"
+    # Any other refusal is the operator's to see, and changes nothing.
+    fake.calls.clear()
+    lost = HTTPException(403, detail="not this machine's")
+    manager._public_origin = lambda app_id: "https://elsewhere.home.arpa:8443"
+    assert authed_client.post("/v1/apps/tiny/restart").status_code == 403
+    assert [call[0] for call in fake.calls] == ["PUT"]
+    assert manager.store.oidc_client("tiny") == "c-made"
+
+
+async def test_at_boot_the_agent_moves_it_with_its_own_token(
+    authed_client: TestClient,
+    app: FastAPI,
+    installing: tuple[apps.AppManager, FakeRegistry],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Troy, 2026-10-05: Eugene updates Workbench's return address itself at
+    startup -- no operator, no Restart, the same client and secret."""
+    from eugene_plexus_agent import sign_in_refresh
+
+    manager, fake = installing
+    saved = _moved_app(manager)
+    app.state.client_key_registry = fake
+    monkeypatch.setattr(sign_in_refresh, "_FIRST_PAUSE", 0.01)
+    attempts = {"n": 0}
+    real = fake.forward
+
+    async def forward(method: str, path: str, **kw: Any) -> Any:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            fake.calls.append((method, path, kw.get("authorization"), kw.get("body")))
+            raise HTTPException(503, detail="the control root is starting")
+        return await real(method, path, **kw)
+
+    monkeypatch.setattr(fake, "forward", forward)
+    assert "moving this app's sign-in address" in (manager.view(manager.store.get("tiny")).detail)
+    with caplog.at_level("INFO"):
+        await asyncio.wait_for(sign_in_refresh.run(app), 10)
+    assert [call[:3] for call in fake.calls] == [
+        ("PUT", "/v1/oidc/clients/c-old/redirect-uris", None),
+        ("PUT", "/v1/oidc/clients/c-old/redirect-uris", None),
+    ]
+    assert fake.calls[-1][3] == {"redirectUris": HTTPS_CALLBACK}
+    assert manager.store.oidc_client("tiny") == "c-old"
+    assert manager.store.oidc_secret_file("tiny").read_text() == "old-secret"
+    assert manager.sign_in_registration_current(manager.store.get("tiny").manifest)
+    assert not (manager.view(manager.store.get("tiny")).detail or "")
     assert saved.read_text() == "keep my chats"
-    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
+    assert "moved tiny's sign-in address" in caplog.text
+    # Current now: the next boot asks nothing.
+    await asyncio.wait_for(sign_in_refresh.run(app), 10)
     assert len(fake.calls) == 2
-    # Returning to direct ports is an explicit migration too.
-    manager._public_origin = lambda app_id: None
-    assert authed_client.post("/v1/apps/tiny/restart").status_code == 200
-    assert len(fake.calls) == 4
-    assert all(uri.startswith("http://") for uri in fake.calls[-1][3]["redirectUris"])
+
+
+async def test_at_boot_a_client_it_may_not_move_is_left_for_the_operator(
+    authed_client: TestClient,
+    app: FastAPI,
+    installing: tuple[apps.AppManager, FakeRegistry],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from eugene_plexus_agent import sign_in_refresh
+
+    manager, fake = installing
+    _moved_app(manager)
+    app.state.client_key_registry = fake
+    monkeypatch.setattr(sign_in_refresh, "_FIRST_PAUSE", 0.01)
+    fake.refuse = HTTPException(403, detail="Not this machine's to change")
+    with caplog.at_level("WARNING"):
+        await asyncio.wait_for(sign_in_refresh.run(app), 10)
+    assert [call[0] for call in fake.calls] == ["PUT"]
+    assert "Restart it in Apps" in caplog.text
+    assert not manager.sign_in_registration_current(manager.store.get("tiny").manifest)
+
+
+async def test_at_boot_nothing_is_asked_of_an_unenrolled_machine(
+    authed_client: TestClient, app: FastAPI, installing: tuple[apps.AppManager, FakeRegistry]
+) -> None:
+    from eugene_plexus_agent import sign_in_refresh
+
+    manager, fake = installing
+    _moved_app(manager)
+    fake.enrolled = False
+    app.state.client_key_registry = fake
+    await asyncio.wait_for(sign_in_refresh.run(app), 10)
+    assert fake.calls == []
 
 
 def test_an_uninstall_whose_client_removal_fails_removes_nothing_else(

@@ -90,11 +90,23 @@ def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> 
     if auth.is_revoked(token):
         raise revoked_session_problem()
     try:
-        return auth.trust.verify(token, classes=classes)
+        claims = auth.trust.verify(token, classes=classes)
     except tokens.TokenError as exc:
         raise _problem(
             status.HTTP_401_UNAUTHORIZED, "Invalid token", f"Bearer token rejected: {exc}"
         ) from exc
+    # An operator session that arrived through the HTTPS entry point keeps a
+    # configuration applied from Settings; without one it goes back
+    # (`entrypoint_setup`).
+    if (
+        claims.is_session
+        and getattr(request.state, "via_entrypoint", False)
+        and getattr(request.app.state, "entrypoint_confirm_by", None) is not None
+    ):
+        from .entrypoint_setup import confirm
+
+        confirm(request.app)
+    return claims
 
 
 def _bearer(creds: HTTPAuthorizationCredentials | None) -> str:

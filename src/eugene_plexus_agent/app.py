@@ -251,7 +251,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         supervisor = Supervisor(
             log=log,
             auth_state=app.state.auth_state,
-            shared_child_env=lambda: shared_child_env(settings, state, identity),
+            shared_child_env=lambda kind=None: shared_child_env(settings, state, identity, kind),
         )
         owns_supervisor = True
     else:
@@ -457,9 +457,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             ).run(),
             name="https-entrypoint",
         )
+    from . import entrypoint_setup, sign_in_refresh
+
+    # A configuration applied from Settings goes back unless an operator
+    # signs in through it in time; and every app's sign-in return address
+    # follows where it is opened now (2026-10-05).
+    approval_task = (
+        asyncio.create_task(entrypoint_setup.watch_approval(app), name="entrypoint-approval")
+        if entry_task is not None and getattr(app.state, "entrypoint_confirm_by", None)
+        else None
+    )
+    sign_in_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(sign_in_refresh.run(app), name="sign-in-addresses")
+    )
     try:
         yield
     finally:
+        for task in (approval_task, sign_in_task):
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         if entry_task is not None:
             entry_task.cancel()
             await asyncio.gather(entry_task, return_exceptions=True)
@@ -708,7 +727,10 @@ async def resolve_gateway_for_apps(app: FastAPI) -> tuple[str | None, str | None
 
 
 def shared_child_env(
-    settings: Settings, state: AgentState, identity: node_identity.NodeIdentityStore
+    settings: Settings,
+    state: AgentState,
+    identity: node_identity.NodeIdentityStore,
+    kind: str | None = None,
 ) -> dict[str, str]:
     """Env values (suffix -> value) every spawned component gets, prefixed
     per kind by the planner.
@@ -724,10 +746,16 @@ def shared_child_env(
         "AGENT_URL": node_identity.local_agent_url(settings.bind_host, int(settings.bind_port)),
     }
     if settings.entrypoint_config:
-        env["BIND_HOST"] = "127.0.0.1"
         if settings._entrypoint_console_origin:
             env["AGENT_PUBLIC_ORIGIN"] = settings._entrypoint_console_origin
-        return env
+        # **The control root keeps its direct port unless the entry point
+        # serves the node hostname** (2026-10-05). Enrolled machines know the
+        # root by that address and it is all they use; moving it behind the
+        # entry point meant editing every machine's node.yaml by hand. Its
+        # port takes signed and authenticated calls only, as it did before.
+        if not (kind == "control" and not settings._entrypoint_nodes):
+            env["BIND_HOST"] = "127.0.0.1"
+            return env
     advertise = node_identity.effective_advertise_url(
         state.get_config("advertiseUrl"), identity.record.advertise_url
     )

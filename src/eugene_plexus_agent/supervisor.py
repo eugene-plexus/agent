@@ -343,7 +343,7 @@ class _ComponentPlanner:
         entry: ComponentEntry,
         log: logging.Logger,
         auth_state: AuthState | None = None,
-        shared_child_env: Callable[[], dict[str, str]] | None = None,
+        shared_child_env: Callable[..., dict[str, str]] | None = None,
     ) -> None:
         self.entry = entry
         self._log = log
@@ -446,15 +446,19 @@ class _ComponentPlanner:
         # included, since a bind host and an agent URL are bootstrap, not
         # the auth trio. Applied before the operator's `spawn.env`, so an
         # explicit per-component value still wins.
-        if self._shared_child_env is not None:
-            for suffix, value in self._shared_child_env().items():
-                env[f"{prefix}_{suffix}"] = str(value)
+        shared = (
+            self._shared_child_env(kind=self.entry.kind.value)
+            if self._shared_child_env is not None
+            else {}
+        )
+        for suffix, value in shared.items():
+            env[f"{prefix}_{suffix}"] = str(value)
 
         if spawn.env:
             env.update({k: str(v) for k, v in spawn.env.items()})
         # The opt-in HTTPS entry point must keep backends private, including
         # a legacy per-component bind override saved before migration.
-        if self._shared_child_env and self._shared_child_env().get("BIND_HOST") == "127.0.0.1":
+        if shared.get("BIND_HOST") == "127.0.0.1":
             env[f"{prefix}_BIND_HOST"] = "127.0.0.1"
 
         # Force unbuffered Python output. Without this, redirecting the
@@ -582,7 +586,7 @@ class SupervisedProcess:
         entry: ComponentEntry,
         log: logging.Logger,
         auth_state: AuthState | None = None,
-        shared_child_env: Callable[[], dict[str, str]] | None = None,
+        shared_child_env: Callable[..., dict[str, str]] | None = None,
     ) -> SupervisedProcess:
         """Supervise one Eugene Plexus component."""
         return cls(_ComponentPlanner(entry, log, auth_state, shared_child_env), log)
@@ -1005,7 +1009,7 @@ class Supervisor:
         self,
         log: logging.Logger | None = None,
         auth_state: AuthState | None = None,
-        shared_child_env: Callable[[], dict[str, str]] | None = None,
+        shared_child_env: Callable[..., dict[str, str]] | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
         self._shared_child_env = shared_child_env

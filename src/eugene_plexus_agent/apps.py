@@ -514,6 +514,10 @@ class AppStore:
     def oidc_secret_file(self, app_id: str) -> Path:
         return self.data_dir(app_id) / OIDC_SECRET_FILE
 
+    def sign_in_stamp_file(self, app_id: str) -> Path:
+        """The return addresses last registered for this app's sign-in."""
+        return self.oidc_secret_file(app_id).with_suffix(".redirects.json")
+
 
 def _url(value: str | None) -> AnyUrl | None:
     return AnyUrl(value) if value else None
@@ -1297,7 +1301,8 @@ class AppManager:
             detail = "This app has no published address in single-port mode."
         if record.manifest.signIn and not self.sign_in_registration_current(record.manifest):
             detail = (
-                "Restart this app in Eugene to apply its changed sign-in address. Chats are kept."
+                "Eugene is moving this app's sign-in address to where it is opened now. If "
+                "this stays, Restart it in Apps. Chats are kept."
             )
         if key is not None and not self.store.key_file(record.id).is_file():
             detail = (
@@ -1390,7 +1395,7 @@ class AppManager:
         redirects = self.sign_in_redirects(
             manifest.id, manifest.signInCallbackPath or "/oidc/callback"
         )
-        stamp = self.store.oidc_secret_file(manifest.id).with_suffix(".redirects.json")
+        stamp = self.store.sign_in_stamp_file(manifest.id)
         previous = None
         with contextlib.suppress(OSError, ValueError):
             previous = json.loads(stamp.read_text(encoding="utf-8"))

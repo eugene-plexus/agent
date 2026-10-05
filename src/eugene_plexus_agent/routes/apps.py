@@ -279,17 +279,33 @@ async def _ensure_sign_in(request: Request, manager: AppManager, manifest: AppMa
     redirects = manager.sign_in_redirects(
         manifest.id, manifest.signInCallbackPath or "/oidc/callback"
     )
-    stamp = secret_file.with_suffix(".redirects.json")
+    stamp = store.sign_in_stamp_file(manifest.id)
     # Old direct-port installs have no stamp. Do not rotate those merely
-    # because the agent was upgraded; do rotate when entering HTTPS mode.
+    # because the agent was upgraded.
     current = manager.sign_in_registration_current(manifest)
-    if (
-        store.oidc_client(manifest.id)
-        and secret_file.is_file()
-        and secret_file.stat().st_size
-        and current
-    ):
+    registered = bool(
+        store.oidc_client(manifest.id) and secret_file.is_file() and secret_file.stat().st_size
+    )
+    if registered and current:
         return
+    if registered:
+        # Its address moved (one HTTPS port): move the client with it, so its
+        # sign-ins carry on, rather than replacing it (2026-10-05). Only a
+        # client the root no longer has is registered again below.
+        try:
+            await registry(request).forward(
+                "PUT",
+                f"/v1/oidc/clients/{store.oidc_client(manifest.id)}/redirect-uris",
+                authorization=request.headers.get("authorization"),
+                body={"redirectUris": redirects},
+            )
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+        else:
+            write_private(stamp, json.dumps(redirects))
+            log.info("moved app %s's sign-in address to %s", manifest.id, ", ".join(redirects))
+            return
     await _drop_sign_in(request, manager, manifest.id)
     node = manager.node_name() or "this-node"
     created = await registry(request).forward(

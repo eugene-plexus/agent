@@ -9,6 +9,7 @@ state file, which interface to bind, and the safe-mode escape hatch.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import PrivateAttr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -54,12 +55,26 @@ class Settings(BaseSettings):
     which is before any config it could read is open."""
 
     entrypoint_config: Path | None = None
-    """Opt-in container HTTPS entry point. An invalid file stops the agent; a
-    missing one falls back to the direct ports (`entrypoint.resolve`)."""
+    """Opt-in container HTTPS entry point. Unset, `entrypoint.json` beside
+    `agent.yaml` is read where the bundled proxy exists (Settings, Container
+    access setup writes it). An invalid file stops the agent; a missing one
+    falls back to the direct ports (`entrypoint.resolve`)."""
     entrypoint_binary: str = "caddy"
+    entrypoint_confirm_seconds: int = 900
+    """How long a configuration applied from Settings waits for an operator
+    request through it before going back. Startup-only; tests shorten it."""
     _entrypoint_console_origin: str | None = PrivateAttr(default=None)
     _entrypoint_fallback: str | None = PrivateAttr(default=None)
     """Why the entry point named above is off, when its file did not exist."""
+    _entrypoint_named: Path | None = PrivateAttr(default=None)
+    """The file this agent reads, kept after a fallback clears `entrypoint_config`."""
+    _entrypoint_nodes: bool = PrivateAttr(default=False)
+    """The entry point serves the node hostname; otherwise the control root
+    keeps its direct port, so enrolled machines need no change."""
+    _entrypoint_seen: bool = PrivateAttr(default=False)
+    _entrypoint_prepared: bool = PrivateAttr(default=False)
+    _entrypoint_ready: Any = PrivateAttr(default=None)
+    """`entrypoint.prepare`'s answer, once per process."""
 
     @field_validator("passphrase_file", "entrypoint_config", mode="before")
     @classmethod

@@ -149,16 +149,17 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # `--unattended` comes first because a TTY is not the same thing as
     # someone watching one: a Windows scheduled task has both handles as
     # a console and nobody in front of it. See this module's docstring.
-    if settings.entrypoint_config:
-        from .entrypoint import EntryPointConfigError, resolve
+    from .entrypoint import EntryPointConfigError, prepare
 
-        # A missing file falls back to the direct ports and is logged once
-        # logging exists, below; a broken one stops here, in one sentence.
-        try:
-            if resolve(settings) is not None:
-                settings.bind_host = "127.0.0.1"
-        except EntryPointConfigError as exc:
-            raise SystemExit(f"agent: {exc}") from None
+    # The variable's file, or `entrypoint.json` beside agent.yaml where the
+    # bundled proxy exists. A missing file falls back to the direct ports and
+    # is logged once logging exists, below; a broken one stops here, in one
+    # sentence -- unless it was just applied from Settings, which goes back.
+    try:
+        if prepare(settings) is not None:
+            settings.bind_host = "127.0.0.1"
+    except EntryPointConfigError as exc:
+        raise SystemExit(f"agent: {exc}") from None
     refuse_quarantined(settings.config_file)
     if not unattended and is_fresh_boot(settings) and has_tty():
         request = ask(settings)
@@ -265,11 +266,22 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     config = uvicorn.Config(
         app, host=bind_host, port=port, log_level=log_level, forwarded_allow_ips=[]
     )
-    return uvicorn.Server(config)
+    server = uvicorn.Server(config)
+    # How a restart asked for by Settings stops this server (`entrypoint_setup`).
+    app.state.uvicorn_server = server
+    return server
 
 
 def _serve(settings: Settings, *, unattended: bool = False) -> None:
-    build_server(settings, unattended=unattended).run()
+    server = build_server(settings, unattended=unattended)
+    server.run()
+    # Settings applied or turned off the HTTPS entry point: start again, in
+    # this same process, so a container keeps running (`entrypoint_setup`).
+    state = getattr(server.config.app, "state", None)
+    if getattr(state, "restart_requested", False):
+        from .entrypoint_setup import reexec
+
+        reexec()
 
 
 if __name__ == "__main__":

@@ -819,7 +819,7 @@ def test_the_planner_prefixes_shared_env_per_kind_and_the_operator_wins() -> Non
         url="http://127.0.0.1:8091",  # type: ignore[arg-type]
         spawn=SpawnConfig(configFile="/tmp/d1.yaml"),
     )
-    plan = _ComponentPlanner(driver, logging.getLogger("t"), None, lambda: shared).plan()
+    plan = _ComponentPlanner(driver, logging.getLogger("t"), None, lambda **_: shared).plan()
     assert plan is not None
     assert plan.env["EUGENE_PLEXUS_DRIVER_AGENT_URL"] == "http://127.0.0.1:8084"
     assert plan.env["EUGENE_PLEXUS_DRIVER_BIND_HOST"] == "0.0.0.0"
@@ -833,7 +833,7 @@ def test_the_planner_prefixes_shared_env_per_kind_and_the_operator_wins() -> Non
         url="http://127.0.0.1:8083",  # type: ignore[arg-type]
         spawn=SpawnConfig(configFile="/tmp/control.yaml"),
     )
-    plan = _ComponentPlanner(control, logging.getLogger("t"), None, lambda: shared).plan()
+    plan = _ComponentPlanner(control, logging.getLogger("t"), None, lambda **_: shared).plan()
     assert plan is not None
     assert plan.env["EUGENE_PLEXUS_CONTROL_BIND_HOST"] == "0.0.0.0"
     assert not any("TRUST" in k or "SERVICE_TOKEN" in k for k in plan.env)
@@ -847,7 +847,7 @@ def test_the_planner_prefixes_shared_env_per_kind_and_the_operator_wins() -> Non
             configFile="/tmp/d2.yaml", env={"EUGENE_PLEXUS_DRIVER_BIND_HOST": "10.0.0.5"}
         ),
     )
-    plan = _ComponentPlanner(pinned, logging.getLogger("t"), None, lambda: shared).plan()
+    plan = _ComponentPlanner(pinned, logging.getLogger("t"), None, lambda **_: shared).plan()
     assert plan is not None
     assert plan.env["EUGENE_PLEXUS_DRIVER_BIND_HOST"] == "10.0.0.5"
 
