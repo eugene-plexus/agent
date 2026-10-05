@@ -150,10 +150,15 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # someone watching one: a Windows scheduled task has both handles as
     # a console and nobody in front of it. See this module's docstring.
     if settings.entrypoint_config:
-        from .entrypoint import EntryConfig
+        from .entrypoint import EntryPointConfigError, resolve
 
-        EntryConfig.load(settings.entrypoint_config)
-        settings.bind_host = "127.0.0.1"
+        # A missing file falls back to the direct ports and is logged once
+        # logging exists, below; a broken one stops here, in one sentence.
+        try:
+            if resolve(settings) is not None:
+                settings.bind_host = "127.0.0.1"
+        except EntryPointConfigError as exc:
+            raise SystemExit(f"agent: {exc}") from None
     refuse_quarantined(settings.config_file)
     if not unattended and is_fresh_boot(settings) and has_tty():
         request = ask(settings)
@@ -186,6 +191,10 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,
     )
+    if settings._entrypoint_fallback:
+        logging.getLogger("eugene_plexus_agent.entrypoint").warning(
+            "%s", settings._entrypoint_fallback
+        )
 
     bootstrap_state = AgentState(settings.config_file)
     if not settings.safe_mode:

@@ -54,9 +54,12 @@ class Settings(BaseSettings):
     which is before any config it could read is open."""
 
     entrypoint_config: Path | None = None
-    """Opt-in container HTTPS entry point; invalid configuration fails closed."""
+    """Opt-in container HTTPS entry point. An invalid file stops the agent; a
+    missing one falls back to the direct ports (`entrypoint.resolve`)."""
     entrypoint_binary: str = "caddy"
     _entrypoint_console_origin: str | None = PrivateAttr(default=None)
+    _entrypoint_fallback: str | None = PrivateAttr(default=None)
+    """Why the entry point named above is off, when its file did not exist."""
 
     @field_validator("passphrase_file", "entrypoint_config", mode="before")
     @classmethod

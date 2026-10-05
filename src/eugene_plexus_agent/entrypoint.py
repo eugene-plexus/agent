@@ -1,7 +1,9 @@
 """Opt-in container HTTPS ingress. Caddy owns HTTP/TLS; destinations are local.
 
-Configuration is startup-only and fails closed. No URL or forwarding header from
-a request can select an upstream. See specs/docs/design/single-port-entrypoint.md.
+Configuration is startup-only. A file that exists and is invalid stops the
+agent; a variable naming a file that does not exist falls back to the direct
+ports with a warning (`resolve`). No URL or forwarding header from a request can
+select an upstream. See specs/docs/design/single-port-entrypoint.md.
 """
 
 from __future__ import annotations
@@ -23,7 +25,14 @@ from urllib.parse import urlsplit
 
 import certifi
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from ._http import internal_client
 from ._private_files import write_private
@@ -233,6 +242,62 @@ class EntryConfig(BaseModel):
             if item and (not item.is_absolute() or not item.is_file()):
                 raise ValueError(f"TLS file must exist at an absolute path: {item}")
         return config
+
+
+ENV_VARIABLE = "EUGENE_PLEXUS_AGENT_ENTRYPOINT_CONFIG"
+
+
+class EntryPointConfigError(ValueError):
+    """The configuration file exists and cannot be used. Stops the agent."""
+
+
+def resolve(settings: Any) -> EntryConfig | None:
+    """The configuration to run with, and what a missing file means.
+
+    **A missing file falls back to the direct ports** (Troy, 2026-10-04,
+    on the first live NAS migration). The variable set and the file absent
+    crashed the agent with a traceback on every restart, which left the
+    owner with no console to fix it from. Now the variable is cleared for
+    this process, the reason is kept on `settings._entrypoint_fallback` for
+    the log and `/healthz`, and the install runs exactly as it did before
+    the variable was set. Nothing is opened that the old mode did not open:
+    the direct ports are only reachable where the owner still publishes them.
+
+    **A file that exists and cannot be used still stops the agent**, with one
+    sentence instead of a traceback. Someone is part-way through configuring
+    it, and quietly running the old mode would hide a mistake in a file that
+    decides who can reach the console.
+    """
+    path = settings.entrypoint_config
+    if path is None:
+        return None
+    try:
+        return EntryConfig.load(path)
+    except FileNotFoundError:
+        settings.entrypoint_config = None
+        settings._entrypoint_fallback = (
+            f"{ENV_VARIABLE} names {path}, which does not exist, so the HTTPS entry "
+            "point is off and Eugene is serving on its direct ports, as it did before "
+            "the variable was set. To use one HTTPS port, save the configuration from "
+            f"Settings, Container access setup, as {path} and restart the container. "
+            "To stay on the direct ports, remove the variable."
+        )
+        return None
+    except ValidationError as exc:
+        reason = "; ".join(
+            (".".join(str(part) for part in error["loc"]) + ": " if error["loc"] else "")
+            + error["msg"]
+            for error in exc.errors(include_input=False, include_context=False)
+        )
+    except (OSError, ValueError) as exc:
+        reason = str(exc)
+    raise EntryPointConfigError(
+        f"the HTTPS entry point configuration at {path} cannot be used: {reason}. "
+        "Eugene does not start with a broken file, so it never opens ports you meant "
+        "to close. Fix the file (Settings, Container access setup prepares a valid one) "
+        f"and restart the container, or remove {ENV_VARIABLE} to go back to the direct "
+        "ports."
+    )
 
 
 def caddy_config(
@@ -610,7 +675,12 @@ class EntryPoint:
 
 def install(app: Any) -> None:
     settings = app.state.settings
-    config = EntryConfig.load(settings.entrypoint_config) if settings.entrypoint_config else None
+    named = settings.entrypoint_config
+    config = resolve(settings)
+    if named is not None and config is None:
+        # `build_server` normally resolves first and says this itself; an app
+        # built without it (the Windows service, tests) says it here.
+        log.warning("%s", settings._entrypoint_fallback)
     app.state.entrypoint_config = config
     app.state.entrypoint_token = secrets.token_urlsafe(32) if config else None
     if config:

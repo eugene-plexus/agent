@@ -38,6 +38,11 @@ async def healthz(request: Request) -> Health:
     (`install_permissions`). It does not degrade the status -- the
     install works, and a status that flips for a permissions problem
     would hide the next real outage behind a known one.
+
+    **`entrypointFallback`** rides the same way: the sentence saying the
+    HTTPS entry point's file was missing and the direct ports are in use
+    (`entrypoint.resolve`). Not a status either -- the install works, on
+    the mode it had before the variable was set.
     """
     safe_mode = bool(getattr(request.app.state, "safe_mode", False))
     if safe_mode:
@@ -59,6 +64,7 @@ async def healthz(request: Request) -> Health:
             details={
                 **_permissions(request),
                 **_trust(request),
+                **_entrypoint(request),
                 "configError": reason,
                 "configFile": str(state.path) if state is not None else None,
                 "configFilePreserved": (
@@ -83,6 +89,7 @@ async def healthz(request: Request) -> Health:
             details={
                 **_permissions(request),
                 **_trust(request),
+                **_entrypoint(request),
                 "appsError": apps_reason,
                 "appsFile": str(apps.store.path),
                 "appsFilePreserved": str(
@@ -96,13 +103,19 @@ async def healthz(request: Request) -> Health:
         version=__version__,
         component="agent",
         safeMode=False,
-        details={**_permissions(request), **_trust(request)} or None,
+        details={**_permissions(request), **_trust(request), **_entrypoint(request)} or None,
     )
 
 
 def _permissions(request: Request) -> dict[str, list[str]]:
     sentences = list(getattr(request.app.state, "install_permissions", None) or [])
     return {"installPermissions": sentences} if sentences else {}
+
+
+def _entrypoint(request: Request) -> dict[str, str]:
+    settings = getattr(request.app.state, "settings", None)
+    reason = getattr(settings, "_entrypoint_fallback", None) if settings is not None else None
+    return {"entrypointFallback": reason} if reason else {}
 
 
 def _trust(request: Request) -> dict[str, int]:

@@ -365,3 +365,108 @@ def test_setup_preview_preserves_linux_certificate_paths_on_any_os(authed_client
     reply = authed_client.post("/v1/entrypoint/preview", json={"configuration": body})
     assert reply.status_code == 200, reply.text
     assert reply.json()["configuration"]["certificate"] == "/data/tls/chain.pem"
+
+
+# -- a missing or broken configuration file ---------------------------------
+#
+# Troy, 2026-10-04, on the first live NAS migration: the variable set and the
+# file absent crashed the agent with a traceback on every restart. A missing
+# file now falls back to the direct ports; a broken one still stops the agent,
+# in one sentence.
+
+
+def _settings(tmp_path: Path, entrypoint: Path):
+    from eugene_plexus_agent.settings import Settings
+
+    # 0.0.0.0 is what the container image sets, and the value a fallback
+    # must leave alone: forcing loopback would make the direct ports unusable.
+    return Settings(
+        config_file=tmp_path / "agent.yaml",
+        default_topology=False,
+        bind_host="0.0.0.0",
+        entrypoint_config=entrypoint,
+    )
+
+
+def test_a_missing_file_falls_back_to_the_direct_ports(tmp_path, caplog, monkeypatch):
+    import logging
+
+    from eugene_plexus_agent.__main__ import build_server
+
+    # build_server's basicConfig(force=True) would remove caplog's handler.
+    monkeypatch.setattr(logging, "basicConfig", lambda **kw: None)
+    missing = tmp_path / "entrypoint.json"
+    settings = _settings(tmp_path, missing)
+    with caplog.at_level("WARNING"):
+        server = build_server(settings, unattended=True)
+    assert server.config.host == "0.0.0.0"
+    assert settings.entrypoint_config is None  # children get the direct-mode environment
+    assert server.config.app.state.entrypoint_config is None
+    sentence = settings._entrypoint_fallback
+    assert str(missing) in sentence and "EUGENE_PLEXUS_AGENT_ENTRYPOINT_CONFIG" in sentence
+    assert "direct ports" in sentence and "restart the container" in sentence
+    assert caplog.text.count(sentence) == 1, caplog.text
+
+
+def test_install_without_build_server_also_falls_back_and_says_so(tmp_path, caplog):
+    from eugene_plexus_agent.entrypoint import install
+
+    settings = _settings(tmp_path, tmp_path / "absent" / "entrypoint.json")
+    app = SimpleNamespace(state=SimpleNamespace(settings=settings))
+    with caplog.at_level("WARNING"):
+        install(app)
+    assert app.state.entrypoint_config is None and app.state.entrypoint_token is None
+    assert settings._entrypoint_fallback in caplog.text
+
+
+def test_a_valid_file_is_kept(tmp_path):
+    from eugene_plexus_agent.entrypoint import resolve
+
+    path = tmp_path / "entrypoint.json"
+    path.write_text(config().model_dump_json(exclude_none=True), encoding="utf-8")
+    settings = _settings(tmp_path, path)
+    assert resolve(settings) == config()
+    assert settings.entrypoint_config == path and settings._entrypoint_fallback is None
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        ("{not json", "Invalid JSON"),
+        (
+            json.dumps(
+                {
+                    **config().model_dump(mode="json", exclude_none=True),
+                    "internal_ca": False,
+                    "listen_port": 8088,
+                    "proxy": {"addresses": ["172.18.0.0/16"]},
+                }
+            ),
+            "trust individual proxy IPs",
+        ),
+        (None, "entrypoint.json"),  # a directory where the file should be
+    ],
+)
+def test_a_broken_file_stops_the_agent_in_one_sentence(tmp_path, body, reason):
+    from eugene_plexus_agent.__main__ import build_server
+
+    path = tmp_path / "entrypoint.json"
+    if body is None:
+        path.mkdir()
+    else:
+        path.write_text(body, encoding="utf-8")
+    settings = _settings(tmp_path, path)
+    with pytest.raises(SystemExit) as stopped:
+        build_server(settings, unattended=True)
+    message = str(stopped.value.code)
+    assert message.startswith(f"agent: the HTTPS entry point configuration at {path}")
+    assert reason in message and "\n" not in message and "Traceback" not in message
+    assert "EUGENE_PLEXUS_AGENT_ENTRYPOINT_CONFIG" in message
+    assert settings.entrypoint_config == path and settings._entrypoint_fallback is None
+
+
+def test_healthz_names_the_fallback_without_degrading(client, settings):
+    settings._entrypoint_fallback = "the file was missing"
+    reply = client.get("/healthz").json()
+    assert reply["status"] == "ok"
+    assert reply["details"]["entrypointFallback"] == "the file was missing"
