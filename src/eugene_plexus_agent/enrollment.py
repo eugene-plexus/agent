@@ -318,6 +318,7 @@ async def perform_enrollment(
         recovery_public_key=_str_or_none(body.get("recoveryPublicKey")),
         advertise_url=advertise_url,
         job_site="files" in (body.get("grants") or []),
+        site_owner=_str_or_none(body.get("owner")),
     )
     return EnrollmentOutcome(
         name=granted_name, epoch=epoch, bundle=bundle, advertise_url=advertise_url
