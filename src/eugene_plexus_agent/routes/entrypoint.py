@@ -121,6 +121,12 @@ def _steps(config: EntryConfig) -> list[str]:
             "Mount your private CA's public certificate at trusted_ca so Eugene's services "
             "can verify it. Trust that CA on browsers, proxies and nodes too."
         )
+    if config.public_console:
+        steps.append(
+            "The console answers any network: anyone who can reach it can try to sign in, "
+            "and your passphrase is all that stops them. Use a long passphrase used nowhere "
+            "else, and watch Logs for failed sign-ins."
+        )
     steps += [
         nodes_note,
         "Apply from this page: Eugene saves it and restarts. Then open "

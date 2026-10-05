@@ -166,6 +166,11 @@ class EntryConfig(BaseModel):
     internal_ca: bool = False
     acme: AutomaticCertificates | None = None
     proxy: TrustedProxy | None = None
+    public_console: bool = False
+    """The owner chose to let the console answer any network, risks read
+    (Troy, 2026-10-05: behind Cloudflare every visitor is a Cloudflare
+    address, so a home-only console refuses its owner at home). Without it a
+    console network covering everything is refused, as it always was."""
 
     @property
     def private_http(self) -> bool:
@@ -178,9 +183,16 @@ class EntryConfig(BaseModel):
             raise ValueError("each service needs a different hostname")
         if len({urlsplit(s.origin).port or 443 for s in services}) != 1:
             raise ValueError("all public origins must share one HTTPS port")
-        for service in (self.console, self.nodes):
-            if service and any(ipaddress.ip_network(n).prefixlen == 0 for n in service.networks):
-                raise ValueError("console and node administration require specific source networks")
+        everything = lambda service: any(  # noqa: E731
+            ipaddress.ip_network(n).prefixlen == 0 for n in service.networks
+        )
+        if self.nodes and everything(self.nodes):
+            raise ValueError("node connections require specific source networks")
+        if everything(self.console) and not self.public_console:
+            raise ValueError(
+                "the console answers any network only with public_console: true "
+                "(Settings, Container access setup: allow the console from any network)"
+            )
         if self.private_http:
             if self.internal_ca or self.certificate or self.private_key or self.acme:
                 raise ValueError("private HTTP uses the trusted proxy's certificates only")

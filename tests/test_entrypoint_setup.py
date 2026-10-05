@@ -423,3 +423,49 @@ def test_direct_refusals_name_the_connecting_address(tmp_path):
     texts = [h["body"] for _, h in _bodies(caddy_config(direct, tmp_path, "s", {"agent": 8079}))]
     assert len(texts) == 3
     assert "does not answer {http.request.remote.host}" in texts[1]
+
+
+# --------------------------------------------------------------------------- #
+# the console from any network, only when the owner says so (2026-10-05)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_public_console_needs_the_owner_to_say_so(tmp_path):
+    public = {"origin": "https://eugene.example.org", "networks": ["0.0.0.0/0", "::/0"]}
+    with pytest.raises(ValueError, match="public_console"):
+        proxy_config(console=public)
+    allowed = proxy_config(console=public, public_console=True)
+    document = caddy_config(allowed, tmp_path, "secret", {"agent": 8079})
+    routes = document["apps"]["http"]["servers"]["entry"]["routes"]
+    console = next(
+        r
+        for r in routes
+        if r.get("match", [{}])[0].get("host") == ["eugene.example.org"]
+        and "path" not in r["match"][0]
+    )
+    assert console["match"][0]["client_ip"]["ranges"] == ["0.0.0.0/0", "::/0"]
+    # It opens the console and nothing else: node connections stay restricted.
+    nodes = {"origin": "https://nodes.example.org", "networks": ["0.0.0.0/0"]}
+    with pytest.raises(ValueError, match="node connections require specific"):
+        proxy_config(console=public, public_console=True, nodes=nodes)
+
+
+def test_the_preview_says_what_a_public_console_risks(authed_client: TestClient):
+    body = as_json(
+        proxy_config(
+            console={"origin": "https://eugene.example.org", "networks": ["0.0.0.0/0"]},
+            public_console=True,
+        )
+    )
+    reply = authed_client.post("/v1/entrypoint/preview", json={"configuration": body})
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["configuration"]["public_console"] is True
+    assert any(
+        "anyone who can reach it can try to sign in" in step
+        for step in reply.json()["instructions"]
+    )
+    refused = authed_client.post(
+        "/v1/entrypoint/preview",
+        json={"configuration": {**body, "public_console": False}},
+    )
+    assert refused.status_code == 400 and "public_console" in refused.text
