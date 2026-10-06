@@ -92,6 +92,11 @@ def test_an_operation_is_bound_to_this_machine_and_in_time(app: FastAPI) -> None
     ]:
         with pytest.raises(ValueError):
             relay.validate(operation(**{field: value}), CONFIG)
+    # The root's own record agreeing on another machine's key is not enough:
+    # the claim must name this machine's key.
+    other = {**CONFIG, "nodeKey": "other-key"}
+    with pytest.raises(ValueError):
+        relay.validate(operation(nodeKey="other-key"), other)
 
 
 def test_on_a_node_the_grants_must_be_the_folders_the_root_registered(app: FastAPI) -> None:
