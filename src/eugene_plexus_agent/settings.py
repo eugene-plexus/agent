@@ -72,7 +72,6 @@ class Settings(BaseSettings):
     """The entry point serves the node hostname; otherwise the control root
     keeps its direct port, so enrolled machines need no change."""
     _entrypoint_nodes_origin: str | None = PrivateAttr(default=None)
-    _entrypoint_nodes_public: bool = PrivateAttr(default=False)
     _entrypoint_nodes_probe: str | None = PrivateAttr(default=None)
     """Handed to the control root: its nodes name, whether that name answers
     any network for the node paths, and where to read the key it presents."""

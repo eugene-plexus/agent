@@ -319,16 +319,6 @@ class IdentityRecord:
     epoch: int | None = None
     advertise_url: str | None = None
     enrolled_at: str | None = None
-    job_site: bool | None = None
-    """True when this machine joined as a Job Site (remote-nodes.md §3.2): it
-    connects out and nothing connects to it, it announces no address, runs no
-    inference work, and pins its root's identity key (`root_tls`). None, and
-    absent from `node.yaml`, on every other node."""
-    site_owner: str | None = None
-    """A Job Site's owner (a person's id), pinned when the person confirmed
-    the join at this machine (`Enrollment.owner`). Its host takes management
-    actions from this person alone, and a poll naming anyone else changes
-    nothing (remote-nodes.md J6b, rule 2 of §3.3)."""
 
     @property
     def enrolled(self) -> bool:
@@ -349,8 +339,6 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("epoch", "epoch"),
     ("advertiseUrl", "advertise_url"),
     ("enrolledAt", "enrolled_at"),
-    ("jobSite", "job_site"),
-    ("siteOwner", "site_owner"),
 )
 
 
@@ -388,8 +376,6 @@ class NodeIdentityStore:
                     values[attr] = int(value) if isinstance(value, int) else None
                 elif attr == "advertise_sequence":
                     values[attr] = int(value) if isinstance(value, int) else 0
-                elif attr == "job_site":
-                    values[attr] = True if value is True else None
                 else:
                     values[attr] = (
                         str(value) if isinstance(value, str | int) and value != "" else None
@@ -462,14 +448,10 @@ class NodeIdentityStore:
         control_public_key: str,
         recovery_public_key: str | None,
         advertise_url: str | None,
-        job_site: bool = False,
-        site_owner: str | None = None,
     ) -> IdentityRecord:
         with self._lock:
             self._record = replace(
                 self._record,
-                job_site=True if job_site else None,
-                site_owner=site_owner if job_site else None,
                 name=name,
                 control_url=control_url.rstrip("/"),
                 epoch=epoch,
@@ -540,24 +522,9 @@ class NodeIdentityStore:
                 advertise_url=None,
                 advertise_sequence=0,
                 enrolled_at=None,
-                job_site=None,
-                site_owner=None,
             )
             self._write_locked()
             return self._record
-
-    def pin_site_owner(self, owner: str) -> str:
-        """The owner this Job Site answers to: the one pinned at its join, or,
-        for a site joined before owners were pinned, the first one its root
-        names. Never replaced after that: the root's state saying someone
-        else owns this machine is not enough (rule 2 of §3.3)."""
-        with self._lock:
-            if self._record.site_owner:
-                return self._record.site_owner
-            self._record = replace(self._record, site_owner=owner)
-            self._write_locked()
-            log.info("this job site pinned its owner")
-            return owner
 
     def accept_epoch(self, epoch: int) -> None:
         """Record a newer control-root epoch. Raises `FencedError` on a lower one.

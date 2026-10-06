@@ -413,13 +413,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # task, not an await: a management-plane call must not hold up
     # supervision, and an unreachable root is a normal state here.
     announce_task: asyncio.Task[None] | None = None
-    # A job site has no address to announce: nothing connects to it.
-    if not settings.safe_mode and identity.record.enrolled and not identity.record.job_site:
+    if not settings.safe_mode and identity.record.enrolled:
         announce_task = asyncio.create_task(_announce_address(app, settings, state, identity))
-    from .root_tls import RootLink
-
-    # How this machine's own calls reach its root: pinned on a job site (J7a).
-    app.state.root_link = RootLink(identity)
 
     registry = ClientKeyRegistry(app)
     app.state.client_key_registry = registry
@@ -442,12 +437,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.safe_mode
         else asyncio.create_task(RunWorker(app).run_forever(), name="run-operations")
     )
-    from .site_host import SiteHostRelay
+    from .site_host import SiteHostSupervisor
 
+    # A job site on this machine is its own enrollment (J19, J23): the agent
+    # installs and keeps its host, and relays nothing for it.
+    app.state.site_host = SiteHostSupervisor(app)
     helper_task = (
         None
         if settings.safe_mode
-        else asyncio.create_task(SiteHostRelay(app).run(), name="site-host")
+        else asyncio.create_task(app.state.site_host.run(), name="site-host")
     )
     from .entrypoint import EntryPoint
 
@@ -540,9 +538,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # makes. Last because everything above may still be probing on
         # the way down, and closing a pool under an in-flight probe
         # turns an orderly shutdown into a traceback.
-        link = getattr(app.state, "root_link", None)
-        if link is not None:
-            await link.aclose()
         await aclose_shared()
 
 
@@ -568,21 +563,9 @@ async def _pull_trust_bundle(app: FastAPI) -> None:
             record = app.state.node_identity.record
             if trust.enrolled and record.control_url:
                 try:
-                    link = getattr(app.state, "root_link", None)
-                    if record.job_site and link is not None:
-                        # The public node route gives the bundle only to a
-                        # member presenting its own token (J3), and a job
-                        # site re-reads the root's TLS key list with it.
-                        response = await link.request(
-                            "GET",
-                            "/v1/trust/bundle",
-                            headers={"Authorization": "Bearer " + trust.agent_token("control")},
-                        )
-                        await link.recheck()
-                    else:
-                        response = await client.get(
-                            f"{str(record.control_url).rstrip('/')}/v1/trust/bundle"
-                        )
+                    response = await client.get(
+                        f"{str(record.control_url).rstrip('/')}/v1/trust/bundle"
+                    )
                     if response.status_code == 200:
                         held = trust.bundle
                         taken = trust.accept(str(response.json()["jws"]))
@@ -777,7 +760,6 @@ def shared_child_env(
             # Job Sites (remote-nodes.md §3.1): invitations name this
             # origin, and the root signs the TLS key it presents (J7a).
             env["NODES_ORIGIN"] = settings._entrypoint_nodes_origin
-            env["NODES_PUBLIC"] = "true" if settings._entrypoint_nodes_public else "false"
             if settings._entrypoint_nodes_probe:
                 env["NODES_PROBE"] = settings._entrypoint_nodes_probe
         if not (kind == "control" and not settings._entrypoint_nodes):

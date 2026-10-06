@@ -40,7 +40,7 @@ from ..measurement_node import (
     unlisted,
 )
 from ..model_copies import resolve_local_path, settings_from_config
-from ..node_work import launch_lock, refuse_on_job_site
+from ..node_work import launch_lock
 from ..profile_builds import (
     CANDIDATE_TYPES,
     DISK_NEEDED_BYTES,
@@ -261,7 +261,6 @@ async def preflight_profile_build(
 
 @router.post("/v1/profile-builds", response_model=ProfileBuild, status_code=202)
 async def start_profile_build(body: ProfileBuildRequest, request: Request) -> ProfileBuild:
-    refuse_on_job_site(request)
     async with launch_lock(request):
         manager = manager_for(request)
         if kind := active_measurement(request.app):

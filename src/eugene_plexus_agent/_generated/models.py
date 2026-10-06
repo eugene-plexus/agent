@@ -2833,9 +2833,9 @@ class PublicEntryPoint(BaseModel):
     workbenchUrl: AnyUrl
     inferenceUrl: AnyUrl | None = None
     nodesUrl: AnyUrl | None = None
-    publicNodes: bool | None = Field(
+    publicSites: bool | None = Field(
         None,
-        description="The nodes name also answers machines on any network, for the\nnode paths only (`public_nodes`, J3,\n`docs/design/remote-nodes.md` §3.1): joining as a Job Site,\nthe trust bundle with a node's token, the signed TLS key list,\nand the file helper's poll, claim and result. Every other path\non that name is refused with a sentence naming the console.\nThe networks listed for the name keep the whole control API,\nas before. Set only with an acknowledgement of the risks.\n",
+        description="The nodes name also answers Job Sites on any network, on six\npaths only (`public_sites`, J3, J31;\n`docs/design/job-sites-own-enrollment.md` §2.3): a site's join\n(`POST /v1/sites/enroll`), its poll, claim, result and leave, and\nthe signed TLS key list (`GET /v1/trust/tls`). The trust bundle\nis not among them. Every other path on that name is refused with\na sentence naming the console. The networks listed for the name\nkeep the whole control API, as before. Set only with an\nacknowledgement of the risks. A machine on the root's own\nnetwork needs none of this: a site there joins through the LAN\naddress (J31). Read from an older `entrypoint.json` as\n`public_nodes`.\n",
     )
 
 
@@ -4470,9 +4470,10 @@ class NodeIdentity(BaseModel):
     """
 
     entrypoint: PublicEntryPoint | None = None
-    jobSite: bool | None = Field(
+    hostedSites: list[str] | None = Field(
         None,
-        description='True when this machine joined as a Job Site\n(`docs/design/remote-nodes.md` §3.2): it connects out to the\nroot and nothing connects to it, it announces no address, and\nit runs no inference work. Declaring a runtime, installing an\nengine, starting a benchmark or a profile build here answers\n409. Its files are managed by its owner, from Workbench.\n',
+        description="The Job Sites whose site host this agent supervises, by id\n(`docs/design/job-sites-own-enrollment.md`, J21, J32). Each is\nits own enrollment, held by its site host: this agent holds none\nof its identity, and the node's own enrollment is unchanged by\nit. Reported to the root (`PUT /v1/nodes/{name}/hosted-sites`)\nfor display only.\n",
+        max_length=16,
     )
     enrolled: bool = Field(
         ...,

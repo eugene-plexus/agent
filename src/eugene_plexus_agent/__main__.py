@@ -104,59 +104,8 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Join even though components are already declared here (see the refusal's text).",
     )
-    join.add_argument(
-        "--job-site",
-        action="store_true",
-        help=(
-            "Join as a job site: a machine whose files its owner uses from Workbench, "
-            "which connects out to the root and runs no models. The owner the invitation "
-            "names confirms here with their own sign-in."
-        ),
-    )
-    join.add_argument(
-        "--owner",
-        metavar="NAME",
-        help="A job site's owner: how they sign in to Eugene. The join command names them.",
-    )
-    join.add_argument(
-        "--root-key",
-        metavar="KEY",
-        help=(
-            "The root's identity key from the join command. A job site pins it and checks "
-            "the root's certificate against it before sending anything."
-        ),
-    )
-    join.add_argument(
-        "--password-stdin",
-        action="store_true",
-        help="Read the job site owner's password from the first line of standard input.",
-    )
     site_cli.add_parser(sub)
     return parser
-
-
-def _site_owner(args: argparse.Namespace) -> tuple[str, str] | None:
-    """The person confirming a job site at this machine, asked for here."""
-    if not args.job_site:
-        return None
-    import getpass
-
-    name = (args.owner or "").strip()
-    if not name:
-        # Not asked for: a piped install (`curl | sh`) has the script, not a
-        # person, on standard input. The join command always names the owner.
-        raise SystemExit("A job site's join command names its owner: give --owner.")
-    if args.password_stdin:
-        password = sys.stdin.readline().rstrip("\r\n")
-    else:
-        # From the terminal itself, even when standard input is a pipe.
-        password = getpass.getpass(f"{name}, your Eugene password (confirms this machine): ")
-    if not password:
-        raise SystemExit(
-            "A job site is confirmed by the person who owns it, signing in here: give "
-            "--owner and their password."
-        )
-    return name, password
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -174,8 +123,6 @@ def main(argv: list[str] | None = None) -> None:
                     name=args.name,
                     advertise_url=args.advertise,
                     force=args.force,
-                    root_key=args.root_key,
-                    owner=_site_owner(args),
                 ),
                 settings,
             )

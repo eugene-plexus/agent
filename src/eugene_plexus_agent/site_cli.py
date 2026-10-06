@@ -1,5 +1,8 @@
-"""`eugene-plexus-agent site`: this machine's tools, from the machine itself.
+"""`eugene-plexus-agent site`: this machine as a Job Site, from the machine itself.
 
+    eugene-plexus-agent site join --url URL --token TOKEN --owner NAME --label NAME
+        [--root-key KEY] [--password-stdin]
+    eugene-plexus-agent site leave
     eugene-plexus-agent site status
     eugene-plexus-agent site audit [--limit N]
     eugene-plexus-agent site server add ID --name NAME --command PATH
@@ -15,6 +18,15 @@ cannot write, with the program's SHA-256: a program that changes after it
 is added is not run. Who may use it is then the site owner's policy, set
 from Workbench; a new server is off until they turn it on.
 
+**`join` makes this machine a Job Site**, its own enrollment, separate
+from the node (J19, J21, J35). Elevated, because it turns on a service. It
+asks the running agent to install the site host, then runs the **site
+host's own** join with the site's own directory: the site's key is made
+there, by the site host, and the agent never holds it (J23). The owner
+confirms with their own password, read from the terminal or, with
+`--password-stdin`, from the first line of standard input. `leave` tells the
+root and forgets the enrollment; the site's policy and audit log stay.
+
 **`--system`** marks a server able to alter the operating system, and adding
 one is J9's gate: the administrator proves elevation here, and their consent
 is recorded with the program's hash. The host refuses to turn on a `system`
@@ -28,11 +40,14 @@ an added or removed server at its next poll and restarts the host with it.
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,9 +58,11 @@ from pydantic import ValidationError
 from ._generated.site_host_models import SiteLocalServerList
 from .apps import APPS_DIR
 from .settings import Settings
+from .site_host import HELPER_ID, SYSTEMD_STATE_ROOT, set_wanted
 
 SERVERS_FILE = "site-servers.yaml"
-HELPER_ID = "node-files"
+#: How long `join` waits for the running agent to prepare the site host.
+PREPARE_SECONDS = 900
 MAX_SERVERS = 32
 _ID = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
 
@@ -78,6 +95,22 @@ def add_parser(sub: Any) -> None:
         ),
     )
     actions = site.add_subparsers(dest="site_command", required=True)
+    joining = actions.add_parser("join", help="Make this machine a job site (elevated).")
+    joining.add_argument("--url", required=True, help="The root's address, from the join command.")
+    joining.add_argument("--token", required=True, help="The site invitation.")
+    joining.add_argument("--owner", required=True, help="How the owner signs in to Eugene.")
+    joining.add_argument("--label", required=True, help="This machine's name in the install.")
+    joining.add_argument("--root-key", dest="root_key", help="The root's identity key (HTTPS).")
+    joining.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="Read the owner's password from the first line of standard input.",
+    )
+    joining.add_argument("--python", help=argparse.SUPPRESS)
+    joining.add_argument("--data-dir", dest="data_dir", help=argparse.SUPPRESS)
+    leaving = actions.add_parser("leave", help="This machine stops being a job site (elevated).")
+    leaving.add_argument("--python", help=argparse.SUPPRESS)
+    leaving.add_argument("--data-dir", dest="data_dir", help=argparse.SUPPRESS)
     actions.add_parser("status", help="What this machine allows, and to whom.")
     audit = actions.add_parser("audit", help="The newest lines of this machine's audit log.")
     audit.add_argument("--limit", type=int, default=50, help="How many lines (1-200).")
@@ -113,7 +146,11 @@ def add_parser(sub: Any) -> None:
 def run(args: argparse.Namespace, settings: Settings) -> int:
     config_dir = Path(settings.config_file).resolve().parent
     try:
-        if args.site_command == "status":
+        if args.site_command == "join":
+            print(join(config_dir, args))
+        elif args.site_command == "leave":
+            print(leave(config_dir, args))
+        elif args.site_command == "status":
             print(status(config_dir))
         elif args.site_command == "audit":
             print(audit(config_dir, args.limit))
@@ -243,11 +280,118 @@ def remove_server(config_dir: Path, server_id: str) -> str:
     return f"Removed {server_id}. Eugene restarts this machine's tools without it within a minute."
 
 
-# --- reading what the host keeps ------------------------------------------------
+# --- joining and leaving ----------------------------------------------------------
 
 
 def _host_data(config_dir: Path) -> Path:
+    if sys.platform == "linux" and (SYSTEMD_STATE_ROOT / HELPER_ID).exists():
+        return SYSTEMD_STATE_ROOT / HELPER_ID
     return config_dir / APPS_DIR / HELPER_ID / "data"
+
+
+def _host_python(config_dir: Path) -> Path | None:
+    """The site host's interpreter, once the agent has prepared it."""
+    versions = config_dir / APPS_DIR / HELPER_ID / "versions"
+    found: list[Path] = []
+    for venv in versions.glob("*/venv"):
+        python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+        if python.exists():
+            found.append(python)
+    return max(found, key=lambda p: p.stat().st_mtime) if found else None
+
+
+def _prepared(config_dir: Path, args: argparse.Namespace) -> tuple[Path, Path]:
+    if args.python and args.data_dir:
+        return Path(args.python), Path(args.data_dir)
+    deadline = time.perf_counter() + PREPARE_SECONDS
+    said = False
+    while True:
+        python, data = _host_python(config_dir), _host_data(config_dir)
+        if python is not None and data.exists():
+            return python, data
+        if time.perf_counter() >= deadline:
+            raise SiteError(
+                "Eugene did not prepare this machine's job site in time. Check that its "
+                "service is running, then run this again."
+            )
+        if not said:
+            print("Preparing this machine's job site. This takes a minute or two the first time.")
+            said = True
+        time.sleep(2)
+
+
+def _password(args: argparse.Namespace) -> str:
+    if args.password_stdin:
+        return sys.stdin.readline().rstrip("\r\n")
+    return getpass.getpass(f"{args.owner}, your Eugene password (confirms this machine): ")
+
+
+def _give_to_owner_of(data: Path) -> None:
+    """POSIX: what an administrator made in the site's directory belongs to
+    the site host's account, as the directory does."""
+    chown = getattr(os, "chown", None)
+    if chown is None:
+        return
+    owner = data.stat()
+    for name in ("site.json", "site_key.pem", "root_tls.json"):
+        path = data / name
+        if path.exists():
+            chown(path, owner.st_uid, owner.st_gid)
+
+
+def join(config_dir: Path, args: argparse.Namespace) -> str:
+    _need_elevation()
+    password = _password(args)
+    if not password:
+        raise SiteError("A job site is confirmed by its owner's own password.")
+    set_wanted(config_dir, True)
+    python, data = _prepared(config_dir, args)
+    command = [
+        str(python),
+        "-m",
+        "eugene_plexus_site_host",
+        "join",
+        "--url",
+        args.url,
+        "--token",
+        args.token,
+        "--owner",
+        args.owner,
+        "--label",
+        args.label,
+        "--data-dir",
+        str(data),
+    ]
+    if args.root_key:
+        command += ["--root-key", args.root_key]
+    done = subprocess.run(
+        command, input=password + "\n", capture_output=True, text=True, check=False
+    )
+    if done.returncode != 0:
+        raise SiteError((done.stderr or done.stdout).strip() or "The join did not finish.")
+    _give_to_owner_of(data)
+    return done.stdout.strip()
+
+
+def leave(config_dir: Path, args: argparse.Namespace) -> str:
+    _need_elevation()
+    python = Path(args.python) if args.python else _host_python(config_dir)
+    data = Path(args.data_dir) if args.data_dir else _host_data(config_dir)
+    if python is not None and data.exists():
+        done = subprocess.run(
+            [str(python), "-m", "eugene_plexus_site_host", "leave", "--data-dir", str(data)],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+        if done.returncode != 0:
+            raise SiteError((done.stderr or done.stdout).strip() or "The site did not leave.")
+    set_wanted(config_dir, False)
+    return "This machine is no longer a job site. Its folders' list and audit log are kept."
+
+
+# --- reading what the host keeps ------------------------------------------------
 
 
 def _read_json(path: Path) -> Any:

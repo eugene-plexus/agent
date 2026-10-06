@@ -67,7 +67,7 @@ from ..engines.llama_cpp import LlamaCppAdapter, places_by_itself
 from ..engines.strata import StrataAdapter
 from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, resolve_model_path, rules_from_config
-from ..node_work import refuse_on_job_site, runtime_launch
+from ..node_work import runtime_launch
 from ..reservations import ReservationLedger
 from ..runtime_context import RuntimeContext
 from ..runtimes import (
@@ -476,7 +476,7 @@ def _engine_kind(engine: str) -> EngineKind:
     response_model=EngineInstall,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["engines"],
-    dependencies=[*_write_auth, Depends(refuse_on_job_site)],
+    dependencies=_write_auth,
 )
 async def install_engine(engine: str, body: EngineInstallRequest | None = None) -> EngineInstall:
     """Fetch, verify and unpack an engine build.

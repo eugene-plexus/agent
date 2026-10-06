@@ -196,14 +196,18 @@ def normalized(manifest: AppManifest) -> AppManifest:
     return manifest.model_copy(update={"uses": uses})
 
 
-#: The entries Eugene's own file support may hold as app `node-files`: the
-#: site host (Job Sites J6), and the helper it replaces until the next
-#: reconcile installs the host over it. Neither is an app the owner manages.
-NODE_FILES_ENTRIES = frozenset({"eugene_plexus_site_host", "eugene_plexus_node_helper"})
+#: The entries a Job Site's host may hold: the site host itself, and the
+#: file helper slice 1 shipped before it. Not an app the owner manages: an
+#: administrator turns it on at the machine (`site join`), and the agent
+#: keeps it (job-sites-own-enrollment.md, J21).
+SITE_HOST_ENTRIES = frozenset({"eugene_plexus_site_host", "eugene_plexus_node_helper"})
+#: Its id since slice 2b.1, and the id slice 2 ran it under, which the
+#: agent removes when it finds it (J20).
+SITE_HOST_IDS = frozenset({"site-host", "node-files"})
 
 
-def is_node_files(app_id: str, entry: str) -> bool:
-    return app_id == "node-files" and entry in NODE_FILES_ENTRIES
+def is_site_host(app_id: str, entry: str) -> bool:
+    return app_id in SITE_HOST_IDS and entry in SITE_HOST_ENTRIES
 
 
 #: The schema's `environment` limits, which the generated model does not keep.
@@ -1249,7 +1253,7 @@ class AppManager:
             (AppOrigin.custom, self.store.custom()),
         ):
             for manifest in manifests:
-                if manifest.id in seen or is_node_files(manifest.id, manifest.entry):
+                if manifest.id in seen or is_site_host(manifest.id, manifest.entry):
                     continue
                 seen.add(manifest.id)
                 record = self.store.get(manifest.id)
@@ -1355,9 +1359,7 @@ class AppManager:
 
     def views(self) -> list[App]:
         return [
-            self.view(r)
-            for r in self.store.installed()
-            if not is_node_files(r.id, r.manifest.entry)
+            self.view(r) for r in self.store.installed() if not is_site_host(r.id, r.manifest.entry)
         ]
 
     # --- ports ----------------------------------------------------------
@@ -1447,7 +1449,7 @@ class AppManager:
             record,
             store=self.store,
             gateway_url=lambda: self._gateway.get(record.id),
-            bind_host=(lambda: "127.0.0.1") if record.id == "node-files" else self._bind_host,
+            bind_host=(lambda: "127.0.0.1") if record.id in SITE_HOST_IDS else self._bind_host,
             oidc_issuer=self._oidc_issuer,
             app_url=lambda: self.app_url(record.id),
             public_origin=self._public_origin(record.id),

@@ -45,7 +45,7 @@ from typing import Any
 
 import httpx
 
-from . import __version__, root_tls, tokens
+from . import __version__, tokens
 from ._http import internal_client
 from .node_identity import (
     NodeIdentityStore,
@@ -159,21 +159,12 @@ async def perform_enrollment(
     advertise_url: str | None,
     devices: list[dict[str, Any]] | None = None,
     transport: Any = None,
-    root_key: str | None = None,
-    owner: tuple[str, str] | None = None,
 ) -> EnrollmentOutcome:
     """Exchange a join token for membership, and persist the result.
 
     Raises `EnrollmentError` and records nothing if any step fails: a node
     that half-enrolled would hold an install's key without the install
     knowing it exists.
-
-    **A Job Site** (`owner` given: the person's sign-in, typed at this
-    machine) sends no address, and pins `root_key`, the root's identity key
-    from the join command (J7a): over HTTPS it checks the root's signed TLS
-    key list before the join token or the password leaves this machine, and
-    the answer must come from that same key. `root_key` on an ordinary join
-    is checked against the answer too; it was trust-on-first-use before.
     """
     if store.record.enrolled:
         held = store.record
@@ -203,53 +194,19 @@ async def perform_enrollment(
         "arch": host_arch(),
         "devices": devices or [],
     }
-    job_site = owner is not None
-    if owner is not None:
-        advertise_url = None
-        payload["owner"] = {"name": owner[0], "password": owner[1]}
     if advertise_url is not None:
         payload["url"] = advertise_url
 
-    pins: root_tls.Pins | None = None
-    if job_site and control_url.startswith("https://"):
-        if not root_key:
-            raise EnrollmentError(
-                "root-key-missing",
-                "No root key",
-                "A job site joining over the internet pins the root's identity key from its "
-                "join command (--root-key). Copy the whole command again.",
-            )
-        pins = root_tls.Pins(store.path.parent / root_tls.PINS_FILE)
-        try:
-            pins.adopt(await root_tls.fetch_list(control_url, root_key))
-        except root_tls.RootTlsError as exc:
-            pins.forget()
-            raise EnrollmentError(
-                "root-not-trusted",
-                "The root could not be trusted",
-                f"{exc}. Nothing was sent and nothing was recorded.",
-            ) from exc
-
     try:
-        if pins is not None:
-            client = root_tls.pinned_client(
-                control_url, pins.accepts, timeout=ENROLL_TIMEOUT_SECONDS
-            )
-        else:
-            client = internal_client(timeout=ENROLL_TIMEOUT_SECONDS, transport=transport)
-        async with client:
+        async with internal_client(timeout=ENROLL_TIMEOUT_SECONDS, transport=transport) as client:
             response = await client.post(f"{control_url}/v1/nodes/enroll", json=payload)
     except httpx.HTTPError as exc:
-        if pins is not None:
-            pins.forget()
         raise EnrollmentError(
             "control-root-unreachable",
             "Control root unreachable",
             f"Could not reach the control root at {control_url}: {exc}. Nothing was recorded; "
             f"this agent is still unenrolled.",
         ) from exc
-    if response.status_code != 201 and pins is not None:
-        pins.forget()
 
     if response.status_code in (401, 409):
         # The root answers 401 for a token it does not know or that has
@@ -285,10 +242,6 @@ async def perform_enrollment(
         raise _malformed(control_url, f"`epoch` is {epoch!r}")
     if control_public_key is None:
         raise _malformed(control_url, "`controlPublicKey` is missing")
-    if root_key and control_public_key != root_key:
-        if pins is not None:
-            pins.forget()
-        raise _malformed(control_url, "it is not the root the join command names")
     raw_bundle = body.get("trustBundle")
     jws = raw_bundle.get("jws") if isinstance(raw_bundle, dict) else None
     if not isinstance(jws, str):
@@ -317,8 +270,6 @@ async def perform_enrollment(
         control_public_key=control_public_key,
         recovery_public_key=_str_or_none(body.get("recoveryPublicKey")),
         advertise_url=advertise_url,
-        job_site="files" in (body.get("grants") or []),
-        site_owner=_str_or_none(body.get("owner")),
     )
     return EnrollmentOutcome(
         name=granted_name, epoch=epoch, bundle=bundle, advertise_url=advertise_url

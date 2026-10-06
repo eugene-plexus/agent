@@ -18,7 +18,7 @@ class SiteLocalServer(BaseModel):
     A local MCP server a machine administrator added at the machine
     (`eugene-plexus-agent site server add`, elevated). Kept in the install's
     protected configuration, which the host's own account cannot write, and
-    handed to the host when it starts (§6.2).
+    handed to the host when it starts (remote-nodes.md §6.2).
 
     """
 
@@ -50,22 +50,26 @@ class SiteLocalServer(BaseModel):
     )
 
 
-class SiteHostHealth(BaseModel):
+class SiteOwnerProof(BaseModel):
+    """
+    The person a site invitation names, confirming the join at the machine
+    with their own password (remote-nodes.md §3.3, rule 1). Checked after
+    the join token, rate-limited as a sign-in is, and never stored: the root
+    records the site's owner from it, so ownership comes from presence plus
+    the person's own credential.
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    ready: bool
-    reason: str | None = Field(None, max_length=1024)
-
-
-class SiteHostMode(StrEnum):
-    site = 'site'
-    node = 'node'
+    name: str = Field(..., max_length=256, min_length=1)
+    password: str = Field(..., max_length=1024, min_length=1)
 
 
 class SiteHostProtocol(StrEnum):
     """
-    What a machine's host speaks to the root, through its agent. The only value is MCP's 2026-07-28 revision.
+    What a site host speaks to the root. The only value is MCP's 2026-07-28 revision.
     """
 
     mcp_2026_07_28 = 'mcp-2026-07-28'
@@ -84,6 +88,15 @@ class SiteFolderPerson(BaseModel):
     writable: bool = Field(
         ...,
         description='The person may change files in it: a standing pre-approval for\n`write_text` (J6b). Otherwise they may list and read.\n',
+    )
+
+
+class SiteServerId(RootModel[str]):
+    root: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
 
 
@@ -124,23 +137,31 @@ class SiteToolGrant(BaseModel):
     )
 
 
-class McpJsonRpc(StrEnum):
-    field_2_0 = '2.0'
+class SitePollAnswer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    operation: str | None = Field(
+        ...,
+        description='The id of an operation waiting for this site to claim, or null when the long poll ended with none.',
+    )
 
 
-class McpMethod(StrEnum):
-    server_discover = 'server/discover'
-    tools_list = 'tools/list'
-    tools_call = 'tools/call'
+class InstallModeName(StrEnum):
+    """
+    The install's mode (J13, J18). In `dev`, Eugene's owner sees all tool information; in `production`, owners are restricted.
+    """
+
+    production = 'production'
+    dev = 'dev'
 
 
 class SiteGrantHint(BaseModel):
     """
-    One of the root's own folder grants, carried with a call in a list
-    (`grants`): on an ordinary node, all of the person's grants there, the
-    root's grant being final (J6d); on a job site, Eugene's owner's dev-mode
-    grants, which the site honours only if its owner opted in (J6e). The
-    host checks the folder a call names against them.
+    One of Eugene's owner's dev-mode folder grants on a site (J13b), carried
+    with a call in a list (`grants`). The site honours them only if its
+    owner opted in there (J6e) and Eugene is in dev mode. The host checks
+    the folder a call names against them.
 
     """
 
@@ -159,34 +180,86 @@ class SiteGrantHint(BaseModel):
     writable: bool
 
 
-class InstallModeName(StrEnum):
-    production = 'production'
-    dev = 'dev'
+class SiteOperationKind(StrEnum):
+    """
+    `mcp`: one MCP request to one of the site's servers. `manage`: one of the site host's management actions (`SiteManageAction`, site-host.yaml).
+    """
+
+    mcp = 'mcp'
+    manage = 'manage'
+
+
+class McpJsonRpc(StrEnum):
+    field_2_0 = '2.0'
+
+
+class McpMethod(StrEnum):
+    server_discover = 'server/discover'
+    tools_list = 'tools/list'
+    tools_call = 'tools/call'
+
+
+class McpResponse(BaseModel):
+    """
+    The JSON-RPC response to an `McpRequest`, exactly as the site's server
+    produced it after the site's policy filtered it: `result` or `error`.
+
+    """
+
+    jsonrpc: McpJsonRpc
+    id: str | int | None = None
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+
+
+class SiteAnswerStatus(StrEnum):
+    """
+    `done`: the site answered (an MCP error or a tool's own failure is still
+    `done`, inside `response`). `failed`: the site refused or could not run
+    it, and `message` says why in the site's words; nothing ran. `uncertain`:
+    a tool call started and its end could not be established; it may have
+    acted.
+
+    """
+
+    done = 'done'
+    failed = 'failed'
+    uncertain = 'uncertain'
+
+
+class SiteHostHealth(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    ready: bool
+    reason: str | None = Field(None, max_length=1024)
+    site: str | None = Field(None, description="This site's id, once it has joined.")
+    lastContactAt: AwareDatetime | None = Field(
+        None, description="When the root last answered this site's poll."
+    )
 
 
 class SiteManageAction(StrEnum):
     """
-    - `folder.inspect` (`SiteFolderInspect`), node mode, from `operator`:
-      check a folder can be opened, and return its full path and
-      identity for the root to register.
-    - `folder.add` (`SiteFolderAdd`), site mode, from the owner:
+    Each is taken from the owner this site recorded at its join, and from
+    nobody else, Eugene's owner included (J6b).
+    - `folder.add` (`SiteFolderAdd`):
       register a folder here, under a name no other folder here has. It
       returns `SiteFolder`, with nobody on its list.
-    - `folder.remove` (`SiteFolderRemove`), site mode, from the owner.
-    - `folder.people` (`SiteFolderPeople`), site mode, from the owner:
+    - `folder.remove` (`SiteFolderRemove`).
+    - `folder.people` (`SiteFolderPeople`):
       who may use one folder, and who may change files in it, replacing
       what was there. It returns `SiteFolder`.
-    - `access.set` (`SiteAccessSet`), site mode, from the owner: who may
+    - `access.set` (`SiteAccessSet`): who may
       use one local server, and which tools, replacing what was there.
-    - `server.enable` (`SiteServerEnable`), site mode, from the owner: a
+    - `server.enable` (`SiteServerEnable`): a
       local server on or off.
-    - `settings.set` (`SiteSettings`), site mode, from the owner.
-    - `audit.read` (`SiteAuditRead`), site mode, from the owner: the
+    - `settings.set` (`SiteSettings`).
+    - `audit.read` (`SiteAuditRead`): the
       newest entries of the site's audit log.
 
     """
 
-    folder_inspect = 'folder.inspect'
     folder_add = 'folder.add'
     folder_remove = 'folder.remove'
     folder_people = 'folder.people'
@@ -208,21 +281,6 @@ class SiteManage(BaseModel):
         ...,
         description="The action's arguments; see `SiteManageAction` for each one's schema.",
     )
-
-
-class SiteFolderInspect(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    path: str = Field(..., max_length=4096, min_length=1)
-
-
-class SiteFolderInspected(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    path: str = Field(..., max_length=4096, min_length=1)
-    identity: str = Field(..., max_length=256, min_length=1)
 
 
 class SiteFolderAdd(BaseModel):
@@ -305,21 +363,6 @@ class SiteAuditRead(BaseModel):
     limit: int | None = Field(50, ge=1, le=200)
 
 
-class SiteAnswerStatus(StrEnum):
-    """
-    `done`: the site answered (an MCP error or a tool's own failure is still
-    `done`, inside `response`). `failed`: the site refused or could not run
-    it, and `message` says why in the site's words; nothing ran. `uncertain`:
-    a tool call started and its end could not be established; it may have
-    acted.
-
-    """
-
-    done = 'done'
-    failed = 'failed'
-    uncertain = 'uncertain'
-
-
 class SiteAuditDecision(StrEnum):
     allowed = 'allowed'
     refused = 'refused'
@@ -330,17 +373,18 @@ class SiteAuditKind(StrEnum):
     manage = 'manage'
 
 
-class McpResponse(BaseModel):
-    """
-    The JSON-RPC response to an `McpRequest`, exactly as the site's server
-    produced it after the site's policy filtered it: `result` or `error`.
-
-    """
-
-    jsonrpc: McpJsonRpc
-    id: str | int | None = None
-    result: dict[str, Any] | None = None
-    error: dict[str, Any] | None = None
+class SiteAnswer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    status: SiteAnswerStatus
+    message: str | None = Field(None, max_length=1024)
+    response: McpResponse | None = Field(
+        None, description='For an MCP request answered, the JSON-RPC response.'
+    )
+    result: dict[str, Any] | None = Field(
+        None, description='For a management action, its result.'
+    )
 
 
 class SiteLocalServerList(BaseModel):
@@ -352,6 +396,73 @@ class SiteLocalServerList(BaseModel):
         extra='forbid',
     )
     servers: list[SiteLocalServer] = Field(..., max_length=32)
+
+
+class SiteEnrollmentRequest(BaseModel):
+    """
+    What a site host sends to join (`POST /v1/sites/enroll`). It generated
+    its token key first and sends only the public half; no private key
+    leaves the machine (J23).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    token: str = Field(
+        ...,
+        description="The site invitation's join token.",
+        max_length=4096,
+        min_length=1,
+    )
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
+    tokenPublicKey: str = Field(
+        ...,
+        description="Base64 of the site's raw Ed25519 token public key. Its tokens are checked against it, by the root alone; it is never in the trust bundle nodes receive.",
+        max_length=64,
+        min_length=40,
+    )
+    owner: SiteOwnerProof
+    hostVersion: str | None = Field(None, max_length=64)
+
+
+class SiteEnrollment(BaseModel):
+    """
+    The root's answer to a site's join. The site records its owner from it,
+    once (J6b); no later answer changes it.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    label: str = Field(
+        ...,
+        description="What people call the site, the machine's name by default. Not unique, not an identifier.",
+        max_length=63,
+        min_length=1,
+        pattern='^[A-Za-z0-9][A-Za-z0-9_.-]*$',
+    )
+    owner: str = Field(
+        ..., description="The owner's person id.", max_length=64, min_length=1
+    )
+    ownerName: str = Field(..., description='How the owner signs in', max_length=256)
+    controlPublicKey: str = Field(
+        ...,
+        description="Base64 of the root's raw Ed25519 identity key. A site that pinned a key at its join (J7a) checks it is this one.",
+    )
+    enrolledAt: AwareDatetime
 
 
 class SiteAccess(BaseModel):
@@ -446,9 +557,11 @@ class McpRequest(BaseModel):
     """
     One MCP request of the 2026-07-28 revision: `server/discover`,
     `tools/list` or `tools/call`. `params._meta` carries
-    `io.modelcontextprotocol/protocolVersion` (`2026-07-28`) and may carry the
-    client's info and capabilities. Nothing else crosses: no notifications, no
-    server-initiated requests, no other methods.
+    `io.modelcontextprotocol/protocolVersion` (`2026-07-28`) and
+    `io.modelcontextprotocol/clientCapabilities` (the revision's envelope: the
+    SDK answers a request without it with an error), and may carry the
+    client's info. Nothing else crosses: no notifications, no server-initiated
+    requests, no other methods.
 
     """
 
@@ -458,6 +571,57 @@ class McpRequest(BaseModel):
     )
     method: McpMethod
     params: dict[str, Any] | None = None
+
+
+class SiteResult(BaseModel):
+    """
+    A site's answer to an operation it claimed (`POST /v1/sites/operations/{id}/result`).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    status: SiteAnswerStatus
+    message: str | None = Field(None, max_length=1024)
+    result: dict[str, Any] | None = Field(
+        None, description="A management action's result."
+    )
+    response: McpResponse | None = Field(
+        None,
+        description="An MCP request's JSON-RPC response, as the site's server answered it after its policy filtered it.",
+    )
+
+
+class SiteCall(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="The root's operation id; used once.",
+        max_length=128,
+        min_length=1,
+    )
+    expiresAt: float = Field(..., description='Unix seconds. At most 30 s ahead.')
+    subject: str = Field(
+        ...,
+        description="Who asked, as the root says (a person's id, or `operator` for Eugene's owner).",
+        max_length=64,
+        min_length=1,
+    )
+    server: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+    )
+    request: McpRequest
+    grants: list[SiteGrantHint] | None = Field(
+        None,
+        description="Eugene's owner's dev-mode grants on this site (J6e). Empty otherwise.",
+        max_length=64,
+    )
+    installMode: InstallModeName
 
 
 class SiteAuditEntry(BaseModel):
@@ -486,20 +650,6 @@ class SiteAuditEntry(BaseModel):
     decision: SiteAuditDecision
     outcome: SiteAnswerStatus | None = None
     reason: str | None = Field(None, max_length=1024)
-
-
-class SiteAnswer(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    status: SiteAnswerStatus
-    message: str | None = Field(None, max_length=1024)
-    response: McpResponse | None = Field(
-        None, description='For an MCP request answered, the JSON-RPC response.'
-    )
-    result: dict[str, Any] | None = Field(
-        None, description='For a management action, its result.'
-    )
 
 
 class SiteSummary(BaseModel):
@@ -532,34 +682,46 @@ class SiteSummary(BaseModel):
     )
 
 
-class SiteCall(BaseModel):
+class SiteOperation(BaseModel):
+    """
+    What a site claims (`POST /v1/sites/operations/{id}/claim`): one
+    operation, bound to this site's enrollment, to be done before
+    `expiresAt`. The site host refuses one whose `site` or `enrolledAt` is
+    not its own, so an operation queued for an earlier enrollment never runs
+    on a later one; then its policy decides (J8).
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    id: str = Field(
-        ...,
-        description="The root's operation id; used once.",
-        max_length=128,
-        min_length=1,
-    )
+    id: str = Field(..., max_length=128, min_length=1)
     expiresAt: float = Field(..., description='Unix seconds. At most 30 s ahead.')
+    site: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    enrolledAt: AwareDatetime
     subject: str = Field(
         ...,
-        description="Who asked, as the root says (a person's id, or `operator` for Eugene's owner).",
+        description="Who asked, as the root established it (a person's id, or `operator` for Eugene's owner).",
         max_length=64,
         min_length=1,
     )
-    server: str = Field(
-        ...,
-        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
-        max_length=40,
-        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+    kind: SiteOperationKind
+    server: SiteServerId | None = Field(
+        None, description="For `mcp`, the site's server."
     )
-    request: McpRequest
+    request: McpRequest | None = Field(None, description='For `mcp`, the request.')
     grants: list[SiteGrantHint] | None = Field(
         None,
-        description="The person's grants on this machine, on a node; Eugene's owner's dev-mode grants, on a site. Empty otherwise.",
+        description="For `mcp` to the file server from Eugene's owner, their dev-mode grants (J6e). Empty otherwise.",
         max_length=64,
+    )
+    action: str | None = Field(None, description='For `manage`, the action.')
+    arguments: dict[str, Any] | None = Field(
+        None, description='For `manage`, its arguments.'
     )
     installMode: InstallModeName
 
@@ -571,13 +733,22 @@ class SiteAuditPage(BaseModel):
     entries: list[SiteAuditEntry] = Field(..., max_length=200)
 
 
-class SiteHostReport(BaseModel):
+class SiteReport(BaseModel):
+    """
+    What a site host reports in each poll (`POST /v1/sites/poll`). The root
+    keeps it as a cache for listings; the site checks every call against
+    its own copy again (rule 2 of remote-nodes.md §3.3).
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
     protocol: SiteHostProtocol
-    version: str = Field(..., max_length=64)
-    mode: SiteHostMode
+    hostVersion: str | None = Field(None, max_length=64)
     ready: bool
     reason: str | None = Field(None, max_length=1024)
-    site: SiteSummary | None = Field(None, description='In `site` mode only.')
+    account: str | None = Field(
+        None, description="The OS account the site's tools run as.", max_length=256
+    )
+    site: SiteSummary | None = None

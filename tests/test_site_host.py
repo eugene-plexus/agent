@@ -1,13 +1,14 @@
-"""The site host's relay (Job Sites J6, J8): it decides nothing about a tool
-call, binds each operation to this machine's enrolment, hands the host what
-only the agent may say, and adds local servers only at the machine."""
+"""The site host on a node (job-sites-own-enrollment.md, J19, J21, J23): the
+agent installs and keeps it when an administrator turned it on here, tells
+it only what the agent may say, says which site it hosts (J32), and holds
+none of the site's identity. `site join` runs the site host's own join."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,221 +23,21 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_agent import app_accounts, site_cli, site_host
 from eugene_plexus_agent._generated.models import AppOrigin
-from eugene_plexus_agent.apps import AppStore, InstalledApp, is_node_files
-from eugene_plexus_agent.node_identity import NodeIdentityStore
-from eugene_plexus_agent.site_host import HELPER_ID, SiteHostRelay
+from eugene_plexus_agent.apps import AppStore, InstalledApp, is_site_host
+from eugene_plexus_agent.site_host import HELPER_ID, RETIRED_ID, SiteHostSupervisor
 
 
-def identity(**overrides: Any) -> SimpleNamespace:
-    values: dict[str, Any] = {
-        "enrolled": True,
-        "name": "desk",
-        "signing_public_key": "key",
-        "control_url": "http://root",
-        "job_site": None,
-        "site_owner": None,
+def test_the_host_is_told_what_only_the_agent_may_say(app: FastAPI) -> None:
+    """The install's private directory and the local servers; never who the
+    site is or who owns it, which is the site's own enrollment."""
+    supervisor = SiteHostSupervisor(app)
+    manager: Any = SimpleNamespace(store=AppStore(supervisor.config_dir / "apps.yaml"))
+    plain = supervisor.environment(manager)
+    assert set(plain) == {
+        "SITE_HOST_PROTECTED_ROOTS",
+        "SITE_HOST_LOCAL_SERVERS_FILE",
+        "SITE_HOST_LOCAL_SERVERS_SHA256",
     }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def operation(**overrides: Any) -> dict[str, Any]:
-    value: dict[str, Any] = {
-        "id": "op-1",
-        "expiresAt": time.time() + 20,
-        "node": "desk",
-        "nodeKey": "key",
-        "enrolledAt": "e1",
-        "subject": "p-ada",
-        "kind": "mcp",
-        "server": "files",
-        "request": {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-        "grants": [
-            {
-                "folderId": "f1",
-                "name": "Shared",
-                "path": "/srv/shared",
-                "identity": "1:2",
-                "writable": False,
-            }
-        ],
-        "installMode": "production",
-    }
-    value.update(overrides)
-    return value
-
-
-CONFIG = {
-    "node": "desk",
-    "nodeKey": "key",
-    "enrolledAt": "e1",
-    "enabled": True,
-    "folders": [
-        {"id": "f1", "name": "Shared", "path": "/srv/shared", "identity": "1:2", "writable": False}
-    ],
-}
-
-
-def test_an_operation_is_bound_to_this_machine_and_in_time(app: FastAPI) -> None:
-    relay = SiteHostRelay(app)
-    app.state.node_identity = SimpleNamespace(record=identity())
-    relay.validate(operation(), CONFIG)
-    for field, value in [
-        ("node", "other"),
-        ("nodeKey", "old-key"),
-        ("enrolledAt", "old-enrolment"),
-        ("expiresAt", time.time() - 1),
-        ("expiresAt", time.time() + 600),
-        ("kind", "tool"),
-        ("subject", ""),
-    ]:
-        with pytest.raises(ValueError):
-            relay.validate(operation(**{field: value}), CONFIG)
-    # The root's own record agreeing on another machine's key is not enough:
-    # the claim must name this machine's key.
-    other = {**CONFIG, "nodeKey": "other-key"}
-    with pytest.raises(ValueError):
-        relay.validate(operation(nodeKey="other-key"), other)
-
-
-def test_on_a_node_the_grants_must_be_the_folders_the_root_registered(app: FastAPI) -> None:
-    relay = SiteHostRelay(app)
-    app.state.node_identity = SimpleNamespace(record=identity())
-    good = operation()["grants"][0]
-    for bad in (
-        {**good, "path": "/outside"},
-        {**good, "identity": "9:9"},
-        {**good, "folderId": "f2"},
-        {**good, "writable": True},
-    ):
-        with pytest.raises(ValueError, match="folder grant"):
-            relay.validate(operation(grants=[good, bad]), CONFIG)
-    # A job site's own policy decides; its folders are not the root's.
-    app.state.node_identity = SimpleNamespace(record=identity(job_site=True, site_owner="p-ada"))
-    relay.validate(operation(grants=[{**good, "path": "/outside"}]), CONFIG)
-
-
-async def test_perform_hands_the_host_the_grants_and_its_answer_back(app: FastAPI) -> None:
-    relay = SiteHostRelay(app)
-    app.state.node_identity = SimpleNamespace(record=identity())
-    sent: list[tuple[str, dict[str, Any]]] = []
-
-    async def ask(method: str, path: str, **kwargs: Any) -> httpx.Response:
-        sent.append((path, kwargs["json"]))
-        return httpx.Response(200, json={"status": "done", "message": None, "response": {}})
-
-    relay._ask = ask  # type: ignore[method-assign]
-    try:
-        answer = await relay.perform(operation(), CONFIG)
-        assert answer == {"status": "done", "response": {}}
-        path, body = sent[0]
-        assert path == "/v1/mcp" and body["grants"] == operation()["grants"]
-        assert body["server"] == "files" and "nodeKey" not in body
-
-        async def silent(method: str, path: str, **kwargs: Any) -> httpx.Response:
-            raise httpx.ReadTimeout("lost")
-
-        relay._ask = silent  # type: ignore[method-assign]
-        call = operation(request={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}})
-        assert (await relay.perform(call, CONFIG))["status"] == "uncertain"
-        assert (await relay.perform(operation(), CONFIG))["status"] == "failed"
-    finally:
-        await relay._host.aclose()
-
-
-async def test_a_claimed_operation_is_never_run_twice(app: FastAPI) -> None:
-    relay = SiteHostRelay(app)
-    record = identity()
-    app.state.node_identity = SimpleNamespace(record=record)
-    seen: list[str] = []
-
-    async def transport(request: httpx.Request) -> httpx.Response:
-        seen.append(request.url.path)
-        if request.url.path.endswith("poll"):
-            first = len([p for p in seen if p.endswith("poll")]) == 1
-            return httpx.Response(
-                200, json={"configuration": CONFIG, "operation": "job1" if first else None}
-            )
-        if request.url.path.endswith("claim"):
-            return httpx.Response(200, json=operation())
-        raise httpx.ReadTimeout("result acknowledgement lost", request=request)
-
-    relay._root = "http://root"
-    relay._root_client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
-    app.state.auth_state = SimpleNamespace(trust=SimpleNamespace(agent_token=lambda _: "service"))
-    relay.reconcile = AsyncMock()  # type: ignore[method-assign]
-    relay.report = AsyncMock(return_value={"supported": True, "ready": True})  # type: ignore[method-assign]
-    relay.perform = AsyncMock(return_value={"status": "done"})  # type: ignore[method-assign]
-    try:
-        with pytest.raises(httpx.ReadTimeout):
-            await relay.step()
-        await relay.step()
-        assert relay.perform.await_count == 1
-        record.enrolled = False
-        await relay.step()
-        relay.reconcile.assert_awaited_with({"enabled": False})
-    finally:
-        await relay._root_client.aclose()
-        await relay._host.aclose()
-
-
-def test_a_job_site_keeps_the_owner_it_pinned(app: FastAPI, tmp_path: Path) -> None:
-    """Rule 2 of §3.3: the owner confirmed at the join is the owner, whatever
-    the root's state later says. The real identity store, read back."""
-    store = NodeIdentityStore(tmp_path / "node.yaml")
-    store.ensure_keypair()
-    store.record_enrollment(
-        name="desk",
-        control_url="https://nodes.home.arpa:8443",
-        epoch=1,
-        control_public_key="key",
-        recovery_public_key=None,
-        advertise_url=None,
-        job_site=True,
-        site_owner="p-ada",
-    )
-    app.state.node_identity = store
-    relay = SiteHostRelay(app)
-    relay._pin_owner("p-mallory")
-    again = NodeIdentityStore(tmp_path / "node.yaml")
-    again.load()
-    assert again.record.site_owner == "p-ada"
-    # A site joined before owners were pinned takes the first one it is told.
-    older = NodeIdentityStore(tmp_path / "older" / "node.yaml")
-    older.ensure_keypair()
-    older.record_enrollment(
-        name="old",
-        control_url="https://nodes.home.arpa:8443",
-        epoch=1,
-        control_public_key="key",
-        recovery_public_key=None,
-        advertise_url=None,
-        job_site=True,
-    )
-    app.state.node_identity = older
-    relay._pin_owner("p-bo")
-    relay._pin_owner("p-mallory")
-    assert older.record.site_owner == "p-bo"
-    # An ordinary node pins nobody.
-    plain = NodeIdentityStore(tmp_path / "plain" / "node.yaml")
-    plain.ensure_keypair()
-    app.state.node_identity = plain
-    relay._pin_owner("p-bo")
-    assert plain.record.site_owner is None
-
-
-def test_the_host_learns_its_mode_owner_and_servers_from_the_agent(
-    app: FastAPI, tmp_path: Path
-) -> None:
-    relay = SiteHostRelay(app)
-    manager: Any = SimpleNamespace(store=AppStore(relay.config_dir / "apps.yaml"))
-    app.state.node_identity = SimpleNamespace(record=identity())
-    node = relay.environment(manager)
-    assert node is not None and node["SITE_HOST_MODE"] == "node"
-    assert "SITE_HOST_OWNER" not in node and "SITE_HOST_LOCAL_SERVERS_FILE" not in node
-    app.state.node_identity = SimpleNamespace(record=identity(job_site=True))
-    assert relay.environment(manager) is None
-    app.state.node_identity = SimpleNamespace(record=identity(job_site=True, site_owner="p-ada"))
     # A long list, and braces the launcher would otherwise read as a placeholder.
     servers = [
         {
@@ -248,23 +49,27 @@ def test_the_host_learns_its_mode_owner_and_servers_from_the_agent(
         }
         for n in range(4)
     ]
-    (relay.config_dir / site_host.SERVERS_FILE).write_text(
+    (supervisor.config_dir / site_host.SERVERS_FILE).write_text(
         yaml.safe_dump({"servers": servers}), encoding="utf-8"
     )
-    site = relay.environment(manager)
-    assert site is not None and site["SITE_HOST_MODE"] == "site"
-    assert site["SITE_HOST_OWNER"] == "p-ada"
+    site = supervisor.environment(manager)
     copy = Path(site["SITE_HOST_LOCAL_SERVERS_FILE"])
     data = copy.read_bytes()
     assert hashlib.sha256(data).hexdigest() == site["SITE_HOST_LOCAL_SERVERS_SHA256"]
     assert [s["id"] for s in json.loads(data)] == [s["id"] for s in servers]
     assert copy.parent == manager.store.app_dir(HELPER_ID)
-    assert all(
-        len(v) <= 2048 and "{" not in v
-        for v in site.values()
-        if v != site["SITE_HOST_PROTECTED_ROOTS"]
-    )
-    assert json.loads(site["SITE_HOST_PROTECTED_ROOTS"]) == [str(relay.config_dir)]
+    assert json.loads(site["SITE_HOST_PROTECTED_ROOTS"]) == [str(supervisor.config_dir)]
+    assert not any("OWNER" in key or "MODE" in key for key in site)
+
+
+def test_the_site_host_runs_only_when_an_administrator_turned_it_on(tmp_path: Path) -> None:
+    assert site_host.wanted(tmp_path) is False
+    site_host.set_wanted(tmp_path, True)
+    assert site_host.wanted(tmp_path) is True
+    site_host.set_wanted(tmp_path, False)
+    assert site_host.wanted(tmp_path) is False
+    (tmp_path / site_host.WANTED_FILE).write_text("{not json", encoding="utf-8")
+    assert site_host.wanted(tmp_path) is False
 
 
 async def test_unsupported_never_installs_and_the_host_is_not_an_app(
@@ -276,21 +81,21 @@ async def test_unsupported_never_installs_and_the_host_is_not_an_app(
     )
     install = AsyncMock()
     monkeypatch.setattr(manager.installer, "start", install)
-    relay = SiteHostRelay(app)
+    supervisor = SiteHostSupervisor(app)
     try:
-        await relay.reconcile({"enabled": True})
-        assert relay._availability()["supported"] is False
+        await supervisor.reconcile(True)
         install.assert_not_called()
-        for suffix in ["install", "start", "stop", "restart"]:
-            response = authed_client.post(f"/v1/apps/{HELPER_ID}/{suffix}")
-            assert response.status_code == 409 and "People" in response.text
+        for app_id in (HELPER_ID, RETIRED_ID):
+            for suffix in ["install", "start", "stop", "restart"]:
+                response = authed_client.post(f"/v1/apps/{app_id}/{suffix}")
+                assert response.status_code == 409 and "site join" in response.text
     finally:
-        await relay._host.aclose()
-    assert is_node_files(HELPER_ID, site_host.ENTRY)
-    assert is_node_files(HELPER_ID, "eugene_plexus_node_helper")
-    assert not is_node_files("workbench", site_host.ENTRY)
+        await supervisor._host.aclose()
+    assert is_site_host(HELPER_ID, site_host.ENTRY)
+    assert is_site_host(RETIRED_ID, "eugene_plexus_node_helper")
+    assert not is_site_host("workbench", site_host.ENTRY)
     record = InstalledApp(
-        manifest=site_host.manifest({"SITE_HOST_MODE": "node"}),
+        manifest=site_host.manifest({}),
         origin=AppOrigin.catalogue,
         port=8300,
         installed_at=datetime.now(UTC),
@@ -298,6 +103,146 @@ async def test_unsupported_never_installs_and_the_host_is_not_an_app(
     manager.store.put(record)
     assert all(v.id != HELPER_ID for v in manager.views())
     assert authed_client.delete(f"/v1/apps/{HELPER_ID}").status_code == 409
+
+
+async def test_turned_on_it_installs_and_slice_2s_host_is_removed(
+    app: FastAPI, authed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = app.state.apps
+    manager.accounts = app_accounts.AccountSupport("windows_service", None)
+    started: list[Any] = []
+    monkeypatch.setattr(manager.installer, "start", lambda want, **_: started.append(want))
+    monkeypatch.setattr(manager, "uv", lambda: Path(sys.executable))
+    removed: list[str] = []
+
+    async def uninstall(app_id: str, *, purge: bool = False) -> None:
+        removed.append(app_id)
+
+    monkeypatch.setattr(manager, "uninstall", uninstall)
+    old = InstalledApp(
+        manifest=site_host.manifest({}).model_copy(update={"id": RETIRED_ID}),
+        origin=AppOrigin.catalogue,
+        port=8301,
+        installed_at=datetime.now(UTC),
+    )
+    manager.store.put(old)
+    supervisor = SiteHostSupervisor(app)
+    try:
+        await supervisor.reconcile(True)
+    finally:
+        await supervisor._host.aclose()
+    assert removed == [RETIRED_ID]
+    assert [want.id for want in started] == [HELPER_ID]
+    assert started[0].name == "Job site" and started[0].entry == site_host.ENTRY
+
+
+async def test_the_node_says_which_site_it_hosts(app: FastAPI) -> None:
+    supervisor = SiteHostSupervisor(app)
+    sent: list[tuple[str, Any]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    app.state.node_identity = SimpleNamespace(
+        record=SimpleNamespace(enrolled=True, control_url="http://root", name="amish")
+    )
+    app.state.auth_state = SimpleNamespace(trust=SimpleNamespace(agent_token=lambda audience: "t"))
+    supervisor._root = "http://root"
+    supervisor._root_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        supervisor.site = "s-" + "a" * 26
+        await supervisor._report()
+        await supervisor._report()  # unchanged: not sent again
+        supervisor.site = None
+        await supervisor._report()
+    finally:
+        await supervisor._root_client.aclose()
+        await supervisor._host.aclose()
+    assert sent == [
+        ("/v1/nodes/amish/hosted-sites", {"sites": ["s-" + "a" * 26]}),
+        ("/v1/nodes/amish/hosted-sites", {"sites": []}),
+    ]
+
+
+def test_join_runs_the_site_hosts_own_join_with_the_password_piped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(site_cli, "elevated", lambda: True)
+    data = tmp_path / "data"
+    data.mkdir()
+    ran: list[tuple[list[str], str | None]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        ran.append((command, kwargs.get("input")))
+        return subprocess.CompletedProcess(command, 0, "Joined as ada's job site desk.", "")
+
+    monkeypatch.setattr(site_cli.subprocess, "run", run)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(readline=lambda: "secret\n"))
+    args = SimpleNamespace(
+        url="https://nodes.example.test",
+        token="invitation",
+        owner="ada",
+        label="desk",
+        root_key="KEY",
+        password_stdin=True,
+        python=sys.executable,
+        data_dir=str(data),
+    )
+    said = site_cli.join(tmp_path, args)  # type: ignore[arg-type]
+    assert "ada's job site" in said and site_host.wanted(tmp_path) is True
+    ((command, given),) = ran
+    assert command[:4] == [sys.executable, "-m", "eugene_plexus_site_host", "join"]
+    assert command[command.index("--data-dir") + 1] == str(data)
+    assert command[command.index("--root-key") + 1] == "KEY"
+    assert given == "secret\n" and "secret" not in command
+
+
+def test_join_and_leave_need_the_machines_administrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(site_cli, "elevated", lambda: False)
+    args = SimpleNamespace(python=None, data_dir=None, password_stdin=True)
+    with pytest.raises(site_cli.SiteError, match="administrator"):
+        site_cli.join(tmp_path, args)  # type: ignore[arg-type]
+    with pytest.raises(site_cli.SiteError, match="administrator"):
+        site_cli.leave(tmp_path, args)  # type: ignore[arg-type]
+    assert site_host.wanted(tmp_path) is False
+
+
+def test_a_refused_join_says_why_and_leave_turns_the_host_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(site_cli, "elevated", lambda: True)
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(readline=lambda: "secret\n"))
+    monkeypatch.setattr(
+        site_cli.subprocess,
+        "run",
+        lambda command, **_: subprocess.CompletedProcess(
+            command, 1, "", "eugene-plexus-site-host: The join was refused: wrong password"
+        ),
+    )
+    args = SimpleNamespace(
+        url="http://192.168.1.5:8083",
+        token="t",
+        owner="ada",
+        label="desk",
+        root_key=None,
+        password_stdin=True,
+        python=sys.executable,
+        data_dir=str(data),
+    )
+    with pytest.raises(site_cli.SiteError, match="wrong password"):
+        site_cli.join(tmp_path, args)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        site_cli.subprocess,
+        "run",
+        lambda command, **_: subprocess.CompletedProcess(command, 0, "", ""),
+    )
+    assert "no longer a job site" in site_cli.leave(tmp_path, args)  # type: ignore[arg-type]
+    assert site_host.wanted(tmp_path) is False
 
 
 # --- the `site` command ------------------------------------------------------------

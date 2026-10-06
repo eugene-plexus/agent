@@ -320,15 +320,6 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     )
 
     enrolled = auth.trust.enrolled
-    identity = getattr(request.app.state, "node_identity", None)
-    if identity is not None and identity.record.job_site:
-        raise _problem(
-            status.HTTP_409_CONFLICT,
-            "A job site has no console",
-            "This machine is a job site: it connects out to its root and serves its owner's "
-            "files to Workbench. Manage it from Workbench (Job sites), or from the console "
-            "of the install it belongs to.",
-        )
     if not state.has_passphrase() and not enrolled:
         raise _problem(
             status.HTTP_503_SERVICE_UNAVAILABLE,

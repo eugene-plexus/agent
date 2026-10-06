@@ -118,7 +118,6 @@ class _Snapshot:
     # name, which is exactly how `resolve_target` keys them locally.
     owners: dict[str, str] = field(default_factory=dict)
     node_urls: dict[str, str] = field(default_factory=dict)
-    job_sites: frozenset[str] = frozenset()
     error: str | None = None
     # A refusal of this node's own token means the root does not know its
     # key yet -- an enrollment a moment old, a bundle not yet caught up.
@@ -259,7 +258,6 @@ class InstallTopology:
             expires_at=0.0,
             owners=_owners(components),
             node_urls=_node_urls(nodes),
-            job_sites=_job_sites(nodes),
         )
 
 
@@ -283,11 +281,6 @@ def _reachable_url(snapshot: _Snapshot, node: str, subject: str) -> str:
     about reaching anything: see `not_a_node_address`.
     """
     url = snapshot.node_urls.get(node)
-    if not url and node in snapshot.job_sites:
-        raise InstallLookupError(
-            f"{node!r} is a job site: it only connects out, so nothing reaches it. Its files "
-            "are under People, and are its owner's."
-        )
     if not url:
         raise InstallLookupError(
             f"{subject} on node {node!r}, but that node has no address in the install's "
@@ -346,14 +339,6 @@ def _node_urls(response: httpx.Response) -> dict[str, str]:
         if isinstance(name, str) and isinstance(url, str):
             urls[name] = url
     return urls
-
-
-def _job_sites(response: httpx.Response) -> frozenset[str]:
-    return frozenset(
-        str(entry["name"])
-        for entry in _items(response, "nodes")
-        if isinstance(entry.get("name"), str) and "files" in (entry.get("grants") or [])
-    )
 
 
 def _items(response: httpx.Response, key: str) -> list[dict[str, Any]]:

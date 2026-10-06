@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 import certifi
 import httpx
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -42,19 +43,22 @@ log = logging.getLogger(__name__)
 TOKEN_HEADER = "x-eugene-entry-token"
 CLIENT_HEADER = "x-eugene-entry-client"
 ENTRY_HEADER = "X-Eugene-Plexus-Entry"
-PUBLIC_NODES = "public-nodes"
-"""Set on a request the public node route carries to the control root, and
-stripped from every other request: the root then lets only a job site join
-and gives the trust bundle only to a member's token (J3)."""
-PUBLIC_NODE_PATHS: dict[str, list[str]] = {
-    # The node paths, and nothing else (remote-nodes.md §3.1, J3, J7a).
+PUBLIC_SITES = "public-sites"
+"""Set on a request the public route for Job Sites carries to the control
+root, and stripped from every other request: the root then lets no node join
+that way, and gives the trust bundle to nobody without a member's token
+(J3, J31)."""
+PUBLIC_SITE_PATHS: dict[str, list[str]] = {
+    # A Job Site's six paths, and nothing else (job-sites-own-enrollment.md
+    # §2.3, J31; J7a's signed TLS list). No trust bundle: no site needs one.
     "POST": [
-        "/v1/nodes/enroll",
-        "/v1/node-helpers/poll",
-        "/v1/node-helpers/operations/*/claim",
-        "/v1/node-helpers/operations/*/result",
+        "/v1/sites/enroll",
+        "/v1/sites/poll",
+        "/v1/sites/operations/*/claim",
+        "/v1/sites/operations/*/result",
+        "/v1/sites/leave",
     ],
-    "GET": ["/v1/trust/bundle", "/v1/trust/tls"],
+    "GET": ["/v1/trust/tls"],
 }
 STRIP_HEADERS = [
     "Forwarded",
@@ -200,11 +204,14 @@ class EntryConfig(BaseModel):
     acme: AutomaticCertificates | None = None
     proxy: TrustedProxy | None = None
     public_console: bool = False
-    public_nodes: bool = False
-    """The nodes name also answers any network, for the node paths only
-    (`PUBLIC_NODE_PATHS`), with the risks read (J3, Troy 2026-10-05): job sites
-    join and poll through it from anywhere, and nothing else does. The
-    networks listed for the name keep the whole control API."""
+    public_sites: bool = Field(
+        default=False, validation_alias=AliasChoices("public_sites", "public_nodes")
+    )
+    """The nodes name also answers any network, for a Job Site's six paths
+    only (`PUBLIC_SITE_PATHS`), with the risks read (J3, J31): job sites join
+    and poll through it from anywhere, and nothing else does. The networks
+    listed for the name keep the whole control API. Read as `public_nodes`
+    from a file written before slice 2b.1."""
     console_direct: bool = False
     """The console stays on its own port, as before; this setup serves Workbench,
     and the console's name only Workbench's sign-in (Troy, 2026-10-05: the safest
@@ -241,10 +248,10 @@ class EntryConfig(BaseModel):
         if self.nodes and everything(self.nodes):
             raise ValueError(
                 "node connections require specific source networks; to let job sites join "
-                "from anywhere, set public_nodes (Settings, Container access setup)"
+                "from anywhere, set public_sites (Settings, Container access setup)"
             )
-        if self.public_nodes and not self.nodes:
-            raise ValueError("public_nodes needs a nodes name")
+        if self.public_sites and not self.nodes:
+            raise ValueError("public_sites needs a nodes name")
         for service in services:
             if service.is_address and service is not self.nodes:
                 raise ValueError(
@@ -314,7 +321,7 @@ class EntryConfig(BaseModel):
             result["inferenceUrl"] = self.inference.origin
         if self.nodes:
             result["nodesUrl"] = self.nodes.origin
-            result["publicNodes"] = self.public_nodes
+            result["publicSites"] = self.public_sites
         return result
 
     @classmethod
@@ -476,7 +483,6 @@ def prepare(settings: Any) -> EntryConfig | None:
         settings._entrypoint_nodes = config.nodes is not None
         if config.nodes is not None:
             settings._entrypoint_nodes_origin = config.nodes.origin
-            settings._entrypoint_nodes_public = config.public_nodes
             # Where the root reads the key its nodes name presents (J7a):
             # the proxy here, on loopback, unless an outside one holds it.
             settings._entrypoint_nodes_probe = (
@@ -635,7 +641,7 @@ def caddy_config(
         route(config.inference, "gateway", _INFERENCE_PATHS)
     if config.nodes:
         route(config.nodes, "control")
-        if config.public_nodes:
+        if config.public_sites:
             routes.extend(_public_node_routes(config, ports.get("control")))
     # Refuse known but disallowed hosts/paths; never a catch-all upstream.
     # Through Cloudflare every visitor arrives as a Cloudflare address, so a
@@ -804,7 +810,7 @@ def _public_node_routes(config: EntryConfig, port: int | None) -> list[dict[str,
     else:
         if not 1 <= port <= 65535 or port == config.listen_port:
             raise ValueError("invalid local upstream port")
-        headers = {"Host": [urlsplit(nodes.origin).netloc], ENTRY_HEADER: [PUBLIC_NODES]}
+        headers = {"Host": [urlsplit(nodes.origin).netloc], ENTRY_HEADER: [PUBLIC_SITES]}
         handlers = [
             {"handler": "request_body", "max_size": 1024 * 1024},
             {
@@ -824,7 +830,7 @@ def _public_node_routes(config: EntryConfig, port: int | None) -> list[dict[str,
         {
             "match": [
                 {"host": [nodes.host], "method": [method], "path": paths}
-                for method, paths in PUBLIC_NODE_PATHS.items()
+                for method, paths in PUBLIC_SITE_PATHS.items()
             ],
             "handle": handlers,
             "terminal": True,

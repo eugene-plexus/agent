@@ -50,7 +50,7 @@ from ..apps import (
     AppInstallError,
     AppKey,
     AppManager,
-    is_node_files,
+    is_site_host,
     normalized,
     pip_requirement,
     validate_manifest,
@@ -126,12 +126,12 @@ async def list_apps(request: Request) -> AppList:
 
 
 def _not_node_capability(app_id: str) -> None:
-    if app_id == "node-files":
+    if app_id in ("site-host", "node-files"):
         raise _problem(
             409,
-            "Managed node capability",
-            "Manage file support in People > Files on your machines. "
-            "The node helper is installed and updated with Eugene.",
+            "This machine's job site",
+            "A job site is turned on at the machine (eugene-plexus-agent site join) and "
+            "managed by its owner from Workbench. Eugene installs and updates it.",
         )
 
 
@@ -238,7 +238,7 @@ async def _revoke_key(request: Request, manager: AppManager, app_id: str) -> Non
 async def uninstall(request: Request, app_id: str, purge: bool = False) -> Response:
     manager = _apps(request)
     record = manager.store.get(app_id)
-    if record is None or is_node_files(app_id, record.manifest.entry):
+    if record is None or is_site_host(app_id, record.manifest.entry):
         _not_node_capability(app_id)
     if manager.store.get(app_id) is None and manager.store.key(app_id) is None:
         raise _problem(
