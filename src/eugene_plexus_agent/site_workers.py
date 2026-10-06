@@ -137,6 +137,10 @@ def _filter_by_hand(token: Any) -> Any:
     """CreateRestrictedToken(DISABLE_MAX_PRIVILEGE | LUA_TOKEN), Administrators
     deny-only, Medium integrity, owner and default DACL the person's: the
     shape §2.4.1 measured working, on Amish_Station, 2026-10-06."""
+    # For the type checker as much as the runtime: CI type-checks on Linux,
+    # where ctypes has no WinDLL (process_io.py says why not `type: ignore`).
+    if sys.platform != "win32":
+        raise OSError("filtering a Windows token is a Windows-only API")
     import ctypes
     from ctypes import wintypes
 

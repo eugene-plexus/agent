@@ -97,6 +97,9 @@ class Attempt:
 def _socket_owner(client_port: int, server_port: int) -> str:
     """The SID of the process that owns the loopback connection from
     `client_port` to this agent's `server_port` (Windows)."""
+    # For the type checker as much as the runtime (process_io.py says why).
+    if sys.platform != "win32":
+        raise OSError("a connection's owner is read with a Windows-only API")
     import ctypes
     from ctypes import wintypes
 
