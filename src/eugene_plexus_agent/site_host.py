@@ -39,7 +39,7 @@ from ._generated.models import AppManifest, AppOrigin
 from ._generated.site_host_models import SiteLocalServerList
 from ._http import client_for, internal_client
 from ._private_files import write_private
-from .apps import AppManager
+from .apps import NODE_FILES_ENTRIES, AppManager
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ PACKAGE = "eugene-plexus-site-host"
 ENTRY = "eugene_plexus_site_host"
 #: The entries this app id may hold: the host, and the helper it replaces,
 #: until the next reconcile installs the host over it.
-MANAGED_ENTRIES = frozenset({ENTRY, "eugene_plexus_node_helper"})
+MANAGED_ENTRIES = NODE_FILES_ENTRIES
 PROTOCOL = "mcp-2026-07-28"
 
 SITE_HOST_COMMIT = "f58a0a6d28e85e395029844eb99d8cb1085bc0e8"
@@ -58,6 +58,8 @@ SITE_HOST_SOURCE = f"https://github.com/eugene-plexus/site-host/archive/{SITE_HO
 #: A checkout to install instead, for development and the acceptance runs.
 SOURCE_OVERRIDE = "EUGENE_PLEXUS_AGENT_SITE_HOST_SOURCE"
 SERVERS_FILE = "site-servers.yaml"
+#: The host's copy, beside its install: readable by its account, not writable.
+SERVERS_COPY = "site-servers.json"
 MAX_RESULT = 70_000
 
 
@@ -129,7 +131,7 @@ class SiteHostRelay:
     def config_dir(self) -> Path:
         return Path(self.app.state.settings.config_file).resolve().parent
 
-    def environment(self) -> dict[str, str] | None:
+    def environment(self, manager: AppManager) -> dict[str, str] | None:
         """What the host is told at start; None while a site's owner is unknown."""
         identity = self.app.state.node_identity.record
         env = {"SITE_HOST_PROTECTED_ROOTS": json.dumps([str(self.config_dir)])}
@@ -141,7 +143,24 @@ class SiteHostRelay:
             **env,
             "SITE_HOST_MODE": "site",
             "SITE_HOST_OWNER": identity.site_owner,
-            "SITE_HOST_LOCAL_SERVERS": json.dumps(local_servers(self.config_dir)),
+            **self._servers_copy(manager),
+        }
+
+    def _servers_copy(self, manager: AppManager) -> dict[str, str]:
+        """The local servers, copied where the host may read and not write
+        them, named with their SHA-256. A list may outgrow one variable, and
+        an argument may hold braces the launcher would read as a placeholder."""
+        data = json.dumps(local_servers(self.config_dir), ensure_ascii=False).encode()
+        path = manager.store.app_dir(HELPER_ID) / SERVERS_COPY
+        if not path.exists() or path.read_bytes() != data:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(".tmp")
+            temporary.write_bytes(data)
+            os.chmod(temporary, 0o644)
+            os.replace(temporary, path)
+        return {
+            "SITE_HOST_LOCAL_SERVERS_FILE": str(path),
+            "SITE_HOST_LOCAL_SERVERS_SHA256": hashlib.sha256(data).hexdigest(),
         }
 
     # --- what this machine reports ---------------------------------------------
@@ -173,7 +192,7 @@ class SiteHostRelay:
         if running:
             return {"supported": True, "ready": True, "reason": None, "account": account}
         progress = manager.installer.snapshot(HELPER_ID)
-        reason = self._error or detail or (progress.message if progress else "Starting.")
+        reason = self._error or detail or (progress.message if progress else None) or "Starting."
         return {"supported": True, "ready": False, "reason": reason[:1024], "account": account}
 
     async def report(self) -> dict[str, Any]:
@@ -227,7 +246,7 @@ class SiteHostRelay:
                 await manager.stop(HELPER_ID)
             self._error, self._attempt_version = None, None
             return
-        environment = self.environment()
+        environment = await asyncio.to_thread(self.environment, manager)
         if environment is None:
             self._error = "Waiting for the root to name this job site's owner."
             return
@@ -298,6 +317,19 @@ class SiteHostRelay:
             raise ValueError("This operation does not belong to this enrolled node or has expired.")
         if command.get("kind") not in ("mcp", "manage") or not command.get("subject"):
             raise ValueError("This Eugene sent an operation this machine does not take. Update it.")
+        if getattr(identity, "job_site", None):
+            return
+        # An ordinary node: the root's grants are final (J6d), and must be
+        # folders it registered here, as it registered them.
+        folders = {f["id"]: f for f in config.get("folders") or []}
+        for grant in command.get("grants") or []:
+            folder = folders.get(grant.get("folderId"))
+            if (
+                folder is None
+                or any(grant.get(k) != folder[k] for k in ("path", "identity"))
+                or (grant.get("writable") and not folder["writable"])
+            ):
+                raise ValueError("This operation exceeds the node's current folder grant.")
 
     async def perform(self, command: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -319,7 +351,7 @@ class SiteHostRelay:
                     **common,
                     "server": command.get("server"),
                     "request": request,
-                    "grant": command.get("grant"),
+                    "grants": command.get("grants") or [],
                     "installMode": command.get("installMode") or "production",
                 },
             )

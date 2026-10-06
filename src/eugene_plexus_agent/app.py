@@ -442,12 +442,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.safe_mode
         else asyncio.create_task(RunWorker(app).run_forever(), name="run-operations")
     )
-    from .node_file_helper import NodeFileHelper
+    from .site_host import SiteHostRelay
 
     helper_task = (
         None
         if settings.safe_mode
-        else asyncio.create_task(NodeFileHelper(app).run(), name="node-file-helper")
+        else asyncio.create_task(SiteHostRelay(app).run(), name="site-host")
     )
     from .entrypoint import EntryPoint
 

@@ -1,0 +1,322 @@
+"""`eugene-plexus-agent site`: this machine's tools, from the machine itself.
+
+    eugene-plexus-agent site status
+    eugene-plexus-agent site audit [--limit N]
+    eugene-plexus-agent site server add ID --name NAME --command PATH
+        [--arg A]... [--env K=V]... [--system]
+    eugene-plexus-agent site server remove ID
+
+**Adding a local MCP server is the machine administrator's act**
+(`remote-nodes.md` §6.2): it names a program on this machine, so it is done
+here, elevated (an administrator token on Windows, uid 0 on Linux), and
+never from Workbench. It writes `site-servers.yaml` beside `agent.yaml`, in
+the install's protected configuration, which the site host's own account
+cannot write, with the program's SHA-256: a program that changes after it
+is added is not run. Who may use it is then the site owner's policy, set
+from Workbench; a new server is off until they turn it on.
+
+**`--system`** marks a server able to alter the operating system, and adding
+one is J9's gate: the administrator proves elevation here, and their consent
+is recorded with the program's hash. The host refuses to turn on a `system`
+server without that record.
+
+`status` and `audit` read what the host keeps (its policy and its audit
+log) from its own directory; they change nothing. The running agent picks up
+an added or removed server at its next poll and restarts the host with it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+from pydantic import ValidationError
+
+from ._generated.site_host_models import SiteLocalServerList
+from .apps import APPS_DIR
+from .settings import Settings
+
+SERVERS_FILE = "site-servers.yaml"
+HELPER_ID = "node-files"
+MAX_SERVERS = 32
+_ID = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
+
+
+class SiteError(Exception):
+    """Refused; the message says why and what to do."""
+
+
+def elevated() -> bool:
+    """An administrator token on Windows; uid 0 elsewhere."""
+    if sys.platform == "win32":
+        import ctypes
+
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:  # pragma: no cover - defensive
+            return False
+    getter = getattr(os, "geteuid", None)
+    return getter is not None and int(getter()) == 0
+
+
+def add_parser(sub: Any) -> None:
+    site = sub.add_parser(
+        "site",
+        help="This machine's tools for Workbench: status, audit log, local servers.",
+        description=(
+            "Show what this machine's site host allows and what it was asked, and add or "
+            "remove the local MCP servers it may offer. Adding or removing a server needs "
+            "an administrator (root)."
+        ),
+    )
+    actions = site.add_subparsers(dest="site_command", required=True)
+    actions.add_parser("status", help="What this machine allows, and to whom.")
+    audit = actions.add_parser("audit", help="The newest lines of this machine's audit log.")
+    audit.add_argument("--limit", type=int, default=50, help="How many lines (1-200).")
+    server = actions.add_parser("server", help="Add or remove a local MCP server (elevated).")
+    verbs = server.add_subparsers(dest="server_command", required=True)
+    add = verbs.add_parser("add", help="Add a local MCP server, off until the site's owner says.")
+    add.add_argument("id", help="Its id: lower-case letters, digits and hyphens.")
+    add.add_argument("--name", required=True, help="Its name, as people will see it.")
+    add.add_argument("--command", required=True, help="The program's absolute path.")
+    add.add_argument("--arg", action="append", default=[], help="One argument; repeat for more.")
+    add.add_argument("--env", action="append", default=[], help="NAME=VALUE; repeat for more.")
+    add.add_argument(
+        "--system",
+        action="store_true",
+        help=(
+            "It can alter this machine's operating system. Adding it records your consent, "
+            "as this machine's administrator, with the program's hash (J9)."
+        ),
+    )
+    remove = verbs.add_parser("remove", help="Remove a local MCP server.")
+    remove.add_argument("id")
+
+
+def run(args: argparse.Namespace, settings: Settings) -> int:
+    config_dir = Path(settings.config_file).resolve().parent
+    try:
+        if args.site_command == "status":
+            print(status(config_dir))
+        elif args.site_command == "audit":
+            print(audit(config_dir, args.limit))
+        elif args.server_command == "add":
+            print(
+                add_server(
+                    config_dir,
+                    server_id=args.id,
+                    name=args.name,
+                    command=args.command,
+                    args=list(args.arg),
+                    env=list(args.env),
+                    system=args.system,
+                )
+            )
+        else:
+            print(remove_server(config_dir, args.id))
+    except SiteError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return 0
+
+
+# --- the protected list ---------------------------------------------------------
+
+
+def read_servers(config_dir: Path) -> list[dict[str, Any]]:
+    path = config_dir / SERVERS_FILE
+    if not path.exists():
+        return []
+    try:
+        value = SiteLocalServerList.model_validate(yaml.safe_load(path.read_text("utf-8")) or {})
+    except (OSError, ValueError, ValidationError) as exc:
+        raise SiteError(
+            f"{path} could not be read ({type(exc).__name__}). Fix or remove it."
+        ) from None
+    return [s.model_dump(mode="json", exclude_none=True) for s in value.servers]
+
+
+def write_servers(config_dir: Path, servers: list[dict[str, Any]]) -> None:
+    SiteLocalServerList.model_validate({"servers": servers})
+    path = config_dir / SERVERS_FILE
+    temporary = path.with_suffix(".tmp")
+    data = yaml.safe_dump({"servers": servers}, sort_keys=False, allow_unicode=True).encode()
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _need_elevation() -> None:
+    if not elevated():
+        raise SiteError(
+            "Adding or removing a local server names a program on this machine, so only its "
+            "administrator may. Run this again as an administrator (Windows) or as root."
+        )
+
+
+def add_server(
+    config_dir: Path,
+    *,
+    server_id: str,
+    name: str,
+    command: str,
+    args: list[str],
+    env: list[str],
+    system: bool,
+) -> str:
+    _need_elevation()
+    if not _ID.match(server_id):
+        raise SiteError("A server's id is lower-case letters, digits and hyphens, at most 40.")
+    if server_id.startswith("files"):
+        raise SiteError("Ids beginning 'files' are Eugene's own file server. Choose another.")
+    program = Path(command)
+    if not program.is_absolute() or not program.is_file():
+        raise SiteError(f"{command} is not a program on this machine. Give its absolute path.")
+    environment: dict[str, str] = {}
+    for item in env:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise SiteError(f"--env {item!r} is not NAME=VALUE.")
+        environment[key] = value
+    servers = read_servers(config_dir)
+    if any(s["id"] == server_id for s in servers):
+        raise SiteError(f"This machine already has a server called {server_id}. Remove it first.")
+    if len(servers) >= MAX_SERVERS:
+        raise SiteError(f"This machine already has {MAX_SERVERS} local servers. Remove one first.")
+    entry: dict[str, Any] = {
+        "id": server_id,
+        "name": name.strip(),
+        "command": str(program),
+        "args": args,
+        "env": environment,
+        "sha256": hashlib.sha256(program.read_bytes()).hexdigest(),
+        "system": system,
+        "consentedAt": datetime.now(UTC).isoformat() if system else None,
+    }
+    try:
+        write_servers(config_dir, [*servers, {k: v for k, v in entry.items() if v is not None}])
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        raise SiteError(f"This server is not valid: {first['msg']}.") from None
+    lines = [
+        f"Added {name} ({server_id}). It is off until this site's owner turns it on in "
+        "Workbench (Job sites), and says who may use which of its tools.",
+        "Eugene restarts this machine's tools with it within a minute.",
+    ]
+    if system:
+        lines.insert(
+            1,
+            "Marked as able to change this machine's operating system. Your consent, as its "
+            "administrator, is recorded with the program's hash; if the program changes it "
+            "will not run.",
+        )
+    return "\n".join(lines)
+
+
+def remove_server(config_dir: Path, server_id: str) -> str:
+    _need_elevation()
+    servers = read_servers(config_dir)
+    kept = [s for s in servers if s["id"] != server_id]
+    if len(kept) == len(servers):
+        raise SiteError(f"This machine has no local server called {server_id}.")
+    write_servers(config_dir, kept)
+    return f"Removed {server_id}. Eugene restarts this machine's tools without it within a minute."
+
+
+# --- reading what the host keeps ------------------------------------------------
+
+
+def _host_data(config_dir: Path) -> Path:
+    return config_dir / APPS_DIR / HELPER_ID / "data"
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        raise SiteError(
+            "This account cannot read this machine's tools. Run it as an administrator (root)."
+        ) from None
+    except (OSError, ValueError) as exc:
+        raise SiteError(f"{path} could not be read ({type(exc).__name__}).") from None
+
+
+def status(config_dir: Path) -> str:
+    policy = _read_json(_host_data(config_dir) / "policy.json")
+    servers = read_servers(config_dir)
+    lines: list[str] = []
+    if policy is None:
+        lines.append("This machine's tools have nothing registered yet.")
+    else:
+        lines.append(
+            "Eugene's owner may use folders here in dev mode: "
+            + ("yes, if Eugene is in dev mode" if policy.get("ownerInDevMode") else "no")
+        )
+        folders = policy.get("folders") or []
+        lines.append(f"Folders ({len(folders)}):")
+        for folder in folders:
+            people = ", ".join(
+                f"{p['subject']} ({'may change files' if p.get('writable') else 'read'})"
+                for p in folder.get("people") or []
+            )
+            lines.append(f"  {folder['name']}: {folder['path']}")
+            lines.append(f"    people: {people or 'nobody'}")
+    enabled = (policy or {}).get("enabled") or {}
+    access = (policy or {}).get("access") or []
+    lines.append(f"Local servers ({len(servers)}):")
+    for server in servers:
+        flag = " [system]" if server.get("system") else ""
+        lines.append(
+            f"  {server['id']}{flag}: {server['name']} - "
+            + ("on" if enabled.get(server["id"]) else "off")
+        )
+        for entry in access:
+            if entry.get("server") == server["id"]:
+                tools = ", ".join(t["name"] for t in entry.get("tools") or [])
+                lines.append(f"    {entry['subject']}: {tools}")
+    return "\n".join(lines)
+
+
+def audit(config_dir: Path, limit: int) -> str:
+    if not 1 <= limit <= 200:
+        raise SiteError("--limit is 1 to 200.")
+    data = _host_data(config_dir)
+    lines: list[str] = []
+    for name in ("audit.1.jsonl", "audit.jsonl"):
+        path = data / name
+        try:
+            lines += path.read_text("utf-8").splitlines()
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            raise SiteError(
+                "This account cannot read this machine's audit log. Run it as an administrator "
+                "(root)."
+            ) from None
+    out: list[str] = []
+    for line in reversed(lines[-limit:]):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        what = entry.get("tool") or entry.get("action") or entry.get("method") or ""
+        where = f" on {entry['server']}" if entry.get("server") else ""
+        reason = f" - {entry['reason']}" if entry.get("reason") else ""
+        out.append(
+            f"{entry.get('at', '')}  {entry.get('subject', '')}  {what}{where}  "
+            f"{entry.get('decision', '')}{reason}"
+        )
+    return "\n".join(out) if out else "Nothing has been asked of this machine yet."

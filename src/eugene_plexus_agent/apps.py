@@ -196,6 +196,16 @@ def normalized(manifest: AppManifest) -> AppManifest:
     return manifest.model_copy(update={"uses": uses})
 
 
+#: The entries Eugene's own file support may hold as app `node-files`: the
+#: site host (Job Sites J6), and the helper it replaces until the next
+#: reconcile installs the host over it. Neither is an app the owner manages.
+NODE_FILES_ENTRIES = frozenset({"eugene_plexus_site_host", "eugene_plexus_node_helper"})
+
+
+def is_node_files(app_id: str, entry: str) -> bool:
+    return app_id == "node-files" and entry in NODE_FILES_ENTRIES
+
+
 #: The schema's `environment` limits, which the generated model does not keep.
 _MAX_ENVIRONMENT = 64
 _MAX_ENVIRONMENT_VALUE = 2048
@@ -1239,9 +1249,7 @@ class AppManager:
             (AppOrigin.custom, self.store.custom()),
         ):
             for manifest in manifests:
-                if manifest.id in seen or (
-                    manifest.id == "node-files" and manifest.entry == "eugene_plexus_node_helper"
-                ):
+                if manifest.id in seen or is_node_files(manifest.id, manifest.entry):
                     continue
                 seen.add(manifest.id)
                 record = self.store.get(manifest.id)
@@ -1349,7 +1357,7 @@ class AppManager:
         return [
             self.view(r)
             for r in self.store.installed()
-            if r.id != "node-files" or r.manifest.entry != "eugene_plexus_node_helper"
+            if not is_node_files(r.id, r.manifest.entry)
         ]
 
     # --- ports ----------------------------------------------------------

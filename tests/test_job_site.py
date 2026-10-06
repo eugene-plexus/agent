@@ -324,7 +324,7 @@ def test_the_helper_honours_the_systems_proxy_for_a_root_off_this_network(
 ) -> None:
     """The proxy fix (§3.1): a forcing network blocked the helper, whose client
     turned the proxy off by hand. The rule is now the address's own."""
-    from eugene_plexus_agent import node_file_helper
+    from eugene_plexus_agent import site_host
 
     made: list[dict[str, Any]] = []
 
@@ -342,7 +342,7 @@ def test_the_helper_honours_the_systems_proxy_for_a_root_off_this_network(
         made.append({"url": url, **kwargs})
         return Client()
 
-    monkeypatch.setattr(node_file_helper, "client_for", client_for)
+    monkeypatch.setattr(site_host, "client_for", client_for)
     for root in ("https://root.example.com", "http://192.168.1.10:8083"):
         app = SimpleNamespace(
             state=SimpleNamespace(
@@ -352,7 +352,7 @@ def test_the_helper_honours_the_systems_proxy_for_a_root_off_this_network(
                 auth_state=SimpleNamespace(trust=SimpleNamespace(agent_token=lambda _: "t")),
             )
         )
-        relay = node_file_helper.NodeFileHelper(app)  # type: ignore[arg-type]
+        relay = site_host.SiteHostRelay(app)  # type: ignore[arg-type]
         with pytest.raises(Stop):
             asyncio.run(relay.step())
     assert [m["url"] for m in made] == ["https://root.example.com", "http://192.168.1.10:8083"]

@@ -50,6 +50,7 @@ from ..apps import (
     AppInstallError,
     AppKey,
     AppManager,
+    is_node_files,
     normalized,
     pip_requirement,
     validate_manifest,
@@ -237,7 +238,7 @@ async def _revoke_key(request: Request, manager: AppManager, app_id: str) -> Non
 async def uninstall(request: Request, app_id: str, purge: bool = False) -> Response:
     manager = _apps(request)
     record = manager.store.get(app_id)
-    if record is None or record.manifest.entry == "eugene_plexus_node_helper":
+    if record is None or is_node_files(app_id, record.manifest.entry):
         _not_node_capability(app_id)
     if manager.store.get(app_id) is None and manager.store.key(app_id) is None:
         raise _problem(

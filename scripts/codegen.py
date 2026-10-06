@@ -46,6 +46,8 @@ SPECS_TO_GENERATE = [
     # old path is the correct one here. Move both together, never one.
     ("openapi/agent.yaml", "models.py"),
     ("openapi/components/common.yaml", "common_models.py"),
+    # The site host's loopback API, which the agent relays to (Job Sites J6).
+    ("openapi/site-host.yaml", "site_host_models.py"),
 ]
 
 

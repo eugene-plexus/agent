@@ -11,6 +11,7 @@ ask, or be told on the command line.
     eugene-plexus-agent                 start (asks once, on a fresh boot with a TTY)
     eugene-plexus-agent --unattended    start, never asking
     eugene-plexus-agent join --control <url> --token <jwt>
+    eugene-plexus-agent site status|audit|server add|server remove   (see site_cli.py)
 
 See `onboarding.py` for why a missing TTY means "start a new install"
 rather than "wait".
@@ -40,7 +41,7 @@ import sys
 
 import uvicorn
 
-from . import node_identity
+from . import node_identity, site_cli
 from .app import create_app
 from .console_logging import install_console_capture
 from .onboarding import JoinRequest, ask, has_tty, is_fresh_boot, run_join
@@ -130,6 +131,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Read the job site owner's password from the first line of standard input.",
     )
+    site_cli.add_parser(sub)
     return parser
 
 
@@ -178,6 +180,9 @@ def main(argv: list[str] | None = None) -> None:
                 settings,
             )
         )
+
+    if args.command == "site":
+        raise SystemExit(site_cli.run(args, settings))
 
     _serve(settings, unattended=args.unattended)
 
