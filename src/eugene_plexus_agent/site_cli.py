@@ -3,7 +3,7 @@
     eugene-plexus-agent site status
     eugene-plexus-agent site audit [--limit N]
     eugene-plexus-agent site server add ID --name NAME --command PATH
-        [--arg A]... [--env K=V]... [--system]
+        [--arg=A]... [--env K=V]... [--system]
     eugene-plexus-agent site server remove ID
 
 **Adding a local MCP server is the machine administrator's act**
@@ -86,8 +86,17 @@ def add_parser(sub: Any) -> None:
     add = verbs.add_parser("add", help="Add a local MCP server, off until the site's owner says.")
     add.add_argument("id", help="Its id: lower-case letters, digits and hyphens.")
     add.add_argument("--name", required=True, help="Its name, as people will see it.")
-    add.add_argument("--command", required=True, help="The program's absolute path.")
-    add.add_argument("--arg", action="append", default=[], help="One argument; repeat for more.")
+    # Not dest "command": that is the subcommand's, and sharing it once
+    # made `site server add --command X` start the whole agent instead.
+    add.add_argument(
+        "--command", dest="program", required=True, help="The program's absolute path."
+    )
+    add.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        help="One argument; repeat for more. One that begins with - is given as --arg=-x.",
+    )
     add.add_argument("--env", action="append", default=[], help="NAME=VALUE; repeat for more.")
     add.add_argument(
         "--system",
@@ -114,7 +123,7 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
                     config_dir,
                     server_id=args.id,
                     name=args.name,
-                    command=args.command,
+                    command=args.program,
                     args=list(args.arg),
                     env=list(args.env),
                     system=args.system,

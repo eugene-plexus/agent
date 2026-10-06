@@ -395,3 +395,34 @@ def test_status_and_audit_read_what_the_host_keeps(tmp_path: Path) -> None:
     log = site_cli.audit(tmp_path, 10).splitlines()
     assert log[0].startswith("2026-10-05T12:01") and "refused" in log[0]
     assert "allowed" in log[1]
+
+
+def test_the_site_command_never_starts_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--command` once shared its dest with the subcommand, so `site server
+    add --command X` fell through and started a whole agent."""
+    from eugene_plexus_agent import __main__ as entry
+
+    ran: list[Any] = []
+    monkeypatch.setenv("EUGENE_PLEXUS_AGENT_CONFIG_FILE", str(tmp_path / "agent.yaml"))
+    monkeypatch.setattr(entry, "_serve", lambda *a, **k: ran.append("serve"))
+    monkeypatch.setattr(site_cli, "run", lambda args, settings: ran.append(args) or 0)
+    with pytest.raises(SystemExit) as done:
+        entry.main(
+            [
+                "site",
+                "server",
+                "add",
+                "notes",
+                "--name",
+                "Notes",
+                "--command",
+                str(program(tmp_path)),
+                "--arg=-I",
+                "--arg",
+                "x.py",
+            ]
+        )
+    assert done.value.code == 0 and ran and ran[0] != "serve"
+    assert ran[0].program == str(program(tmp_path)) and ran[0].arg == ["-I", "x.py"]
