@@ -20,8 +20,9 @@ On a Linux system install root runs the workers (`eugene-plexus-site-
 worker@<uid>.service`), never this unprivileged agent.
 
 Workers run the site host's own installed program, from the administrator-
-only install directory. They are put in a job that closes with this agent,
-so an agent restart never leaves one running beside its replacement.
+only install directory. Each is put in a job of its own that closes with
+this agent, so an agent restart never leaves one running beside its
+replacement.
 """
 
 from __future__ import annotations
@@ -85,6 +86,8 @@ class _Running:
     pid: int
     session: int | None
     program: WorkerProgram
+    #: Windows: the worker's own job, which kills it when this agent goes.
+    job: Any = None
     started: float = field(default_factory=time.perf_counter)
 
 
@@ -226,6 +229,30 @@ def _filter_by_hand(token: Any) -> Any:
                 k32.LocalFree(value)
 
 
+def _worker_job() -> Any:
+    """A job for one worker, which kills it when its last handle closes.
+
+    One per worker, never one for all: a process already in a job joins
+    another only while that one is empty or sits on its own job's chain.
+    An agent that is itself in a job (Task Scheduler puts every task in
+    one) passes it to each child, so a shared job took the first worker
+    and refused the second with *Access is denied* (the first Windows run).
+    An empty job is always accepted."""
+    import win32job
+
+    job = win32job.CreateJobObject(None, "")
+    info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
+    info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
+    return job
+
+
+def _close(handle: Any) -> None:
+    if handle is not None:
+        with contextlib.suppress(Exception):
+            handle.Close()
+
+
 def _session_users() -> dict[str, int]:
     """Each signed-in account's SID and one session of theirs, an active
     session preferred over a disconnected one."""
@@ -257,20 +284,10 @@ class WindowsStarter:
     """Workers for linked accounts that are signed in, as LocalSystem."""
 
     def __init__(self, links: LinkStore) -> None:
-        import win32job
-
         self.links = links
         self.running: dict[str, _Running] = {}
         self.backoff = _Backoff()
         self.program: WorkerProgram | None = None
-        self._job = win32job.CreateJobObject(None, "")
-        info = win32job.QueryInformationJobObject(
-            self._job, win32job.JobObjectExtendedLimitInformation
-        )
-        info["BasicLimitInformation"]["LimitFlags"] |= win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        win32job.SetInformationJobObject(
-            self._job, win32job.JobObjectExtendedLimitInformation, info
-        )
 
     def _exited(self, entry: _Running) -> bool:
         import win32event
@@ -284,6 +301,7 @@ class WindowsStarter:
         if entry is not None:
             with contextlib.suppress(Exception):
                 win32process.TerminateProcess(entry.handle, 1)
+            _close(entry.job)
 
     def step(self) -> None:
         program = self.program
@@ -291,6 +309,7 @@ class WindowsStarter:
         for account, entry in list(self.running.items()):
             if self._exited(entry):
                 self.running.pop(account)
+                _close(entry.job)
                 self.backoff.failed(account, time.perf_counter() - entry.started)
                 log.info("a site worker for %s ended", account)
             elif account not in linked or program is None or entry.program != program:
@@ -335,26 +354,32 @@ class WindowsStarter:
             | win32con.CREATE_UNICODE_ENVIRONMENT
             | win32process.CREATE_NEW_PROCESS_GROUP
         )
-        process, thread, pid, _tid = win32process.CreateProcessAsUser(
-            limited,
-            None,
-            subprocess.list2cmdline(program.argv(account)),
-            None,
-            None,
-            False,
-            flags,
-            environment,
-            environment.get("USERPROFILE"),
-            startup,
-        )
+        job = _worker_job()
         try:
-            win32job.AssignProcessToJobObject(self._job, process)
+            process, thread, pid, _tid = win32process.CreateProcessAsUser(
+                limited,
+                None,
+                subprocess.list2cmdline(program.argv(account)),
+                None,
+                None,
+                False,
+                flags,
+                environment,
+                environment.get("USERPROFILE"),
+                startup,
+            )
+        except Exception:
+            _close(job)
+            raise
+        try:
+            win32job.AssignProcessToJobObject(job, process)
         except Exception:
             win32process.TerminateProcess(process, 1)
+            _close(job)
             raise
         win32process.ResumeThread(thread)
         thread.Close()
-        self.running[account] = _Running(process, pid, session, program)
+        self.running[account] = _Running(process, pid, session, program, job)
         log.info("started the site worker for %s in session %s (pid %s)", account, session, pid)
 
     def connected_accounts(self) -> set[str]:

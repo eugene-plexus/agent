@@ -1,6 +1,6 @@
 """The Windows calls a person's worker is started with, faked at the pywin32
 boundary (job-sites-own-enrollment.md §2.4): which token the process gets,
-whose session it is started in, that it is in the agent's job before it runs,
+whose session it is started in, that it is in a job of its own before it runs,
 and which session stands for an account. The real calls are exercised by an
 elevated acceptance run; what these hold is the order and the arguments."""
 
@@ -29,6 +29,17 @@ class Token:
         return None
 
 
+class Job:
+    def __init__(self, name: str, events: list[tuple[str, Any]]) -> None:
+        self.name, self.events = name, events
+        self.members: list[Any] = []
+        self.closed = False
+
+    def Close(self) -> None:
+        self.closed = True
+        self.events.append(("close", self.name))
+
+
 class Win32:
     """One recording stand-in for the six pywin32 modules a start touches."""
 
@@ -36,7 +47,11 @@ class Win32:
         self.events: list[tuple[str, Any]] = []
         self.session_users = sessions or {}
         self.states: dict[int, int] = {}
-        self.limit_flags = 0
+        self.limit_flags: dict[str, int] = {}
+        self.jobs: list[Job] = []
+        #: Windows' rule: a process already in a job joins another only while
+        #: that one is empty (the agent's own job reaches every child).
+        self.nesting_rule = True
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         events = self.events
@@ -77,14 +92,26 @@ class Win32:
         job = types.ModuleType("win32job")
         job.JobObjectExtendedLimitInformation = 9  # type: ignore[attr-defined]
         job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000  # type: ignore[attr-defined]
-        job.CreateJobObject = lambda *_a: "JOB"  # type: ignore[attr-defined]
+
+        def create_job(*_a: Any) -> Job:
+            made = Job(f"JOB{len(me.jobs) + 1}", events)
+            me.jobs.append(made)
+            return made
+
+        job.CreateJobObject = create_job  # type: ignore[attr-defined]
         job.QueryInformationJobObject = lambda *_a: {"BasicLimitInformation": {"LimitFlags": 0}}  # type: ignore[attr-defined]
 
-        def set_information(_job: Any, _kind: int, info: dict[str, Any]) -> None:
-            me.limit_flags = info["BasicLimitInformation"]["LimitFlags"]
+        def set_information(target: Job, _kind: int, info: dict[str, Any]) -> None:
+            me.limit_flags[target.name] = info["BasicLimitInformation"]["LimitFlags"]
+
+        def assign(target: Job, process: Any) -> None:
+            if me.nesting_rule and target.members:
+                raise OSError(5, "AssignProcessToJobObject", "Access is denied.")
+            target.members.append(process)
+            events.append(("assign", (target.name, process)))
 
         job.SetInformationJobObject = set_information  # type: ignore[attr-defined]
-        job.AssignProcessToJobObject = lambda j, p: events.append(("assign", (j, p)))  # type: ignore[attr-defined]
+        job.AssignProcessToJobObject = assign  # type: ignore[attr-defined]
 
         for module in (ts, security, profile, con, process, job):
             monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -97,13 +124,61 @@ def program(tmp_path: Path) -> WorkerProgram:
     )
 
 
-def test_the_agents_job_closes_with_the_agent(
+def test_each_workers_job_closes_with_the_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake = Win32()
+    fake = Win32({7: ADA})
     fake.install(monkeypatch)
-    WindowsStarter(LinkStore(tmp_path))
-    assert fake.limit_flags & 0x2000
+    starter = WindowsStarter(LinkStore(tmp_path))
+    assert fake.jobs == [], "no job until a worker starts"
+    starter._start(ADA, 7, program(tmp_path))
+    assert fake.limit_flags == {"JOB1": 0x2000}
+    assert starter.running[ADA].job is fake.jobs[0]
+
+
+def test_a_second_person_gets_a_job_of_their_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first Windows run: an agent that is itself in a job (as a task is)
+    passes it to each worker, and Windows then lets a worker join only an
+    empty job. One shared job took the owner's worker and refused Jessie's."""
+    fake = Win32({7: ADA, 8: BO})
+    fake.install(monkeypatch)
+    starter = WindowsStarter(LinkStore(tmp_path))
+    starter._start(ADA, 7, program(tmp_path))
+    starter._start(BO, 8, program(tmp_path))
+    assert [e for e in fake.events if e[0] == "assign"] == [
+        ("assign", ("JOB1", "PROCESS")),
+        ("assign", ("JOB2", "PROCESS")),
+    ]
+    assert set(starter.running) == {ADA, BO}
+
+
+def test_stopping_a_worker_closes_its_job_and_no_one_elses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = Win32({7: ADA, 8: BO})
+    fake.install(monkeypatch)
+    starter = WindowsStarter(LinkStore(tmp_path))
+    starter._start(ADA, 7, program(tmp_path))
+    starter._start(BO, 8, program(tmp_path))
+    starter._stop(ADA)
+    assert [job.closed for job in fake.jobs] == [True, False]
+
+
+def test_a_worker_that_cannot_join_its_job_is_ended_and_its_job_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = Win32({7: ADA})
+    fake.install(monkeypatch)
+    starter = WindowsStarter(LinkStore(tmp_path))
+    fake.jobs.append(Job("taken", fake.events))
+    sys.modules["win32job"].CreateJobObject = lambda *_a: fake.jobs[0]  # type: ignore[attr-defined]
+    fake.jobs[0].members.append("someone")
+    with pytest.raises(OSError, match="Access is denied"):
+        starter._start(ADA, 7, program(tmp_path))
+    kinds = [kind for kind, _ in fake.events]
+    assert kinds == ["create", "terminate", "close"] and starter.running == {}
 
 
 def test_a_worker_gets_the_filtered_token_and_is_in_the_job_before_it_runs(
