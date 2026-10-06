@@ -436,3 +436,29 @@ def test_a_linux_system_install_leaves_the_local_server_list_to_root(
         )
     with pytest.raises(site_cli.SiteError, match=r"/etc/eugene-plexus/site/servers.yaml"):
         site_cli.remove_server(tmp_path, "notes")
+
+
+def test_the_site_host_is_prepared_when_its_install_is_recorded_not_when_its_venv_appears(
+    tmp_path: Path,
+) -> None:
+    """uv makes a venv's interpreter before it installs anything into it; the
+    first Windows run's `site join` called that interpreter and found no site
+    host. Only the version `apps.yaml` records is an install."""
+    from datetime import UTC, datetime
+
+    from eugene_plexus_agent.apps import APPS_FILE, AppOrigin, AppStore, InstalledApp, venv_python
+
+    store = AppStore(tmp_path / APPS_FILE)
+    want = site_host.manifest({})
+    python = venv_python(store.version_dir(site_cli.HELPER_ID, want.version) / "venv")
+    python.parent.mkdir(parents=True)
+    python.write_bytes(b"")
+    assert site_cli._host_python(tmp_path) is None
+    store.put(
+        InstalledApp(
+            manifest=want, origin=AppOrigin.catalogue, port=8300, installed_at=datetime.now(UTC)
+        )
+    )
+    assert site_cli._host_python(tmp_path) == python
+    python.unlink()
+    assert site_cli._host_python(tmp_path) is None

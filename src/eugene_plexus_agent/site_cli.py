@@ -69,7 +69,7 @@ import yaml
 from pydantic import ValidationError
 
 from ._generated.site_host_models import SiteLocalServerList
-from .apps import APPS_DIR
+from .apps import APPS_DIR, APPS_FILE, AppStore, venv_python
 from .settings import Settings
 from .site_host import HELPER_ID, servers_path, set_wanted
 from .site_links import LinkError, LinkStore, account_name, account_sid
@@ -406,14 +406,20 @@ def _owner_account(args: argparse.Namespace) -> str:
 
 
 def _host_python(config_dir: Path) -> Path | None:
-    """The site host's interpreter, once the agent has prepared it."""
-    versions = config_dir / APPS_DIR / HELPER_ID / "versions"
-    found: list[Path] = []
-    for venv in versions.glob("*/venv"):
-        python = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-        if python.exists():
-            found.append(python)
-    return max(found, key=lambda p: p.stat().st_mtime) if found else None
+    """The site host's interpreter, once the agent has installed it: the
+    version `apps.yaml` records. An interpreter alone is not an install:
+    uv makes a venv's `python` before it installs anything into it, and the
+    first Windows run's `site join` ran one with no site host in it."""
+    store = AppStore(config_dir / APPS_FILE)
+    try:
+        store.load()
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    record = store.get(HELPER_ID)
+    if record is None:
+        return None
+    python = venv_python(store.version_dir(HELPER_ID, record.version) / "venv")
+    return python if python.exists() else None
 
 
 def _prepared(config_dir: Path, args: argparse.Namespace) -> tuple[Path, Path]:
