@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from eugene_plexus_agent import app_accounts, site_cli, site_host
 from eugene_plexus_agent._generated.models import AppOrigin
 from eugene_plexus_agent.apps import AppStore, InstalledApp, is_node_files
+from eugene_plexus_agent.node_identity import NodeIdentityStore
 from eugene_plexus_agent.site_host import HELPER_ID, SiteHostRelay
 
 
@@ -175,20 +176,48 @@ async def test_a_claimed_operation_is_never_run_twice(app: FastAPI) -> None:
 
 
 def test_a_job_site_keeps_the_owner_it_pinned(app: FastAPI, tmp_path: Path) -> None:
-    pinned: list[str] = []
-    record = identity(job_site=True, site_owner=None)
-
-    def pin(owner: str) -> str:
-        if record.site_owner is None:
-            record.site_owner = owner
-            pinned.append(owner)
-        return str(record.site_owner)
-
-    app.state.node_identity = SimpleNamespace(record=record, pin_site_owner=pin)
+    """Rule 2 of §3.3: the owner confirmed at the join is the owner, whatever
+    the root's state later says. The real identity store, read back."""
+    store = NodeIdentityStore(tmp_path / "node.yaml")
+    store.ensure_keypair()
+    store.record_enrollment(
+        name="desk",
+        control_url="https://nodes.home.arpa:8443",
+        epoch=1,
+        control_public_key="key",
+        recovery_public_key=None,
+        advertise_url=None,
+        job_site=True,
+        site_owner="p-ada",
+    )
+    app.state.node_identity = store
     relay = SiteHostRelay(app)
-    relay._pin_owner("p-ada")
     relay._pin_owner("p-mallory")
-    assert record.site_owner == "p-ada" and pinned == ["p-ada"]
+    again = NodeIdentityStore(tmp_path / "node.yaml")
+    again.load()
+    assert again.record.site_owner == "p-ada"
+    # A site joined before owners were pinned takes the first one it is told.
+    older = NodeIdentityStore(tmp_path / "older" / "node.yaml")
+    older.ensure_keypair()
+    older.record_enrollment(
+        name="old",
+        control_url="https://nodes.home.arpa:8443",
+        epoch=1,
+        control_public_key="key",
+        recovery_public_key=None,
+        advertise_url=None,
+        job_site=True,
+    )
+    app.state.node_identity = older
+    relay._pin_owner("p-bo")
+    relay._pin_owner("p-mallory")
+    assert older.record.site_owner == "p-bo"
+    # An ordinary node pins nobody.
+    plain = NodeIdentityStore(tmp_path / "plain" / "node.yaml")
+    plain.ensure_keypair()
+    app.state.node_identity = plain
+    relay._pin_owner("p-bo")
+    assert plain.record.site_owner is None
 
 
 def test_the_host_learns_its_mode_owner_and_servers_from_the_agent(
