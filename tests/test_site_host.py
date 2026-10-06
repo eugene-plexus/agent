@@ -405,3 +405,12 @@ def test_the_site_command_never_starts_the_agent(
         )
     assert done.value.code == 0 and ran and ran[0] != "serve"
     assert ran[0].program == str(program(tmp_path)) and ran[0].arg == ["-I", "x.py"]
+
+
+def test_only_the_site_host_itself_is_kept_out_of_the_owners_apps() -> None:
+    """The id and the entry must both be the host's: an app that merely takes
+    its id is the owner's to see and manage."""
+    assert is_site_host("site-host", "eugene_plexus_site_host")
+    assert is_site_host(RETIRED_ID, "eugene_plexus_site_host")
+    assert not is_site_host("site-host", "something_else")
+    assert not is_site_host("workbench", "eugene_plexus_site_host")

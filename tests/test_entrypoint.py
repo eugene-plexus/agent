@@ -470,3 +470,83 @@ def test_healthz_names_the_fallback_without_degrading(client, settings):
     reply = client.get("/healthz").json()
     assert reply["status"] == "ok"
     assert reply["details"]["entrypointFallback"] == "the file was missing"
+
+
+# --------------------------------------------------------------------------- #
+# the public route for Job Sites (J3, J31)
+# --------------------------------------------------------------------------- #
+
+NODES = {"origin": "https://nodes.home.arpa:8443", "networks": ["192.168.1.0/24"]}
+SITE_PATHS = {
+    "POST": [
+        "/v1/sites/enroll",
+        "/v1/sites/poll",
+        "/v1/sites/operations/*/claim",
+        "/v1/sites/operations/*/result",
+        "/v1/sites/leave",
+    ],
+    "GET": ["/v1/trust/tls"],
+}
+
+
+def _entry_routes(tmp_path: Path, **changes) -> list[dict]:
+    document = caddy_config(
+        config(nodes=NODES, **changes), tmp_path, "secret", {"agent": 8079, "control": 8083}
+    )
+    return document["apps"]["http"]["servers"]["entry"]["routes"]
+
+
+def _public_route(routes: list[dict]) -> dict:
+    (found,) = [r for r in routes if any("method" in m for m in r.get("match", []))]
+    return found
+
+
+def test_the_public_route_carries_a_sites_paths_and_nothing_else(tmp_path):
+    """Exactly the paths a site needs, by method, on the nodes name; no trust
+    bundle and no node enrollment."""
+    route = _public_route(_entry_routes(tmp_path, public_sites=True))
+    carried = {m["method"][0]: m["path"] for m in route["match"]}
+    assert carried == SITE_PATHS
+    assert all(m["host"] == ["nodes.home.arpa"] for m in route["match"])
+
+
+def test_the_public_route_marks_its_requests_and_every_other_route_strips_the_mark(tmp_path):
+    from eugene_plexus_agent.entrypoint import ENTRY_HEADER, PUBLIC_SITES
+
+    routes = _entry_routes(tmp_path, public_sites=True)
+    public = _public_route(routes)
+    (proxy,) = [h for h in public["handle"] if h["handler"] == "reverse_proxy"]
+    assert proxy["headers"]["request"]["set"][ENTRY_HEADER] == [PUBLIC_SITES]
+    others = 0
+    for route in routes:
+        if route is public:
+            continue
+        for handler in route.get("handle", []):
+            if handler.get("handler") == "reverse_proxy":
+                others += 1
+                request = handler["headers"]["request"]
+                assert ENTRY_HEADER in request["delete"], "a caller could mark its own request"
+                assert ENTRY_HEADER not in request["set"]
+    assert others
+
+
+def test_without_public_sites_there_is_no_public_route(tmp_path):
+    assert not [
+        r for r in _entry_routes(tmp_path) if any("method" in m for m in r.get("match", []))
+    ]
+
+
+def test_public_sites_needs_a_nodes_name_and_the_old_spelling_is_still_read():
+    with pytest.raises(ValidationError, match="needs a nodes name"):
+        config(public_sites=True)
+    assert config(nodes=NODES, public_nodes=True).public_sites is True
+    assert config(nodes=NODES, public_sites=True).public_sites is True
+
+
+def test_only_the_nodes_name_may_be_a_bare_address():
+    config(nodes={"origin": "https://203.0.113.5:8443", "networks": ["192.168.1.0/24"]})
+    with pytest.raises(ValidationError, match="is an address"):
+        config(
+            workbench={"origin": "https://203.0.113.5:8443", "networks": ["0.0.0.0/0"]},
+            nodes=NODES,
+        )
