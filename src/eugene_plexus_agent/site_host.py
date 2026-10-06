@@ -53,7 +53,7 @@ ENTRY = "eugene_plexus_site_host"
 MANAGED_ENTRIES = NODE_FILES_ENTRIES
 PROTOCOL = "mcp-2026-07-28"
 
-SITE_HOST_COMMIT = "f58a0a6d28e85e395029844eb99d8cb1085bc0e8"
+SITE_HOST_COMMIT = "38d7ed8c0185440c6fc9abc6139fc48834d614f2"
 SITE_HOST_SOURCE = f"https://github.com/eugene-plexus/site-host/archive/{SITE_HOST_COMMIT}.tar.gz"
 #: A checkout to install instead, for development and the acceptance runs.
 SOURCE_OVERRIDE = "EUGENE_PLEXUS_AGENT_SITE_HOST_SOURCE"
