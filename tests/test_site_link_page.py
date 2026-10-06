@@ -445,6 +445,7 @@ def test_the_happy_path_links_the_person_to_the_account(
         pytest.param(lambda r: r.claims.update(eugene_role=None), id="no role"),
         pytest.param(lambda r: r.claims.update(sub="operator"), id="the owner's subject"),
         pytest.param(lambda r: r.claims.update(exp=int(time.time()) - 3600), id="expired"),
+        pytest.param(lambda r: r.claims.update(exp=None), id="no expiry"),
         pytest.param(lambda r: r.claims.update(sub=None), id="no subject"),
         pytest.param(lambda r: setattr(r, "sign_with", r.other), id="signed by another key"),
         pytest.param(
@@ -555,6 +556,13 @@ def test_a_stale_attempt_is_swept(
     next(iter(pages(app).attempts.values())).started -= site_link.ATTEMPT_SECONDS + 1
     assert callback(browser, attempt).status_code == 403
     assert not pages(app).attempts
+
+
+def test_attempts_are_bounded_and_the_oldest_goes_first() -> None:
+    pages_ = site_link.LinkPages()
+    keys = [pages_.begin(ADA)[0] for _ in range(site_link.MAX_ATTEMPTS + 5)]
+    assert len(pages_.attempts) == site_link.MAX_ATTEMPTS
+    assert keys[0] not in pages_.attempts and keys[-1] in pages_.attempts
 
 
 # --- confirm ----------------------------------------------------------------------------
@@ -726,6 +734,7 @@ def test_no_one_but_the_root_may_remove_a_link(
         local_service_token(app, "control"),  # this node's key signing as control
         local_service_token(app, "gateway"),
         enrolled.service("node:other-box"),  # addressed to another node
+        enrolled.service("node:gpu-box", sub="gateway"),  # the root's key, another subject
     ]
     for token in refused:
         headers = {"Authorization": f"Bearer {token}"} if token else {}

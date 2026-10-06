@@ -21,6 +21,8 @@ import pytest
 from eugene_plexus_agent import site_cli, site_host
 from eugene_plexus_agent.site_links import LinkError, LinkStore
 
+_REAL_NEVER = site_cli._never  # the autouse fixture replaces it for every test
+
 ADA = "S-1-5-21-1-2-3-1001"
 BO = "S-1-5-21-1-2-3-1002"
 NAMES = {ADA: "PC\\ada", BO: "PC\\bo", "S-1-5-18": "NT AUTHORITY\\SYSTEM"}
@@ -404,3 +406,33 @@ def test_run_prints_a_refusal_and_exits_two(
     LinkStore(tmp_path).add(subject="p-ada", name="Ada", account=ADA, account_name="PC\\ada")
     assert site_cli.run(parse("unlink", "--person", "Ada"), settings) == 0  # type: ignore[arg-type]
     assert os.linesep.join(["Ada is no longer linked to PC\\ada."]) in capsys.readouterr().out
+
+
+def test_the_real_list_of_eugenes_own_accounts_names_system_and_the_site_hosts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host_sid = "S-1-5-80-111"
+    monkeypatch.setattr(site_cli, "account_sid", lambda name: host_sid)
+    assert _REAL_NEVER() == frozenset({"S-1-5-18", host_sid})
+
+    # A machine where the site host's account does not exist yet still names SYSTEM.
+    def missing(name: str) -> str:
+        raise LinkError("none")
+
+    monkeypatch.setattr(site_cli, "account_sid", missing)
+    assert _REAL_NEVER() == frozenset({"S-1-5-18"})
+
+
+def test_a_linux_system_install_leaves_the_local_server_list_to_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(site_cli, "sys", SimpleNamespace(platform="linux", stdin=sys.stdin))
+    monkeypatch.setattr(site_cli, "_system_install", lambda config_dir: True)
+    exe = tmp_path / "server.exe"
+    exe.write_bytes(b"MZ")
+    with pytest.raises(site_cli.SiteError, match=r"/etc/eugene-plexus/site/servers.yaml"):
+        site_cli.add_server(
+            tmp_path, server_id="notes", name="N", command=str(exe), args=[], env=[], system=False
+        )
+    with pytest.raises(site_cli.SiteError, match=r"/etc/eugene-plexus/site/servers.yaml"):
+        site_cli.remove_server(tmp_path, "notes")
