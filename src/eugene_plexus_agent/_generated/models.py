@@ -2835,7 +2835,7 @@ class PublicEntryPoint(BaseModel):
     nodesUrl: AnyUrl | None = None
     publicSites: bool | None = Field(
         None,
-        description="The nodes name also answers Job Sites on any network, on six\npaths only (`public_sites`, J3, J31;\n`docs/design/job-sites-own-enrollment.md` §2.3): a site's join\n(`POST /v1/sites/enroll`), its poll, claim, result and leave, and\nthe signed TLS key list (`GET /v1/trust/tls`). The trust bundle\nis not among them. Every other path on that name is refused with\na sentence naming the console. The networks listed for the name\nkeep the whole control API, as before. Set only with an\nacknowledgement of the risks. A machine on the root's own\nnetwork needs none of this: a site there joins through the LAN\naddress (J31). Read from an older `entrypoint.json` as\n`public_nodes`.\n",
+        description="The nodes name also answers Job Sites on any network, on seven\npaths only (`public_sites`, J3, J31;\n`docs/design/job-sites-own-enrollment.md` §2.3, §3.2): a site's\njoin (`POST /v1/sites/enroll`), its poll, claim, result and\nleave, its check of a person typed at the machine to link them\n(`POST /v1/sites/links/check`, J36), and the signed TLS key list\n(`GET /v1/trust/tls`). The trust bundle\nis not among them. Every other path on that name is refused with\na sentence naming the console. The networks listed for the name\nkeep the whole control API, as before. Set only with an\nacknowledgement of the risks. A machine on the root's own\nnetwork needs none of this: a site there joins through the LAN\naddress (J31). Read from an older `entrypoint.json` as\n`public_nodes`.\n",
     )
 
 

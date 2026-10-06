@@ -1283,6 +1283,12 @@ class AppManager:
         """
         if self.accounts.available or manifest.localActions is False:
             return None
+        if manifest.entry in SITE_HOST_ENTRIES:
+            # The site host runs nothing a model chooses: each person's tools
+            # run in a worker as that person (job-sites-own-enrollment.md
+            # §3.2). On a per-user install that person is the one who
+            # installed it, and the only one served (J38).
+            return None
         return (
             f"{manifest.name} runs actions a model chooses on this machine, so it needs an "
             f"account of its own, and this install cannot make one. {self.accounts.reason}"

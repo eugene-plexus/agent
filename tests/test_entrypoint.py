@@ -484,6 +484,7 @@ SITE_PATHS = {
         "/v1/sites/operations/*/claim",
         "/v1/sites/operations/*/result",
         "/v1/sites/leave",
+        "/v1/sites/links/check",
     ],
     "GET": ["/v1/trust/tls"],
 }
@@ -508,6 +509,10 @@ def test_the_public_route_carries_a_sites_paths_and_nothing_else(tmp_path):
     carried = {m["method"][0]: m["path"] for m in route["match"]}
     assert carried == SITE_PATHS
     assert all(m["host"] == ["nodes.home.arpa"] for m in route["match"])
+    # Seven, since 2b.2: a person typed at a machine is checked at the root
+    # through the site's own key (J36). Nothing else came with it.
+    assert sum(len(paths) for paths in carried.values()) == 7
+    assert "/v1/sites/links/check" in carried["POST"]
 
 
 def test_the_public_route_marks_its_requests_and_every_other_route_strips_the_mark(tmp_path):

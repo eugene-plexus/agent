@@ -67,6 +67,7 @@ from .routes import oidc_forward as oidc_forward_routes
 from .routes import profile_builds as profile_build_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
+from .routes import site_link as site_link_routes
 from .routes import updates as update_routes
 from .runtimes import RuntimeSupervisor, close_installers
 from .settings import Settings, load_settings
@@ -840,6 +841,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(log_ingress_routes.router)
     # Signing in with Eugene (C2): /oidc/* forwards to the control root.
     app.include_router(oidc_forward_routes.router)
+    # A Job Site: the link page at the machine (J27, J37), and the root's
+    # removal of a link (§3.2).
+    app.include_router(site_link_routes.router)
+    app.include_router(site_link_routes.api)
 
     # The browser surface, registered LAST and in this order. The proxy
     # is deliberately unauthenticated — it is the path the login request

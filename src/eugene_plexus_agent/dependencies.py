@@ -195,6 +195,19 @@ def require_operator_or_control(
     raise _refuse(claims, "declare a runtime; only the operator or the control root may")
 
 
+def require_control(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """The control root's own token, addressed to this node, and nothing
+    else: for what only the root asks, such as removing a person's link to
+    an account here when they or their site's owner did so in Workbench."""
+    claims = verify_bearer(request, _bearer(creds), classes=_SESSION_OR_SERVICE)
+    if _is_control(claims):
+        return claims
+    raise _refuse(claims, "do this; only the control root may")
+
+
 def require_local_service(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),

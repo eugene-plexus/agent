@@ -49,14 +49,16 @@ root, and stripped from every other request: the root then lets no node join
 that way, and gives the trust bundle to nobody without a member's token
 (J3, J31)."""
 PUBLIC_SITE_PATHS: dict[str, list[str]] = {
-    # A Job Site's six paths, and nothing else (job-sites-own-enrollment.md
-    # §2.3, J31; J7a's signed TLS list). No trust bundle: no site needs one.
+    # A Job Site's seven paths, and nothing else (job-sites-own-enrollment.md
+    # §2.3, §3.2, J31; J7a's signed TLS list; J36's check of a person typed
+    # at the machine). No trust bundle: no site needs one.
     "POST": [
         "/v1/sites/enroll",
         "/v1/sites/poll",
         "/v1/sites/operations/*/claim",
         "/v1/sites/operations/*/result",
         "/v1/sites/leave",
+        "/v1/sites/links/check",
     ],
     "GET": ["/v1/trust/tls"],
 }

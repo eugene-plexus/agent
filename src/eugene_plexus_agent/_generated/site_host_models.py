@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
@@ -17,8 +17,9 @@ class SiteLocalServer(BaseModel):
     """
     A local MCP server a machine administrator added at the machine
     (`eugene-plexus-agent site server add`, elevated). Kept in the install's
-    protected configuration, which the host's own account cannot write, and
-    handed to the host when it starts (remote-nodes.md §6.2).
+    protected configuration, which neither the site host nor a worker can
+    write (remote-nodes.md §6.2). It runs in the worker of whoever calls it,
+    as that person, or as the site's owner for someone with no link (J27).
 
     """
 
@@ -73,6 +74,33 @@ class SiteHostProtocol(StrEnum):
     """
 
     mcp_2026_07_28 = 'mcp-2026-07-28'
+
+
+class SitePersonLink(BaseModel):
+    """
+    One person linked to an OS account on a site's machine, as the site reports it.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ..., description="The person's id.", max_length=64, min_length=1
+    )
+    accountName: str = Field(
+        ...,
+        description='The OS account, for display, e.g. `AMISH_STATION\\jessie` or `jessie`.',
+        max_length=256,
+        min_length=1,
+    )
+    available: bool = Field(
+        ..., description='Their worker is connected, so their calls can run now.'
+    )
+    reason: str | None = Field(
+        None,
+        description='Why not, when it is not, e.g. that they are not signed in on a Windows machine (J25).',
+        max_length=1024,
+    )
 
 
 class SiteFolderPerson(BaseModel):
@@ -225,6 +253,59 @@ class SiteAnswerStatus(StrEnum):
     done = 'done'
     failed = 'failed'
     uncertain = 'uncertain'
+
+
+class SiteAccountLink(BaseModel):
+    """
+    One link in the links file: *this Eugene person is this OS account on
+    this machine* (§2.2, J27). Made at the machine only, by the machine's
+    privileged starter (the agent on a Windows service install, root on a
+    Linux system install, the join on a per-user install), never by the root
+    or the site host.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ..., description="The person's id.", max_length=64, min_length=1
+    )
+    name: str | None = Field(
+        None, description='How the person signs in, for display.', max_length=256
+    )
+    account: str = Field(
+        ...,
+        description="The OS account's SID on Windows, or its uid in decimal elsewhere. Compared exactly.",
+        max_length=256,
+        min_length=1,
+    )
+    accountName: str = Field(..., max_length=256, min_length=1)
+    linkedAt: AwareDatetime
+
+
+class SitePersonCheckRequest(BaseModel):
+    """
+    A person's Eugene sign-in, typed at the machine to link them there (J36).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(
+        ..., description='How the person signs in.', max_length=256, min_length=1
+    )
+    password: str = Field(..., max_length=1024, min_length=1)
+
+
+class SitePersonCheck(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ..., description="The person's id.", max_length=64, min_length=1
+    )
+    name: str = Field(..., max_length=256)
 
 
 class SiteHostHealth(BaseModel):
@@ -389,7 +470,11 @@ class SiteAnswer(BaseModel):
 
 class SiteLocalServerList(BaseModel):
     """
-    The file of local servers (`site-servers.yaml`) the agent keeps in its protected configuration.
+    The local-server list (`servers.yaml`), beside the links in the
+    install's administrator-only place (§3.2). An administrator writes it at
+    the machine. The site host and each worker read it directly and cannot
+    write it, so the site host cannot name a program for a worker to run.
+
     """
 
     model_config = ConfigDict(
@@ -592,6 +677,21 @@ class SiteResult(BaseModel):
     )
 
 
+class SiteLinkFile(BaseModel):
+    """
+    The links file (§3.2): written by the machine's privileged starter,
+    read by the site host, which cannot write it. One link per person, and
+    one person per account.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    version: Literal[1]
+    links: list[SiteAccountLink] = Field(..., max_length=256)
+
+
 class SiteCall(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -680,6 +780,20 @@ class SiteSummary(BaseModel):
         description="Who may use the local servers' tools. Folders carry their own people.",
         max_length=2048,
     )
+    links: list[SitePersonLink] | None = Field(
+        None,
+        description="The people linked to an OS account on this machine (§2.2, J27), and\nwhether each one's worker is connected now. A linked person's calls\nrun as their own account; anyone else's run in the owner's worker,\nas the owner, confined to the folder (J27).\n",
+        max_length=256,
+    )
+    linkPage: str | None = Field(
+        None,
+        description="Where a person links their account, on the machine itself: the\nagent's loopback link page on a Windows service install. Null where\nlinking is the elevated one-liner (a Linux system install, J36) or\nwhere only the installing person is served (a per-user install, J38).\n",
+        max_length=256,
+    )
+    sharing: bool | None = Field(
+        None,
+        description='Whether this site can serve anyone but its owner. False on macOS,\nwhich has no folder boundary yet (§2.6). Absent means true.\n',
+    )
 
 
 class SiteOperation(BaseModel):
@@ -749,6 +863,8 @@ class SiteReport(BaseModel):
     ready: bool
     reason: str | None = Field(None, max_length=1024)
     account: str | None = Field(
-        None, description="The OS account the site's tools run as.", max_length=256
+        None,
+        description="The kind of OS account the site host itself runs in. Since 2b.2 the\nsite's tools run in each person's worker, as `SiteSummary.links`\nsays, and never in this account.\n",
+        max_length=256,
     )
     site: SiteSummary | None = None

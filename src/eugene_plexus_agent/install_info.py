@@ -124,7 +124,17 @@ def _systemd_scope() -> str | None:
     return None
 
 
+#: For acceptance runs only: a throwaway agent started as LocalSystem by a
+#: one-shot task, beside a live install it must never disturb, says it is a
+#: service install so its site host gets an account of its own and its
+#: starter runs (job-sites-own-enrollment.md §3.2). Nothing ever sets it.
+MECHANISM_OVERRIDE = "EUGENE_PLEXUS_AGENT_ACCEPTANCE_MECHANISM"
+
+
 def mechanism() -> InstallMechanism:
+    override = os.environ.get(MECHANISM_OVERRIDE, "").strip()
+    if override:
+        return InstallMechanism(override)
     if container() is not None:
         return InstallMechanism.container
     if sys.platform.startswith("linux"):

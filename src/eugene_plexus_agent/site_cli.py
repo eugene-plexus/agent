@@ -3,6 +3,8 @@
     eugene-plexus-agent site join --url URL --token TOKEN --owner NAME --label NAME
         [--root-key KEY] [--password-stdin]
     eugene-plexus-agent site leave
+    eugene-plexus-agent site link --person NAME [--account ACCOUNT] [--password-stdin]
+    eugene-plexus-agent site unlink --person NAME
     eugene-plexus-agent site status
     eugene-plexus-agent site audit [--limit N]
     eugene-plexus-agent site server add ID --name NAME --command PATH
@@ -12,10 +14,10 @@
 **Adding a local MCP server is the machine administrator's act**
 (`remote-nodes.md` §6.2): it names a program on this machine, so it is done
 here, elevated (an administrator token on Windows, uid 0 on Linux), and
-never from Workbench. It writes `site-servers.yaml` beside `agent.yaml`, in
-the install's protected configuration, which the site host's own account
-cannot write, with the program's SHA-256: a program that changes after it
-is added is not run. Who may use it is then the site owner's policy, set
+never from Workbench. It writes `site/servers.yaml` beside `agent.yaml`, in
+the install's protected configuration, which neither the site host nor a
+worker can write, with the program's SHA-256: a program that changes after
+it is added is not run. Who may use it is then the site owner's policy, set
 from Workbench; a new server is off until they turn it on.
 
 **`join` makes this machine a Job Site**, its own enrollment, separate
@@ -25,7 +27,17 @@ host's own** join with the site's own directory: the site's key is made
 there, by the site host, and the agent never holds it (J23). The owner
 confirms with their own password, read from the terminal or, with
 `--password-stdin`, from the first line of standard input. `leave` tells the
-root and forgets the enrollment; the site's policy and audit log stay.
+root and forgets the enrollment and the links; the site's policy and audit
+log stay.
+
+**`join` also links the owner** to the account that ran it (§2.2): the
+elevated administrator's own on Windows, or the console's signed-in person
+when SYSTEM runs it, or this account on a per-user install, where no
+elevation is needed. `--site-account` names another. **`link` and
+`unlink`** are the expert's way to link someone else (elevated): it checks
+their Eugene password with the root, through the site's own key, as root
+does on Linux (J36). Most people link on the page at the machine instead
+(`http://127.0.0.1:<port>/link`, a Windows service install).
 
 **`--system`** marks a server able to alter the operating system, and adding
 one is J9's gate: the administrator proves elevation here, and their consent
@@ -40,6 +52,7 @@ an added or removed server at its next poll and restarts the host with it.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import hashlib
 import json
@@ -58,9 +71,12 @@ from pydantic import ValidationError
 from ._generated.site_host_models import SiteLocalServerList
 from .apps import APPS_DIR
 from .settings import Settings
-from .site_host import HELPER_ID, SYSTEMD_STATE_ROOT, set_wanted
+from .site_host import HELPER_ID, servers_path, set_wanted
+from .site_links import LinkError, LinkStore, account_name, account_sid
 
-SERVERS_FILE = "site-servers.yaml"
+#: Where root keeps a Linux system install's site (install.sh, §2.4).
+ROOT_SITE_DATA = Path("/var/lib/eugene-plexus-site")
+SITE_HOST_ACCOUNT = r"NT SERVICE\EugenePlexusApp-site-host"
 #: How long `join` waits for the running agent to prepare the site host.
 PREPARE_SECONDS = 900
 MAX_SERVERS = 32
@@ -106,8 +122,23 @@ def add_parser(sub: Any) -> None:
         action="store_true",
         help="Read the owner's password from the first line of standard input.",
     )
+    joining.add_argument(
+        "--site-account",
+        dest="site_account",
+        help="The owner's account on this machine, when not the one running this.",
+    )
     joining.add_argument("--python", help=argparse.SUPPRESS)
     joining.add_argument("--data-dir", dest="data_dir", help=argparse.SUPPRESS)
+    linking = actions.add_parser(
+        "link", help="Link a person to their account on this machine (elevated)."
+    )
+    linking.add_argument("--person", required=True, help="How they sign in to Eugene.")
+    linking.add_argument("--account", help="Their account here; the console's person if absent.")
+    linking.add_argument("--password-stdin", action="store_true")
+    linking.add_argument("--python", help=argparse.SUPPRESS)
+    linking.add_argument("--data-dir", dest="data_dir", help=argparse.SUPPRESS)
+    unlinking = actions.add_parser("unlink", help="Remove a person's link here (elevated).")
+    unlinking.add_argument("--person", required=True, help="How they sign in to Eugene.")
     leaving = actions.add_parser("leave", help="This machine stops being a job site (elevated).")
     leaving.add_argument("--python", help=argparse.SUPPRESS)
     leaving.add_argument("--data-dir", dest="data_dir", help=argparse.SUPPRESS)
@@ -150,6 +181,10 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
             print(join(config_dir, args))
         elif args.site_command == "leave":
             print(leave(config_dir, args))
+        elif args.site_command == "link":
+            print(link(config_dir, args))
+        elif args.site_command == "unlink":
+            print(unlink(config_dir, args.person))
         elif args.site_command == "status":
             print(status(config_dir))
         elif args.site_command == "audit":
@@ -178,7 +213,7 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def read_servers(config_dir: Path) -> list[dict[str, Any]]:
-    path = config_dir / SERVERS_FILE
+    path = servers_path(config_dir)
     if not path.exists():
         return []
     try:
@@ -192,7 +227,8 @@ def read_servers(config_dir: Path) -> list[dict[str, Any]]:
 
 def write_servers(config_dir: Path, servers: list[dict[str, Any]]) -> None:
     SiteLocalServerList.model_validate({"servers": servers})
-    path = config_dir / SERVERS_FILE
+    path = servers_path(config_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     data = yaml.safe_dump({"servers": servers}, sort_keys=False, allow_unicode=True).encode()
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -201,6 +237,18 @@ def write_servers(config_dir: Path, servers: list[dict[str, Any]]) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+
+
+def _root_owns_the_list(config_dir: Path) -> None:
+    """On a Linux system install the list is root's, beside the links
+    (`/etc/eugene-plexus/site/servers.yaml`), and this agent's code never
+    runs as root: its account owns the prefix it runs from (§2.4, J36)."""
+    if sys.platform == "linux" and _system_install(config_dir):
+        raise SiteError(
+            "On a Linux system install root keeps this machine's local servers, in "
+            "/etc/eugene-plexus/site/servers.yaml. Edit it there as root; the site host "
+            "and its workers read it when they next start."
+        )
 
 
 def _need_elevation() -> None:
@@ -221,6 +269,7 @@ def add_server(
     env: list[str],
     system: bool,
 ) -> str:
+    _root_owns_the_list(config_dir)
     _need_elevation()
     if not _ID.match(server_id):
         raise SiteError("A server's id is lower-case letters, digits and hyphens, at most 40.")
@@ -271,6 +320,7 @@ def add_server(
 
 
 def remove_server(config_dir: Path, server_id: str) -> str:
+    _root_owns_the_list(config_dir)
     _need_elevation()
     servers = read_servers(config_dir)
     kept = [s for s in servers if s["id"] != server_id]
@@ -284,9 +334,75 @@ def remove_server(config_dir: Path, server_id: str) -> str:
 
 
 def _host_data(config_dir: Path) -> Path:
-    if sys.platform == "linux" and (SYSTEMD_STATE_ROOT / HELPER_ID).exists():
-        return SYSTEMD_STATE_ROOT / HELPER_ID
+    if sys.platform == "linux" and ROOT_SITE_DATA.exists():
+        return ROOT_SITE_DATA
     return config_dir / APPS_DIR / HELPER_ID / "data"
+
+
+def _system_install(config_dir: Path) -> bool:
+    """Whether this is the machine's own install rather than one person's:
+    under ProgramData on Windows, under /var/lib on Linux."""
+    where = str(config_dir.resolve()).lower()
+    if sys.platform == "win32":
+        program_data = os.environ.get("PROGRAMDATA", r"C:\ProgramData").lower()
+        return where.startswith(program_data)
+    return where.startswith("/var/lib/")
+
+
+def _console_sid() -> str | None:
+    """The person signed in at this machine's console, when SYSTEM runs this."""
+    try:
+        import win32security
+        import win32ts
+
+        session = win32ts.WTSGetActiveConsoleSessionId()
+        token = win32ts.WTSQueryUserToken(session)
+        user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        return str(win32security.ConvertSidToStringSid(user))
+    except Exception:
+        return None
+
+
+def _own_sid() -> str:
+    if sys.platform != "win32":
+        return str(os.getuid())
+    import win32api
+    import win32con
+    import win32security
+
+    token = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_QUERY)
+    user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+    return str(win32security.ConvertSidToStringSid(user))
+
+
+def _never() -> frozenset[str]:
+    accounts = {"S-1-5-18"}
+    with contextlib.suppress(LinkError):
+        accounts.add(account_sid(SITE_HOST_ACCOUNT))
+    return frozenset(accounts)
+
+
+def _owner_account(args: argparse.Namespace) -> str:
+    """Whose account a link names (§2.2): the one named, else the one
+    running this, else the console's person when SYSTEM runs it."""
+    named = getattr(args, "site_account", None) or getattr(args, "account", None)
+    if named:
+        return account_sid(named)
+    mine = _own_sid()
+    if mine == "S-1-5-18":
+        console = _console_sid()
+        if console is None:
+            raise SiteError(
+                "Nobody is signed in at this machine's console. Name the account with "
+                "--site-account."
+            )
+        return console
+    if sys.platform != "win32" and mine == "0":
+        sudo = os.environ.get("SUDO_UID")
+        if not sudo:
+            raise SiteError("Name the person's account here with --site-account.")
+        return sudo
+    return mine
 
 
 def _host_python(config_dir: Path) -> Path | None:
@@ -340,7 +456,13 @@ def _give_to_owner_of(data: Path) -> None:
 
 
 def join(config_dir: Path, args: argparse.Namespace) -> str:
-    _need_elevation()
+    if sys.platform == "linux" and _system_install(config_dir):
+        raise SiteError(
+            "On a Linux system install root makes this machine a job site: run the installer "
+            "with --job-site (J36)."
+        )
+    if _system_install(config_dir):
+        _need_elevation()
     password = _password(args)
     if not password:
         raise SiteError("A job site is confirmed by its owner's own password.")
@@ -370,11 +492,92 @@ def join(config_dir: Path, args: argparse.Namespace) -> str:
     if done.returncode != 0:
         raise SiteError((done.stderr or done.stdout).strip() or "The join did not finish.")
     _give_to_owner_of(data)
-    return done.stdout.strip()
+    said = [done.stdout.strip(), _link_owner(config_dir, data, args)]
+    return "\n".join(line for line in said if line)
+
+
+def _link_owner(config_dir: Path, data: Path, args: argparse.Namespace) -> str:
+    """The owner's link, from the join's own answer and the account that ran it."""
+    site = _read_json(data / "site.json") or {}
+    owner, name = site.get("owner"), site.get("ownerName")
+    if not isinstance(owner, str):
+        return "The owner could not be linked: the site's enrollment could not be read."
+    try:
+        account = _owner_account(args)
+        LinkStore(config_dir).add(
+            subject=owner,
+            name=name if isinstance(name, str) else None,
+            account=account,
+            account_name=account_name(account),
+            never=_never(),
+        )
+    except (LinkError, SiteError) as exc:
+        return f"The owner was not linked to an account here: {exc}"
+    return f"{name or 'The owner'}'s calls here run as {account_name(account)}."
+
+
+def link(config_dir: Path, args: argparse.Namespace) -> str:
+    """Link someone at the machine, by their Eugene password (elevated)."""
+    if sys.platform == "linux" and _system_install(config_dir):
+        raise SiteError(
+            "On a Linux system install root links people: run the installer with --site-link (J36)."
+        )
+    _need_elevation()
+    python = Path(args.python) if args.python else _host_python(config_dir)
+    data = Path(args.data_dir) if args.data_dir else _host_data(config_dir)
+    if python is None or not (data / "site.json").exists():
+        raise SiteError("This machine is not a job site.")
+    password = (
+        sys.stdin.readline().rstrip("\r\n")
+        if args.password_stdin
+        else getpass.getpass(f"{args.person}, your Eugene password (links you here): ")
+    )
+    done = subprocess.run(
+        [
+            str(python),
+            "-m",
+            "eugene_plexus_site_host",
+            "check-person",
+            "--name",
+            args.person,
+            "--data-dir",
+            str(data),
+        ],
+        input=password + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        raise SiteError((done.stderr or done.stdout).strip() or "The person could not be checked.")
+    person = json.loads(done.stdout)
+    account = _owner_account(args)
+    try:
+        LinkStore(config_dir).add(
+            subject=person["subject"],
+            name=person.get("name"),
+            account=account,
+            account_name=account_name(account),
+            never=_never(),
+        )
+    except LinkError as exc:
+        raise SiteError(str(exc)) from None
+    return f"{person.get('name')}'s calls here now run as {account_name(account)}."
+
+
+def unlink(config_dir: Path, person: str) -> str:
+    _need_elevation()
+    store = LinkStore(config_dir)
+    for entry in store.load():
+        if person in (entry.name, entry.subject):
+            store.remove(entry.subject)
+            return f"{entry.name or entry.subject} is no longer linked to {entry.account_name}."
+    raise SiteError(f"Nobody called {person} is linked here.")
 
 
 def leave(config_dir: Path, args: argparse.Namespace) -> str:
-    _need_elevation()
+    if _system_install(config_dir):
+        _need_elevation()
     python = Path(args.python) if args.python else _host_python(config_dir)
     data = Path(args.data_dir) if args.data_dir else _host_data(config_dir)
     if python is not None and data.exists():
@@ -388,6 +591,9 @@ def leave(config_dir: Path, args: argparse.Namespace) -> str:
         if done.returncode != 0:
             raise SiteError((done.stderr or done.stdout).strip() or "The site did not leave.")
     set_wanted(config_dir, False)
+    links = LinkStore(config_dir)
+    for entry in links.load():
+        links.remove(entry.subject)
     return "This machine is no longer a job site. Its folders' list and audit log are kept."
 
 

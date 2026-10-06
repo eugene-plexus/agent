@@ -23,21 +23,29 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_agent import app_accounts, site_cli, site_host
 from eugene_plexus_agent._generated.models import AppOrigin
-from eugene_plexus_agent.apps import AppStore, InstalledApp, is_site_host
+from eugene_plexus_agent.apps import InstalledApp, is_site_host
 from eugene_plexus_agent.site_host import HELPER_ID, RETIRED_ID, SiteHostSupervisor
 
 
 def test_the_host_is_told_what_only_the_agent_may_say(app: FastAPI) -> None:
-    """The install's private directory and the local servers; never who the
-    site is or who owns it, which is the site's own enrollment."""
+    """The install's private directory, the links and the local servers, where
+    they live; never who the site is or who owns it, which is the site's own
+    enrollment. The agent no longer copies the server list for the host (2b.2):
+    the host reads the protected file itself, and is told when it changes."""
     supervisor = SiteHostSupervisor(app)
-    manager: Any = SimpleNamespace(store=AppStore(supervisor.config_dir / "apps.yaml"))
-    plain = supervisor.environment(manager)
+    folder = supervisor.config_dir / "site"
+    plain = supervisor.environment("user")
     assert set(plain) == {
         "SITE_HOST_PROTECTED_ROOTS",
+        "SITE_HOST_LINKS_FILE",
         "SITE_HOST_LOCAL_SERVERS_FILE",
-        "SITE_HOST_LOCAL_SERVERS_SHA256",
+        "SITE_HOST_CHANNEL",
+        "SITE_HOST_SERVERS_STAMP",
     }
+    assert plain["SITE_HOST_LINKS_FILE"] == str(folder / "links.json")
+    assert plain["SITE_HOST_LOCAL_SERVERS_FILE"] == str(folder / "servers.yaml")
+    assert plain["SITE_HOST_SERVERS_STAMP"] == ""  # no list yet
+    assert plain["SITE_HOST_CHANNEL"] == site_host.channel_name(supervisor.config_dir)
     # A long list, and braces the launcher would otherwise read as a placeholder.
     servers = [
         {
@@ -49,17 +57,21 @@ def test_the_host_is_told_what_only_the_agent_may_say(app: FastAPI) -> None:
         }
         for n in range(4)
     ]
-    (supervisor.config_dir / site_host.SERVERS_FILE).write_text(
-        yaml.safe_dump({"servers": servers}), encoding="utf-8"
+    folder.mkdir()
+    listed = folder / "servers.yaml"
+    listed.write_text(yaml.safe_dump({"servers": servers}), encoding="utf-8")
+    site = supervisor.environment("user")
+    # Not a copy: the very file, and a stamp that moves when it does.
+    assert Path(site["SITE_HOST_LOCAL_SERVERS_FILE"]) == listed
+    assert site["SITE_HOST_SERVERS_STAMP"] == hashlib.sha256(listed.read_bytes()).hexdigest()
+    listed.write_text(yaml.safe_dump({"servers": servers[:1]}), encoding="utf-8")
+    assert (
+        supervisor.environment("user")["SITE_HOST_SERVERS_STAMP"] != site["SITE_HOST_SERVERS_STAMP"]
     )
-    site = supervisor.environment(manager)
-    copy = Path(site["SITE_HOST_LOCAL_SERVERS_FILE"])
-    data = copy.read_bytes()
-    assert hashlib.sha256(data).hexdigest() == site["SITE_HOST_LOCAL_SERVERS_SHA256"]
-    assert [s["id"] for s in json.loads(data)] == [s["id"] for s in servers]
-    assert copy.parent == manager.store.app_dir(HELPER_ID)
     assert json.loads(site["SITE_HOST_PROTECTED_ROOTS"]) == [str(supervisor.config_dir)]
     assert not any("OWNER" in key or "MODE" in key for key in site)
+    assert not any("SHA256" in key for key in site), "the old copy's hash is gone"
+    assert "SITE_HOST_LINK_PAGE" not in site, "no link page unless a service install offers it"
 
 
 def test_the_site_host_runs_only_when_an_administrator_turned_it_on(tmp_path: Path) -> None:
@@ -198,15 +210,27 @@ def test_join_runs_the_site_hosts_own_join_with_the_password_piped(
     assert given == "secret\n" and "secret" not in command
 
 
-def test_join_and_leave_need_the_machines_administrator(
+def test_leave_on_a_system_install_needs_the_machines_administrator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2b.2: only a system install (ProgramData, /var/lib) needs elevation."""
+    monkeypatch.setattr(site_cli, "elevated", lambda: False)
+    monkeypatch.setattr(site_cli, "_system_install", lambda config_dir: True)
+    args = SimpleNamespace(python=None, data_dir=None, password_stdin=True)
+    with pytest.raises(site_cli.SiteError, match="administrator"):
+        site_cli.leave(tmp_path, args)  # type: ignore[arg-type]
+    assert site_host.wanted(tmp_path) is False
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="a Linux system install refuses join outright")
+def test_join_on_a_system_install_needs_the_machines_administrator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(site_cli, "elevated", lambda: False)
+    monkeypatch.setattr(site_cli, "_system_install", lambda config_dir: True)
     args = SimpleNamespace(python=None, data_dir=None, password_stdin=True)
     with pytest.raises(site_cli.SiteError, match="administrator"):
         site_cli.join(tmp_path, args)  # type: ignore[arg-type]
-    with pytest.raises(site_cli.SiteError, match="administrator"):
-        site_cli.leave(tmp_path, args)  # type: ignore[arg-type]
     assert site_host.wanted(tmp_path) is False
 
 
@@ -268,7 +292,7 @@ def test_adding_a_server_needs_the_machines_administrator(
             env=[],
             system=False,
         )
-    assert not (tmp_path / site_cli.SERVERS_FILE).exists()
+    assert not site_host.servers_path(tmp_path).exists()
     with pytest.raises(site_cli.SiteError, match="administrator"):
         site_cli.remove_server(tmp_path, "notes")
 
@@ -288,7 +312,7 @@ def test_a_server_is_written_with_its_programs_hash(
         system=False,
     )
     assert "off until" in said
-    saved = yaml.safe_load((tmp_path / site_cli.SERVERS_FILE).read_text(encoding="utf-8"))
+    saved = yaml.safe_load(site_host.servers_path(tmp_path).read_text(encoding="utf-8"))
     entry = saved["servers"][0]
     assert entry["sha256"] == hashlib.sha256(b"a program").hexdigest()
     assert entry["args"] == ["--root", "{here}"] and entry["env"] == {"MODE": "fast"}
@@ -414,3 +438,135 @@ def test_only_the_site_host_itself_is_kept_out_of_the_owners_apps() -> None:
     assert is_site_host(RETIRED_ID, "eugene_plexus_site_host")
     assert not is_site_host("site-host", "something_else")
     assert not is_site_host("workbench", "eugene_plexus_site_host")
+
+
+# --- the starter's part, 2b.2 ---------------------------------------------------------------
+
+
+def test_the_site_host_is_exempt_from_the_own_account_rule_and_nothing_else_is(
+    app: FastAPI, client: TestClient
+) -> None:
+    """On a per-user install there is no account of its own to give an app, and
+    the site host is allowed because it runs nothing a model chooses (§3.2)."""
+    manager = app.state.apps
+    manager.accounts = app_accounts.AccountSupport(None, "No accounts here.")
+    host = site_host.manifest({})
+    assert manager.local_actions_refusal(host) is None
+    other = host.model_copy(update={"id": "notes", "entry": "notes_app"})
+    assert "needs an account of its own" in (manager.local_actions_refusal(other) or "")
+
+
+def prepared_host(app: FastAPI, version: str = "local-abc") -> Path:
+    """The host as the agent installed it: a record, enabled, with an interpreter."""
+    manager = app.state.apps
+    manifest = site_host.manifest({}).model_copy(update={"version": version})
+    manager.store.put(
+        InstalledApp(
+            manifest=manifest,
+            origin=AppOrigin.catalogue,
+            port=8302,
+            installed_at=datetime.now(UTC),
+            enabled=True,
+        )
+    )
+    python = manager.store.version_dir(HELPER_ID, version) / "venv"
+    interpreter = (
+        (python / "Scripts" / "python.exe")
+        if sys.platform == "win32"
+        else python / "bin" / "python"
+    )
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"")
+    return interpreter
+
+
+def test_a_per_users_worker_program_is_the_hosts_own_python_for_the_installer(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(site_host, "_own_account", lambda: "S-1-5-21-1-2-3-1001")
+    supervisor = SiteHostSupervisor(app)
+    assert supervisor._program("user") is None, "nothing installed yet"
+    python = prepared_host(app)
+    wanted = supervisor._program("user")
+    assert wanted is not None and wanted.python == python
+    assert wanted.host == "S-1-5-21-1-2-3-1001"
+    assert wanted.servers == supervisor.config_dir / "site" / "servers.yaml"
+    assert wanted.channel == site_host.channel_name(supervisor.config_dir)
+    assert supervisor.config_dir in wanted.protect
+    record = app.state.apps.store.get(HELPER_ID)
+    assert record is not None
+    record.enabled = False
+    app.state.apps.store.put(record)
+    assert supervisor._program("user") is None, "a host that is off has no workers"
+
+
+async def test_a_per_users_install_runs_one_child_worker_for_its_person(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Any] = []
+
+    class Child:
+        def __init__(self, account: str) -> None:
+            self.account, self.program = account, None
+            seen.append(self)
+            self.steps = 0
+
+        async def step(self) -> None:
+            self.steps += 1
+
+        async def stop(self) -> None:
+            self.program = "stopped"
+
+    monkeypatch.setattr(site_host, "ChildStarter", Child)
+    monkeypatch.setattr(site_host, "_own_account", lambda: "1001")
+    supervisor = SiteHostSupervisor(app)
+    prepared_host(app)
+    await supervisor._workers("user")
+    await supervisor._workers("user")
+    (child,) = seen
+    assert child.account == "1001" and child.steps == 2
+    assert child.program is not None and child.program.python.name.startswith("python")
+    await supervisor._stop_workers()
+    assert child.program == "stopped"
+    await supervisor._host.aclose()
+
+
+def test_a_container_hosts_no_site_and_a_linux_system_install_is_roots(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_agent import install_info
+    from eugene_plexus_agent._generated.models import InstallMechanism
+
+    manager = app.state.apps
+    supervisor = SiteHostSupervisor(app)
+    manager.accounts = app_accounts.AccountSupport(None, "none")
+    monkeypatch.setattr(install_info, "mechanism", lambda: InstallMechanism.container)
+    assert supervisor.mode() is None and supervisor.link_store() is None
+    monkeypatch.setattr(install_info, "mechanism", lambda: InstallMechanism.none)
+    assert supervisor.mode() == "user"
+    manager.accounts = app_accounts.AccountSupport("systemd", None)
+    assert supervisor.mode() == "root"
+
+
+async def test_on_a_linux_system_install_the_agent_only_reads_which_site_it_is(
+    app: FastAPI, client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    where = tmp_path / "host.json"
+    where.write_text(json.dumps({"port": 8411}), encoding="utf-8")
+    monkeypatch.setattr(site_host, "ROOT_SITE_FILE", where)
+    supervisor = SiteHostSupervisor(app)
+    asked: list[str] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        asked.append(str(request.url))
+        return httpx.Response(200, json={"site": "s-" + "b" * 26})
+
+    await supervisor._host.aclose()
+    supervisor._host = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    assert await supervisor._hosted("root") == "s-" + "b" * 26
+    assert asked == ["http://127.0.0.1:8411/healthz"]
+    where.write_text("not json", encoding="utf-8")
+    assert await supervisor._hosted("root") is None
+    where.unlink()
+    assert await supervisor._hosted("root") is None
+    await supervisor._host.aclose()

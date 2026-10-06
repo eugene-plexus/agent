@@ -158,6 +158,13 @@ module = [
     "win32security",
     # ...plus pywin32's error type, for the app services (C1).
     "pywintypes",
+    # ...plus the four a Job Site's starter uses: each linked person's
+    # session token, their environment, and the job their worker runs in
+    # (job-sites-own-enrollment.md §3.2).
+    "win32ts",
+    "win32job",
+    "win32process",
+    "win32profile",
 ]
 ignore_missing_imports = true
 
