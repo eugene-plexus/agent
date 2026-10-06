@@ -65,6 +65,9 @@ def test_a_workers_command_line_is_exactly_this(tmp_path: Path) -> None:
         str(tmp_path / "apps"),
     ]
     assert two.argv(BO)[5] == BO, "each worker is named for its own account"
+    assert "--shared-account" not in two.argv(BO), "a service install's workers never share"
+    shared = program(tmp_path, shared=True)
+    assert shared.argv(ADA)[-1] == "--shared-account"
 
 
 def write_links(tmp_path: Path, *accounts: str) -> LinkStore:

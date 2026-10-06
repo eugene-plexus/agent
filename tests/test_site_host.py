@@ -490,6 +490,9 @@ def test_a_per_users_worker_program_is_the_hosts_own_python_for_the_installer(
     wanted = supervisor._program("user")
     assert wanted is not None and wanted.python == python
     assert wanted.host == "S-1-5-21-1-2-3-1001"
+    # The per-user starter says the worker shares the host's account (J38);
+    # without it the worker refuses, as it must on a service install.
+    assert wanted.shared is True and wanted.argv("S-1-5-21-1-2-3-1001")[-1] == "--shared-account"
     assert wanted.servers == supervisor.config_dir / "site" / "servers.yaml"
     assert wanted.channel == site_host.channel_name(supervisor.config_dir)
     assert supervisor.config_dir in wanted.protect

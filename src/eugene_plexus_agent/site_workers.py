@@ -53,6 +53,9 @@ class WorkerProgram:
     host: str
     servers: Path
     protect: tuple[Path, ...] = ()
+    #: A per-user install (J38): the site host runs as the one person it
+    #: serves, so their worker shares its account, and says so.
+    shared: bool = False
 
     def argv(self, account: str) -> list[str]:
         args = [
@@ -71,6 +74,8 @@ class WorkerProgram:
         ]
         for path in self.protect:
             args += ["--protect", str(path)]
+        if self.shared:
+            args.append("--shared-account")
         return args
 
 

@@ -373,6 +373,7 @@ class SiteHostSupervisor:
             host=host,
             servers=servers_path(self.config_dir),
             protect=(self.config_dir, manager.store.root),
+            shared=mode == "user",
         )
 
     def _grant_windows(self, links: LinkStore, program: WorkerProgram | None) -> None:
