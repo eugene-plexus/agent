@@ -147,6 +147,24 @@ def test_a_list_signed_by_any_other_key_is_refused(root: dict[str, Any]) -> None
         asyncio.run(root_tls.fetch_list(root["url"], root["key"]))
 
 
+def test_a_root_whose_clock_runs_ahead_is_still_believed(root: dict[str, Any]) -> None:
+    """A root a few seconds ahead of the site (WSL2 behind its NAT, measured
+    2.4 s, 2026-10-05) signs a list "issued" in the site's future. Every token
+    here allows the same clock skew; so does this list."""
+    ahead = int(time.time()) + 30
+    root["routes"]["/v1/trust/tls"] = {
+        "jws": _signed_list(root["identity"], root["url"], [root["der"]], iat=ahead)
+    }
+    claims = asyncio.run(root_tls.fetch_list(root["url"], root["key"]))
+    assert claims["iat"] == ahead
+    far = int(time.time()) + tokens.LEEWAY_SECONDS + 60
+    root["routes"]["/v1/trust/tls"] = {
+        "jws": _signed_list(root["identity"], root["url"], [root["der"]], iat=far)
+    }
+    with pytest.raises(root_tls.RootTlsError, match="clock"):
+        asyncio.run(root_tls.fetch_list(root["url"], root["key"]))
+
+
 def test_a_list_for_another_origin_is_refused(root: dict[str, Any]) -> None:
     root["routes"]["/v1/trust/tls"] = {
         "jws": _signed_list(root["identity"], "https://elsewhere.example:8443", [root["der"]])

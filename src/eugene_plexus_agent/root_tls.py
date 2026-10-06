@@ -151,9 +151,21 @@ def verify_list(jws: str, root_key: str, origin: str) -> dict[str, Any]:
     """The claims of a signed TLS key list, checked against the pinned identity key."""
     try:
         header = jwt.get_unverified_header(jws)
+        # The same clock skew every token here allows: a root a few seconds
+        # ahead (WSL2 behind its NAT, 2.4 s, 2026-10-05) signs a list issued
+        # in this machine's future, and zero leeway refused the join.
         claims: dict[str, Any] = jwt.decode(
-            jws, tokens.load_public(root_key), algorithms=["EdDSA"], options={"verify_aud": False}
+            jws,
+            tokens.load_public(root_key),
+            algorithms=["EdDSA"],
+            options={"verify_aud": False},
+            leeway=tokens.LEEWAY_SECONDS,
         )
+    except jwt.ImmatureSignatureError as exc:
+        raise RootTlsError(
+            "the root's TLS key list is dated in this machine's future: check this machine's "
+            f"clock, and the root's ({exc})"
+        ) from exc
     except (jwt.InvalidTokenError, ValueError) as exc:
         raise RootTlsError(
             f"the root's TLS key list is not signed by its pinned key: {exc}"
