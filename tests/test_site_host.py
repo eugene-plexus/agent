@@ -84,13 +84,23 @@ def test_the_site_host_runs_only_when_an_administrator_turned_it_on(tmp_path: Pa
     assert site_host.wanted(tmp_path) is False
 
 
-async def test_unsupported_never_installs_and_the_host_is_not_an_app(
-    app: FastAPI, authed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("found", ["windows_service", "systemd_system", "container"])
+async def test_a_broken_service_install_never_installs_and_the_host_is_not_an_app(
+    app: FastAPI, authed_client: TestClient, monkeypatch: pytest.MonkeyPatch, found: str
 ) -> None:
+    """A service install with no isolated accounts (pywin32 missing, an old
+    install.sh) is not a per-user install (J38): it hosts no site, rather than
+    running one as LocalSystem or the agent's account. CI on Linux found the
+    old version of this test passing only where uv could not be found."""
+    from eugene_plexus_agent import install_info
+    from eugene_plexus_agent._generated.models import InstallMechanism
+
+    monkeypatch.setattr(install_info, "mechanism", lambda: InstallMechanism(found))
     manager = app.state.apps
     manager.accounts = app_accounts.AccountSupport(
         None, "Isolated accounts are not available here."
     )
+    monkeypatch.setattr(manager, "uv", lambda: Path(sys.executable))
     install = AsyncMock()
     monkeypatch.setattr(manager.installer, "start", install)
     supervisor = SiteHostSupervisor(app)
@@ -545,8 +555,12 @@ def test_a_container_hosts_no_site_and_a_linux_system_install_is_roots(
     manager.accounts = app_accounts.AccountSupport(None, "none")
     monkeypatch.setattr(install_info, "mechanism", lambda: InstallMechanism.container)
     assert supervisor.mode() is None and supervisor.link_store() is None
-    monkeypatch.setattr(install_info, "mechanism", lambda: InstallMechanism.none)
-    assert supervisor.mode() == "user"
+    for per_user in ("none", "windows_task", "systemd_user", "launchd"):
+        monkeypatch.setattr(install_info, "mechanism", lambda m=per_user: InstallMechanism(m))
+        assert supervisor.mode() == "user", per_user
+    for broken in ("windows_service", "systemd_system"):
+        monkeypatch.setattr(install_info, "mechanism", lambda m=broken: InstallMechanism(m))
+        assert supervisor.mode() is None, broken
     manager.accounts = app_accounts.AccountSupport("systemd", None)
     assert supervisor.mode() == "root"
 

@@ -465,3 +465,20 @@ def _memoise_keyring_probe() -> Iterator[None]:
     keyring_store._probe_done = True
     yield
     keyring_store.reset_probe_cache()
+
+
+# The app's lifespan starts `SiteHostSupervisor.run()`. In a test its first
+# step finds no administrator turned a site on and turns off the host record
+# a test has just put, racing the test (CI on Linux found two tests failing
+# that way, 2026-10-06). Tests drive a supervisor of their own by hand, so
+# the app's loop idles here.
+@pytest.fixture(autouse=True)
+def _idle_site_host_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
+    from eugene_plexus_agent import site_host
+
+    async def idle(self: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(site_host.SiteHostSupervisor, "run", idle)

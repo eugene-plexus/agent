@@ -224,7 +224,15 @@ class SiteHostSupervisor:
         from ._generated.models import InstallMechanism
         from .install_info import mechanism
 
-        if mechanism() == InstallMechanism.container:
+        # A service install whose accounts are broken (pywin32 missing, an old
+        # install.sh's units) is not a per-user install: hosting the site as
+        # this agent's own child would run it as LocalSystem or the agent's
+        # account. No site until it is repaired, as `accounts.reason` says.
+        if mechanism() in (
+            InstallMechanism.container,
+            InstallMechanism.windows_service,
+            InstallMechanism.systemd_system,
+        ):
             return None
         return "user"
 
