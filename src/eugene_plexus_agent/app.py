@@ -412,10 +412,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # nobody was listening on — and the root could not poll its way out,
     # because the only address it had was the stale one. A background
     # task, not an await: a management-plane call must not hold up
-    # supervision, and an unreachable root is a normal state here.
+    # supervision, and an unreachable root is a normal state here. Since
+    # agent#8 it keeps trying until the root has heard, and says so again
+    # when the address moves while running.
     announce_task: asyncio.Task[None] | None = None
-    if not settings.safe_mode and identity.record.enrolled:
-        announce_task = asyncio.create_task(_announce_address(app, settings, state, identity))
+    if not settings.safe_mode:
+        announce_task = asyncio.create_task(
+            _announce_address(app, settings, state, identity), name="address-announce"
+        )
 
     registry = ClientKeyRegistry(app)
     app.state.client_key_registry = registry
@@ -513,6 +517,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await profile_builds.close()
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
+            await asyncio.gather(announce_task, return_exceptions=True)
         permissions_task = app.state.install_permissions_task
         if not permissions_task.done():
             permissions_task.cancel()
@@ -632,7 +637,8 @@ async def _announce_address(
     state: AgentState,
     identity: node_identity.NodeIdentityStore,
 ) -> None:
-    """Re-derive this node's address and tell the control root.
+    """Re-derive this node's address and keep the control root told
+    (`enrollment.keep_address_announced`).
 
     **Re-derived rather than read back**, which is the whole point: a
     host that rebooted onto a new address has a *stale* persisted value,
@@ -640,30 +646,26 @@ async def _announce_address(
     `advertiseUrl` still wins, and a root that cannot be reached leaves
     the persisted value alone.
     """
-    try:
-        url = await enrollment.resolve_advertise_url(
+
+    async def resolve(quiet: bool) -> str | None:
+        return await enrollment.resolve_advertise_url(
             configured=state.get_config("advertiseUrl"),
             control_url=identity.record.control_url,
             bind_port=int(settings.bind_port),
             persisted=identity.record.advertise_url,
+            quiet=quiet,
         )
-        if url is None:
-            log.warning(
-                "enrolled with %s but this node has no address to advertise; other hosts "
-                "cannot reach it. Set `advertiseUrl` in the agent config.",
-                identity.record.control_url,
-            )
-            return
-        identity.record_advertise_url(url)
-        await enrollment.announce_address(
+
+    try:
+        await enrollment.keep_address_announced(
             store=identity,
-            url=url,
+            resolve=resolve,
             transport=getattr(app.state, "control_transport", None),
         )
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # pragma: no cover - defensive
-        log.warning("could not announce this node's address: %s", exc)
+        log.warning("stopped announcing this node's address: %s", exc)
 
 
 def _oidc_issuer(host: str | None, port: int) -> str:
@@ -730,6 +732,17 @@ async def resolve_gateway_for_apps(app: FastAPI) -> tuple[str | None, str | None
     return owner.agent_url.rstrip("/") + "/api/proxy/gateway", None
 
 
+#: Component kinds the root's gateway reaches on another machine directly.
+_DIALLED_BY_THE_ROOT = frozenset({"inference-driver", "tool-driver"})
+
+
+def _hosts_control(state: AgentState) -> bool:
+    """This agent supervises the control root: it is the control host."""
+    from ._generated.models import ComponentKind
+
+    return any(e.kind == ComponentKind.control for e in state.list_topology_entries())
+
+
 def shared_child_env(
     settings: Settings,
     state: AgentState,
@@ -763,7 +776,15 @@ def shared_child_env(
             env["NODES_ORIGIN"] = settings._entrypoint_nodes_origin
             if settings._entrypoint_nodes_probe:
                 env["NODES_PROBE"] = settings._entrypoint_nodes_probe
-        if not (kind == "control" and not settings._entrypoint_nodes):
+        # **An enrolled worker's drivers keep their direct bind too**
+        # (agent#9): the root's gateway dials each inference-driver and
+        # tool-driver on another machine at its advertised address, so
+        # loopback took every model and search account here out of
+        # routing. On the control host its own gateway reaches them here.
+        direct = (
+            kind in _DIALLED_BY_THE_ROOT and identity.record.enrolled and not _hosts_control(state)
+        )
+        if not (kind == "control" and not settings._entrypoint_nodes) and not direct:
             env["BIND_HOST"] = "127.0.0.1"
             return env
     advertise = node_identity.effective_advertise_url(

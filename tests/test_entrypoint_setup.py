@@ -353,6 +353,45 @@ def test_the_control_root_keeps_its_direct_port_unless_nodes_are_behind_it(
         assert shared_child_env(settings, state, identity, kind)["BIND_HOST"] == "127.0.0.1"
 
 
+@pytest.mark.parametrize("hosts_control", [False, True])
+def test_an_enrolled_workers_drivers_keep_their_direct_bind(
+    tmp_path: Path, hosts_control: bool
+) -> None:
+    """agent#9: the root's gateway dials a worker's inference-drivers and
+    tool-drivers at its advertised address. Behind loopback, every model
+    and search account on the worker left routing. The control host's
+    own drivers, reached by its own gateway, still go behind it."""
+    from eugene_plexus_agent._generated.common_models import ConfigUpdateRequest
+    from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind
+
+    settings = _settings(tmp_path, entrypoint_config=tmp_path / "entrypoint.json")
+    settings._entrypoint_console_origin = "https://worker.example.org"
+    state = AgentState(settings.config_file)
+    state.load()
+    state.apply_config_patch(
+        ConfigUpdateRequest.model_validate({"advertiseUrl": "http://192.168.16.20:8079"})
+    )
+    if hosts_control:
+        state.add_topology_entry(
+            ComponentEntry(name="control", kind=ComponentKind.control, url="http://127.0.0.1:8083")
+        )
+    identity = NodeIdentityStore(tmp_path / "node.yaml")
+    identity.load()
+    identity.record_enrollment(
+        name="worker",
+        control_url="http://192.168.16.252:8283",
+        epoch=1,
+        control_public_key="x",
+        recovery_public_key=None,
+        advertise_url=None,
+    )
+    for kind in ("inference-driver", "tool-driver"):
+        expected = "127.0.0.1" if hosts_control else "0.0.0.0"
+        assert shared_child_env(settings, state, identity, kind)["BIND_HOST"] == expected, kind
+    for kind in ("gateway", "library", None):
+        assert shared_child_env(settings, state, identity, kind)["BIND_HOST"] == "127.0.0.1"
+
+
 def test_the_supervisor_tells_shared_env_which_kind_it_is_starting() -> None:
     """Without the kind, the control root went loopback with everything else
     (found by sabotage: the env rule was tested, its caller was not)."""

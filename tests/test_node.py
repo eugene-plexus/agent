@@ -13,6 +13,7 @@ verifies here verified against a bundle, the way it will in production
 from __future__ import annotations
 
 import base64
+import itertools
 import json
 import logging
 import socket
@@ -20,6 +21,7 @@ import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
+from unittest import mock
 from urllib.parse import urlparse
 
 import httpx
@@ -1090,6 +1092,135 @@ async def test_announcing_never_raises_when_the_root_refuses(
     )
     assert outcome.announced is False
     assert outcome.detail
+
+
+# agent#8: announced until the root has heard, and again when it moves.
+
+
+class _Stop(Exception):
+    """Ends `keep_address_announced` from its sleep, after enough of it."""
+
+
+def _sleeps(limit: int) -> tuple[list[float], Any]:
+    slept: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        if len(slept) >= limit:
+            raise _Stop
+
+    return slept, sleep
+
+
+def _resolving(*urls: str) -> Any:
+    """Each check's address, the last one repeated."""
+    queue = list(urls)
+
+    async def resolve(_quiet: bool) -> str | None:
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    return resolve
+
+
+def _patches(control: FakeControl, fail_first: int = 0) -> tuple[list[str], httpx.MockTransport]:
+    """The root's transport, refusing to connect `fail_first` times; it
+    records each announcement's address."""
+    real = control.transport()
+    seen: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "PATCH":
+            seen.append(json.loads(request.content)["url"])
+            if len(seen) <= fail_first:
+                raise httpx.ConnectError("the root is not up yet")
+        return real.handler(request)  # type: ignore[no-any-return]
+
+    return seen, httpx.MockTransport(handle)
+
+
+@pytest.mark.asyncio
+async def test_an_announcement_the_root_never_got_is_tried_again_until_it_does(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """A power cut on a LAN: the node boots before its root. It tries
+    again after 5 s, then 10 s, and once the root answers it only checks
+    each minute."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    seen, transport = _patches(control, fail_first=2)
+    slept, sleep = _sleeps(4)
+    with pytest.raises(_Stop):
+        await enrollment.keep_address_announced(
+            store=store,
+            resolve=_resolving("http://10.0.0.9:8079"),
+            transport=transport,
+            sleep=sleep,
+        )
+    assert seen == ["http://10.0.0.9:8079"] * 3
+    assert control.nodes["gpu-box"]["url"] == "http://10.0.0.9:8079"
+    assert 4 <= slept[0] <= 6 and 8 <= slept[1] <= 12, slept
+    assert slept[2:] == [enrollment.ADDRESS_RECHECK_SECONDS] * 2
+
+
+@pytest.mark.asyncio
+async def test_retries_back_off_to_five_minutes() -> None:
+    store = mock.MagicMock()
+    store.record.enrolled = True
+    outcome = enrollment.AnnounceOutcome(False, False, "http://x:1", "down", retry=True)
+    slept, sleep = _sleeps(12)
+    with (
+        mock.patch.object(enrollment, "announce_address", mock.AsyncMock(return_value=outcome)),
+        pytest.raises(_Stop),
+    ):
+        await enrollment.keep_address_announced(
+            store=store, resolve=_resolving("http://x:1"), sleep=sleep
+        )
+    assert all(b > a for a, b in itertools.pairwise(slept[:7])), slept
+    assert max(slept) <= enrollment.ANNOUNCE_RETRY_MAX_SECONDS * 1.2
+    assert min(slept[-3:]) >= enrollment.ANNOUNCE_RETRY_MAX_SECONDS * 0.8
+
+
+@pytest.mark.asyncio
+async def test_a_definite_refusal_is_not_repeated_for_the_same_address(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    control.nodes["gpu-box"]["signingPublicKey"] = None  # the root answers 401
+    seen, transport = _patches(control)
+    slept, sleep = _sleeps(3)
+    with pytest.raises(_Stop):
+        await enrollment.keep_address_announced(
+            store=store,
+            resolve=_resolving("http://10.0.0.9:8079"),
+            transport=transport,
+            sleep=sleep,
+        )
+    assert seen == ["http://10.0.0.9:8079"]
+    assert slept == [enrollment.ADDRESS_RECHECK_SECONDS] * 3
+
+
+@pytest.mark.asyncio
+async def test_a_running_node_that_moves_says_so_at_the_next_check(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """A laptop that changes network without restarting."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    seen, transport = _patches(control)
+    _, sleep = _sleeps(4)
+    with pytest.raises(_Stop):
+        await enrollment.keep_address_announced(
+            store=store,
+            resolve=_resolving(
+                "http://10.0.0.9:8079", "http://10.0.0.9:8079", "http://10.0.5.7:8079"
+            ),
+            transport=transport,
+            sleep=sleep,
+        )
+    assert seen == ["http://10.0.0.9:8079", "http://10.0.5.7:8079"]
+    assert control.nodes["gpu-box"]["url"] == "http://10.0.5.7:8079"
+    assert store.record.advertise_url == "http://10.0.5.7:8079"
 
 
 @pytest.mark.asyncio

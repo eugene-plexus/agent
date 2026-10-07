@@ -38,8 +38,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import platform
+import random
 import socket
 import sys
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,6 +69,13 @@ ENROLL_TIMEOUT_SECONDS = 15.0
 # Deliberately shorter than enrollment's: this runs on every boot, and a
 # root that is slow to answer must not hold up supervision.
 ANNOUNCE_TIMEOUT_SECONDS = 8.0
+
+# agent#8: a failed announcement is tried again after 5 s, doubling to
+# 5 minutes; a settled address is re-derived every minute and announced
+# when it moved.
+ANNOUNCE_RETRY_FIRST_SECONDS = 5.0
+ANNOUNCE_RETRY_MAX_SECONDS = 300.0
+ADDRESS_RECHECK_SECONDS = 60.0
 
 
 #: The slug for a join token the control root refused (401 or 409).
@@ -104,6 +113,9 @@ class AnnounceOutcome:
     changed: bool
     url: str | None
     detail: str | None = None
+    #: Worth trying again: no answer, or one that says "later" (408, 429,
+    #: 5xx). Any other refusal is definite for this address.
+    retry: bool = False
 
 
 def host_os() -> str | None:
@@ -126,7 +138,12 @@ def host_arch() -> str | None:
 
 
 async def resolve_advertise_url(
-    *, configured: Any, control_url: str | None, bind_port: int, persisted: str | None = None
+    *,
+    configured: Any,
+    control_url: str | None,
+    bind_port: int,
+    persisted: str | None = None,
+    quiet: bool = False,
 ) -> str | None:
     """Where other hosts reach this agent, in the order that survives a
     reboot onto a different address.
@@ -139,12 +156,15 @@ async def resolve_advertise_url(
        the announcement announce the old address.
     3. Otherwise whatever was persisted, which is better than nothing on
        a boot where the root is unreachable.
+
+    `quiet`: a root that cannot be reached is logged at debug, for the
+    minute-by-minute recheck (`keep_address_announced`).
     """
     configured_url = effective_advertise_url(configured, None)
     if configured_url is not None:
         return configured_url
     if control_url:
-        host = await asyncio.to_thread(derive_advertise_host, control_url)
+        host = await asyncio.to_thread(derive_advertise_host, control_url, quiet=quiet)
         if host is not None:
             return format_url(host, int(bind_port))
     return effective_advertise_url(None, persisted)
@@ -306,10 +326,11 @@ async def announce_address(
             response = await client.patch(target, json=body)
     except httpx.HTTPError as exc:
         log.warning("could not announce this node's address to %s: %s", record.control_url, exc)
-        return AnnounceOutcome(False, False, url, str(exc))
+        return AnnounceOutcome(False, False, url, str(exc), retry=True)
 
     if response.status_code != 200:
         detail = problem_detail(response)
+        later = response.status_code >= 500 or response.status_code in (408, 429)
         # 401 here has one likely cause and it is worth naming, because
         # the symptom (a node nothing can reach) is far away from it.
         if response.status_code == 401:
@@ -325,7 +346,7 @@ async def announce_address(
                 response.status_code,
                 detail,
             )
-        return AnnounceOutcome(False, False, url, detail)
+        return AnnounceOutcome(False, False, url, detail, retry=later)
 
     try:
         payload = response.json()
@@ -335,6 +356,68 @@ async def announce_address(
     if changed:
         log.info("told the control root this node is now reachable at %s", url)
     return AnnounceOutcome(True, changed, url)
+
+
+async def keep_address_announced(
+    *,
+    store: NodeIdentityStore,
+    resolve: Callable[[bool], Awaitable[str | None]],
+    transport: Any = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """Tell the control root where this node is until it has heard, and
+    again whenever the address moves (agent#8). Runs for the agent's life
+    and never raises, but for its cancellation.
+
+    Before, the address was announced once, at boot: a node that booted
+    before its root (a power cut on a LAN) stayed at an address nobody
+    listened on until it restarted, and one that changed network while
+    running kept its old address at the root.
+
+    - An attempt that may work later (no answer, 408, 429, 5xx) is tried
+      again after 5 s, doubling to 5 minutes, with jitter.
+    - A definite refusal is logged once, by `announce_address`, and not
+      repeated for that address.
+    - Once settled, the address is re-derived every minute and announced
+      when it differs. `resolve(quiet)` is `resolve_advertise_url`, so an
+      operator's `advertiseUrl` still wins and a root that cannot be
+      reached leaves the persisted address in place.
+
+    An address a route has just announced (a config change, the Reach
+    switch) is announced once more at the next check; the root answers
+    *unchanged* and appends nothing.
+    """
+    settled: str | None = None
+    warned = False
+    delay = ANNOUNCE_RETRY_FIRST_SECONDS
+    quiet = False
+    while True:
+        if store.record.enrolled:
+            try:
+                url = await resolve(quiet)
+            except Exception as exc:  # pragma: no cover - defensive
+                log.debug("could not work out this node's address: %s", exc)
+                url = None
+            quiet = True
+            if url is None:
+                if not warned:
+                    log.warning(
+                        "enrolled with %s but this node has no address to advertise; other "
+                        "hosts cannot reach it. Set `advertiseUrl` in the agent config.",
+                        store.record.control_url,
+                    )
+                    warned = True
+            elif url != settled:
+                warned = False
+                store.record_advertise_url(url)
+                outcome = await announce_address(store=store, url=url, transport=transport)
+                if outcome.announced or not outcome.retry:
+                    settled, delay = url, ANNOUNCE_RETRY_FIRST_SECONDS
+                else:
+                    await sleep(delay * random.uniform(0.8, 1.2))
+                    delay = min(delay * 2, ANNOUNCE_RETRY_MAX_SECONDS)
+                    continue
+        await sleep(ADDRESS_RECHECK_SECONDS)
 
 
 def problem_detail(response: httpx.Response) -> str:
@@ -364,6 +447,9 @@ def _str_or_none(value: Any) -> str | None:
 
 
 __all__ = [
+    "ADDRESS_RECHECK_SECONDS",
+    "ANNOUNCE_RETRY_FIRST_SECONDS",
+    "ANNOUNCE_RETRY_MAX_SECONDS",
     "ANNOUNCE_TIMEOUT_SECONDS",
     "ENROLL_TIMEOUT_SECONDS",
     "TOKEN_REFUSED",
@@ -373,6 +459,7 @@ __all__ = [
     "announce_address",
     "host_arch",
     "host_os",
+    "keep_address_announced",
     "perform_enrollment",
     "problem_detail",
     "resolve_advertise_url",

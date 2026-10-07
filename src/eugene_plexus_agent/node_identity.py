@@ -202,7 +202,7 @@ def format_url(host: str, port: int, *, scheme: str = "http") -> str:
 
 
 def derive_advertise_host(
-    control_url: str, *, timeout: float = _DERIVE_TIMEOUT_SECONDS
+    control_url: str, *, timeout: float = _DERIVE_TIMEOUT_SECONDS, quiet: bool = False
 ) -> str | None:
     """The local address this host uses to reach the control root.
 
@@ -226,7 +226,11 @@ def derive_advertise_host(
         with socket.create_connection((host, port), timeout=timeout) as sock:
             local = sock.getsockname()[0]
     except OSError as exc:
-        log.warning("could not derive an advertise address by reaching %s: %s", control_url, exc)
+        # Quiet for the running node's minute-by-minute recheck (agent#8):
+        # a root that is down is said once by the announcement's own warning.
+        (log.debug if quiet else log.warning)(
+            "could not derive an advertise address by reaching %s: %s", control_url, exc
+        )
         return None
     return str(local)
 
