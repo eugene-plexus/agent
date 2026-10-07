@@ -73,6 +73,13 @@ class StubSite:
     def mode(self) -> str:
         return self._mode
 
+    async def held(self, method: str, path: str, **kwargs: Any) -> Any:
+        """The site host's loopback API, not answering: the page's own
+        sections that need it say nothing (J14a.3's passkeys)."""
+        from eugene_plexus_agent.site_host import HostUnavailable
+
+        raise HostUnavailable("This machine's job site is not running.")
+
 
 class Marked:
     """An ASGI wrapper marking each request as one that came through the entry point."""

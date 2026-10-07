@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Any, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
@@ -346,6 +346,23 @@ class SiteManageAction(StrEnum):
     - `settings.set` (`SiteSettings`).
     - `audit.read` (`SiteAuditRead`): the
       newest entries of the site's audit log.
+    - `passkey.pair` (`SitePasskeyPair`, J14a.3): pin the owner's
+      passkey, made in Workbench, if its MAC checks with the code this
+      site showed at the machine. It returns `SitePasskey`.
+    - `held.list` (`SiteHeldListRequest`): what the owner has waiting,
+      as `/v1/held` lists it, with the envelopes to sign when `key` is
+      one of their passkeys. It returns `SiteHeldList`.
+    - `held.approve` (`SitePasskeyApproval`): apply a held change (or
+      the rules as a whole), approved with a passkey assertion over its
+      envelope.
+    - `held.reject` (`SiteHeldRejectRequest`): drop a held change.
+      Turning a change down only keeps access from being given, so the
+      root may ask for it.
+    - `passkey.remove` (`SitePasskeyRemove`): remove one of the owner's
+      passkeys, as at the machine; what it approved stays. Removing a key
+      only takes it away (a lost phone), so the root may ask for it: if it
+      was the owner's last key here, no tool runs until they add a key and
+      approve the rules (J48).
 
     """
 
@@ -356,6 +373,11 @@ class SiteManageAction(StrEnum):
     server_enable = 'server.enable'
     settings_set = 'settings.set'
     audit_read = 'audit.read'
+    passkey_pair = 'passkey.pair'
+    held_list = 'held.list'
+    held_approve = 'held.approve'
+    held_reject = 'held.reject'
+    passkey_remove = 'passkey.remove'
 
 
 class SiteManage(BaseModel):
@@ -438,16 +460,14 @@ class Key(RootModel[str]):
     root: str = Field(..., pattern='^[a-f0-9]{32}$')
 
 
-class SiteHeldList(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    subject: str = Field(..., max_length=64)
-    keys: list[Key] = Field(
-        ..., description='The ids of the keys pinned to this person.', max_length=8
-    )
-    state: SiteSigningState | None = None
-    items: list[SiteHeldEdit] = Field(..., max_length=64)
+class SitePasskeyAlgorithm(IntEnum):
+    """
+    A passkey's COSE algorithm: -8 EdDSA, -7 ES256, -257 RS256.
+    """
+
+    integer__8 = -8
+    integer__7 = -7
+    integer__257 = -257
 
 
 class SiteApproval(BaseModel):
@@ -480,6 +500,152 @@ class SiteHeldReject(BaseModel):
         extra='forbid',
     )
     subject: str = Field(..., max_length=64, min_length=1)
+
+
+class SitePasskeyCodeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ...,
+        description="The person the starter serves; the site's owner.",
+        max_length=64,
+        min_length=1,
+    )
+
+
+class SitePasskeyCode(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(..., max_length=64)
+    code: str = Field(
+        ...,
+        description='Shown at the machine and typed into Workbench; never sent to the root.',
+        pattern='^[0-9A-HJKMNP-TV-Z]{5}-[0-9A-HJKMNP-TV-Z]{5}$',
+    )
+    expiresAt: AwareDatetime
+
+
+class SitePasskeyBinding(BaseModel):
+    """
+    What the pairing MAC covers (J14a.3, `person-held-keys.md` §12.5).
+    Workbench builds it, canonical (keys sorted, no spaces, UTF-8), and
+    sends `mac` = base64url(HMAC-SHA256(k, those bytes)) without padding,
+    where `k` = PBKDF2-HMAC-SHA256 over the code (its ten characters,
+    upper case, without the dash) with salt
+    `eugene-plexus/site-passkey:<site>:<person>`, 600000 iterations,
+    32 bytes. The code is the only secret: it never leaves the machine
+    and the browser, so a root that swaps the public key cannot make the
+    MAC check.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    typ: Literal['eugene-plexus/site-passkey']
+    v: Literal[1]
+    site: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    person: str = Field(..., max_length=64, min_length=1)
+    credentialId: str = Field(..., max_length=1366)
+    publicKey: str = Field(..., max_length=1100)
+    alg: int
+    rpId: str = Field(..., max_length=253)
+
+
+class SitePasskeyPair(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    credentialId: str = Field(
+        ..., max_length=1366, min_length=1, pattern='^[A-Za-z0-9_-]+$'
+    )
+    publicKey: str = Field(
+        ...,
+        description='Base64 of the public key as `SubjectPublicKeyInfo`, DER (`AuthenticatorAttestationResponse.getPublicKey()`).',
+        max_length=1100,
+        min_length=1,
+    )
+    alg: SitePasskeyAlgorithm
+    rpId: str = Field(..., max_length=253, min_length=1)
+    label: str | None = Field(
+        None,
+        description='How Workbench names it, for the lists at the machine.',
+        max_length=128,
+    )
+    mac: str = Field(
+        ..., description='See `SitePasskeyBinding`.', pattern='^[A-Za-z0-9_-]{43}$'
+    )
+
+
+class SiteHeldListRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    key: str | None = Field(
+        None,
+        description="One of the owner's passkeys; with it, each item carries the envelope to sign.",
+        pattern='^[a-f0-9]{32}$',
+    )
+
+
+class SitePasskeyApproval(BaseModel):
+    """
+    A held change approved with a passkey. The assertion's challenge is
+    SHA-256 of the envelope's UTF-8 bytes. The site checks the envelope
+    as it checks the loopback page's (`SiteApproval`), then the
+    assertion: `clientDataJSON` is `webauthn.get` with that challenge,
+    from an HTTPS origin, not cross-origin; `authenticatorData` carries
+    the SHA-256 of the passkey's pinned `rpId` and says the person was
+    present and verified (UP and UV); its sign count grows when the
+    authenticator counts; and the signature over `authenticatorData ||
+    SHA-256(clientDataJSON)` verifies with the pinned public key.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description='The held change, or `rules` for the rules as a whole (J52).',
+        pattern='^[a-z0-9]{1,32}$',
+    )
+    envelope: str = Field(..., max_length=262144, min_length=2)
+    key: str = Field(..., pattern='^[a-f0-9]{32}$')
+    credentialId: str = Field(
+        ..., max_length=1366, min_length=1, pattern='^[A-Za-z0-9_-]+$'
+    )
+    authenticatorData: str = Field(
+        ..., description='Base64url.', max_length=4096, min_length=1
+    )
+    clientDataJSON: str = Field(
+        ..., description='Base64url.', max_length=8192, min_length=1
+    )
+    signature: str = Field(..., description='Base64url.', max_length=1024, min_length=1)
+
+
+class SiteHeldRejectRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-z0-9]{1,32}$')
+
+
+class SitePasskeyRemove(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="The passkey's key id (`SitePasskey.id`).",
+        pattern='^[a-f0-9]{32}$',
+    )
 
 
 class SiteFolderAdd(BaseModel):
@@ -775,8 +941,12 @@ class SiteSigning(BaseModel):
     )
     approvePage: str | None = Field(
         None,
-        description='Where a person adds a key and approves held changes, on the machine\nitself: a Windows service install, and a per-user install on Windows,\nLinux or macOS (J14a.2). Null where this install has no such page yet\n(a Linux system install, J14a.3).\n',
+        description='Where a person adds a key and approves held changes, on the machine\nitself: a Windows service install, and a per-user install on Windows,\nLinux or macOS (J14a.2). Null where this install has no such page (a\nLinux system install, whose owner pairs a passkey instead, J14a.3).\n',
         max_length=256,
+    )
+    passkeys: bool | None = Field(
+        None,
+        description="The site takes its owner's passkey from Workbench, paired with a code\nshown at the machine, and approvals made with it (J14a.3). Absent\nfrom a site older than that.\n",
     )
 
 
@@ -878,6 +1048,49 @@ class SiteCall(BaseModel):
         max_length=64,
     )
     installMode: InstallModeName
+
+
+class SitePasskey(BaseModel):
+    """
+    A passkey pinned to a person here (J14a.3). Its private half is in the person's own authenticator.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description='The key id an envelope names: the first 16 bytes of SHA-256 over the public key (`SubjectPublicKeyInfo`, DER), in hex.',
+        pattern='^[a-f0-9]{32}$',
+    )
+    credentialId: str = Field(
+        ...,
+        description='The WebAuthn credential id, base64url without padding.',
+        max_length=1366,
+        min_length=1,
+        pattern='^[A-Za-z0-9_-]+$',
+    )
+    alg: SitePasskeyAlgorithm
+    rpId: str = Field(
+        ...,
+        description="The WebAuthn relying party id it was made for (Workbench's HTTPS name).",
+        max_length=253,
+        min_length=1,
+    )
+    label: str = Field(..., max_length=128)
+    addedAt: AwareDatetime
+
+
+class SitePasskeyList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(..., max_length=64)
+    passkeys: list[SitePasskey] = Field(..., max_length=8)
+    codeExpiresAt: AwareDatetime | None = Field(
+        None,
+        description='When the code waiting for this person expires; null when none is.',
+    )
 
 
 class SiteAuditEntry(BaseModel):
@@ -1034,6 +1247,25 @@ class SiteAccountLink(BaseModel):
         max_length=8,
         validate_default=True,
     )
+
+
+class SiteHeldList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(..., max_length=64)
+    keys: list[Key] = Field(
+        ...,
+        description='The ids of the keys pinned to this person, at the machine and as passkeys.',
+        max_length=16,
+    )
+    passkeys: list[SitePasskey] | None = Field(
+        None,
+        description='Their passkeys (J14a.3), for Workbench to choose which one signs.',
+        max_length=8,
+    )
+    state: SiteSigningState | None = None
+    items: list[SiteHeldEdit] = Field(..., max_length=64)
 
 
 class SiteAuditPage(BaseModel):

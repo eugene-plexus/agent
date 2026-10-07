@@ -41,6 +41,13 @@ the one person it serves, linked at `site join` (J38). There this page makes
 and pins keys and approves held changes, and links nobody: only the account
 this agent runs as is served, read from the connection the same way
 (`loopback_peer.py`), and any other account on the machine is refused.
+
+**A passkey from Workbench** (J14a.3, Path B). The site's owner may also pair
+a passkey made in Workbench, to approve from away from the machine. This page
+shows the code the site host makes for that (`/link/passkey/code`), lists the
+passkeys pinned to them, and removes one (`/link/passkey/remove`). The code
+is shown here and typed into Workbench by the person; it never reaches the
+root, and the site host checks the passkey's MAC with it itself.
 """
 
 from __future__ import annotations
@@ -361,6 +368,7 @@ async def link_page(request: Request) -> Response:
             f"<p>This job site is <b>{html.escape(link.name or link.subject)}</b>'s, and its "
             f"calls run as your account here, <b>{html.escape(name)}</b>.</p>"
             + _keys_section(link.keys, attempt.csrf)
+            + await _passkeys_section(request, link, attempt.csrf)
         )
     elif link is not None:
         body = (
@@ -368,6 +376,7 @@ async def link_page(request: Request) -> Response:
             f"<b>{html.escape(link.name or link.subject)}</b> in Eugene. Their calls to this job "
             "site run as this account, while it is signed in.</p>"
             + _keys_section(link.keys, attempt.csrf)
+            + await _passkeys_section(request, link, attempt.csrf)
             + "<h2>This link</h2>"
             + _form("/link/remove", "Remove this link", attempt.csrf)
         )
@@ -678,6 +687,130 @@ async def link_key_remove(request: Request) -> Response:
             request.app.state.site_host.links_changed()
     except NotHere as exc:
         return _refused(str(exc))
+    return RedirectResponse("/link", status_code=303)
+
+
+# --- a passkey from Workbench (J14a.3) ---------------------------------------------------
+
+
+def _hidden(name: str, value: str) -> str:
+    return f"<input type=hidden name={name} value='{html.escape(value)}'>"
+
+
+async def _passkeys_section(request: Request, link: Any, csrf: str) -> str:
+    """The owner's passkeys and the way to pair one. Silent when the site
+    host cannot say: the rest of the page still works."""
+    try:
+        answer = await request.app.state.site_host.held(
+            "GET", "/v1/passkeys", params={"subject": link.subject}
+        )
+    except HostUnavailable:
+        return ""
+    if answer.status_code != 200:
+        return ""
+    listed = answer.json()
+    rows = "".join(
+        f"<li><b>{html.escape(_fingerprint(str(k['id'])))}</b> "
+        f"{html.escape(str(k.get('label') or ''))} (for {html.escape(str(k.get('rpId') or ''))}"
+        f", added {html.escape(str(k.get('addedAt') or '')[:10])}) "
+        "<form method=post action='/link/passkey/remove' style='display:inline'>"
+        f"{_hidden('csrf', csrf)}{_hidden('id', str(k['id']))}"
+        "<button type=submit>Remove</button></form></li>"
+        for k in listed.get("passkeys") or []
+    )
+    waiting = listed.get("codeExpiresAt")
+    return (
+        "<h2>A passkey from Workbench</h2>"
+        "<p>To approve changes away from this machine, use a passkey in Workbench, at its https "
+        "address. Show a code here, then type it into Workbench (Job sites, then this machine, "
+        "then Add a passkey). The code stays on this machine and in your browser: Eugene's root "
+        "never sees it.</p>"
+        + (f"<ul data-passkeys>{rows}</ul>" if rows else "")
+        + (
+            f"<p>A code is waiting until {html.escape(str(waiting)[11:16])} UTC.</p>"
+            if waiting
+            else ""
+        )
+        + "<form method=post action='/link/passkey/code'>"
+        f"{_hidden('csrf', csrf)}<button type=submit>Show a code for a passkey</button></form>"
+    )
+
+
+async def _posted_form(request: Request, account: str) -> Any:
+    """The posted form, if the page's CSRF token came with it."""
+    found = _pages(request).find(request, account)
+    try:
+        form = await request.form()
+    except Exception:
+        form = None
+    csrf = form.get("csrf") if form is not None else None
+    if (
+        found is None
+        or not isinstance(csrf, str)
+        or not secrets.compare_digest(csrf, found[1].csrf)
+    ):
+        raise NotHere("This request is not from this page. Open it again.")
+    return form
+
+
+@router.post("/link/passkey/code")
+async def passkey_code(request: Request) -> Response:
+    """A code for pairing the owner's passkey from Workbench, made by the
+    site host and shown only here."""
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        account, link = _linked(request)
+        await _posted_form(request, account)
+        answer = await request.app.state.site_host.held(
+            "POST", "/v1/passkeys/code", json={"subject": link.subject}
+        )
+    except NotHere as exc:
+        return _refused(str(exc))
+    except HostUnavailable as exc:
+        return _refused(str(exc), 503)
+    if answer.status_code == 404:
+        return _refused(
+            "Only this machine's owner pairs a passkey here: theirs are the keys that approve "
+            "changes to it."
+        )
+    if answer.status_code != 200:
+        return _refused("This job site did not answer. Try again in a moment.", 503)
+    made = answer.json()
+    code, until = str(made["code"]), str(made["expiresAt"])
+    body = (
+        "<p>In Workbench, at its https address, open <b>Job sites</b>, then this machine, and "
+        "choose <b>Add a passkey</b>. Type this code there:</p>"
+        f"<p data-code style='font-size:2em;font-family:monospace;letter-spacing:0.1em'>"
+        f"{html.escape(code)}</p>"
+        f"<p>It works once, until {html.escape(until[11:16])} UTC. It stays on this machine and "
+        "in your browser: Eugene's root never sees it. Anyone who sees it could pair their "
+        "passkey instead of yours until then, so do not share it.</p>"
+        "<p><a href='/link'>Back to your link and keys</a></p>"
+    )
+    return _page("Pair a passkey", body)
+
+
+@router.post("/link/passkey/remove")
+async def passkey_remove(request: Request) -> Response:
+    """A passkey goes, at the machine (J45). What it approved stays."""
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        account, link = _linked(request)
+        form = await _posted_form(request, account)
+        ident = form.get("id")
+        if not isinstance(ident, str) or not _KEY_ID.fullmatch(ident):
+            raise NotHere("That passkey is not one of yours here.")
+        answer = await request.app.state.site_host.held(
+            "DELETE", f"/v1/passkeys/{ident}", params={"subject": link.subject}
+        )
+    except NotHere as exc:
+        return _refused(str(exc))
+    except HostUnavailable as exc:
+        return _refused(str(exc), 503)
+    if answer.status_code not in (204, 404):
+        return _refused("This job site did not answer. Try again in a moment.", 503)
     return RedirectResponse("/link", status_code=303)
 
 
