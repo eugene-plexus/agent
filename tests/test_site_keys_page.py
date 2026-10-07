@@ -176,6 +176,13 @@ def test_pinning_needs_this_pages_token_json_and_a_real_key(
     assert send(browser, "/link/key", "guess", good).status_code == 403
     form = browser.post("/link/key", data=good, headers={"X-Eugene-Csrf": token})
     assert form.status_code == 403
+    # A form can send JSON as text/plain; only JSON sent as JSON is taken.
+    plain = browser.post(
+        "/link/key",
+        content=json.dumps(good),
+        headers={"X-Eugene-Csrf": token, "Content-Type": "text/plain"},
+    )
+    assert plain.status_code == 403
     for bad in (
         {"alg": "RS256", "publicKey": public},
         {"alg": "Ed25519", "publicKey": "not base64!"},
