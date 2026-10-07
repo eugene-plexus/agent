@@ -25,6 +25,16 @@ person per account. A person may remove their own link here too.
 
 A root cannot make a link: it needs someone at the machine signed in as that
 account. Nor can the site host, which cannot write the links file.
+
+**Keys and approvals** (J14a, `person-held-keys.md`). A linked person makes
+their own key on this page: the browser generates it, will not hand its
+private half to any script, and keeps it; this agent pins its public half to
+their link (`/link/key`). On `/link/approve` the page lists what the site
+host holds for them, in the site host's own words, and signs exactly the
+text the site host gave for each change they approve; the site host checks
+that signature against the pinned key. This agent only carries it: the
+signature, not this agent, is the authority. Every request here is checked
+from the connection as above, and every write carries the page's CSRF token.
 """
 
 from __future__ import annotations
@@ -34,6 +44,8 @@ import hashlib
 import html
 import json
 import logging
+import platform
+import re
 import secrets
 import sys
 import time
@@ -44,10 +56,11 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import jwt
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from .._http import client_for
 from ..dependencies import require_control
+from ..site_host import HostUnavailable
 from ..site_links import LinkError, LinkStore, account_name, not_a_person
 from .oidc_forward import (
     FORWARDED_FOR_HEADER,
@@ -187,13 +200,15 @@ def _account(request: Request) -> str:
 # --- the pages ---------------------------------------------------------------------
 
 
-def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
+def _page(title: str, body: str, status: int = 200, *, script: bool = False) -> HTMLResponse:
+    scripts = "script-src 'self'; connect-src 'self'; " if script else ""
     return HTMLResponse(
         "<!doctype html><html lang=en><head><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         f"<title>{html.escape(title)}</title><style>"
         "body{font:16px/1.5 system-ui,sans-serif;max-width:36rem;margin:3rem auto;padding:0 1rem;"
         "background:#f7f7f5;color:#1d1d1b}button{font:inherit;padding:.5rem 1rem}"
+        ".held{border:1px solid #8884;border-radius:4px;padding:0 1rem 1rem;margin:1rem 0}"
         "@media(prefers-color-scheme:dark){body{background:#16181d;color:#e6e6e3}}"
         "</style></head><body>"
         f"<h1>{html.escape(title)}</h1>{body}</body></html>",
@@ -202,7 +217,7 @@ def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
             "Cache-Control": "no-store",
             "X-Frame-Options": "DENY",
             "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; "
-            "form-action 'self'; frame-ancestors 'none'",
+            f"{scripts}form-action 'self'; frame-ancestors 'none'",
             "Referrer-Policy": "no-referrer",
         },
     )
@@ -376,6 +391,8 @@ async def link_page(request: Request) -> Response:
             f"<p>Your account here, <b>{html.escape(name)}</b>, is linked to "
             f"<b>{html.escape(link.name or link.subject)}</b> in Eugene. Their calls to this job "
             "site run as this account, while it is signed in.</p>"
+            + _keys_section(link.keys, attempt.csrf)
+            + "<h2>This link</h2>"
             + _form("/link/remove", "Remove this link", attempt.csrf)
         )
     else:
@@ -385,7 +402,7 @@ async def link_page(request: Request) -> Response:
             "job site will then run as this account, with its permissions, while it is signed "
             "in.</p><p><a href='/link/start'>Sign in to link</a></p>"
         )
-    page = _page("Link your account", body)
+    page = _page("Link your account", body, script=link is not None)
     page.set_cookie(
         COOKIE, key, httponly=True, samesite="strict", max_age=ATTEMPT_SECONDS, path="/link"
     )
@@ -518,6 +535,272 @@ async def link_remove(request: Request) -> Response:
     except NotHere as exc:
         return _refused(str(exc))
     return _page("Link removed", "<p>This account is no longer linked to anyone here.</p>")
+
+
+# --- keys and approvals (J14a) -----------------------------------------------------------
+
+KEY_SCRIPT = "/link/site-keys.js"
+_ALGS = {"Ed25519", "ES256"}
+_HELD_ID = re.compile(r"^[a-z0-9]{1,32}$")
+_KEY_ID = re.compile(r"^[a-f0-9]{32}$")
+
+
+def _fingerprint(key_id: str) -> str:
+    return " ".join(key_id[i : i + 4] for i in range(0, 16, 4))
+
+
+def _keys_section(keys: tuple[dict[str, Any], ...], csrf: str) -> str:
+    rows = "".join(
+        f"<li><b>{html.escape(_fingerprint(str(k['id'])))}</b>"
+        f" {html.escape(str(k.get('label') or ''))}, added {html.escape(str(k['addedAt'])[:10])} "
+        f"<form method=post action='/link/key/remove' style='display:inline'>"
+        f"<input type=hidden name=csrf value='{html.escape(csrf)}'>"
+        f"<input type=hidden name=id value='{html.escape(str(k['id']))}'>"
+        "<button type=submit>Remove</button></form></li>"
+        for k in keys
+    )
+    pinned = html.escape(json.dumps([str(k["id"]) for k in keys]))
+    return (
+        "<h2>Your key</h2>"
+        "<p>Changes to what this machine allows wait until you approve them here, with your own "
+        "key. The key is made in this browser and never leaves this machine. Eugene never sees "
+        "it.</p>"
+        + (f"<ul>{rows}</ul>" if rows else "")
+        + f"<div id=site-key data-csrf='{html.escape(csrf)}' data-keys='{pinned}'>"
+        "<p data-state>Checking this browser…</p>"
+        "<button type=button data-make hidden>Make a key in this browser</button></div>"
+        "<p><a href='/link/approve'>Changes waiting for your approval</a></p>"
+        f"<script src='{KEY_SCRIPT}'></script>"
+    )
+
+
+def _attempt(request: Request, account: str) -> tuple[str, Attempt, bool]:
+    """This browser's attempt, or a new one: the key, it, and whether it is new."""
+    found = _pages(request).find(request, account)
+    if found is not None:
+        return found[0], found[1], False
+    key, attempt = _pages(request).begin(account)
+    return key, attempt, True
+
+
+def _linked(request: Request) -> tuple[str, Any]:
+    """The account at the other end and its link, or `NotHere` saying why."""
+    account = _account(request)
+    store = _store(request)
+    if store is None:
+        raise NotHere("This machine is not a job site any more.")
+    link = store.for_account(account)
+    if link is None:
+        raise NotHere(
+            f"{account_name(account)} is not linked to anyone here. Link it on the link page first."
+        )
+    return account, link
+
+
+def _json(value: Any, status: int = 200) -> JSONResponse:
+    return JSONResponse(value, status_code=status, headers={"Cache-Control": "no-store"})
+
+
+def _json_refused(message: str, status: int = 403) -> JSONResponse:
+    return _json({"detail": message}, status)
+
+
+async def _csrf_json(request: Request, account: str) -> tuple[str, dict[str, Any]]:
+    """The attempt's key and the posted JSON, if the page's CSRF token came with it."""
+    found = _pages(request).find(request, account)
+    given = request.headers.get("x-eugene-csrf") or ""
+    if found is None or not secrets.compare_digest(given, found[1].csrf):
+        raise NotHere("This request is not from this page. Open it again.")
+    if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+        raise NotHere("This request is not from this page. Open it again.")
+    try:
+        value = await request.json()
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        raise NotHere("This request could not be read.")
+    return found[0], value
+
+
+def _browser(request: Request) -> str:
+    agent = request.headers.get("user-agent", "")
+    for marker, name in (("Edg/", "Edge"), ("Firefox/", "Firefox"), ("Chrome/", "Chrome")):
+        if marker in agent:
+            return name
+    return "A browser"
+
+
+@router.get(KEY_SCRIPT)
+async def site_keys_script(request: Request) -> Response:
+    if not _available(request):
+        return Response(status_code=404)
+    from importlib.resources import files
+
+    script = (files("eugene_plexus_agent") / "static_site_keys.js").read_text(encoding="utf-8")
+    return Response(
+        script,
+        media_type="text/javascript",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@router.post("/link/key")
+async def link_key(request: Request) -> Response:
+    """Pin the public half of a key this browser just made, to this account's link."""
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        account, _link = _linked(request)
+        _key, value = await _csrf_json(request, account)
+        alg, public = value.get("alg"), value.get("publicKey")
+        if alg not in _ALGS or not isinstance(public, str) or len(public) > 128:
+            raise NotHere("That is not a key this page made.")
+        store = _store(request)
+        assert store is not None
+        label = f"{_browser(request)} on {platform.node() or 'this machine'}"
+        try:
+            pinned = store.add_key(account, alg, public, label)
+        except LinkError as exc:
+            raise NotHere(str(exc)) from None
+        request.app.state.site_host.links_changed()
+    except NotHere as exc:
+        return _json_refused(str(exc))
+    return _json({"id": pinned["id"]})
+
+
+@router.post("/link/key/remove")
+async def link_key_remove(request: Request) -> Response:
+    """A key goes, at the machine (J45). What it approved stays."""
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        account, _link = _linked(request)
+        found = _pages(request).find(request, account)
+        try:
+            form = await request.form()
+        except Exception:
+            form = None
+        csrf = form.get("csrf") if form is not None else None
+        ident = form.get("id") if form is not None else None
+        if (
+            found is None
+            or not isinstance(csrf, str)
+            or not secrets.compare_digest(csrf, found[1].csrf)
+        ):
+            raise NotHere("This request is not from this page. Open it again.")
+        if not isinstance(ident, str) or not _KEY_ID.fullmatch(ident):
+            raise NotHere("That key is not one of yours here.")
+        store = _store(request)
+        assert store is not None
+        if store.remove_key(account, ident):
+            request.app.state.site_host.links_changed()
+    except NotHere as exc:
+        return _refused(str(exc))
+    return RedirectResponse("/link", status_code=303)
+
+
+@router.get("/link/approve")
+async def approve_page(request: Request) -> Response:
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        account, link = _linked(request)
+    except NotHere as exc:
+        return _refused(str(exc))
+    key, attempt, new = _attempt(request, account)
+    pinned = html.escape(json.dumps([str(k["id"]) for k in link.keys]))
+    body = (
+        f"<p>Changes to this job site for <b>{html.escape(link.name or link.subject)}</b> "
+        "wait here until you approve them with your key. Nothing changes until you do.</p>"
+        f"<div id=site-approve data-csrf='{html.escape(attempt.csrf)}' data-keys='{pinned}'>"
+        "<p data-state>Checking this browser…</p><div data-items></div></div>"
+        "<p><a href='/link'>Your link and keys</a></p>"
+        f"<script src='{KEY_SCRIPT}'></script>"
+    )
+    page = _page("Approve changes", body, script=True)
+    if new:
+        page.set_cookie(
+            COOKIE, key, httponly=True, samesite="strict", max_age=ATTEMPT_SECONDS, path="/link"
+        )
+    return page
+
+
+@router.get("/link/approve/items")
+async def approve_items(request: Request) -> Response:
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        account, link = _linked(request)
+        if _pages(request).find(request, account) is None:
+            raise NotHere("Open the approval page again.")
+        key = request.query_params.get("key")
+        if key is not None and not _KEY_ID.fullmatch(key):
+            raise NotHere("That key is not one of yours here.")
+        params = {"subject": link.subject, **({"key": key} if key else {})}
+        answer = await request.app.state.site_host.held("GET", "/v1/held", params=params)
+    except NotHere as exc:
+        return _json_refused(str(exc))
+    except HostUnavailable as exc:
+        return _json_refused(str(exc), 503)
+    if answer.status_code == 404:
+        return _json_refused("That key is not one of yours here. Make one on the link page.", 404)
+    if answer.status_code != 200:
+        return _json_refused("This job site did not answer. Try again in a moment.", 503)
+    return _json(answer.json())
+
+
+@router.post("/link/approve/items/{ident}")
+async def approve_item(request: Request, ident: str) -> Response:
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        if not _HELD_ID.fullmatch(ident):
+            raise NotHere("Nothing is waiting under that name.")
+        account, link = _linked(request)
+        _key, value = await _csrf_json(request, account)
+        body = {
+            "subject": link.subject,
+            "envelope": value.get("envelope"),
+            "key": value.get("key"),
+            "signature": value.get("signature"),
+        }
+        answer = await request.app.state.site_host.held(
+            "POST", f"/v1/held/{ident}/approve", json=body
+        )
+    except NotHere as exc:
+        return _json_refused(str(exc))
+    except HostUnavailable as exc:
+        return _json_refused(str(exc), 503)
+    if answer.status_code == 404:
+        return _json_refused("That is no longer waiting. Open the page again.", 404)
+    if answer.status_code == 422:
+        return _json_refused("That approval could not be read. Open the page again.", 422)
+    if answer.status_code != 200:
+        return _json_refused("This job site did not answer. Try again in a moment.", 503)
+    return _json(answer.json())
+
+
+@router.post("/link/approve/items/{ident}/reject")
+async def reject_item(request: Request, ident: str) -> Response:
+    if not _available(request):
+        return Response(status_code=404)
+    try:
+        if not _HELD_ID.fullmatch(ident):
+            raise NotHere("Nothing is waiting under that name.")
+        account, link = _linked(request)
+        await _csrf_json(request, account)
+        answer = await request.app.state.site_host.held(
+            "POST", f"/v1/held/{ident}/reject", json={"subject": link.subject}
+        )
+    except NotHere as exc:
+        return _json_refused(str(exc))
+    except HostUnavailable as exc:
+        return _json_refused(str(exc), 503)
+    if answer.status_code == 404:
+        return _json_refused("That is no longer waiting. Open the page again.", 404)
+    if answer.status_code != 204:
+        return _json_refused("This job site did not answer. Try again in a moment.", 503)
+    return _json({"status": "done"})
 
 
 def json_problem(status: int, title: str, detail: str) -> Response:

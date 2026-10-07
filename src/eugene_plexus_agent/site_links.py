@@ -18,10 +18,19 @@ account that is never a person's: LocalSystem and the other system
 accounts, service and virtual accounts (the site host's among them), root,
 and system uids. The same rules as the worker's own (`site-host`
 `accounts.py`).
+
+**A link carries its person's keys** (J14a, `person-held-keys.md` §4.1):
+the public half of a key made in their browser on the loopback page, pinned
+here by this agent at the machine, and checked by the site host against
+every change that person approves. The root never sees one. At most eight a
+person; one whose id is not the SHA-256 of its own public key is dropped.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import os
@@ -45,6 +54,8 @@ _SYSTEM_SIDS = frozenset({"S-1-5-18", "S-1-5-19", "S-1-5-20"})
 _PROGRAM_PREFIXES = ("S-1-5-80-", "S-1-5-82-", "S-1-5-90-", "S-1-5-96-")
 LINUX_UID_MIN = 1000
 MACOS_UID_MIN = 500
+MAX_KEYS = 8
+_KEY_LENGTH = {"Ed25519": 32, "ES256": 65}
 
 
 class LinkError(Exception):
@@ -72,6 +83,50 @@ def not_a_person(account: str) -> str | None:
     return None
 
 
+def key_id(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()[:32]
+
+
+def check_key(alg: str, public_b64: str) -> bytes:
+    """The raw public key, or `LinkError` saying why it is not one."""
+    try:
+        raw = base64.b64decode(public_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise LinkError("That key could not be read.") from None
+    if _KEY_LENGTH.get(alg) != len(raw):
+        raise LinkError("That is not an Ed25519 or P-256 public key.")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        if alg == "Ed25519":
+            Ed25519PublicKey.from_public_bytes(raw)
+        else:
+            ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+    except ValueError:
+        raise LinkError("That is not a valid public key.") from None
+    return raw
+
+
+def _key(entry: Any) -> dict[str, Any] | None:
+    """A pinned key from the file, or None when it is not a sound one."""
+    if not isinstance(entry, dict):
+        return None
+    try:
+        raw = check_key(str(entry["alg"]), str(entry["publicKey"]))
+    except (KeyError, LinkError):
+        return None
+    if entry.get("id") != key_id(raw):
+        return None
+    return {
+        "id": entry["id"],
+        "alg": entry["alg"],
+        "publicKey": entry["publicKey"],
+        "label": entry.get("label"),
+        "addedAt": str(entry.get("addedAt") or ""),
+    }
+
+
 @dataclass(frozen=True)
 class Link:
     subject: str
@@ -79,15 +134,19 @@ class Link:
     account: str
     account_name: str
     linked_at: str
+    keys: tuple[dict[str, Any], ...] = ()
 
     def as_json(self) -> dict[str, Any]:
-        return {
+        value: dict[str, Any] = {
             "subject": self.subject,
             "name": self.name,
             "account": self.account,
             "accountName": self.account_name,
             "linkedAt": self.linked_at,
         }
+        if self.keys:
+            value["keys"] = [dict(k) for k in self.keys]
+        return value
 
 
 def site_dir(config_dir: Path) -> Path:
@@ -114,6 +173,7 @@ class LinkStore:
         entries = raw.get("links") if isinstance(raw, dict) else None
         for entry in entries if isinstance(entries, list) else []:
             try:
+                keys = [_key(k) for k in entry.get("keys") or []]
                 links.append(
                     Link(
                         str(entry["subject"]),
@@ -121,9 +181,10 @@ class LinkStore:
                         str(entry["account"]),
                         str(entry["accountName"]),
                         str(entry["linkedAt"]),
+                        tuple(k for k in keys if k is not None)[:MAX_KEYS],
                     )
                 )
-            except (KeyError, TypeError):
+            except (KeyError, TypeError, AttributeError):
                 continue
         return links
 
@@ -180,6 +241,52 @@ class LinkStore:
             new = Link(subject, name, account, account_name, datetime.now(UTC).isoformat())
             self._write([*links, new])
             return new
+
+    def add_key(self, account: str, alg: str, public_b64: str, label: str | None) -> dict[str, Any]:
+        """Pin a key to the person linked to `account`, at the machine. The
+        same key again is the key already pinned."""
+        raw = check_key(alg, public_b64)
+        ident = key_id(raw)
+        with self._lock:
+            links = self.load()
+            link = next((link for link in links if link.account == account), None)
+            if link is None:
+                raise LinkError("Link this account first, then add a key.")
+            for key in link.keys:
+                if key["id"] == ident:
+                    return dict(key)
+            if len(link.keys) >= MAX_KEYS:
+                raise LinkError(f"You have {MAX_KEYS} keys here already. Remove one first.")
+            key = {
+                "id": ident,
+                "alg": alg,
+                "publicKey": base64.b64encode(raw).decode("ascii"),
+                "label": (label or "")[:120] or None,
+                "addedAt": datetime.now(UTC).isoformat(),
+            }
+            updated = Link(
+                link.subject,
+                link.name,
+                link.account,
+                link.account_name,
+                link.linked_at,
+                (*link.keys, key),
+            )
+            self._write([updated if item is link else item for item in links])
+            return key
+
+    def remove_key(self, account: str, ident: str) -> bool:
+        with self._lock:
+            links = self.load()
+            link = next((link for link in links if link.account == account), None)
+            if link is None or not any(k["id"] == ident for k in link.keys):
+                return False
+            kept = tuple(k for k in link.keys if k["id"] != ident)
+            updated = Link(
+                link.subject, link.name, link.account, link.account_name, link.linked_at, kept
+            )
+            self._write([updated if item is link else item for item in links])
+            return True
 
     def remove(self, subject: str) -> Link | None:
         with self._lock:

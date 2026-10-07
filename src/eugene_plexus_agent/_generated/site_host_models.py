@@ -101,6 +101,12 @@ class SitePersonLink(BaseModel):
         description='Why not, when it is not, e.g. that they are not signed in on a Windows machine (J25).',
         max_length=1024,
     )
+    keys: int | None = Field(
+        None,
+        description='How many keys this person has pinned at the machine (J14a). Absent from a site older than J14a.',
+        ge=0,
+        le=8,
+    )
 
 
 class SiteFolderPerson(BaseModel):
@@ -135,6 +141,21 @@ class SiteServerKind(StrEnum):
 
     files = 'files'
     local = 'local'
+
+
+class SiteSigningState(StrEnum):
+    """
+    `unsigned`: the site's owner has no key pinned at the machine. Its rules
+    are trusted to the root, and no tool runs there as anyone (J48).
+    `unconfirmed`: the owner has a key, but has not approved the site's
+    current rules with it (J52); no tool runs. `signed`: every rule the site
+    holds was approved with its owner's key, at the machine; tools run.
+
+    """
+
+    unsigned = 'unsigned'
+    unconfirmed = 'unconfirmed'
+    signed = 'signed'
 
 
 class SiteTool(BaseModel):
@@ -246,42 +267,29 @@ class SiteAnswerStatus(StrEnum):
     `done`, inside `response`). `failed`: the site refused or could not run
     it, and `message` says why in the site's words; nothing ran. `uncertain`:
     a tool call started and its end could not be established; it may have
-    acted.
+    acted. `held` (J14a, J50): a change that gives access, from a person who
+    has a key pinned at the machine; the site keeps it until they approve it
+    there with that key, and `message` says where. Nothing changed yet.
 
     """
 
     done = 'done'
     failed = 'failed'
     uncertain = 'uncertain'
+    held = 'held'
 
 
-class SiteAccountLink(BaseModel):
+class SitePersonKeyAlg(StrEnum):
     """
-    One link in the links file: *this Eugene person is this OS account on
-    this machine* (§2.2, J27). Made at the machine only, by the machine's
-    privileged starter (the agent on a Windows service install, root on a
-    Linux system install, the join on a per-user install), never by the root
-    or the site host.
+    `Ed25519`: a raw 32-byte public key and a 64-byte signature. `ES256`:
+    ECDSA on P-256 with SHA-256, for a browser without Ed25519: an
+    uncompressed 65-byte public point and a 64-byte `r||s` signature, as
+    WebCrypto gives it.
 
     """
 
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    subject: str = Field(
-        ..., description="The person's id.", max_length=64, min_length=1
-    )
-    name: str | None = Field(
-        None, description='How the person signs in, for display.', max_length=256
-    )
-    account: str = Field(
-        ...,
-        description="The OS account's SID on Windows, or its uid in decimal elsewhere. Compared exactly.",
-        max_length=256,
-        min_length=1,
-    )
-    accountName: str = Field(..., max_length=256, min_length=1)
-    linkedAt: AwareDatetime
+    Ed25519 = 'Ed25519'
+    ES256 = 'ES256'
 
 
 class SitePersonCheckRequest(BaseModel):
@@ -362,6 +370,116 @@ class SiteManage(BaseModel):
         ...,
         description="The action's arguments; see `SiteManageAction` for each one's schema.",
     )
+    names: dict[str, Any] | None = Field(
+        None,
+        description='How the root names the people the arguments name (`SiteOperation.names`). Display only (J54).',
+    )
+
+
+class SiteEditEnvelope(BaseModel):
+    """
+    What a person's key signs to approve one change (J14a,
+    `person-held-keys.md` §12.2). The site host builds it and gives it to
+    the page as canonical JSON (keys sorted, no spaces, UTF-8); the page
+    signs those bytes as given, and the site checks them against what it
+    holds. `typ` and `v` keep the signature from meaning anything else.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    typ: Literal['eugene-plexus/site-edit']
+    v: Literal[1]
+    site: str = Field(
+        ...,
+        description="A site's id: random, given by the root at enrollment, and fixed for\nthat enrollment. A machine that joins again gets a new one. Never a\nmachine's name, which is only its `label`.\n",
+        pattern='^s-[a-z2-7]{26}$',
+    )
+    enrolledAt: AwareDatetime
+    person: str = Field(..., max_length=64, min_length=1)
+    key: str = Field(..., pattern='^[a-f0-9]{32}$')
+    act: str = Field(
+        ...,
+        description='A `SiteManageAction` that changes something, or `rules.confirm` (J52), whose `args` are `{"digest"}`, the SHA-256 of the site\'s whole policy.',
+    )
+    args: dict[str, Any]
+    seq: int = Field(
+        ..., description='Greater than the last this person approved here.', ge=1
+    )
+    iat: int = Field(..., description='Unix seconds.')
+
+
+class Word(RootModel[str]):
+    root: str = Field(..., max_length=1024)
+
+
+class SiteHeldEdit(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-z0-9]{1,32}$')
+    action: str = Field(..., max_length=64)
+    words: list[Word] = Field(
+        ...,
+        description="The change in the site host's own words, line by line, as the page shows it.",
+        max_length=600,
+    )
+    heldAt: AwareDatetime | None
+    expiresAt: AwareDatetime | None = Field(
+        None, description='When the site drops it unapproved.'
+    )
+    envelope: str | None = Field(
+        None, description='With `key`, the canonical `SiteEditEnvelope` to sign.'
+    )
+
+
+class Key(RootModel[str]):
+    root: str = Field(..., pattern='^[a-f0-9]{32}$')
+
+
+class SiteHeldList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(..., max_length=64)
+    keys: list[Key] = Field(
+        ..., description='The ids of the keys pinned to this person.', max_length=8
+    )
+    state: SiteSigningState | None = None
+    items: list[SiteHeldEdit] = Field(..., max_length=64)
+
+
+class SiteApproval(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ...,
+        description="The person the starter's page serves.",
+        max_length=64,
+        min_length=1,
+    )
+    envelope: str = Field(
+        ...,
+        description='The canonical `SiteEditEnvelope`, exactly as listed.',
+        max_length=262144,
+        min_length=2,
+    )
+    key: str = Field(..., pattern='^[a-f0-9]{32}$')
+    signature: str = Field(
+        ...,
+        description="Base64 of the signature over the envelope's UTF-8 bytes.",
+        max_length=256,
+        min_length=1,
+    )
+
+
+class SiteHeldReject(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(..., max_length=64, min_length=1)
 
 
 class SiteFolderAdd(BaseModel):
@@ -542,7 +660,9 @@ class SiteEnrollment(BaseModel):
     owner: str = Field(
         ..., description="The owner's person id.", max_length=64, min_length=1
     )
-    ownerName: str = Field(..., description='How the owner signs in', max_length=256)
+    ownerName: str = Field(
+        ..., description='How the owner signs in, for display.', max_length=256
+    )
     controlPublicKey: str = Field(
         ...,
         description="Base64 of the root's raw Ed25519 identity key. A site that pinned a key at its join (J7a) checks it is this one.",
@@ -638,6 +758,28 @@ class SiteServer(BaseModel):
     tools: list[SiteTool] = Field(..., max_length=64)
 
 
+class SiteSigning(BaseModel):
+    """
+    Whether the site checks its owner's changes with the owner's own key (J14a).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    state: SiteSigningState
+    held: int = Field(
+        ...,
+        description='Changes the site holds until their person approves them at the machine (J50).',
+        ge=0,
+        le=64,
+    )
+    approvePage: str | None = Field(
+        None,
+        description='Where a person adds a key and approves held changes, on the machine\nitself. Null where this install has no such page yet (J14a.2, J14a.3).\n',
+        max_length=256,
+    )
+
+
 class McpRequest(BaseModel):
     """
     One MCP request of the 2026-07-28 revision: `server/discover`,
@@ -677,19 +819,33 @@ class SiteResult(BaseModel):
     )
 
 
-class SiteLinkFile(BaseModel):
+class SitePersonKey(BaseModel):
     """
-    The links file (§3.2): written by the machine's privileged starter,
-    read by the site host, which cannot write it. One link per person, and
-    one person per account.
+    A person's own key (J14a, Path A). Its private half was made in the
+    person's browser on the machine's loopback page and cannot leave it;
+    the root never saw either half. Written to the links file by the
+    machine's privileged starter, at the machine.
 
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    version: Literal[1]
-    links: list[SiteAccountLink] = Field(..., max_length=256)
+    id: str = Field(
+        ...,
+        description='The first 16 bytes of SHA-256 over the raw public key, in hex.',
+        pattern='^[a-f0-9]{32}$',
+    )
+    alg: SitePersonKeyAlg
+    publicKey: str = Field(
+        ..., description='Base64 of the raw public key.', max_length=128, min_length=1
+    )
+    label: str | None = Field(
+        None,
+        description='Where it was made, for display, e.g. "Chrome on AMISH_STATION".',
+        max_length=120,
+    )
+    addedAt: AwareDatetime
 
 
 class SiteCall(BaseModel):
@@ -794,6 +950,7 @@ class SiteSummary(BaseModel):
         None,
         description='Whether this site can serve anyone but its owner. False on macOS,\nwhich has no folder boundary yet (§2.6). Absent means true.\n',
     )
+    signing: SiteSigning | None = None
 
 
 class SiteOperation(BaseModel):
@@ -837,7 +994,46 @@ class SiteOperation(BaseModel):
     arguments: dict[str, Any] | None = Field(
         None, description='For `manage`, its arguments.'
     )
+    names: dict[str, Any] | None = Field(
+        None,
+        description="For `manage`, how the root names each person the arguments name, by\nid. Display only: a site shows them on a held change marked as the\nroot's names (J54), and decides nothing by them.\n",
+    )
     installMode: InstallModeName
+
+
+class SiteAccountLink(BaseModel):
+    """
+    One link in the links file: *this Eugene person is this OS account on
+    this machine* (§2.2, J27). Made at the machine only, by the machine's
+    privileged starter (the agent on a Windows service install, root on a
+    Linux system install, the join on a per-user install), never by the root
+    or the site host.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ..., description="The person's id.", max_length=64, min_length=1
+    )
+    name: str | None = Field(
+        None, description='How the person signs in, for display.', max_length=256
+    )
+    account: str = Field(
+        ...,
+        description="The OS account's SID on Windows, or its uid in decimal elsewhere. Compared exactly.",
+        max_length=256,
+        min_length=1,
+    )
+    accountName: str = Field(..., max_length=256, min_length=1)
+    linkedAt: AwareDatetime
+    keys: list[SitePersonKey] | None = Field(
+        [],
+        description="The person's own keys, pinned at the machine (J14a,\n`person-held-keys.md` §4.1). The site checks every change this\nperson approves against them, never the person the root names.\n",
+        max_length=8,
+        validate_default=True,
+    )
 
 
 class SiteAuditPage(BaseModel):
@@ -868,3 +1064,18 @@ class SiteReport(BaseModel):
         max_length=256,
     )
     site: SiteSummary | None = None
+
+
+class SiteLinkFile(BaseModel):
+    """
+    The links file (§3.2): written by the machine's privileged starter,
+    read by the site host, which cannot write it. One link per person, and
+    one person per account.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    version: Literal[1]
+    links: list[SiteAccountLink] = Field(..., max_length=256)

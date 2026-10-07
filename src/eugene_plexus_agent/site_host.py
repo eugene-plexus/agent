@@ -20,6 +20,9 @@ node is the machine's privileged starter, and does this and nothing else:
    (`site_workers.py`): on Windows while they are signed in (J25), on a
    per-user install for the installing person.
 4. **Says which site it hosts** (J32), for display.
+5. **Carries a person's approvals** (J14a) from its loopback page to the
+   site host's own loopback API (`held`), with the token the site host keeps
+   in its data directory. The signature is checked there, not here.
 
 The agent holds none of the site's identity, and the node's enrollment is
 unchanged by any of this: the two share nothing but the machine.
@@ -80,6 +83,12 @@ ROOT_SITE_FILE = Path("/etc/eugene-plexus/site/host.json")
 REPORT_SECONDS = 60.0
 
 Mode = Literal["service", "user", "root"]
+#: The site host's approval API's token, in its own data directory (J53).
+LOCAL_TOKEN_FILE = "local_token"
+
+
+class HostUnavailable(Exception):
+    """The site host is not running, or did not answer."""
 
 
 def source() -> tuple[str, str]:
@@ -263,6 +272,29 @@ class SiteHostSupervisor:
             return None
         port = getattr(self.app.state.settings, "bind_port", None) or 8079
         return f"http://127.0.0.1:{port}/link"
+
+    # --- the site host's approval API (J14a, J53) ---------------------------------
+
+    async def held(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        """One call to the site host's `/v1/held` API on loopback."""
+        manager = self.manager
+        record = manager.store.get(HELPER_ID) if manager else None
+        if manager is None or record is None or not record.enabled or not record.port:
+            raise HostUnavailable("This machine's job site is not running.")
+        token_file = manager.store.data_dir(HELPER_ID) / LOCAL_TOKEN_FILE
+        try:
+            token = (await asyncio.to_thread(token_file.read_text, encoding="utf-8")).strip()
+        except OSError:
+            raise HostUnavailable("This machine's job site has not started yet.") from None
+        try:
+            return await self._host.request(
+                method,
+                f"http://127.0.0.1:{record.port}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                **kwargs,
+            )
+        except httpx.HTTPError:
+            raise HostUnavailable("This machine's job site did not answer.") from None
 
     # --- the site host's launch environment -------------------------------------
 
