@@ -44,6 +44,10 @@ dependencies = [
     # one, and on a fresh machine OpenSSL's read of the store failed it
     # (2026-09-26).
     "truststore>=0.10,<1",
+    # The job site's link page reads posted forms (`routes/site_link.py`).
+    # Installs had it only because the gateway and control declare it, so a
+    # bare agent venv (CI) read every form as missing (2026-10-07).
+    "python-multipart>=0.0.20,<0.1",
 ]
 
 [project.optional-dependencies]
