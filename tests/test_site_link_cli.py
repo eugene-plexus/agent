@@ -497,8 +497,10 @@ def test_a_system_installs_join_points_at_no_page_of_its_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A service install's owner makes their key on its link page, in their
-    own session, never in the elevated one that ran the join."""
+    own session, never in the elevated one that ran the join. (A Linux
+    system install's join is root's installer's, and refused earlier.)"""
     fake_host(monkeypatch, tmp_path)
+    monkeypatch.setattr(site_cli, "sys", SimpleNamespace(platform="win32", stdin=sys.stdin))
     monkeypatch.setattr(site_cli, "_system_install", lambda config_dir: True)
     monkeypatch.setattr(site_cli, "_open_in_browser", lambda page: pytest.fail("opened"))
     said = site_cli.join(tmp_path, join_args(tmp_path), port=8179)
