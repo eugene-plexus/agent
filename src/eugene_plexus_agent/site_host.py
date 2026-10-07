@@ -269,6 +269,19 @@ class SiteHostSupervisor:
         any connection's account, and nobody else can make a link (J36, J38)."""
         return sys.platform == "win32" and self.mode() == "service" and wanted(self.config_dir)
 
+    def key_page_offered(self) -> bool:
+        """Keys and approvals at the machine (J14a): on a Windows service
+        install, and on a per-user install, where the one person served is
+        the account this agent runs as and the connection's account can be
+        read on Windows, Linux and macOS (J14a.2, `loopback_peer.py`)."""
+        if self.link_page_offered():
+            return True
+        return (
+            sys.platform in ("win32", "linux", "darwin")
+            and self.mode() == "user"
+            and wanted(self.config_dir)
+        )
+
     def never_linked(self) -> frozenset[str]:
         """Eugene's own accounts, which are never a person's."""
         accounts = {"S-1-5-18"}
@@ -279,11 +292,17 @@ class SiteHostSupervisor:
     def links_changed(self) -> None:
         self._wake.set()
 
-    def link_page(self) -> str | None:
-        if not self.link_page_offered():
-            return None
+    def _page(self, path: str) -> str:
         port = getattr(self.app.state.settings, "bind_port", None) or 8079
-        return f"http://127.0.0.1:{port}/link"
+        return f"http://127.0.0.1:{port}{path}"
+
+    def link_page(self) -> str | None:
+        """Where people link themselves: a Windows service install only."""
+        return self._page("/link") if self.link_page_offered() else None
+
+    def approve_page(self) -> str | None:
+        """Where a person adds a key and approves held changes (J14a)."""
+        return self._page("/link/approve") if self.key_page_offered() else None
 
     # --- the site host's approval API (J14a, J53) ---------------------------------
 
@@ -322,6 +341,8 @@ class SiteHostSupervisor:
         }
         if page := self.link_page():
             environment["SITE_HOST_LINK_PAGE"] = page
+        if page := self.approve_page():
+            environment["SITE_HOST_APPROVE_PAGE"] = page
         return environment
 
     # --- install and start ------------------------------------------------------

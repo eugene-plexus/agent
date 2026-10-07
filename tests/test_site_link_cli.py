@@ -462,3 +462,60 @@ def test_the_site_host_is_prepared_when_its_install_is_recorded_not_when_its_ven
     assert site_cli._host_python(tmp_path) == python
     python.unlink()
     assert site_cli._host_python(tmp_path) is None
+
+
+# --- the owner's key, where the join happened (J14a.2) ------------------------------------
+
+
+def test_a_per_users_join_opens_the_key_page_in_the_owners_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_host(monkeypatch, tmp_path)
+    opened: list[str] = []
+    monkeypatch.setattr(site_cli, "_open_in_browser", lambda page: opened.append(page) or True)
+    said = site_cli.join(tmp_path, join_args(tmp_path), port=8179)
+    assert opened == ["http://127.0.0.1:8179/link"]
+    assert "No tool runs here until you add your own key" in said
+    assert "http://127.0.0.1:8179/link" in said and "It is opening now." in said
+
+
+def test_with_no_browser_or_no_desktop_the_join_prints_the_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_host(monkeypatch, tmp_path)
+    opened: list[str] = []
+    monkeypatch.setattr(site_cli, "_open_in_browser", lambda page: opened.append(page) or True)
+    said = site_cli.join(tmp_path, join_args(tmp_path, no_browser=True), port=8179)
+    assert opened == [] and "http://127.0.0.1:8179/link" in said and "opening" not in said
+    # No desktop session that can show it: printed, never opened in the terminal.
+    monkeypatch.setattr(site_cli, "_open_in_browser", lambda page: False)
+    said = site_cli.join(tmp_path, join_args(tmp_path), port=8179)
+    assert "http://127.0.0.1:8179/link" in said and "opening" not in said
+
+
+def test_a_system_installs_join_points_at_no_page_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A service install's owner makes their key on its link page, in their
+    own session, never in the elevated one that ran the join."""
+    fake_host(monkeypatch, tmp_path)
+    monkeypatch.setattr(site_cli, "_system_install", lambda config_dir: True)
+    monkeypatch.setattr(site_cli, "_open_in_browser", lambda page: pytest.fail("opened"))
+    said = site_cli.join(tmp_path, join_args(tmp_path), port=8179)
+    assert "/link" not in said
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the Linux and macOS openers")
+def test_the_browser_is_never_a_text_one_in_this_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    started: list[list[str]] = []
+    monkeypatch.setattr(site_cli.subprocess, "Popen", lambda command, **kw: started.append(command))
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    if sys.platform == "linux":
+        assert site_cli._open_in_browser("http://127.0.0.1:8079/link") is False and started == []
+        monkeypatch.setenv("DISPLAY", ":0")
+        assert site_cli._open_in_browser("http://127.0.0.1:8079/link") is True
+        assert started == [["xdg-open", "http://127.0.0.1:8079/link"]]
+    else:
+        assert site_cli._open_in_browser("http://127.0.0.1:8079/link") is True
+        assert started == [["open", "http://127.0.0.1:8079/link"]]

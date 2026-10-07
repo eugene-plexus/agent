@@ -3,7 +3,7 @@
 
 What is faked, and so left to an elevated acceptance run: the operating
 system's answer to "which account owns this loopback connection"
-(`_socket_owner`, GetExtendedTcpTable and the process token). Everything the
+(`loopback_peer`, whose readers have their own tests). Everything the
 page decides from that answer, and the whole sign-in against the root (the code
 exchange, the JWKS, the ID token's signature and claims), is real."""
 
@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import app_accounts, site_host
+from eugene_plexus_agent import app_accounts, loopback_peer, site_host
 from eugene_plexus_agent.routes import site_link
 from eugene_plexus_agent.site_links import LinkStore
 
@@ -56,6 +56,9 @@ class StubSite:
         self._mode = "service"
 
     def link_page_offered(self) -> bool:
+        return self.offered and self._mode == "service"
+
+    def key_page_offered(self) -> bool:
         return self.offered
 
     def link_store(self) -> LinkStore | None:
@@ -96,16 +99,19 @@ class Owner:
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.sid = ADA
+        #: The account this agent runs as, which a per-user install serves alone.
+        self.own = ADA
         self.asked: list[tuple[int, int]] = []
         self.fail: str | None = None
 
-        def socket_owner(client_port: int, server_port: int) -> str:
+        def peer_account(client_port: int, server_port: int) -> str:
             self.asked.append((client_port, server_port))
             if self.fail:
-                raise site_link.NotHere(self.fail)
+                raise loopback_peer.PeerUnknown(self.fail)
             return self.sid
 
-        monkeypatch.setattr(site_link, "_socket_owner", socket_owner)
+        monkeypatch.setattr(loopback_peer, "peer_account", peer_account)
+        monkeypatch.setattr(loopback_peer, "own_account", lambda: self.own)
 
 
 @pytest.fixture
@@ -233,14 +239,6 @@ def test_a_connection_the_system_cannot_place_is_refused_with_its_reason(
     owner.fail = "The program that opened this page could not be found."
     refused = browser.get("/link")
     assert refused.status_code == 403 and "could not be found" in refused.text
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="the refusal is for other systems")
-def test_elsewhere_the_page_says_it_is_for_windows(
-    browser: TestClient, site: StubSite, owner: Owner
-) -> None:
-    refused = browser.get("/link")
-    assert refused.status_code == 403 and "Windows" in refused.text and owner.asked == []
 
 
 # --- the page, and the start of an attempt ----------------------------------------------
@@ -810,3 +808,22 @@ def test_the_response_bodies_are_json_parseable_problems() -> None:
         "status": 409,
         "detail": "D",
     }
+
+
+def test_a_wanted_per_user_install_offers_keys_and_approvals_and_no_linking(
+    app: FastAPI, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """J14a.2: the site host is told where its approve page is, and is given
+    no link page, because a per-user install links nobody (J38)."""
+    supervisor = site_host.SiteHostSupervisor(app)
+    app.state.settings.bind_port = 8179
+    monkeypatch.setattr(supervisor, "mode", lambda: "user")
+    assert not supervisor.key_page_offered() and supervisor.approve_page() is None
+    site_host.set_wanted(supervisor.config_dir, True)
+    assert supervisor.key_page_offered() and not supervisor.link_page_offered()
+    assert supervisor.approve_page() == "http://127.0.0.1:8179/link/approve"
+    environment = supervisor.environment("user")
+    assert environment["SITE_HOST_APPROVE_PAGE"] == "http://127.0.0.1:8179/link/approve"
+    assert "SITE_HOST_LINK_PAGE" not in environment
+    monkeypatch.setattr(supervisor, "mode", lambda: "root")
+    assert not supervisor.key_page_offered() and supervisor.approve_page() is None

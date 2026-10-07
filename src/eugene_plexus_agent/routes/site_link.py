@@ -35,6 +35,12 @@ text the site host gave for each change they approve; the site host checks
 that signature against the pinned key. This agent only carries it: the
 signature, not this agent, is the authority. Every request here is checked
 from the connection as above, and every write carries the page's CSRF token.
+
+**On a per-user install** (J14a.2: Windows, Linux, macOS) the agent runs as
+the one person it serves, linked at `site join` (J38). There this page makes
+and pins keys and approves held changes, and links nobody: only the account
+this agent runs as is served, read from the connection the same way
+(`loopback_peer.py`), and any other account on the machine is refused.
 """
 
 from __future__ import annotations
@@ -47,7 +53,6 @@ import logging
 import platform
 import re
 import secrets
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -58,6 +63,7 @@ import jwt
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from .. import loopback_peer
 from .._http import client_for
 from ..dependencies import require_control
 from ..site_host import HostUnavailable
@@ -107,74 +113,9 @@ class Attempt:
 # --- who is at the other end of this connection -------------------------------------
 
 
-def _socket_owner(client_port: int, server_port: int) -> str:
-    """The SID of the process that owns the loopback connection from
-    `client_port` to this agent's `server_port` (Windows)."""
-    # For the type checker as much as the runtime (process_io.py says why).
-    if sys.platform != "win32":
-        raise OSError("a connection's owner is read with a Windows-only API")
-    import ctypes
-    from ctypes import wintypes
-
-    import win32api
-    import win32con
-    import win32security
-
-    iphlpapi = ctypes.WinDLL("iphlpapi")
-
-    class Row(ctypes.Structure):
-        _fields_ = [
-            ("state", wintypes.DWORD),
-            ("local_addr", wintypes.DWORD),
-            ("local_port", wintypes.DWORD),
-            ("remote_addr", wintypes.DWORD),
-            ("remote_port", wintypes.DWORD),
-            ("pid", wintypes.DWORD),
-        ]
-
-    size = wintypes.DWORD(0)
-    # AF_INET (2), TCP_TABLE_OWNER_PID_CONNECTIONS (4).
-    iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 4, 0)
-    buffer = ctypes.create_string_buffer(size.value + 4096)
-    size = wintypes.DWORD(len(buffer))
-    if iphlpapi.GetExtendedTcpTable(buffer, ctypes.byref(size), False, 2, 4, 0) != 0:
-        raise NotHere("This machine's connection table could not be read.")
-    count = ctypes.cast(buffer, ctypes.POINTER(wintypes.DWORD))[0]
-    rows = ctypes.cast(
-        ctypes.addressof(buffer) + ctypes.sizeof(wintypes.DWORD), ctypes.POINTER(Row * count)
-    ).contents
-    loopback = int.from_bytes(bytes([127, 0, 0, 1]), "little")
-
-    def port(value: int) -> int:
-        return ((value & 0xFF) << 8) | ((value >> 8) & 0xFF)
-
-    owners = {
-        row.pid
-        for row in rows
-        if row.local_addr == loopback
-        and row.remote_addr == loopback
-        and port(row.local_port) == client_port
-        and port(row.remote_port) == server_port
-    }
-    if len(owners) != 1:
-        raise NotHere("The program that opened this page could not be found.")
-    pid = owners.pop()
-    try:
-        process = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        token = win32security.OpenProcessToken(process, win32con.TOKEN_QUERY)
-        user = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
-        return str(win32security.ConvertSidToStringSid(user))
-    except Exception:
-        raise NotHere(
-            "The account of the program that opened this page could not be read."
-        ) from None
-
-
 def _account(request: Request) -> str:
     """The OS account at the other end of this request's connection, or a
     refusal saying why it is not one this page serves."""
-    if sys.platform != "win32":
-        raise NotHere("This page runs on a Windows service install.")
     scope = request.scope
     client, server = scope.get("client"), scope.get("server")
     if (
@@ -191,7 +132,17 @@ def _account(request: Request) -> str:
             "Open this page on the machine itself, at http://127.0.0.1 and this agent's port. "
             "It cannot be reached from anywhere else, or through another address."
         )
-    account = _socket_owner(int(client[1]), int(server[1]))
+    try:
+        account = loopback_peer.peer_account(int(client[1]), int(server[1]))
+    except loopback_peer.PeerUnknown as exc:
+        raise NotHere(str(exc)) from None
+    if _per_user(request):
+        own = loopback_peer.own_account()
+        if account != own:
+            raise NotHere(
+                f"This page is for {account_name(own)} only: Eugene on this machine runs as "
+                "that account and serves no one else here."
+            )
     if why := not_a_person(account):
         raise NotHere(f"This page was opened by {why}, which no one can be linked to.")
     return account
@@ -368,8 +319,21 @@ async def _person(request: Request, attempt: Attempt, code: str) -> tuple[str, s
 
 
 def _available(request: Request) -> bool:
+    """Keys and approvals: a Windows service install, or a per-user install
+    where this agent's own account is the one person served (J14a.2)."""
+    supervisor = getattr(request.app.state, "site_host", None)
+    return bool(supervisor is not None and supervisor.key_page_offered())
+
+
+def _linking(request: Request) -> bool:
+    """Linking people: a Windows service install only (J36, J38)."""
     supervisor = getattr(request.app.state, "site_host", None)
     return bool(supervisor is not None and supervisor.link_page_offered())
+
+
+def _per_user(request: Request) -> bool:
+    supervisor = getattr(request.app.state, "site_host", None)
+    return bool(supervisor is not None and supervisor.mode() == "user")
 
 
 @router.get("/link")
@@ -386,7 +350,19 @@ async def link_page(request: Request) -> Response:
     name = account_name(account)
     link = store.for_account(account)
     key, attempt = _pages(request).begin(account)
-    if link is not None:
+    if _per_user(request):
+        # Linked at `site join`, and nobody else is served here (J38).
+        if link is None:
+            return _refused(
+                f"This job site is not linked to {name}. Run `site join` again from this "
+                "account to make it yours."
+            )
+        body = (
+            f"<p>This job site is <b>{html.escape(link.name or link.subject)}</b>'s, and its "
+            f"calls run as your account here, <b>{html.escape(name)}</b>.</p>"
+            + _keys_section(link.keys, attempt.csrf)
+        )
+    elif link is not None:
         body = (
             f"<p>Your account here, <b>{html.escape(name)}</b>, is linked to "
             f"<b>{html.escape(link.name or link.subject)}</b> in Eugene. Their calls to this job "
@@ -402,7 +378,8 @@ async def link_page(request: Request) -> Response:
             "job site will then run as this account, with its permissions, while it is signed "
             "in.</p><p><a href='/link/start'>Sign in to link</a></p>"
         )
-    page = _page("Link your account", body, script=link is not None)
+    title = "Your key" if _per_user(request) else "Link your account"
+    page = _page(title, body, script=link is not None)
     page.set_cookie(
         COOKIE, key, httponly=True, samesite="strict", max_age=ATTEMPT_SECONDS, path="/link"
     )
@@ -411,7 +388,7 @@ async def link_page(request: Request) -> Response:
 
 @router.get("/link/start")
 async def link_start(request: Request) -> Response:
-    if not _available(request):
+    if not _linking(request):
         return Response(status_code=404)
     try:
         account = _account(request)
@@ -438,7 +415,7 @@ async def link_start(request: Request) -> Response:
 
 @router.get("/link/callback")
 async def link_callback(request: Request) -> Response:
-    if not _available(request):
+    if not _linking(request):
         return Response(status_code=404)
     try:
         account = _account(request)
@@ -477,7 +454,7 @@ async def _posted_csrf(request: Request) -> str | None:
 
 @router.post("/link/confirm")
 async def link_confirm(request: Request) -> Response:
-    if not _available(request):
+    if not _linking(request):
         return Response(status_code=404)
     try:
         account = _account(request)
@@ -516,7 +493,7 @@ async def link_confirm(request: Request) -> Response:
 
 @router.post("/link/remove")
 async def link_remove(request: Request) -> Response:
-    if not _available(request):
+    if not _linking(request):
         return Response(status_code=404)
     try:
         account = _account(request)
@@ -591,6 +568,11 @@ def _linked(request: Request) -> tuple[str, Any]:
         raise NotHere("This machine is not a job site any more.")
     link = store.for_account(account)
     if link is None:
+        if _per_user(request):
+            raise NotHere(
+                f"This job site is not linked to {account_name(account)}. Run `site join` again "
+                "from this account to make it yours."
+            )
         raise NotHere(
             f"{account_name(account)} is not linked to anyone here. Link it on the link page first."
         )

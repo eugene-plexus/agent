@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import re
+import sys
 from collections.abc import Iterator
 from typing import Any
 
@@ -325,3 +326,88 @@ def test_keys_survive_other_links_and_a_bad_one_is_dropped(tmp_path: Any) -> Non
     assert [k["id"] for k in store.for_account(ADA).keys] == [ident]  # type: ignore[union-attr]
     assert key_id(base64.b64decode(public)) == ident
     assert store.remove_key(ADA, ident) is True and store.remove_key(ADA, ident) is False
+
+
+# --- a per-user install (J14a.2) --------------------------------------------------------
+# The agent runs as the one person it serves, linked at `site join` (J38): the
+# page makes keys and approves for that account, links nobody, and refuses
+# every other account on the machine. Not Windows-only: the connection's
+# account is read on Windows, Linux and macOS (`loopback_peer`).
+
+ME = ADA if sys.platform == "win32" else "1001"
+SOMEONE_ELSE = BO if sys.platform == "win32" else "1002"
+
+
+@pytest.fixture
+def per_user(held_site: HeldSite, owner: Owner) -> HeldSite:
+    held_site._mode = "user"
+    owner.sid = owner.own = ME
+    held_site.store.add(subject="p-ada", name="Ada", account=ME, account_name="PC\\ada")
+    return held_site
+
+
+def test_per_user_the_agents_own_account_gets_its_key_page(
+    browser: TestClient, per_user: HeldSite
+) -> None:
+    page = browser.get("/link")
+    assert page.status_code == 200, page.text
+    assert "<title>Your key</title>" in page.text and "id=site-key" in page.text
+    assert "/link/start" not in page.text and "/link/remove" not in page.text
+
+
+def test_per_user_another_account_on_the_machine_is_refused(
+    browser: TestClient, per_user: HeldSite, owner: Owner
+) -> None:
+    owner.sid = SOMEONE_ELSE
+    for path in ("/link", "/link/approve", "/link/approve/items"):
+        refused = browser.get(path)
+        assert refused.status_code == 403, (path, refused.text)
+        assert "serves no one else here" in refused.text
+    public, _ = ed25519()
+    pinned = send(browser, "/link/key", "x", {"alg": "Ed25519", "publicKey": public})
+    assert pinned.status_code == 403 and "serves no one else here" in pinned.text
+    assert per_user.store.for_account(ME).keys == ()  # type: ignore[union-attr]
+    assert per_user.calls == []
+
+
+def test_per_user_links_nobody(browser: TestClient, per_user: HeldSite) -> None:
+    token = csrf(browser.get("/link").text)
+    for method, path in (
+        ("GET", "/link/start"),
+        ("GET", "/link/callback?state=x&code=y"),
+        ("POST", "/link/confirm"),
+        ("POST", "/link/remove"),
+    ):
+        answer = browser.request(method, path, data={"csrf": token})
+        assert answer.status_code == 404, (method, path)
+    assert [x.account for x in per_user.store.load()] == [ME]
+
+
+def test_per_user_pins_a_key_and_carries_an_approval(
+    browser: TestClient, per_user: HeldSite
+) -> None:
+    token = csrf(browser.get("/link").text)
+    public, ident = ed25519()
+    pinned = send(browser, "/link/key", token, {"alg": "Ed25519", "publicKey": public})
+    assert pinned.status_code == 200 and pinned.json() == {"id": ident}
+    approve = browser.get("/link/approve")
+    assert approve.status_code == 200
+    assert ident in KEY_ID.search(approve.text).group(1)  # type: ignore[union-attr]
+    listed = browser.get(f"/link/approve/items?key={ident}")
+    assert listed.status_code == 200
+    assert per_user.calls[-1][2]["params"] == {"subject": "p-ada", "key": ident}
+    approval = {"envelope": "{}", "key": ident, "signature": "c2ln"}
+    sent = send(browser, "/link/approve/items/a1b2c3d4", csrf(approve.text), approval)
+    assert sent.status_code == 200
+    assert per_user.calls[-1][:2] == ("POST", "/v1/held/a1b2c3d4/approve")
+    assert per_user.calls[-1][2]["json"]["subject"] == "p-ada"
+
+
+def test_per_user_with_no_link_says_to_join_again(
+    browser: TestClient, held_site: HeldSite, owner: Owner
+) -> None:
+    held_site._mode = "user"
+    owner.sid = owner.own = ME
+    for path in ("/link", "/link/approve"):
+        refused = browser.get(path)
+        assert refused.status_code == 403 and "Run `site join` again" in refused.text

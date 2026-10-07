@@ -127,6 +127,12 @@ def add_parser(sub: Any) -> None:
         dest="site_account",
         help="The owner's account on this machine, when not the one running this.",
     )
+    joining.add_argument(
+        "--no-browser",
+        dest="no_browser",
+        action="store_true",
+        help="Print the page where the owner adds their key, without opening it.",
+    )
     joining.add_argument("--python", help=argparse.SUPPRESS)
     joining.add_argument("--data-dir", dest="data_dir", help=argparse.SUPPRESS)
     linking = actions.add_parser(
@@ -178,7 +184,7 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
     config_dir = Path(settings.config_file).resolve().parent
     try:
         if args.site_command == "join":
-            print(join(config_dir, args))
+            print(join(config_dir, args, port=settings.bind_port))
         elif args.site_command == "leave":
             print(leave(config_dir, args))
         elif args.site_command == "link":
@@ -461,7 +467,7 @@ def _give_to_owner_of(data: Path) -> None:
             chown(path, owner.st_uid, owner.st_gid)
 
 
-def join(config_dir: Path, args: argparse.Namespace) -> str:
+def join(config_dir: Path, args: argparse.Namespace, *, port: int | None = None) -> str:
     if sys.platform == "linux" and _system_install(config_dir):
         raise SiteError(
             "On a Linux system install root makes this machine a job site: run the installer "
@@ -499,7 +505,46 @@ def join(config_dir: Path, args: argparse.Namespace) -> str:
         raise SiteError((done.stderr or done.stdout).strip() or "The join did not finish.")
     _give_to_owner_of(data)
     said = [done.stdout.strip(), _link_owner(config_dir, data, args)]
+    if port is not None and not _system_install(config_dir):
+        opened = not getattr(args, "no_browser", False)
+        said.append(_key_page(f"http://127.0.0.1:{port}/link", opened=opened))
     return "\n".join(line for line in said if line)
+
+
+def _key_page(page: str, *, opened: bool) -> str:
+    """J14a.2: on a per-user install the owner's key is made where the join
+    happened, in their own browser on this machine (J48: no tool runs here
+    until it is). Opened for them where a desktop session can show it,
+    printed either way."""
+    said = f"No tool runs here until you add your own key: open {page} in your browser here."
+    if opened and _open_in_browser(page):
+        said += " It is opening now."
+    return said
+
+
+def _open_in_browser(page: str) -> bool:
+    """Open `page` in this session's browser, never in the terminal: Python's
+    `webbrowser` falls back to a text browser that would take it over."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(page)
+            return True
+        if sys.platform == "darwin":
+            command = ["open", page]
+        elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            command = ["xdg-open", page]
+        else:
+            return False
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
 
 
 def _link_owner(config_dir: Path, data: Path, args: argparse.Namespace) -> str:
