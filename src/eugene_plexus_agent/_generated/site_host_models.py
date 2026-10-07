@@ -76,39 +76,6 @@ class SiteHostProtocol(StrEnum):
     mcp_2026_07_28 = 'mcp-2026-07-28'
 
 
-class SitePersonLink(BaseModel):
-    """
-    One person linked to an OS account on a site's machine, as the site reports it.
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    subject: str = Field(
-        ..., description="The person's id.", max_length=64, min_length=1
-    )
-    accountName: str = Field(
-        ...,
-        description='The OS account, for display, e.g. `AMISH_STATION\\jessie` or `jessie`.',
-        max_length=256,
-        min_length=1,
-    )
-    available: bool = Field(
-        ..., description='Their worker is connected, so their calls can run now.'
-    )
-    reason: str | None = Field(
-        None,
-        description='Why not, when it is not, e.g. that they are not signed in on a Windows machine (J25).',
-        max_length=1024,
-    )
-    keys: int | None = Field(
-        None,
-        description='How many keys this person has pinned at the machine (J14a). Absent from a site older than J14a.',
-        ge=0,
-        le=8,
-    )
-
-
 class SiteFolderPerson(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -121,7 +88,7 @@ class SiteFolderPerson(BaseModel):
     )
     writable: bool = Field(
         ...,
-        description='The person may change files in it: a standing pre-approval for\n`write_text` (J6b). Otherwise they may list and read.\n',
+        description='The person may change files in it: a standing pre-approval for\n`write_text` and `edit_text` (J6b). Otherwise they may list, read\nand search.\n',
     )
 
 
@@ -150,6 +117,10 @@ class SiteSigningState(StrEnum):
     `unconfirmed`: the owner has a key, but has not approved the site's
     current rules with it (J52); no tool runs. `signed`: every rule the site
     holds was approved with its owner's key, at the machine; tools run.
+    Since 2b.3b (J79) the owner's state governs what the owner's rules
+    govern: their own workspaces, what they shared, the local servers and
+    dev mode. Each other linked person's own workspaces run under their own
+    state (`SitePersonLink.signing`).
 
     """
 
@@ -171,19 +142,33 @@ class SiteTool(BaseModel):
     )
     destructive: bool = Field(
         ...,
-        description="Whether the site treats the tool as able to change or delete\nsomething. True unless the server marks it read-only, or marks it\n`destructiveHint: false`. MCP's own default, so an unmarked tool is\ndestructive. A destructive tool runs only under a standing\npre-approval (J6b).\n",
+        description="Whether the site treats the tool as able to change or delete\nsomething. True unless the server marks it read-only, or marks it\n`destructiveHint: false`. MCP's own default, so an unmarked tool is\ndestructive. Since 2b.3b a destructive tool is granted `ask` unless\nthe site's owner grants it `allow` (`SiteToolGrant.decision`, J78).\n",
     )
 
 
-class SiteToolGrant(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    name: str = Field(..., max_length=128, min_length=1)
-    standing: bool | None = Field(
-        False,
-        description="A standing pre-approval: the person may use this destructive tool\nwithout the site's owner approving each call. Required for a\ndestructive tool, which is otherwise refused: approving each call at\nthe machine waits for the held channel (J6b).\n",
-    )
+class SiteDecision(StrEnum):
+    """
+    What a rule says of a group of tools (J70). `allow`: runs without
+    asking. `ask`: Workbench asks the person who made the call, and the site
+    runs it only when the call says they approved (`SiteCall.asked`, J72);
+    until person-held call signatures (J14b) the site cannot check that they
+    did, and its audit log says the approval was claimed. `deny`: never
+    offered, and refused.
+
+    """
+
+    allow = 'allow'
+    ask = 'ask'
+    deny = 'deny'
+
+
+class SiteGrantDecision(StrEnum):
+    """
+    A `SiteDecision` for a tool granted by name; a tool not granted is denied.
+    """
+
+    allow = 'allow'
+    ask = 'ask'
 
 
 class SitePollAnswer(BaseModel):
@@ -210,7 +195,9 @@ class SiteGrantHint(BaseModel):
     One of Eugene's owner's dev-mode folder grants on a site (J13b), carried
     with a call in a list (`grants`). The site honours them only if its
     owner opted in there (J6e) and Eugene is in dev mode. The host checks
-    the folder a call names against them.
+    the folder a call names against them. Only the site owner's workspaces
+    can be granted. Since 2b.3b the site matches a grant by `folderId` alone
+    (J76): the root keeps no paths, so a newer root sends none.
 
     """
 
@@ -224,8 +211,16 @@ class SiteGrantHint(BaseModel):
         max_length=96,
         min_length=1,
     )
-    path: str = Field(..., max_length=4096, min_length=1)
-    identity: str = Field(..., max_length=256, min_length=1)
+    path: str | None = Field(
+        None,
+        description='From a root before 2b.3b; a newer site ignores it.',
+        max_length=4096,
+    )
+    identity: str | None = Field(
+        None,
+        description='From a root before 2b.3b; a newer site ignores it.',
+        max_length=256,
+    )
     writable: bool
 
 
@@ -330,15 +325,51 @@ class SiteHostHealth(BaseModel):
 
 class SiteManageAction(StrEnum):
     """
-    Each is taken from the owner this site recorded at its join, and from
-    nobody else, Eugene's owner included (J6b).
+    Who may ask for what. Eugene's owner never (J6b).
+    - **A linked person, for their own items** (2b.3b, J67; the owner
+      too): `workspace.add`, `workspace.remove`, `rules.set`,
+      `workspace.list`, `audit.read` (J80), and the passkey actions
+      (`passkey.pair`, `held.list`, `held.approve`, `held.reject`,
+      `passkey.remove`).
+      A change that gives access is held until they approve it with
+      their own key, and never applied on the root's word: with no key
+      yet, it waits for one (J68). The site's owner keeps J52's way: with
+      no key, their changes apply, and no tool runs under them until they
+      approve them as a whole.
+    - **The site's owner alone**, the owner this site recorded at its
+      join: `workspace.people`, `access.set`, `server.enable`,
+      `settings.set`, and, for a root from before 2b.3b,
+      `folder.add`, `folder.remove` and `folder.people`, which act on the
+      owner's workspaces.
+
+    The actions:
+    - `workspace.add` (`SiteWorkspaceAdd`, 2b.3b): add a workspace
+      held by the person who asks, opened by their own worker as their
+      own account, under a name none of their workspaces has. Its rules
+      start as `SiteRules` says unless given. It returns
+      `SiteWorkspaceDetail`, live, to that person.
+    - `workspace.remove` (`SiteWorkspaceRemove`): the holder's own.
+      Only takes access away, so it applies at once (J51).
+    - `workspace.people` (`SiteWorkspacePeople`): whom the owner shares
+      one of their own workspaces with, and each one's rules there,
+      replacing what was there (J69). It returns `SiteWorkspaceDetail`.
+    - `rules.set` (`SiteRulesSet`): the holder's rules in one of their
+      workspaces, and its deny patterns, which bind everyone who uses it.
+      A change that is nowhere looser (no decision looser, no pattern
+      dropped) only takes access away and applies at once (J51).
+    - `workspace.list` (`SiteWorkspaceListRequest`): the person's own
+      workspaces, with their paths, rules and patterns, read live
+      (J76). It returns `SiteWorkspaceList`.
     - `folder.add` (`SiteFolderAdd`):
       register a folder here, under a name no other folder here has. It
-      returns `SiteFolder`, with nobody on its list.
+      returns `SiteFolder`, with nobody on its list. Since 2b.3b, an
+      owner's workspace (for a root from before then).
     - `folder.remove` (`SiteFolderRemove`).
     - `folder.people` (`SiteFolderPeople`):
       who may use one folder, and who may change files in it, replacing
-      what was there. It returns `SiteFolder`.
+      what was there. It returns `SiteFolder`. Since 2b.3b, `writable`
+      reads as `change: allow`, and not as `change: deny`; `read` is
+      `allow`.
     - `access.set` (`SiteAccessSet`): who may
       use one local server, and which tools, replacing what was there.
     - `server.enable` (`SiteServerEnable`): a
@@ -346,23 +377,26 @@ class SiteManageAction(StrEnum):
     - `settings.set` (`SiteSettings`).
     - `audit.read` (`SiteAuditRead`): the
       newest entries of the site's audit log.
-    - `passkey.pair` (`SitePasskeyPair`, J14a.3): pin the owner's
-      passkey, made in Workbench, if its MAC checks with the code this
-      site showed at the machine. It returns `SitePasskey`.
-    - `held.list` (`SiteHeldListRequest`): what the owner has waiting,
-      as `/v1/held` lists it, with the envelopes to sign when `key` is
-      one of their passkeys. It returns `SiteHeldList`.
+    - `passkey.pair` (`SitePasskeyPair`, J14a.3): pin the asking
+      person's passkey, made in Workbench, if its MAC checks with the code
+      this site showed them at the machine. It returns `SitePasskey`.
+    - `held.list` (`SiteHeldListRequest`): what the asking person has
+      waiting, as `/v1/held` lists it, with the envelopes to sign when
+      `key` is one of their passkeys. It returns `SiteHeldList`.
     - `held.approve` (`SitePasskeyApproval`): apply a held change (or
       the rules as a whole), approved with a passkey assertion over its
       envelope.
     - `held.reject` (`SiteHeldRejectRequest`): drop a held change.
       Turning a change down only keeps access from being given, so the
       root may ask for it.
-    - `passkey.remove` (`SitePasskeyRemove`): remove one of the owner's
-      passkeys, as at the machine; what it approved stays. Removing a key
-      only takes it away (a lost phone), so the root may ask for it: if it
-      was the owner's last key here, no tool runs until they add a key and
-      approve the rules (J48).
+    - `passkey.remove` (`SitePasskeyRemove`): remove one of the asking
+      person's passkeys, as at the machine; what it approved stays.
+      Removing a key only takes it away (a lost phone), so the root may
+      ask for it: if it was the owner's last key here, no tool runs under
+      the owner's rules until they add a key and approve them (J48, J79).
+    - `audit.read` (`SiteAuditRead`): since 2b.3b, the lines that belong
+      to the asking person (J80), from anyone linked; the owner's include
+      the local servers, sharing and settings.
 
     """
 
@@ -378,6 +412,11 @@ class SiteManageAction(StrEnum):
     held_approve = 'held.approve'
     held_reject = 'held.reject'
     passkey_remove = 'passkey.remove'
+    workspace_add = 'workspace.add'
+    workspace_remove = 'workspace.remove'
+    workspace_people = 'workspace.people'
+    rules_set = 'rules.set'
+    workspace_list = 'workspace.list'
 
 
 class SiteManage(BaseModel):
@@ -423,7 +462,7 @@ class SiteEditEnvelope(BaseModel):
     key: str = Field(..., pattern='^[a-f0-9]{32}$')
     act: str = Field(
         ...,
-        description='A `SiteManageAction` that changes something, or `rules.confirm` (J52), whose `args` are `{"digest"}`, the SHA-256 of the site\'s whole policy.',
+        description='A `SiteManageAction` that changes something, or `rules.confirm` (J52), whose `args` are `{"digest"}`, the SHA-256 of the rules the person\'s key approves (since 2b.3b, that person\'s own, J67).',
     )
     args: dict[str, Any]
     seq: int = Field(
@@ -508,7 +547,7 @@ class SitePasskeyCodeRequest(BaseModel):
     )
     subject: str = Field(
         ...,
-        description="The person the starter serves; the site's owner.",
+        description='The linked person the starter serves.',
         max_length=64,
         min_length=1,
     )
@@ -676,29 +715,27 @@ class SiteFolderPeople(BaseModel):
     )
 
 
-class SitePersonTools(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    subject: str = Field(..., max_length=64, min_length=1)
-    tools: list[SiteToolGrant] = Field(..., max_length=64)
-
-
-class SiteAccessSet(BaseModel):
-    """
-    A local server's list. Eugene's file server is granted per folder (`folder.people`).
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    server: str = Field(
+class SiteDenyPattern(RootModel[str]):
+    root: str = Field(
         ...,
-        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
-        max_length=40,
-        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+        description="A path inside a workspace that no tool may touch (J70), in `.gitignore`'s\nsyntax without `!`: `.env`, `secrets/`, `*.pem`. It is hidden from every\ntool, for everyone who uses the workspace: listings and searches leave it\nout, and a tool that names it is refused whether or not it exists.\n",
+        max_length=256,
+        min_length=1,
+        pattern='^[^!\\x00-\\x1f]',
     )
-    people: list[SitePersonTools] = Field(..., max_length=256)
+
+
+class SiteWorkspaceRemove(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-f0-9]{32}$')
+
+
+class SiteWorkspaceListRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
 
 
 class SiteServerEnable(BaseModel):
@@ -836,36 +873,14 @@ class SiteEnrollment(BaseModel):
     enrolledAt: AwareDatetime
 
 
-class SiteAccess(BaseModel):
-    """
-    Who may use which tools of one local server. Eugene's file server is
-    granted per folder instead (`SiteFolder.people`, J6g).
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    subject: str = Field(
-        ...,
-        description="A person's id. Never `operator`; Eugene's owner reaches a site only through `ownerInDevMode`.",
-        max_length=64,
-        min_length=1,
-    )
-    server: str = Field(
-        ...,
-        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
-        max_length=40,
-        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
-    )
-    tools: list[SiteToolGrant] = Field(..., max_length=64)
-
-
 class SiteFolder(BaseModel):
     """
-    A folder registered on the machine. Eugene's file server offers it to
-    the people on its list, by its name, as its tools' `folder` argument
-    (J6g).
+    A folder registered on the machine, as a site from before 2b.3b reports
+    it (a newer site reports `SiteWorkspace`, without the path, J76). Eugene's
+    file server offers it to the people on its list, by its name, as its
+    tools' `folder` argument (J6g). Since 2b.3b the site's `folder.add`,
+    `folder.remove` and `folder.people` act on its owner's workspaces, for a
+    root from before then, and answer with this shape.
 
     """
 
@@ -894,6 +909,49 @@ class SiteFolder(BaseModel):
         ...,
         description="Who may use it, the site's owner included (J11). Nobody is on it until the owner says so.",
         max_length=256,
+    )
+
+
+class SitePersonLink(BaseModel):
+    """
+    One person linked to an OS account on a site's machine, as the site reports it.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ..., description="The person's id.", max_length=64, min_length=1
+    )
+    accountName: str = Field(
+        ...,
+        description='The OS account, for display, e.g. `AMISH_STATION\\jessie` or `jessie`.',
+        max_length=256,
+        min_length=1,
+    )
+    available: bool = Field(
+        ..., description='Their worker is connected, so their calls can run now.'
+    )
+    reason: str | None = Field(
+        None,
+        description='Why not, when it is not, e.g. that they are not signed in on a Windows machine (J25).',
+        max_length=1024,
+    )
+    keys: int | None = Field(
+        None,
+        description='How many keys this person has here, at the machine and as passkeys (J14a, J67). Absent from a site older than J14a.',
+        ge=0,
+        le=16,
+    )
+    signing: SiteSigningState | None = Field(
+        None,
+        description="2b.3b (J67, J68): the state of this person's own workspaces and\nrules. `unsigned`: they have no key here, so their changes wait for\none. `unconfirmed`: rules from before 2b.3b they have not approved\nwith their key (the owner's, J69). `signed`: every rule of theirs\nhere was approved with their own key. Absent from an older site.\n",
+    )
+    held: int | None = Field(
+        None,
+        description='Changes the site holds until this person approves them with their own key (2b.3b). Absent from an older site.',
+        ge=0,
+        le=64,
     )
 
 
@@ -935,7 +993,7 @@ class SiteSigning(BaseModel):
     state: SiteSigningState
     held: int = Field(
         ...,
-        description='Changes the site holds until their person approves them at the machine (J50).',
+        description="Changes the site holds until its owner approves them with their key (J50). Since 2b.3b, the owner's alone; each person's own count is on their link.",
         ge=0,
         le=64,
     )
@@ -948,6 +1006,62 @@ class SiteSigning(BaseModel):
         None,
         description="The site takes its owner's passkey from Workbench, paired with a code\nshown at the machine, and approvals made with it (J14a.3). Absent\nfrom a site older than that.\n",
     )
+    people: bool | None = Field(
+        None,
+        description="The site keeps each linked person's own workspaces, rules and keys\n(2b.3b, J67): any linked person pairs a passkey, and adds, changes and\napproves their own. Absent from an older site, whose root offers\nthese to the owner alone.\n",
+    )
+
+
+class SiteRules(BaseModel):
+    """
+    One person's rules in one workspace, per group of tools (J70). `read`:
+    `list_directory`, `read_text`, `glob` and `grep`. `change`: `write_text`
+    and `edit_text`. The site stores them per tool, so commands (2b.4) add a
+    group of their own. `change` cannot be looser than `deny` in a workspace
+    registered read-only (`writable: false`).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    read: SiteDecision
+    change: SiteDecision
+
+
+class SiteToolGrant(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=128, min_length=1)
+    decision: SiteGrantDecision | None = Field(
+        None,
+        description='2b.3b (J70, J78): `allow`, the tool runs without asking; `ask`, it\nruns once the person who made the call approved it in Workbench\n(`SiteCall.asked`, J72). Absent: `allow` for a tool the site does not\ntreat as destructive, or one granted `standing`; `ask` otherwise.\nA tool not granted is denied: it is never offered.\n',
+    )
+    standing: bool | None = Field(
+        False,
+        description='From before 2b.3b: a standing pre-approval, the person may use this\ndestructive tool without being asked. Reads as `decision: allow`.\nBefore 2b.3b it was required for a destructive tool, which was\notherwise refused.\n',
+    )
+
+
+class SiteWorkspacePerson(BaseModel):
+    """
+    Someone the site's owner shares one of their own workspaces with, and
+    their rules there (J69, J70). Only the owner's workspaces are shared.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(
+        ...,
+        description="A person's id. Never `operator`; Eugene's owner reaches a site only through `ownerInDevMode`.",
+        max_length=64,
+        min_length=1,
+    )
+    read: SiteDecision
+    change: SiteDecision
 
 
 class McpRequest(BaseModel):
@@ -1048,6 +1162,10 @@ class SiteCall(BaseModel):
         max_length=64,
     )
     installMode: InstallModeName
+    asked: bool | None = Field(
+        False,
+        description='Workbench says the person approved this call (J72). A tool whose\nrule is `ask` is refused without it. The site cannot check it\nuntil person-held call signatures (J14b), and its audit log says\nthe approval was claimed.\n',
+    )
 
 
 class SitePasskey(BaseModel):
@@ -1093,11 +1211,118 @@ class SitePasskeyList(BaseModel):
     )
 
 
+class SitePersonTools(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subject: str = Field(..., max_length=64, min_length=1)
+    tools: list[SiteToolGrant] = Field(..., max_length=64)
+
+
+class SiteWorkspaceAdd(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(
+        ...,
+        description="Unique among the asking person's own workspaces.",
+        max_length=80,
+        min_length=1,
+    )
+    path: str = Field(
+        ...,
+        description="Opened by the asking person's own worker, as their own account.",
+        max_length=4096,
+        min_length=1,
+    )
+    writable: bool | None = Field(
+        True,
+        description='Whether files may be changed in it at all. When false, every `change` rule in it is `deny`.',
+    )
+    rules: SiteRules | None = Field(
+        None,
+        description="The holder's rules there. Absent, `read: allow` and `change: ask` (§2.6), or `change: deny` when not writable.",
+    )
+    deny: list[SiteDenyPattern] | None = Field(None, max_length=64)
+
+
+class SiteWorkspacePeople(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="One of the site owner's own workspaces.",
+        pattern='^[a-f0-9]{32}$',
+    )
+    people: list[SiteWorkspacePerson] = Field(
+        ...,
+        description='Each person once, never the owner. A `change` looser than `deny` needs a writable workspace.',
+        max_length=256,
+    )
+
+
+class SiteRulesSet(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="One of the asking person's own workspaces.",
+        pattern='^[a-f0-9]{32}$',
+    )
+    rules: SiteRules
+    deny: list[SiteDenyPattern] = Field(
+        ..., description="Replaces the workspace's deny patterns.", max_length=64
+    )
+
+
+class SiteWorkspaceDetail(BaseModel):
+    """
+    One of a person's own workspaces as the site holds it, read live through
+    the root (`workspace.list`, J76) and kept by no one else.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-f0-9]{32}$')
+    name: str = Field(..., max_length=96, min_length=1)
+    path: str = Field(..., max_length=4096, min_length=1)
+    holder: str = Field(..., max_length=64, min_length=1)
+    writable: bool
+    rules: SiteRules
+    deny: list[SiteDenyPattern] = Field(..., max_length=64)
+    people: list[SiteWorkspacePerson] = Field(..., max_length=256)
+
+
+class SiteAccessSet(BaseModel):
+    """
+    A local server's list. Eugene's file server is granted per workspace (`workspace.people`).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    server: str = Field(
+        ...,
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
+    )
+    people: list[SitePersonTools] = Field(..., max_length=256)
+
+
 class SiteAuditEntry(BaseModel):
     """
     One line of the site's own audit log, kept on the machine and read by
     its owner (J8). It records who asked for what and what the site decided,
-    never a file's contents or a tool's result.
+    never a file's contents or a tool's result. Since 2b.3b (J80) each line
+    belongs to one person, who alone reads it through the root: a call or
+    change in a workspace, to its holder; one about a person's own keys, to
+    them; the rest (the local servers, sharing, settings, and anything not
+    yet tied to a workspace), to the site's owner.
 
     """
 
@@ -1119,51 +1344,76 @@ class SiteAuditEntry(BaseModel):
     decision: SiteAuditDecision
     outcome: SiteAnswerStatus | None = None
     reason: str | None = Field(None, max_length=1024)
+    rule: SiteDecision | None = Field(
+        None, description='For a tool call since 2b.3b, the rule that applied (J72).'
+    )
+    asked: bool | None = Field(
+        None,
+        description='For a tool call under an `ask` rule, whether the call said the person\napproved it. Claimed, not checked, until person-held call signatures\n(J14b).\n',
+    )
 
 
-class SiteSummary(BaseModel):
+class SiteAccess(BaseModel):
     """
-    What a job site holds, as the site itself reports it in each poll. The
-    root keeps it as a cache: it answers Workbench's listings from it, and
-    the site checks every call against its own copy again (rule 2 of §3.3).
+    Who may use which tools of one local server. Eugene's file server is
+    granted per folder instead (`SiteFolder.people`, J6g).
 
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    owner: str = Field(
+    subject: str = Field(
         ...,
-        description='The person the site pinned as its owner at its join.',
+        description="A person's id. Never `operator`; Eugene's owner reaches a site only through `ownerInDevMode`.",
         max_length=64,
         min_length=1,
     )
-    ownerInDevMode: bool = Field(
+    server: str = Field(
         ...,
-        description="The site's owner lets Eugene's owner in while Eugene is in dev mode (J6e).",
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
+        max_length=40,
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
-    folders: list[SiteFolder] = Field(..., max_length=64)
-    servers: list[SiteServer] = Field(..., max_length=96)
-    access: list[SiteAccess] = Field(
+    tools: list[SiteToolGrant] = Field(..., max_length=64)
+
+
+class SiteWorkspace(BaseModel):
+    """
+    A workspace, as the site reports it in each poll (2b.3b): a folder on the
+    machine that one linked person, its holder, works in through the file
+    server (J69). Its id and name, never its path (J76): the holder reads the
+    path live (`workspace.list`). The root shows each person only their own,
+    and the people the owner shared theirs with only the ones shared.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-f0-9]{32}$')
+    name: str = Field(
         ...,
-        description="Who may use the local servers' tools. Folders carry their own people.",
-        max_length=2048,
+        description="The name its holder gave it, unique among the holder's own. Each\nperson's `folder` argument names their view: their own workspaces,\nthen those the owner shared with them, in the order reported, and a\nname already taken there, ignoring case, reads `Name (2)`. The root\nnames a person's view the same way, so its names match the site's.\n",
+        max_length=96,
+        min_length=1,
     )
-    links: list[SitePersonLink] | None = Field(
+    holder: str = Field(
+        ...,
+        description='The linked person it belongs to, whose own account opens it.',
+        max_length=64,
+        min_length=1,
+    )
+    writable: bool = Field(
+        ...,
+        description='Registered for changing files at all. When false, every `change` rule in it reads `deny`.',
+    )
+    rules: SiteRules
+    people: list[SiteWorkspacePerson] | None = Field(
         None,
-        description="The people linked to an OS account on this machine (§2.2, J27), and\nwhether each one's worker is connected now. A linked person's calls\nrun as their own account; anyone else's run in the owner's worker,\nas the owner, confined to the folder (J27).\n",
+        description="For the site owner's workspaces, whom they shared it with (J69). Empty otherwise.",
         max_length=256,
     )
-    linkPage: str | None = Field(
-        None,
-        description="Where a person links their account, on the machine itself: the\nagent's loopback link page on a Windows service install. Null where\nlinking is the elevated one-liner (a Linux system install, J36) or\nwhere only the installing person is served (a per-user install, J38).\n",
-        max_length=256,
-    )
-    sharing: bool | None = Field(
-        None,
-        description='Whether this site can serve anyone but its owner. False on macOS,\nwhich has no folder boundary yet (§2.6). Absent means true.\n',
-    )
-    signing: SiteSigning | None = None
 
 
 class SiteOperation(BaseModel):
@@ -1202,6 +1452,10 @@ class SiteOperation(BaseModel):
         None,
         description="For `mcp` to the file server from Eugene's owner, their dev-mode grants (J6e). Empty otherwise.",
         max_length=64,
+    )
+    asked: bool | None = Field(
+        False,
+        description="For `mcp`, Workbench's word that the person approved this call (`SiteCall.asked`, J72).",
     )
     action: str | None = Field(None, description='For `manage`, the action.')
     arguments: dict[str, Any] | None = Field(
@@ -1264,8 +1518,18 @@ class SiteHeldList(BaseModel):
         description='Their passkeys (J14a.3), for Workbench to choose which one signs.',
         max_length=8,
     )
-    state: SiteSigningState | None = None
+    state: SiteSigningState | None = Field(
+        None,
+        description="The site's state for its owner; since 2b.3b, for anyone, the state of their own rules (`SitePersonLink.signing`).",
+    )
     items: list[SiteHeldEdit] = Field(..., max_length=64)
+
+
+class SiteWorkspaceList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    workspaces: list[SiteWorkspaceDetail] = Field(..., max_length=64)
 
 
 class SiteAuditPage(BaseModel):
@@ -1273,6 +1537,75 @@ class SiteAuditPage(BaseModel):
         extra='forbid',
     )
     entries: list[SiteAuditEntry] = Field(..., max_length=200)
+
+
+class SiteSummary(BaseModel):
+    """
+    What a job site holds, as the site itself reports it in each poll. The
+    root keeps it as a cache: it answers Workbench's listings from it, and
+    the site checks every call against its own copy again (rule 2 of §3.3).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    owner: str = Field(
+        ...,
+        description='The person the site pinned as its owner at its join.',
+        max_length=64,
+        min_length=1,
+    )
+    ownerInDevMode: bool = Field(
+        ...,
+        description="The site's owner lets Eugene's owner in while Eugene is in dev mode (J6e).",
+    )
+    folders: list[SiteFolder] | None = Field(
+        None,
+        description='From a site before 2b.3b, which reports folders with their paths. A newer site reports `workspaces` instead.',
+        max_length=64,
+    )
+    workspaces: list[SiteWorkspace] | None = Field(
+        None,
+        description="Every linked person's workspaces, by id and name, never path (2b.3b, J76). The root shows each person only their own and those shared with them.",
+        max_length=512,
+    )
+    servers: list[SiteServer] = Field(..., max_length=96)
+    access: list[SiteAccess] = Field(
+        ...,
+        description="Who may use the local servers' tools. Folders carry their own people.",
+        max_length=2048,
+    )
+    links: list[SitePersonLink] | None = Field(
+        None,
+        description="The people linked to an OS account on this machine (§2.2, J27), and\nwhether each one's worker is connected now. A linked person's calls\nrun as their own account; anyone else's run in the owner's worker,\nas the owner, confined to the folder (J27).\n",
+        max_length=256,
+    )
+    linkPage: str | None = Field(
+        None,
+        description="Where a person links their account, on the machine itself: the\nagent's loopback link page on a Windows service install. Null where\nlinking is the elevated one-liner (a Linux system install, J36) or\nwhere only the installing person is served (a per-user install, J38).\n",
+        max_length=256,
+    )
+    sharing: bool | None = Field(
+        None,
+        description='Whether this site can serve anyone but its owner. False on macOS,\nwhich has no folder boundary yet (§2.6). Absent means true.\n',
+    )
+    signing: SiteSigning | None = None
+
+
+class SiteLinkFile(BaseModel):
+    """
+    The links file (§3.2): written by the machine's privileged starter,
+    read by the site host, which cannot write it. One link per person, and
+    one person per account.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    version: Literal[1]
+    links: list[SiteAccountLink] = Field(..., max_length=256)
 
 
 class SiteReport(BaseModel):
@@ -1296,18 +1629,3 @@ class SiteReport(BaseModel):
         max_length=256,
     )
     site: SiteSummary | None = None
-
-
-class SiteLinkFile(BaseModel):
-    """
-    The links file (§3.2): written by the machine's privileged starter,
-    read by the site host, which cannot write it. One link per person, and
-    one person per account.
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    version: Literal[1]
-    links: list[SiteAccountLink] = Field(..., max_length=256)

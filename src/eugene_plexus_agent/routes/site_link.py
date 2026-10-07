@@ -42,12 +42,17 @@ and pins keys and approves held changes, and links nobody: only the account
 this agent runs as is served, read from the connection the same way
 (`loopback_peer.py`), and any other account on the machine is refused.
 
-**A passkey from Workbench** (J14a.3, Path B). The site's owner may also pair
-a passkey made in Workbench, to approve from away from the machine. This page
-shows the code the site host makes for that (`/link/passkey/code`), lists the
-passkeys pinned to them, and removes one (`/link/passkey/remove`). The code
-is shown here and typed into Workbench by the person; it never reaches the
-root, and the site host checks the passkey's MAC with it itself.
+**A passkey from Workbench** (J14a.3, Path B). Any linked person (since
+2b.3b, J67) may also pair a passkey made in Workbench, to approve their own
+changes from away from the machine. This page shows the code the site host
+makes for that (`/link/passkey/code`), lists the passkeys pinned to them, and
+removes one (`/link/passkey/remove`). The code is shown here and typed into
+Workbench by the person; it never reaches the root, and the site host checks
+the passkey's MAC with it itself.
+
+**The key, in the same visit as the link** (J68). A linked person's
+workspaces and every change to them wait for their own key, so the page that
+confirms a link offers to make the key there and then.
 """
 
 from __future__ import annotations
@@ -490,14 +495,29 @@ async def link_confirm(request: Request) -> Response:
             raise NotHere(str(exc)) from None
         _pages(request).attempts.pop(key, None)
         supervisor.links_changed()
+        link = store.for_account(account)
     except NotHere as exc:
         return _refused(str(exc))
-    return _page(
-        "Linked",
+    # J68: their workspaces and changes wait for their own key, so the key is
+    # offered now, on a fresh attempt, rather than on a second visit.
+    fresh_key, fresh = _pages(request).begin(account)
+    body = (
         f"<p>Done. <b>{html.escape(attempt.name or '')}</b>'s calls to this job site now run as "
-        f"<b>{html.escape(account_name(account))}</b> while it is signed in. You can close this "
-        "page.</p>",
+        f"<b>{html.escape(account_name(account))}</b> while it is signed in.</p>"
+        "<p><b>Now make your own key.</b> Your workspaces on this job site, and every change to "
+        "them, wait until you approve them with it.</p>"
+        + (
+            _keys_section(link.keys, fresh.csrf)
+            + await _passkeys_section(request, link, fresh.csrf)
+            if link is not None
+            else ""
+        )
     )
+    page = _page("Linked", body, script=link is not None)
+    page.set_cookie(
+        COOKIE, fresh_key, httponly=True, samesite="strict", max_age=ATTEMPT_SECONDS, path="/link"
+    )
+    return page
 
 
 @router.post("/link/remove")
@@ -548,9 +568,9 @@ def _keys_section(keys: tuple[dict[str, Any], ...], csrf: str) -> str:
     pinned = html.escape(json.dumps([str(k["id"]) for k in keys]))
     return (
         "<h2>Your key</h2>"
-        "<p>Changes to what this machine allows wait until you approve them here, with your own "
-        "key. The key is made in this browser and never leaves this machine. Eugene never sees "
-        "it.</p>"
+        "<p>Your workspaces and rules on this machine, and every change to them, wait until you "
+        "approve them with your own key. The key is made in this browser and never leaves this "
+        "machine. Eugene never sees it.</p>"
         + (f"<ul>{rows}</ul>" if rows else "")
         + f"<div id=site-key data-csrf='{html.escape(csrf)}' data-keys='{pinned}'>"
         "<p data-state>Checking this browser…</p>"
@@ -698,8 +718,9 @@ def _hidden(name: str, value: str) -> str:
 
 
 async def _passkeys_section(request: Request, link: Any, csrf: str) -> str:
-    """The owner's passkeys and the way to pair one. Silent when the site
-    host cannot say: the rest of the page still works."""
+    """The person's passkeys and the way to pair one (any linked person since
+    2b.3b, J67). Silent when the site host cannot say: the rest of the page
+    still works."""
     try:
         answer = await request.app.state.site_host.held(
             "GET", "/v1/passkeys", params={"subject": link.subject}
@@ -721,7 +742,8 @@ async def _passkeys_section(request: Request, link: Any, csrf: str) -> str:
     waiting = listed.get("codeExpiresAt")
     return (
         "<h2>A passkey from Workbench</h2>"
-        "<p>To approve changes away from this machine, use a passkey in Workbench, at its https "
+        "<p>To approve your changes away from this machine, use a passkey in Workbench, at its "
+        "https "
         "address. Show a code here, then type it into Workbench (Job sites, then this machine, "
         "then Add a passkey). The code stays on this machine and in your browser: Eugene's root "
         "never sees it.</p>"
@@ -755,8 +777,8 @@ async def _posted_form(request: Request, account: str) -> Any:
 
 @router.post("/link/passkey/code")
 async def passkey_code(request: Request) -> Response:
-    """A code for pairing the owner's passkey from Workbench, made by the
-    site host and shown only here."""
+    """A code for pairing the linked person's passkey from Workbench, made by
+    the site host and shown only here."""
     if not _available(request):
         return Response(status_code=404)
     try:
@@ -771,8 +793,8 @@ async def passkey_code(request: Request) -> Response:
         return _refused(str(exc), 503)
     if answer.status_code == 404:
         return _refused(
-            "Only this machine's owner pairs a passkey here: theirs are the keys that approve "
-            "changes to it."
+            "This job site has no link for you any more, or is older than one that takes "
+            "everyone's passkeys. Open this page again, or update Eugene on this machine."
         )
     if answer.status_code != 200:
         return _refused("This job site did not answer. Try again in a moment.", 503)

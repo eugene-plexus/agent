@@ -127,13 +127,16 @@ def test_another_account_gets_no_code(browser: TestClient, site: PasskeySite, ow
     assert ("POST", "/v1/passkeys/code") not in [c[:2] for c in site.calls]
 
 
-def test_the_site_hosts_refusal_says_only_the_owner_pairs(
+def test_the_site_hosts_refusal_says_why_without_naming_an_owner(
     browser: TestClient, site: PasskeySite
 ) -> None:
+    """Since 2b.3b every linked person pairs their own (J67): a 404 means the
+    link went, or the site is older."""
     site.answers[("POST", "/v1/passkeys/code")] = (404, {})
     token = csrf(browser.get("/link").text)
     refused = browser.post("/link/passkey/code", data={"csrf": token})
-    assert refused.status_code == 403 and "Only this machine&#x27;s owner" in refused.text
+    assert refused.status_code == 403 and "no link for you" in refused.text
+    assert "owner" not in refused.text
 
 
 def test_a_passkey_is_removed_here_with_this_pages_token(

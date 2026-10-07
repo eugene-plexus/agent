@@ -425,6 +425,8 @@ def test_the_happy_path_links_the_person_to_the_account(
 
     done = post(browser, "/link/confirm", csrf_of(answer.text))
     assert done.status_code == 200 and "Linked" in done.text
+    # J68: the key is offered in the same visit, on a fresh attempt.
+    assert "Make a key in this browser" in done.text and site_link.KEY_SCRIPT in done.text
     (link,) = site.store.load()
     assert (link.subject, link.name, link.account, link.account_name) == (
         "p-ada",
@@ -433,7 +435,9 @@ def test_the_happy_path_links_the_person_to_the_account(
         "PC\\1001",
     )
     assert site.changed == 1, "the supervisor is told, so the worker starts"
-    assert not pages(app).attempts, "the attempt is spent"
+    (fresh,) = pages(app).attempts.values()
+    assert fresh.csrf != csrf_of(answer.text), "the attempt is spent; the key's is new"
+    assert f"data-csrf='{fresh.csrf}'" in done.text
     again = post(browser, "/link/confirm", csrf_of(answer.text))
     assert again.status_code == 403 and len(site.store.load()) == 1
 
