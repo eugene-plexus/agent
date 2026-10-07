@@ -210,17 +210,34 @@ def _timestamp(value: object) -> datetime | None:
 # --------------------------------------------------------------------------- #
 
 
+#: Every repository run, newest first. Not GitHub's own `branch`/`event`
+#: filters: on 2026-10-07 the filtered listing ended at 2026-09-29 while the
+#: unfiltered one was current, and every node read edge as a nine-day-old
+#: commit and itself as newer, so nothing was offered.
+EDGE_RUNS = f"{API}/actions/runs?per_page=100"
+MAIN_HEAD = f"{API}/commits/main"
+#: How far the newest run may trail `main`'s newest commit before the list
+#: is taken to be behind (a commit no workflow ran for is not behind).
+_RUNS_BEHIND = 6 * 3600
+
+
 def newest_edge(get: Fetch = fetch) -> Target:
     """The newest `main` commit every workflow that ran for succeeded on."""
-    url = f"{API}/actions/runs?branch=main&event=push&per_page=60"
+    url = EDGE_RUNS
     body = _get_json(get, url)
     runs = body.get("workflow_runs") if isinstance(body, dict) else None
     if not isinstance(runs, list):
         raise CheckFailed(f"{url} did not list any workflow runs")
+    runs = [
+        r
+        for r in runs
+        if isinstance(r, dict) and r.get("head_branch") == "main" and r.get("event") == "push"
+    ]
+    _not_behind_main(get, runs)
     order: list[str] = []
     by_commit: dict[str, list[dict[str, Any]]] = {}
     for run in runs:
-        sha = run.get("head_sha") if isinstance(run, dict) else None
+        sha = run.get("head_sha")
         if not isinstance(sha, str) or not _FULL_COMMIT.match(sha):
             continue
         if sha not in by_commit:
@@ -252,6 +269,27 @@ def newest_edge(get: Fetch = fetch) -> Target:
         f"none of the last {len(order)} commits on main has passed every check yet, "
         "so nothing is offered until one has"
     )
+
+
+def _not_behind_main(get: Fetch, runs: list[dict[str, Any]]) -> None:
+    """Refuse a run list that has not reached `main`'s newest commit: an old
+    commit named as edge would read this install as newer and offer nothing,
+    which is a wrong answer, not an empty one."""
+    head = _get_json(get, MAIN_HEAD)
+    sha = head.get("sha") if isinstance(head, dict) else None
+    commit = (head.get("commit") or {}) if isinstance(head, dict) else {}
+    made = _timestamp((commit.get("committer") or {}).get("date"))
+    if not isinstance(sha, str) or made is None:
+        raise CheckFailed(f"{MAIN_HEAD} did not say what main's newest commit is")
+    if any(r.get("head_sha") == sha for r in runs):
+        return
+    times = [t for r in runs if (t := _timestamp(r.get("created_at"))) is not None]
+    newest = max(times, default=None)
+    if newest is None or (made - newest).total_seconds() > _RUNS_BEHIND:
+        raise CheckFailed(
+            f"GitHub's list of checks has not reached main's newest commit ({sha[:7]}) yet, "
+            "so which commit is edge cannot be told; it is checked again later"
+        )
 
 
 def recent_releases(get: Fetch = fetch, *, limit: int = 5) -> list[Target]:

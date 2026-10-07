@@ -98,14 +98,31 @@ def _install_sh(pins: dict[str, str]) -> str:
     return "#!/bin/sh\n" + "\n".join(lines) + "\n"
 
 
-def _run(name: str, sha: str, status: str = "completed", conclusion: str | None = "success"):
+def _run(
+    name: str,
+    sha: str,
+    status: str = "completed",
+    conclusion: str | None = "success",
+    *,
+    branch: str = "main",
+    event: str = "push",
+    created: str = "2026-09-27T15:54:00Z",
+):
     return {
         "name": name,
         "head_sha": sha,
+        "head_branch": branch,
+        "event": event,
         "status": status,
         "conclusion": conclusion,
+        "created_at": created,
         "head_commit": {"timestamp": "2026-09-27T15:53:54Z"},
     }
+
+
+def _head(sha: str, made: str = "2026-09-27T15:53:54Z") -> dict[str, Any]:
+    """GitHub's answer for main's newest commit."""
+    return {"sha": sha, "commit": {"committer": {"date": made}}}
 
 
 #: When the commits in `SHA` and `NEW` were made: `NEW` is the later build.
@@ -159,9 +176,12 @@ class Web:
         )
 
 
-def _edge_web(runs: list[dict[str, Any]], pins: dict[str, str] = NEW) -> Web:
+def _edge_web(
+    runs: list[dict[str, Any]], pins: dict[str, str] = NEW, head: dict[str, Any] | None = None
+) -> Web:
     pages: dict[str, Any] = {
-        f"{updates.API}/actions/runs?branch=main&event=push&per_page=60": {"workflow_runs": runs}
+        updates.EDGE_RUNS: {"workflow_runs": runs},
+        updates.MAIN_HEAD: head or _head(runs[0]["head_sha"] if runs else "0" * 40),
     }
     for run in runs:
         pages[f"{updates.RAW}/{run['head_sha']}/scripts/install.sh"] = _install_sh(pins)
@@ -298,6 +318,42 @@ def test_a_commit_with_no_ci_is_not_offered() -> None:
         updates.newest_edge(_edge_web([_run("Container image", SPECS_OK)]))
 
 
+def test_runs_on_other_branches_and_events_are_not_edge() -> None:
+    """The run list is read unfiltered (GitHub's own filters have been seen
+    days behind) and narrowed here."""
+    web = _edge_web(
+        [
+            _run("CI", SPECS_RED, branch="j14a2-per-user"),
+            _run("CI", SPECS_RUNNING, event="dynamic"),
+            _run("CI", SPECS_OK),
+        ],
+        head=_head(SPECS_OK),
+    )
+    assert updates.newest_edge(web).ref == SPECS_OK
+
+
+def test_a_run_list_behind_main_names_no_edge() -> None:
+    """2026-10-07: GitHub's list ended nine days before main's newest commit,
+    so an old commit was named edge and every install read itself as newer.
+    A list that has not reached main says so instead."""
+    stale = _edge_web(
+        [_run("CI", SPECS_OK, created="2026-09-29T00:09:13Z")],
+        head=_head("d" * 40, made="2026-10-07T11:49:00Z"),
+    )
+    with pytest.raises(updates.CheckFailed, match="has not reached main's newest commit"):
+        updates.newest_edge(stale)
+
+
+def test_a_newest_commit_no_workflow_ran_for_is_not_behind() -> None:
+    """A commit that started no run is not a list that is behind: the newest
+    run is from just before it."""
+    web = _edge_web(
+        [_run("CI", SPECS_OK, created="2026-10-07T11:00:00Z")],
+        head=_head("d" * 40, made="2026-10-07T11:30:00Z"),
+    )
+    assert updates.newest_edge(web).ref == SPECS_OK
+
+
 def test_an_installer_that_pins_too_little_is_not_compared() -> None:
     web = _edge_web([_run("CI", SPECS_OK)])
     web.pages[f"{updates.RAW}/{SPECS_OK}/scripts/install.sh"] = "PIN_AGENT=" + "a" * 40 + "\n"
@@ -318,13 +374,7 @@ def test_releases_are_read_from_their_own_manifests_newest_first() -> None:
 def test_a_failed_check_says_what_happened() -> None:
     import urllib.error
 
-    web = Web(
-        {
-            f"{updates.API}/actions/runs?branch=main&event=push&per_page=60": urllib.error.URLError(
-                TimeoutError("timed out")
-            )
-        }
-    )
+    web = Web({updates.EDGE_RUNS: urllib.error.URLError(TimeoutError("timed out"))})
     with pytest.raises(updates.CheckFailed) as failed:
         updates.newest_edge(web)
     # describe_fetch_failure's words, not "check network access".
@@ -457,7 +507,7 @@ async def test_a_check_that_fails_keeps_what_the_last_one_found() -> None:
     checker = updates.UpdateChecker(setting=settings.get, get=web)
     first = await checker.check(_install(SHA))
     assert first.newest is not None and first.error is None
-    web.pages[f"{updates.API}/actions/runs?branch=main&event=push&per_page=60"] = OSError("down")
+    web.pages[updates.EDGE_RUNS] = OSError("down")
     second = await checker.check(_install(SHA))
     assert second.error and second.newest is not None and second.newest.ref == SPECS_OK
 
@@ -821,7 +871,7 @@ def test_update_does_not_use_last_good_target_when_final_check_fails(authed_clie
     web = _edge_web([_run("CI", SPECS_OK)])
     _checked(authed_client, _install(SHA), web, monkeypatch)
     authed_client.post("/v1/node/update/check")
-    web.pages[f"{updates.API}/actions/runs?branch=main&event=push&per_page=60"] = OSError("offline")
+    web.pages[updates.EDGE_RUNS] = OSError("offline")
     started = []
     monkeypatch.setattr(update_apply, "start", lambda **kwargs: started.append(True))
     response = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
