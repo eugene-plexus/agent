@@ -775,7 +775,7 @@ class SiteSigning(BaseModel):
     )
     approvePage: str | None = Field(
         None,
-        description='Where a person adds a key and approves held changes, on the machine\nitself. Null where this install has no such page yet (J14a.2, J14a.3).\n',
+        description='Where a person adds a key and approves held changes, on the machine\nitself: a Windows service install, and a per-user install on Windows,\nLinux or macOS (J14a.2). Null where this install has no such page yet\n(a Linux system install, J14a.3).\n',
         max_length=256,
     )
 
