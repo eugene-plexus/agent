@@ -194,6 +194,18 @@ def _icacls(path: Path, *args: str) -> None:
         raise OSError(f"icacls {path} failed: {(out.stdout + out.stderr).strip()}")
 
 
+def worker_read_folders(venv: Path) -> set[Path]:
+    """The folders every person's worker must read to start: the site host's
+    venv and the interpreter it was built from, each also where it really is.
+    uv names an interpreter by a link (`cpython-3.12-…` to `cpython-3.12.14-…`)
+    and Windows checks a link's target, so a grant on the link alone left
+    every worker unable to start under a protected install prefix."""
+    from .app_accounts import base_interpreter
+
+    named = {venv.parent, base_interpreter(venv).parent}
+    return named | {Path(os.path.realpath(folder)) for folder in named}
+
+
 class SiteHostSupervisor:
     def __init__(self, app: FastAPI) -> None:
         self.app = app
@@ -437,10 +449,7 @@ class SiteHostSupervisor:
             return
         protect_windows(self.config_dir, current, site_host_exists=site_host_exists)
         if program is not None and manager is not None:
-            from .app_accounts import base_interpreter
-
-            venv = program.python.parent.parent
-            for folder in {venv.parent, base_interpreter(venv).parent}:
+            for folder in sorted(worker_read_folders(program.python.parent.parent)):
                 _icacls(folder, "/grant", "*S-1-5-32-545:(OI)(CI)RX")
         self._granted = stamp
 

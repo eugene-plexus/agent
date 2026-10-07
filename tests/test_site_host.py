@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -587,3 +588,33 @@ async def test_on_a_linux_system_install_the_agent_only_reads_which_site_it_is(
     where.unlink()
     assert await supervisor._hosted("root") is None
     await supervisor._host.aclose()
+
+
+def _link_folder(link: Path, target: Path) -> None:
+    """A directory link, as uv makes one for an interpreter's minor version:
+    a junction on Windows (no privilege needed), a symlink elsewhere."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_worker_may_read_the_interpreter_behind_uvs_link(tmp_path: Path) -> None:
+    """uv names the interpreter by a link to the patch version's folder, and
+    Windows checks the link's target: the grant goes on both, or no person's
+    worker starts under a protected install prefix."""
+    real = tmp_path / "pythons" / "cpython-3.12.14-windows-x86_64-none"
+    real.mkdir(parents=True)
+    named = tmp_path / "pythons" / "cpython-3.12-windows-x86_64-none"
+    _link_folder(named, real)
+    venv = tmp_path / "versions" / "v1" / "venv"
+    venv.mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text(f"home = {named}\n", encoding="utf-8")
+
+    folders = site_host.worker_read_folders(venv)
+
+    assert venv.parent in folders
+    assert named in folders
+    assert Path(os.path.realpath(real)) in folders
