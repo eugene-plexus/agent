@@ -15,13 +15,13 @@
   name: Workbench
   summary: >-
     Chat with the models this install serves, search the web, make images,
-    speech and transcripts, and use shared MCP tools with approval for each call. The owner can also run local MCP
+    video, speech and transcripts, and use shared MCP tools with approval per call. The owner can also run local MCP
     servers in Workbench's own OS account and grant folders to named people
     for approved file operations. Signs people in with Eugene:
     the owner with the passphrase, a small business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/e26adc4e4232c404a4f14a1e050272fd6ccc2f23.tar.gz
-  version: e26adc4e4232c404a4f14a1e050272fd6ccc2f23
+  source: https://github.com/eugene-plexus/workbench/archive/d1db51cb143b89008d94933e33505b2b392af019.tar.gz
+  version: d1db51cb143b89008d94933e33505b2b392af019
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
