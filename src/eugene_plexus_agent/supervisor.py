@@ -48,7 +48,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import orphan_kill, ports, process_signals
+from . import orphan_kill, ports, process_signals, standby, tokens
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 from ._http import internal_client
 from .auth_state import AuthState
@@ -344,8 +344,13 @@ class _ComponentPlanner:
         log: logging.Logger,
         auth_state: AuthState | None = None,
         shared_child_env: Callable[..., dict[str, str]] | None = None,
+        standby_env: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self.entry = entry
+        # The warm standby's wiring (warm-standby.md SB3): its role, the
+        # root it follows, its data directory. Applied last, over
+        # everything, because the agent owns that entry.
+        self._standby_env = standby_env
         self._log = log
         # Suffix -> value for env vars every child gets, prefixed per
         # kind at plan time: AGENT_URL (this agent's own local address,
@@ -456,6 +461,25 @@ class _ComponentPlanner:
 
         if spawn.env:
             env.update({k: str(v) for k, v in spawn.env.items()})
+        if standby.is_standby(self.entry):
+            # **The one control process that gets a credential**, and only
+            # this one: a token for this machine with `sub: standby`, which
+            # it trades at `POST /v1/auth/service-token` for the token the
+            # active root's replication routes accept. No signing key, no
+            # master key, no bundle file (warm-standby.md SB2, SB3).
+            if self._auth_state is None or self._standby_env is None:
+                raise SpawnPlanError(
+                    "the standby needs this node's trust to get its token; it is "
+                    "started only by an enrolled agent"
+                )
+            wiring = self._standby_env()
+            if wiring.get("ROLE") == "standby":
+                trust = self._auth_state.trust
+                env[f"{prefix}_SERVICE_TOKEN"], _ = trust.mint_service(
+                    sub=tokens.SUB_STANDBY, audience=trust.recipient
+                )
+            for suffix, value in wiring.items():
+                env[f"{prefix}_{suffix}"] = value
         # The opt-in HTTPS entry point must keep backends private, including
         # a legacy per-component bind override saved before migration.
         if shared.get("BIND_HOST") == "127.0.0.1":
@@ -587,9 +611,10 @@ class SupervisedProcess:
         log: logging.Logger,
         auth_state: AuthState | None = None,
         shared_child_env: Callable[..., dict[str, str]] | None = None,
+        standby_env: Callable[[], dict[str, str]] | None = None,
     ) -> SupervisedProcess:
         """Supervise one Eugene Plexus component."""
-        return cls(_ComponentPlanner(entry, log, auth_state, shared_child_env), log)
+        return cls(_ComponentPlanner(entry, log, auth_state, shared_child_env, standby_env), log)
 
     @property
     def name(self) -> str:
@@ -1010,9 +1035,11 @@ class Supervisor:
         log: logging.Logger | None = None,
         auth_state: AuthState | None = None,
         shared_child_env: Callable[..., dict[str, str]] | None = None,
+        standby_env: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
         self._shared_child_env = shared_child_env
+        self._standby_env = standby_env
         # v0.2: shared with every SupervisedProcess so each spawn can
         # issue a fresh service token, base64-encode the signing key,
         # and forward the (possibly-still-None) master key. Optional —
@@ -1046,6 +1073,7 @@ class Supervisor:
             self._log,
             auth_state=self._auth_state,
             shared_child_env=self._shared_child_env,
+            standby_env=self._standby_env,
         )
         self._processes[entry.name] = sp
         sp.start()

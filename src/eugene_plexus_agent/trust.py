@@ -237,11 +237,23 @@ class NodeTrust:
             allowed = tokens.GRANT_AUTHORITY in grants or (
                 sub == tokens.SUB_AGENT
                 or (sub == tokens.SUB_GATEWAY and tokens.GRANT_GATEWAY in grants)
+                or (
+                    sub == tokens.SUB_STANDBY
+                    and tokens.GRANT_STANDBY in grants
+                    and audience == tokens.RECIPIENT_CONTROL
+                )
             )
             if not allowed:
                 raise MintRefused(
                     f"this node may not send a {sub!r} token to {audience}"
-                    + (": it holds no gateway grant" if sub == tokens.SUB_GATEWAY else "")
+                    + {
+                        tokens.SUB_GATEWAY: ": it holds no gateway grant",
+                        tokens.SUB_STANDBY: (
+                            ": it is not the standby"
+                            if tokens.GRANT_STANDBY not in grants
+                            else ": a standby token goes to control only"
+                        ),
+                    }.get(sub, "")
                 )
         ttl = ttl_seconds or (
             tokens.LOCAL_SERVICE_TTL_SECONDS if local else tokens.REMOTE_SERVICE_TTL_SECONDS

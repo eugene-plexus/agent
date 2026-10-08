@@ -29,16 +29,19 @@ import logging
 import platform
 import sys
 from datetime import UTC, datetime
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from .. import __version__, default_topology, reach, tokens
+from .. import __version__, default_topology, reach, standby, tokens
 from .._generated.common_models import ConfigUpdateRequest, Problem, SignedTrustBundle
 from .._generated.models import (
     Arch,
+    ComponentStatus,
     EnrollRequest,
+    LocalStandby,
     NodeIdentity,
     NodeReach,
     NodeReachRequest,
@@ -161,12 +164,33 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         arch=_arch(),
         devices=list(snapshot.devices),
         agentVersion=__version__,
+        hostsControl=standby.hosts_active_control(state),
+        standby=_local_standby(request, state, record.control_url),
         # Read at the moment of answering, not cached and not derived
         # from anything: the point of the field is that a console can
         # compare two hosts and see a drift neither host can see about
         # itself. `tokens.note_clock_skew` observes the same quantity
         # precisely and can only write it to a log.
         time=datetime.now(UTC),
+    )
+
+
+def _local_standby(request: Request, state: AgentState, control_url: Any) -> LocalStandby | None:
+    """The warm standby this agent runs, if its node holds the grant."""
+    entry = state.get_topology_entry(standby.STANDBY_COMPONENT)
+    if entry is None or not standby.is_standby(entry):
+        return None
+    supervisor = getattr(request.app.state, "supervisor", None)
+    live = (
+        supervisor.status_for(entry.name, has_spawn=True)[0]
+        if supervisor is not None
+        else ComponentStatus.unreachable
+    )
+    return LocalStandby(
+        component=entry.name,
+        url=entry.url,
+        status=live,
+        following=control_url,
     )
 
 
@@ -452,6 +476,7 @@ async def take_trust_bundle(request: Request, body: SignedTrustBundle) -> NodeId
         log.warning("fenced a trust bundle: %s", exc)
         raise _problem(status.HTTP_409_CONFLICT, "fenced", "Fenced", str(exc)) from exc
     log.info("took trust bundle %d at epoch %d", bundle.version, bundle.epoch)
+    await standby.reconcile(request.app)
     return _identity(request, await _devices(request))
 
 

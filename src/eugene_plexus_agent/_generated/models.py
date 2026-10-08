@@ -1132,6 +1132,13 @@ class TrustGrant(StrEnum):
       with `sub: agent` to `control`, and to **its own machine**.
       Nothing else: a site that joined with a leaked token reaches no
       other machine and no other component, on any network.
+    * `standby`: given to **one** node, beside `node`, by an owner's
+      `PUT /v1/nodes/{name}/standby` at the control root, never by a
+      join token and never claimed by the node
+      (`docs/design/warm-standby.md`, SB1). Service tokens with
+      `sub: standby` to `control`, and nothing else. The control root
+      accepts them on its replication routes alone, and only while
+      its applied state still names that node the standby (SB2).
 
     """
 
@@ -1139,6 +1146,7 @@ class TrustGrant(StrEnum):
     node = 'node'
     gateway = 'gateway'
     files = 'files'
+    standby = 'standby'
 
 
 class TrustKey(BaseModel):
@@ -1484,6 +1492,25 @@ class ComponentStatus(StrEnum):
     exited = 'exited'
     crashed = 'crashed'
     unreachable = 'unreachable'
+
+
+class LocalStandby(BaseModel):
+    """
+    The warm standby this agent runs because its node holds the
+    `standby` grant (`docs/design/warm-standby.md`, SB3). Absent when it
+    does not. The agent starts it when the grant arrives in the trust
+    bundle and stops it, deleting its copy of the replication set, when
+    the grant goes. How far behind it is, the active root says
+    (`ControlStatus.standbys`).
+
+    """
+
+    component: str = Field(..., description="Its id among this agent's components.")
+    url: AnyUrl = Field(..., description='Where it listens on this machine.')
+    status: ComponentStatus
+    following: AnyUrl | None = Field(
+        None, description="The active root it follows, this node's `controlUrl`."
+    )
 
 
 class Os(StrEnum):
@@ -4488,6 +4515,11 @@ class NodeIdentity(BaseModel):
     )
     controlUrl: AnyUrl | None = Field(
         None, description='The control root this node answers to.'
+    )
+    standby: LocalStandby | None = None
+    hostsControl: bool | None = Field(
+        None,
+        description="This agent supervises the install's active control root. The\nroot reads it from its probe of each node to know its own\nmachine, which can never be its standby\n(`docs/design/warm-standby.md`). A standby this agent runs does\nnot count.\n",
     )
     epoch: int | None = Field(
         None,

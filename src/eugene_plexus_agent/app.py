@@ -44,6 +44,7 @@ from . import (
     response_headers,
     session_revocations,
     share_credentials,
+    standby,
     ui_assets,
 )
 from ._http import aclose_shared
@@ -253,6 +254,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             log=log,
             auth_state=app.state.auth_state,
             shared_child_env=lambda kind=None: shared_child_env(settings, state, identity, kind),
+            standby_env=lambda: standby.spawn_env(app),
         )
         owns_supervisor = True
     else:
@@ -386,6 +388,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         for entry in state.list_topology_entries():
             supervisor.add_and_start(entry)
         await supervisor.start_health_loop(state.list_topology_entries)
+        # The bundle this node holds decides whether it runs the standby,
+        # before the first pull: a grant removed while it was off goes now.
+        await standby.reconcile(app)
 
     if not settings.safe_mode and owns_runtimes:
         # Companions first, so a runtime that has one gets it whether the
@@ -577,6 +582,7 @@ async def _pull_trust_bundle(app: FastAPI) -> None:
                         taken = trust.accept(str(response.json()["jws"]))
                         if held is None or taken.version != held.version:
                             log.info("pulled trust bundle %d", taken.version)
+                        await standby.reconcile(app)
                 except BundleRollback:
                     pass
                 except (tokens.BundleError, FencedError) as exc:
@@ -737,10 +743,11 @@ _DIALLED_BY_THE_ROOT = frozenset({"inference-driver", "tool-driver"})
 
 
 def _hosts_control(state: AgentState) -> bool:
-    """This agent supervises the control root: it is the control host."""
-    from ._generated.models import ComponentKind
+    """This agent supervises the control root: it is the control host. A
+    warm standby it runs does not count (warm-standby.md)."""
+    from .standby import hosts_active_control
 
-    return any(e.kind == ComponentKind.control for e in state.list_topology_entries())
+    return hosts_active_control(state)
 
 
 def shared_child_env(
