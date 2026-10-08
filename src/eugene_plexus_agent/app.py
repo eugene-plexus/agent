@@ -572,6 +572,10 @@ async def _pull_trust_bundle(app: FastAPI) -> None:
         while True:
             trust = app.state.auth_state.trust
             record = app.state.node_identity.record
+            # Before asking: a bundle the root pushed once, and that could
+            # not be written then, reaches the file even while the root
+            # this node joined does not answer (after a promotion).
+            trust.save_pending()
             if trust.enrolled and record.control_url:
                 try:
                     response = await client.get(

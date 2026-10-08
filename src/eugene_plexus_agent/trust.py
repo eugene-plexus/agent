@@ -40,6 +40,11 @@ log = logging.getLogger(__name__)
 BUNDLE_FILE = "trust_bundle.json"
 STANDALONE_RECIPIENT = tokens.node_recipient(tokens.STANDALONE_NODE)
 
+#: Pauses before writing the bundle file again when another process has it
+#: open: Windows refuses to replace a file anyone holds (WinError 5 or 32),
+#: and every component this agent runs reads that file.
+SAVE_RETRY_DELAYS_SECONDS = (0.05, 0.15)
+
 
 class BundleRollback(Exception):
     """An authentic bundle older than the one held. The caller answers 409."""
@@ -61,6 +66,10 @@ class NodeTrust:
         # `iat`: a pull returns the same signed bundle until something
         # changes, so on a quiet install that grows without bound.
         self._heard_at: float | None = None
+        # The bundle held in memory but not yet on disk. The components
+        # read the file, so it is written again until it is there.
+        self._unsaved: tokens.TrustBundle | None = None
+        self._save_lock = threading.Lock()
 
     # ----- who this node is ----------------------------------------------
 
@@ -181,10 +190,50 @@ class NodeTrust:
     def _install(self, bundle: tokens.TrustBundle) -> None:
         with self._lock:
             self._bundle = bundle
-        try:
-            tokens.write_bundle_file(self._path, bundle)
-        except OSError as exc:
-            log.warning("could not keep the trust bundle at %s: %s", self._path, exc)
+            self._unsaved = bundle
+        self.save_pending()
+
+    def save_pending(self) -> bool:
+        """Write the held bundle to its file if it is not there yet; True
+        when the file is current.
+
+        A bundle can arrive exactly once: a promoted root pushes it, and
+        this node's pulls still go to the root that stopped. So a write
+        that fails is not dropped. It is tried again at once, briefly,
+        while another process has the file open, and then on every trust
+        pull until it lands."""
+        with self._save_lock:
+            with self._lock:
+                bundle = self._unsaved
+            if bundle is None:
+                return True
+            error: OSError | None = None
+            for delay in (*SAVE_RETRY_DELAYS_SECONDS, None):
+                try:
+                    tokens.write_bundle_file(self._path, bundle)
+                except PermissionError as exc:
+                    error = exc
+                    if delay is None:
+                        break
+                    time.sleep(delay)
+                except OSError as exc:
+                    error = exc
+                    break
+                else:
+                    with self._lock:
+                        if self._unsaved is bundle:
+                            self._unsaved = None
+                    if error is not None:
+                        log.info("kept trust bundle %d at %s", bundle.version, self._path)
+                    return True
+            log.warning(
+                "could not keep trust bundle %d at %s: %s; it is held in memory, and "
+                "written again at the next trust pull",
+                bundle.version,
+                self._path,
+                error,
+            )
+            return False
 
     def forget(self) -> None:
         """Un-enrolled: drop the root's bundle; the caller becomes standalone."""

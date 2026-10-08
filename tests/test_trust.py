@@ -7,11 +7,19 @@ the token anyway and a route test would pass either way.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
+import logging
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from eugene_plexus_agent import tokens
+from eugene_plexus_agent import trust as trust_module
 from eugene_plexus_agent.node_identity import FencedError, NodeIdentityStore
 from eugene_plexus_agent.trust import BUNDLE_FILE, MintRefused, NodeTrust
 
@@ -149,3 +157,119 @@ def test_the_age_survives_a_restart_from_the_kept_file(tmp_path: Path) -> None:
 
 def test_a_standalone_node_has_no_root_to_hear_from(tmp_path: Path) -> None:
     assert standalone_trust(tmp_path).heard_age_seconds() is None
+
+
+# --------------------------------------------------------------------------- #
+# Keeping the bundle on disk
+# --------------------------------------------------------------------------- #
+
+
+def _kept_version(tmp_path: Path, root: FakeRoot) -> int:
+    document = json.loads((tmp_path / BUNDLE_FILE).read_text(encoding="utf-8"))
+    return tokens.parse_bundle(str(document["jws"]), authority=root.public).version
+
+
+def _held_open(monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
+    """The bundle file refused `times` times, as Windows refuses to replace
+    a file another process has open. Returns the versions each write tried."""
+    real = tokens.write_bundle_file
+    tried: list[int] = []
+
+    def write(path: Path, bundle: tokens.TrustBundle) -> None:
+        tried.append(bundle.version)
+        if len(tried) <= times:
+            raise PermissionError(13, "Access is denied")
+        real(path, bundle)
+
+    monkeypatch.setattr(tokens, "write_bundle_file", write)
+    monkeypatch.setattr(trust_module, "SAVE_RETRY_DELAYS_SECONDS", (0.0, 0.0))
+    return tried
+
+
+def test_a_bundle_file_held_open_for_a_moment_is_written_anyway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every component this agent runs reads the bundle file, and Windows
+    refuses to replace a file while anyone has it open. A moment's hold is
+    waited out, not taken as a failure."""
+    trust, root = _enrolled(tmp_path)
+    tried = _held_open(monkeypatch, times=2)
+    taken = trust.accept(root.bundle().jws)
+    assert _kept_version(tmp_path, root) == taken.version
+    assert tried == [taken.version] * 3
+
+
+def test_a_bundle_the_file_refused_is_written_at_the_next_chance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A promoted root pushes its bundle once, and this node's pulls still go
+    to the root that stopped, so no later pull rewrites the file. The bundle
+    is held, the failure is said, and the file is written when it can be."""
+    trust, root = _enrolled(tmp_path)
+    before = _kept_version(tmp_path, root)
+    _held_open(monkeypatch, times=3)
+    with caplog.at_level(logging.WARNING, logger=trust_module.log.name):
+        taken = trust.accept(root.bundle().jws)
+    assert trust.bundle is not None and trust.bundle.version == taken.version
+    assert _kept_version(tmp_path, root) == before, "the file was refused every time"
+    assert f"could not keep trust bundle {taken.version}" in caplog.text
+    assert "Access is denied" in caplog.text
+    assert trust.save_pending() is True
+    assert _kept_version(tmp_path, root) == taken.version
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="only Windows refuses to replace an open file")
+def test_windows_refuses_to_replace_the_open_bundle_file_and_the_agent_writes_it_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real refusal, not a stand-in: a component reading the file while a
+    pushed bundle arrives (found by standby-acceptance.py on 2026-10-08)."""
+    trust, root = _enrolled(tmp_path)
+    before = _kept_version(tmp_path, root)
+    monkeypatch.setattr(trust_module, "SAVE_RETRY_DELAYS_SECONDS", (0.0,))
+    with open(tmp_path / BUNDLE_FILE, encoding="utf-8"):
+        taken = trust.accept(root.bundle().jws)
+    assert trust.bundle is not None and trust.bundle.version == taken.version
+    assert _kept_version(tmp_path, root) == before
+    assert trust.save_pending() is True
+    assert _kept_version(tmp_path, root) == taken.version
+
+
+def test_the_trust_pull_writes_a_held_bundle_while_the_root_does_not_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a promotion the root this node joined is gone, so every pull
+    fails; the bundle the new root pushed still reaches the file."""
+    from eugene_plexus_agent import app as app_module
+
+    trust, root = _enrolled(tmp_path)
+    _held_open(monkeypatch, times=3)
+    taken = trust.accept(root.bundle().jws)
+    assert _kept_version(tmp_path, root) != taken.version
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("the old root is stopped", request=request)
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_state=SimpleNamespace(trust=trust),
+            node_identity=trust._identity,
+            control_transport=httpx.MockTransport(refuse),
+        )
+    )
+    monkeypatch.setattr(app_module, "TRUST_PULL_INTERVAL_SECONDS", 0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(app_module._pull_trust_bundle(app))  # type: ignore[arg-type]
+        try:
+            for _ in range(200):
+                if _kept_version(tmp_path, root) == taken.version:
+                    return
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+    assert _kept_version(tmp_path, root) == taken.version
