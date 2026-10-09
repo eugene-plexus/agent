@@ -404,8 +404,8 @@ class EngineKind(StrEnum):
     `llama_cpp` drives upstream `llama-server` and loads GGUF.
     `vllm` drives upstream `vllm serve` and loads safetensors.
     `mlx` drives upstream `mlx_lm.server` and loads MLX-format
-    safetensors, on Apple silicon only — experimental until a
-    physical Mac run is recorded. We never ship an engine — every
+    safetensors, on Apple silicon only; not experimental since its
+    run on GitHub's macOS runners (A4, 2026-09-30). We never ship an engine — every
     one of them is an upstream project we wrap and track.
 
     They differ in far more than argv, and that is why readiness
@@ -524,12 +524,54 @@ class ModelPreparation(BaseModel):
     note: str | None = Field(None, description='What the step makes, in words.')
 
 
+class EligibilityCandidate(BaseModel):
+    """
+    A model not in the library yet, judged by its facts
+    (library-sources-and-engines.md, LS2): a version in a catalogue
+    repo, a starter entry, or a search row. The library's catalogue
+    answers carry these ready to send back (`CatalogueCandidate.facts`,
+    `StarterModel.facts`, `CatalogueSearchResult.facts`), so a caller
+    derives nothing itself.
+
+    The same terms as a library model's, with one difference: here an
+    absent fact is *not known yet*, where on a library model it means
+    *unreadable*. A term that constrains a fact nobody knows cannot be
+    checked, so a match resting on it is at best `may_run` (an
+    `after_preparation` match stays one), its reason names what was
+    assumed, and the answer is `approximate`.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="The caller's handle for it, echoed as `ModelEligibility.modelId`.\nOpaque; unique within one request.\n",
+    )
+    format: ModelFormat
+    architecture: str | None = Field(
+        None,
+        description="GGUF's `general.architecture`, as the hub read it from the\nrepo's GGUF, or a safetensors folder's `architectures[0]`, from\nits remote `config.json`.\n",
+    )
+    quantization: str | None = Field(
+        None,
+        description="The GGUF quantization, from the file's name (the scan's own fallback).",
+    )
+    mlxQuantized: bool | None = Field(
+        None,
+        description="Whether the folder's `config.json` carries MLX's quantization\nblock (`MlxQuantizationRule`). Absent: not known.\n",
+    )
+    approximate: bool | None = Field(
+        False,
+        description="Guessed from a search row's tags and the hub's repo-level\nmetadata rather than read from one version's files: a repo can\nhold many versions, and only its detail lists them.\n",
+    )
+
+
 class EngineVerdictKind(StrEnum):
     """
     One model against one engine. `runs`: a requirement with authority
-    `eugene` matches. `may_run`: only the engine can tell, at load.
-    `after_preparation`: it runs once the engine prepares it. `no`:
-    no requirement matches, and `reason` says which term failed.
+    `eugene` matches. `may_run`: only the engine can tell, at load, or
+    (for an `EligibilityCandidate`) a term rests on a fact not known
+    yet. `after_preparation`: it runs once the engine prepares it.
+    `no`: no requirement matches, and `reason` says which term failed.
 
     """
 
@@ -577,8 +619,14 @@ class EligibilityLevel(StrEnum):
 
 
 class ModelEligibility(BaseModel):
-    modelId: str
+    modelId: str = Field(
+        ..., description="A library model's id, or an `EligibilityCandidate`'s `id`."
+    )
     level: EligibilityLevel
+    approximate: bool | None = Field(
+        False,
+        description='The facts were a guess (`EligibilityCandidate.approximate`), or\na term could not be checked. Said beside the dot, never hidden.\n',
+    )
     engines: list[EngineVerdict] = Field(
         ...,
         description='Every engine sent, best first: available before not, then\n`runs`, `may_run`, `after_preparation`, `no`, then\n`preference`. The first available `runs` or `may_run` is what\nRun would pick when the person has set no default.\n',
@@ -1474,7 +1522,7 @@ class ModelRequirement(BaseModel):
     format: ModelFormat
     architectures: list[str] | None = Field(
         None,
-        description="The model's `architecture` must be one of these: GGUF's\n`general.architecture`, or a safetensors folder's\n`architectures[0]`. Absent means any.\n",
+        description="The model's `architecture` must be one of these: GGUF's\n`general.architecture`, or a safetensors folder's\n`architectures[0]`. Absent means any. Can be long: llama.cpp\ndeclares every architecture its installed build knows.\n",
     )
     quantizations: list[str] | None = Field(
         None,
@@ -1514,7 +1562,12 @@ class EligibilityEngine(BaseModel):
 
 class EligibilityRequest(BaseModel):
     models: list[str] | None = Field(
-        None, description='Library model ids to judge. Absent means every model.'
+        None,
+        description='Library model ids to judge. Absent means every model, unless\n`candidates` are sent: then none.\n',
+    )
+    candidates: list[EligibilityCandidate] | None = Field(
+        None,
+        description='Models not in the library yet, judged by their facts (LS2).\nAnswered after `models`, in the order sent.\n',
     )
     engines: list[EligibilityEngine]
 
