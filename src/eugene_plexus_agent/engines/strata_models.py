@@ -20,15 +20,27 @@ Moving the Strata pin means reading these again from the new setup.
 
 from __future__ import annotations
 
-from pathlib import PurePosixPath
+from dataclasses import dataclass
+from pathlib import PurePosixPath, PureWindowsPath
 
-from .._generated.models import ModelFormat, ModelPreparation, PreparedSource, SupportedModel
+from .._generated.models import (
+    Context,
+    ModelFormat,
+    ModelPreparation,
+    PreparedSource,
+    SupportedModel,
+)
+
+#: setup.py `CONTEXTS`: the context sizes it offers, which a preparation
+#: fixes (LS5, B50).
+SETUP_CONTEXTS: tuple[int, ...] = (8192, 32768, 65536, 131072, 262144, 393216, 524288)
 
 #: What a GGUF on the list needs before Strata runs it. The same words the
 #: adapter's GGUF requirement carries.
 PREPARATION = ModelPreparation(
     recipe="strata-prepare",
     note="an expert pack, a lookup table and an MTP helper",
+    contexts=[Context(c) for c in SETUP_CONTEXTS],
 )
 
 _QWEN = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
@@ -204,3 +216,94 @@ SUPPORTED_MODELS: tuple[SupportedModel, ...] = (
 STRATA_FILES: tuple[str, ...] = tuple(
     PurePosixPath(m.source.file).name for m in SUPPORTED_MODELS if m.source.file
 )
+
+
+@dataclass(frozen=True)
+class SetupChoice:
+    """How upstream's setup names a choice and sizes it (LS5): `--family` and
+    `--model`, `FAMILIES[f]["name"]` (the start of its `model_name`), and from
+    `MODELS[m]` the experts' size in RAM (`arena_gb`) and whether it keeps a
+    RAM budget of them instead (`budget`, Unsloth's two)."""
+
+    family: str
+    model: str
+    name: str
+    arena_gb: float
+    budget: bool = False
+
+    @property
+    def tag(self) -> str:
+        """Setup's `tag` lowered: its configuration is `strata-<tag>.json`,
+        its pack `packs/<tag>`."""
+        prefix = "" if self.family == "qwen" else f"{self.family}-"
+        return f"{prefix}{self.model}".lower()
+
+    @property
+    def model_name(self) -> str:
+        """What setup calls the model it configured: `<family name>-<size>`."""
+        return f"{self.name}-{self.model.lower()}"
+
+
+#: setup.py `FAMILIES[f]["name"]` and `MODELS[m]["arena_gb"]`, by list id.
+SETUP_CHOICES: dict[str, SetupChoice] = {
+    "Q2_0": SetupChoice("qwen", "Q2_0", "qwen3.8-flash-next", 34.0),
+    "IQ2_XS": SetupChoice("qwen", "IQ2_XS", "qwen3.8-flash-next", 35.5),
+    "IQ3_XXS": SetupChoice("qwen", "IQ3_XXS", "qwen3.8-flash-next", 42.9),
+    "IQ3_S": SetupChoice("qwen", "IQ3_S", "qwen3.8-flash-next", 50.3),
+    "swift-IQ2_XS": SetupChoice("swift", "IQ2_XS", "swift-1.5", 35.5),
+    "swift-IQ3_XXS": SetupChoice("swift", "IQ3_XXS", "swift-1.5", 42.9),
+    "coder-IQ1_M": SetupChoice("coder", "IQ1_M", "qwen3.8-flash-next-coder", 23.4),
+    "unsloth-UD-IQ4_XS": SetupChoice(
+        "unsloth", "UD-IQ4_XS", "qwen3.8-flash-next-unsloth", 59.5, budget=True
+    ),
+    "unsloth-UD-Q4_K_XL": SetupChoice(
+        "unsloth", "UD-Q4_K_XL", "qwen3.8-flash-next-unsloth", 77.0, budget=True
+    ),
+}
+
+#: setup.py `LOW_RAM_HEADROOM_GB`: RAM it keeps beside the experts.
+LOW_RAM_HEADROOM_GB = 10
+#: setup.py's own allowance beside the model files (the pack, the MTP helper).
+SETUP_DISK_GB = 8
+#: Q2_0's experts repacked for an AVX-512 CPU, which setup writes once.
+Q2_0_REPACK_GB = 40
+
+
+def disk_needed(choice: SetupChoice, ram_bytes: int | None) -> int:
+    """What setup checks for before it prepares a choice (`main`, its `need`
+    with `--gguf-dir`), in bytes as its `free_gb` counts them (1e9): 8 GB;
+    the experts written into one file when this PC's RAM is short of them
+    (the low-RAM mode, never for a RAM-budget model); 40 GB for Q2_0 on an
+    AVX-512 CPU, counted always since the CPU feature is not read here (the
+    low-RAM file is then not written, as in setup). An unknown RAM counts as
+    short: the larger answer."""
+    gb: float = SETUP_DISK_GB
+    if choice.family == "qwen" and choice.model == "Q2_0":
+        gb += Q2_0_REPACK_GB
+    elif not choice.budget:
+        ram_gib = ram_bytes / 2**30 if ram_bytes is not None else 0.0
+        if ram_gib < choice.arena_gb + LOW_RAM_HEADROOM_GB:
+            gb += choice.arena_gb + 1
+    return int(gb * 1e9)
+
+
+def supported_here(ram_bytes: int | None) -> tuple[SupportedModel, ...]:
+    """The list as this node reports it: each preparation's disk by setup's
+    rule with this node's RAM (B51)."""
+    out = []
+    for model in SUPPORTED_MODELS:
+        need = disk_needed(SETUP_CHOICES[model.id], ram_bytes)
+        preparation = PREPARATION.model_copy(update={"diskBytes": need})
+        out.append(model.model_copy(update={"preparation": preparation}))
+    return tuple(out)
+
+
+def choice_for_file(path: str) -> tuple[SupportedModel, SetupChoice] | None:
+    """The list entry whose first shard is the file at `path` (its name, case
+    ignored as the GGUF requirement compares), or None: setup prepares no
+    other file."""
+    wanted = PureWindowsPath(path).name.lower()
+    for model in SUPPORTED_MODELS:
+        if model.source.file and PurePosixPath(model.source.file).name.lower() == wanted:
+            return model, SETUP_CHOICES[model.id]
+    return None

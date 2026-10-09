@@ -42,6 +42,7 @@ from .._generated.models import (
     SupportedModel,
 )
 from .._http import shared_internal_client
+from ..preparation import PreparationError, Recipe
 from .acquisition import ManagedStore, engine_root
 
 
@@ -193,6 +194,27 @@ class EngineAdapter(abc.ABC):
         `accepts` for every engine whose rules are not its build's; llama.cpp's
         architectures are (LS2)."""
         return self.accepts
+
+    def supported_models_here(self) -> tuple[SupportedModel, ...]:
+        """`supported_models` as this node reports them: an engine whose
+        preparation depends on the node fills that in (Strata's disk, by
+        this node's RAM; LS5)."""
+        return self.supported_models
+
+    def plan_preparation(
+        self,
+        *,
+        binary: DiscoveredBinary,
+        folder: Path,
+        model: Path,
+        source_path: str,
+        context: int | None,
+    ) -> Recipe:
+        """Plan preparing `model` into the Library folder `folder`, both as
+        this node reaches them, with the engine's own tools (LS5); or say,
+        in a `PreparationError`, why it cannot start. `source_path` is the
+        model as the library spells it. An engine that prepares nothing says so."""
+        raise PreparationError(f"{self.kind.value} prepares no models")
 
     #: Whether the engine answers HTTP while its model loads.
     #:

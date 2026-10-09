@@ -539,6 +539,80 @@
           }
         }
       }
+    },
+    "/v1/run-operations/{id}/prepared": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Prepared Model",
+        "description": "The node prepared the model (LS5): list it and go on with it.",
+        "operationId": "prepared_model_v1_run_operations__id__prepared_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreparedRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -568,7 +642,7 @@
           },
           "step": {
             "type": "string",
-            "pattern": "^(checking|awaiting-install|installing|settings|launching|loading|ready|skipped|failed)$",
+            "pattern": "^(checking|awaiting-install|installing|preparing|settings|launching|loading|ready|skipped|failed)$",
             "title": "Step"
           },
           "engine": {
@@ -615,6 +689,16 @@
               }
             ],
             "title": "Install"
+          },
+          "preparation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparationStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "error": {
             "anyOf": [
@@ -695,6 +779,7 @@
               "checking",
               "awaiting-install",
               "installing",
+              "preparing",
               "settings",
               "launching",
               "loading",
@@ -759,6 +844,27 @@
               }
             ],
             "title": "Install"
+          },
+          "preparation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparationStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preparedFrom": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LibraryModel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The model a preparation started from; `model` is then the prepared one."
           },
           "profile": {
             "anyOf": [
@@ -997,7 +1103,7 @@
               }
             ],
             "title": "Runwhenready",
-            "description": "The operator asked for this model to be run when it lands.\nRecorded, never acted on here \u2014 see `DownloadSpec`. Cleared\nby `POST /v1/downloads/{id}/claim`, so a finished download\nwhose flag is still set is one nobody has picked up yet.\n"
+            "description": "The operator asked for this model to be run when it lands.\nRecorded, never acted on here — see `DownloadSpec`. Cleared\nby `POST /v1/downloads/{id}/claim`, so a finished download\nwhose flag is still set is one nobody has picked up yet.\n"
           },
           "attempts": {
             "anyOf": [
@@ -1022,7 +1128,7 @@
               }
             ],
             "title": "Modelid",
-            "description": "The library entry this download became, filled in after the\npost-completion scan of the destination directory. This is\nwhat closes discovery \u2192 download \u2192 library \u2192 profile \u2192\nlaunch without the UI polling for a model to appear.\n"
+            "description": "The library entry this download became, filled in after the\npost-completion scan of the destination directory. This is\nwhat closes discovery → download → library → profile →\nlaunch without the UI polling for a model to appear.\n"
           },
           "startedAt": {
             "anyOf": [
@@ -1069,7 +1175,7 @@
               }
             ],
             "title": "Errorcode",
-            "description": "Upstream's own error code when it gave one \u2014 `GatedRepo` is\nthe one that will actually happen, and it means \"accept the\nlicence on the model page\" rather than anything the operator\ncan fix here. Carried through so the UI can say that instead\nof surfacing a bare 401.\n"
+            "description": "Upstream's own error code when it gave one — `GatedRepo` is\nthe one that will actually happen, and it means \"accept the\nlicence on the model page\" rather than anything the operator\ncan fix here. Carried through so the UI can say that instead\nof surfacing a bare 401.\n"
           },
           "restartedFromZero": {
             "anyOf": [
@@ -1167,7 +1273,7 @@
               }
             ],
             "title": "Verified",
-            "description": "Whether the finished file matched its digest. Verification\nhappens **before** the `.part` is renamed into place, so a\nfile that exists at `destinationPath` was verified \u2014 and one\nthat failed stays a `.part` with the record in `failed`,\nnever silently retried into the same bytes.\n"
+            "description": "Whether the finished file matched its digest. Verification\nhappens **before** the `.part` is renamed into place, so a\nfile that exists at `destinationPath` was verified — and one\nthat failed stays a `.part` with the record in `failed`,\nnever silently retried into the same bytes.\n"
           },
           "role": {
             "anyOf": [
@@ -1250,7 +1356,7 @@
               }
             ],
             "title": "Root",
-            "description": "Which configured model root to write under. Must be one of\nthem \u2014 this component will not write outside the\ndirectories the operator nominated. Defaults to the first,\nwhich is what the `path_list` config type has promised\nsince M2.\n"
+            "description": "Which configured model root to write under. Must be one of\nthem — this component will not write outside the\ndirectories the operator nominated. Defaults to the first,\nwhich is what the `path_list` config type has promised\nsince M2.\n"
           },
           "subdirectory": {
             "anyOf": [
@@ -1274,7 +1380,7 @@
               }
             ],
             "title": "Runwhenready",
-            "description": "The operator asked for this model to be **run** when it\nlands, not merely fetched.\n\n**This component records it and never acts on it.** The\nlibrary does not launch anything \u2014 a launch is a profile, an\nengine and a runtime on some node's agent, and which node is\na question the library has no business answering. What this\nfield buys is that the *intent* outlives the browser tab\nthat expressed it: a 16 GB download takes long enough that\nthe person will close the laptop lid, and a console opening\nlater can see that a download was started in order to run\nsomething and carry on from there.\n\nExactly one console should carry on, which is what\n`POST /v1/downloads/{id}/claim` is for.\n",
+            "description": "The operator asked for this model to be **run** when it\nlands, not merely fetched.\n\n**This component records it and never acts on it.** The\nlibrary does not launch anything — a launch is a profile, an\nengine and a runtime on some node's agent, and which node is\na question the library has no business answering. What this\nfield buys is that the *intent* outlives the browser tab\nthat expressed it: a 16 GB download takes long enough that\nthe person will close the laptop lid, and a console opening\nlater can see that a download was started in order to run\nsomething and carry on from there.\n\nExactly one console should carry on, which is what\n`POST /v1/downloads/{id}/claim` is for.\n",
             "default": false
           },
           "filename": {
@@ -1287,7 +1393,7 @@
               }
             ],
             "title": "Filename",
-            "description": "Override the written name of the **single-file** case. Rarely\nwanted: the upstream name is what the operator recognises,\nwhat the library will call it, and what\n`Runtime.modelAlias` defaults to \u2014 plainly-named files are\nthe point. Rejected when `files` holds more than one entry,\nbecause renaming one shard of a set breaks the set.\n"
+            "description": "Override the written name of the **single-file** case. Rarely\nwanted: the upstream name is what the operator recognises,\nwhat the library will call it, and what\n`Runtime.modelAlias` defaults to — plainly-named files are\nthe point. Rejected when `files` holds more than one entry,\nbecause renaming one shard of a set breaks the set.\n"
           }
         },
         "type": "object",
@@ -1311,7 +1417,7 @@
           "cancelled"
         ],
         "title": "DownloadState",
-        "description": "Named phases rather than a percentage, following M1's engine\ninstall for the same reason: the phases fail differently and the\noperator needs to know which one they are in. A stall in\n`downloading` is the network, a stall in `verifying` is the\ndisk, and `verifying` *failing* is the one that means the bytes\nare wrong.\n\n* `queued` \u2014 accepted, waiting on `maxConcurrentDownloads`.\n* `resolving` \u2014 asking upstream for the commit, sizes and\n  digests. Where a gated repo's 401 surfaces.\n* `paused` \u2014 operator-stopped; the `.part` is kept and shows up\n  in the next scan as `incomplete_download`.\n* `cancelled` \u2014 operator-abandoned; the `.part` is removed.\n* `failed` \u2014 the retry budget is spent. `resume` runs the same\n  loop again."
+        "description": "Named phases rather than a percentage, following M1's engine\ninstall for the same reason: the phases fail differently and the\noperator needs to know which one they are in. A stall in\n`downloading` is the network, a stall in `verifying` is the\ndisk, and `verifying` *failing* is the one that means the bytes\nare wrong.\n\n* `queued` — accepted, waiting on `maxConcurrentDownloads`.\n* `resolving` — asking upstream for the commit, sizes and\n  digests. Where a gated repo's 401 surfaces.\n* `paused` — operator-stopped; the `.part` is kept and shows up\n  in the next scan as `incomplete_download`.\n* `cancelled` — operator-abandoned; the `.part` is removed.\n* `failed` — the retry budget is spent. `resume` runs the same\n  loop again."
       },
       "EngineKind": {
         "type": "string",
@@ -1323,7 +1429,7 @@
           "strata"
         ],
         "title": "EngineKind",
-        "description": "Which engine adapter constructs the argv and interprets\nreadiness. Deliberately a closed enum rather than a free string:\nan engine is supported exactly when an adapter exists for it,\nand without an adapter there is nothing that knows how to start\nit or tell when it is ready.\n\n`strata` is experimental. It launches Strata's Python HTTP\nserver and native engine together, and loads a model Strata\nprepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`\nnames that model's provenance file (`PreparedProvenance`), whose\n`entry` is Strata's own JSON configuration. A runtime declared\nbefore LS3 may name the JSON configuration itself; that still\nlaunches. It does not accept an arbitrary GGUF, and does not yet\nprepare one itself (LS5).\n\n`kev` drives upstream `python -m kev.serve` and loads Kev\ndecision checkpoints (`kev_checkpoint` format) \u2014 a decision\nmodel, not a chat model: its server speaks the System One\nprotocol and its companion driver serves `POST /v1/decide`,\nnever completions. Like vLLM it loads the model *before*\nbinding its port (read off `kev/serve.py` at the pinned commit\nand observed live 2026-09-22), so alive-and-refusing is\n`loading`; unlike every other engine it handles one request at\na time, which its driver advertises as a concurrency limit.\nIts bind is hardcoded to loopback upstream, which is the\nposture Eugene wants: the gateway is the authenticated front\ndoor.\n\n`llama_cpp` drives upstream `llama-server` and loads GGUF.\n`vllm` drives upstream `vllm serve` and loads safetensors.\n`mlx` drives upstream `mlx_lm.server` and loads MLX-format\nsafetensors, on Apple silicon only; not experimental since its\nrun on GitHub's macOS runners (A4, 2026-09-30). We never ship an engine \u2014 every\none of them is an upstream project we wrap and track.\n\nThey differ in far more than argv, and that is why readiness\nis per-adapter rather than one shared TCP check:\n`llama-server` answers `/health` while it loads and reports that\nit is loading, whereas vLLM binds its port *before* loading the\nmodel and refuses connections until the model is in memory \u2014 so\nfor minutes it is indistinguishable, over the network alone,\nfrom a process that died. `mlx_lm.server` is a third mechanism\nagain and the most awkward: it serves HTTP immediately, and at\nthe pinned release its `/health` answers a hardcoded\n`{\"status\": \"ok\"}` while the model is still loading on another\nthread, so **no read-only probe can tell loading from ready**.\nIts adapter proves residency by asking for one token, once per\nprocess, and only then treats the health endpoint as evidence.\n(Upstream `main` has since taught `/health` to answer 503\n`unavailable` while loading; the adapter reads that as loading\ntoo, so a future pin gets the cheap probe for free.) They\ndiffer in acquisition too: a llama.cpp build is fetched and\nverified by us, while vLLM and mlx-lm are Python packages the\noperator installs themselves. See `EngineAcquisition.policy`.\n\nLives here rather than on the agent because two components\nreference it: the agent's engines and runtimes, and a\nlibrary `ModelProfile`, which names the engine its launch flags\nare written for."
+        "description": "Which engine adapter constructs the argv and interprets\nreadiness. Deliberately a closed enum rather than a free string:\nan engine is supported exactly when an adapter exists for it,\nand without an adapter there is nothing that knows how to start\nit or tell when it is ready.\n\n`strata` is experimental. It launches Strata's Python HTTP\nserver and native engine together, and loads a model Strata\nprepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`\nnames that model's provenance file (`PreparedProvenance`), whose\n`entry` is Strata's own JSON configuration. A runtime declared\nbefore LS3 may name the JSON configuration itself; that still\nlaunches. It does not accept an arbitrary GGUF, and does not yet\nprepare one itself (LS5).\n\n`kev` drives upstream `python -m kev.serve` and loads Kev\ndecision checkpoints (`kev_checkpoint` format) — a decision\nmodel, not a chat model: its server speaks the System One\nprotocol and its companion driver serves `POST /v1/decide`,\nnever completions. Like vLLM it loads the model *before*\nbinding its port (read off `kev/serve.py` at the pinned commit\nand observed live 2026-09-22), so alive-and-refusing is\n`loading`; unlike every other engine it handles one request at\na time, which its driver advertises as a concurrency limit.\nIts bind is hardcoded to loopback upstream, which is the\nposture Eugene wants: the gateway is the authenticated front\ndoor.\n\n`llama_cpp` drives upstream `llama-server` and loads GGUF.\n`vllm` drives upstream `vllm serve` and loads safetensors.\n`mlx` drives upstream `mlx_lm.server` and loads MLX-format\nsafetensors, on Apple silicon only; not experimental since its\nrun on GitHub's macOS runners (A4, 2026-09-30). We never ship an engine — every\none of them is an upstream project we wrap and track.\n\nThey differ in far more than argv, and that is why readiness\nis per-adapter rather than one shared TCP check:\n`llama-server` answers `/health` while it loads and reports that\nit is loading, whereas vLLM binds its port *before* loading the\nmodel and refuses connections until the model is in memory — so\nfor minutes it is indistinguishable, over the network alone,\nfrom a process that died. `mlx_lm.server` is a third mechanism\nagain and the most awkward: it serves HTTP immediately, and at\nthe pinned release its `/health` answers a hardcoded\n`{\"status\": \"ok\"}` while the model is still loading on another\nthread, so **no read-only probe can tell loading from ready**.\nIts adapter proves residency by asking for one token, once per\nprocess, and only then treats the health endpoint as evidence.\n(Upstream `main` has since taught `/health` to answer 503\n`unavailable` while loading; the adapter reads that as loading\ntoo, so a future pin gets the cheap probe for free.) They\ndiffer in acquisition too: a llama.cpp build is fetched and\nverified by us, while vLLM and mlx-lm are Python packages the\noperator installs themselves. See `EngineAcquisition.policy`.\n\nLives here rather than on the agent because two components\nreference it: the agent's engines and runtimes, and a\nlibrary `ModelProfile`, which names the engine its launch flags\nare written for."
       },
       "GgufDetail": {
         "properties": {
@@ -1337,7 +1443,7 @@
               }
             ],
             "title": "Quantization",
-            "description": "Human-readable quant tier, e.g. `\"Q4_K_M\"`. The vocabulary\nthe operator's question is actually phrased in \u2014 \"Q3_K_S vs\n2Q_K_M? No one knows\" \u2014 and M3's guidance hangs off it.\n"
+            "description": "Human-readable quant tier, e.g. `\"Q4_K_M\"`. The vocabulary\nthe operator's question is actually phrased in — \"Q3_K_S vs\n2Q_K_M? No one knows\" — and M3's guidance hangs off it.\n"
           },
           "fileType": {
             "anyOf": [
@@ -1349,7 +1455,7 @@
               }
             ],
             "title": "Filetype",
-            "description": "Raw `general.file_type` enum value, reported alongside the\nlabel rather than instead of it. It **does** distinguish the\nK-quant mixtures (verified: 14 is `Q4_K_S`, 15 is `Q4_K_M`),\nso the label is machine-read rather than guessed from a\nfilename.\n\nReported raw because the quant families churn \u2014 imatrix\nvariants, MXFP4, whatever is next \u2014 and a reader will meet\nvalues it does not know. The rule for those is to surface\nthe number and the filename-derived label, never to map an\nunrecognised value onto a plausible neighbour: guidance\nbuilt on a guess is worse than no guidance.\n"
+            "description": "Raw `general.file_type` enum value, reported alongside the\nlabel rather than instead of it. It **does** distinguish the\nK-quant mixtures (verified: 14 is `Q4_K_S`, 15 is `Q4_K_M`),\nso the label is machine-read rather than guessed from a\nfilename.\n\nReported raw because the quant families churn — imatrix\nvariants, MXFP4, whatever is next — and a reader will meet\nvalues it does not know. The rule for those is to surface\nthe number and the filename-derived label, never to map an\nunrecognised value onto a plausible neighbour: guidance\nbuilt on a guess is worse than no guidance.\n"
           },
           "quantizationDisagrees": {
             "anyOf": [
@@ -1361,7 +1467,7 @@
               }
             ],
             "title": "Quantizationdisagrees",
-            "description": "True when the label derived from `fileType` and the label in\nthe filename are not the same. Both are then reported and\nneither is silently preferred, because either one can be the\nwrong one \u2014 a requantized file keeps its old name more often\nthan a metadata field is wrong, but not always.\n"
+            "description": "True when the label derived from `fileType` and the label in\nthe filename are not the same. Both are then reported and\nneither is silently preferred, because either one can be the\nwrong one — a requantized file keeps its old name more often\nthan a metadata field is wrong, but not always.\n"
           },
           "ggufVersion": {
             "anyOf": [
@@ -1386,7 +1492,7 @@
               }
             ],
             "title": "Shardcount",
-            "description": "Number of `\u2026-0000N-of-0000M.gguf` parts. 1 for a plain file.\nOnly the first is on the launch line; the rest are `shard`\nfiles.\n"
+            "description": "Number of `…-0000N-of-0000M.gguf` parts. 1 for a plain file.\nOnly the first is on the launch line; the rest are `shard`\nfiles.\n"
           },
           "vocabSize": {
             "anyOf": [
@@ -1412,7 +1518,7 @@
               }
             ],
             "title": "Expertbytes",
-            "description": "Bytes of mixture-of-experts expert tensors (names carrying\n`_exps`), summed from the tensor table that follows the KV\nblock: names, shapes and offsets, never a weight. 0 for a\ndense model. Null when the table was not read (a scan from\nbefore 2026-09-30, or a header cut short).\n\nThe number that tells a MoE model from a dense one of the\nsame size: on Qwen3-30B-A3B Q4_K_M it is 16.35 GiB of 17.28,\nand everything else is 0.93 GiB, so a small card holds all of\nthat plus the cache and llama.cpp moves only experts to system\nmemory (`docs/design/moe-aware-fit.md` \u00a70).\n"
+            "description": "Bytes of mixture-of-experts expert tensors (names carrying\n`_exps`), summed from the tensor table that follows the KV\nblock: names, shapes and offsets, never a weight. 0 for a\ndense model. Null when the table was not read (a scan from\nbefore 2026-09-30, or a header cut short).\n\nThe number that tells a MoE model from a dense one of the\nsame size: on Qwen3-30B-A3B Q4_K_M it is 16.35 GiB of 17.28,\nand everything else is 0.93 GiB, so a small card holds all of\nthat plus the cache and llama.cpp moves only experts to system\nmemory (`docs/design/moe-aware-fit.md` §0).\n"
           },
           "projectorPath": {
             "anyOf": [
@@ -1447,7 +1553,7 @@
               }
             ],
             "title": "Metadata",
-            "description": "Selected raw KV pairs, verbatim, minus the tokenizer arrays.\nAn escape hatch for the long tail \u2014 architecture-prefixed\nkeys grow with upstream, and a reader that only ever exposes\nthe fields it was written to understand goes blind on every\nmodel newer than itself.\n"
+            "description": "Selected raw KV pairs, verbatim, minus the tokenizer arrays.\nAn escape hatch for the long tail — architecture-prefixed\nkeys grow with upstream, and a reader that only ever exposes\nthe fields it was written to understand goes blind on every\nmodel newer than itself.\n"
           }
         },
         "type": "object",
@@ -1512,6 +1618,16 @@
               }
             ],
             "title": "Downloadid"
+          },
+          "preparation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparationIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,
@@ -1559,19 +1675,19 @@
         },
         "type": "object",
         "title": "KevCheckpointDetail",
-        "description": "Kev-checkpoint-specific metadata. Present iff `format` is\n`kev_checkpoint`. The point of recording it is\nreproducibility: a checkpoint is only half a runnable model \u2014\nthe loader downloads the named base separately \u2014 so an operator\nrestoring a node offline needs to know exactly which base\nweights, at which revision, the launch will ask for. The\nadapter, decision head, tokenizer and calibration/provenance\nfiles are all in `files` with their roles; the license rides the\ncheckpoint's own metadata on disk."
+        "description": "Kev-checkpoint-specific metadata. Present iff `format` is\n`kev_checkpoint`. The point of recording it is\nreproducibility: a checkpoint is only half a runnable model —\nthe loader downloads the named base separately — so an operator\nrestoring a node offline needs to know exactly which base\nweights, at which revision, the launch will ask for. The\nadapter, decision head, tokenizer and calibration/provenance\nfiles are all in `files` with their roles; the license rides the\ncheckpoint's own metadata on disk."
       },
       "LibraryModel": {
         "properties": {
           "id": {
             "type": "string",
             "title": "Id",
-            "description": "Stable handle for this model: the first 16 hex characters of\nthe SHA-256 of its normalized absolute path. Normalized\nmeans absolute, canonical separators, case-folded on\nWindows, and **symlinks left unresolved**.\n\nDerived rather than random so it survives restarts, since\nprofiles are keyed to it. **Opaque to callers** \u2014 the\nnormalization rules are fiddly enough that a client deriving\nit independently would sooner or later compute a handle the\nserver does not recognise and get an unexplained 404. Use\n`GET /v1/models?path=` instead.\n\nNot content addressing: no byte of the model is read to\nproduce it. Hashing 40 GB on every scan is not on the table,\nand a content-derived identity would change when nothing the\noperator did changed.\n"
+            "description": "Stable handle for this model: the first 16 hex characters of\nthe SHA-256 of its normalized absolute path. Normalized\nmeans absolute, canonical separators, case-folded on\nWindows, and **symlinks left unresolved**.\n\nDerived rather than random so it survives restarts, since\nprofiles are keyed to it. **Opaque to callers** — the\nnormalization rules are fiddly enough that a client deriving\nit independently would sooner or later compute a handle the\nserver does not recognise and get an unexplained 404. Use\n`GET /v1/models?path=` instead.\n\nNot content addressing: no byte of the model is read to\nproduce it. Hashing 40 GB on every scan is not on the table,\nand a content-derived identity would change when nothing the\noperator did changed.\n"
           },
           "path": {
             "type": "string",
             "title": "Path",
-            "description": "Absolute path, verbatim, in the operator's own layout \u2014 the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors, the provenance file\n(`<name>.eugene-prepared.json`) for `prepared`. This is what\ngoes on a runtime's `modelPath`.\n\n**A path on the host this library runs on** \u2014 inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n"
+            "description": "Absolute path, verbatim, in the operator's own layout — the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors, the provenance file\n(`<name>.eugene-prepared.json`) for `prepared`. This is what\ngoes on a runtime's `modelPath`.\n\n**A path on the host this library runs on** — inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n"
           },
           "root": {
             "anyOf": [
@@ -1583,7 +1699,7 @@
               }
             ],
             "title": "Root",
-            "description": "The configured root this model was found under. Two roots\ncan hold the same filename, so this is how the UI\ndisambiguates two entries that otherwise read alike \u2014 and\nhow it tells the operator which drive to go plug back in.\n"
+            "description": "The configured root this model was found under. Two roots\ncan hold the same filename, so this is how the UI\ndisambiguates two entries that otherwise read alike — and\nhow it tells the operator which drive to go plug back in.\n"
           },
           "format": {
             "$ref": "#/components/schemas/ModelFormat"
@@ -1591,7 +1707,7 @@
           "name": {
             "type": "string",
             "title": "Name",
-            "description": "The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to \u2014 so\nplainly-named files mean the obvious name is already the\nright one.\n"
+            "description": "The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n"
           },
           "displayName": {
             "anyOf": [
@@ -1619,7 +1735,7 @@
               }
             ],
             "title": "Sizebytes",
-            "description": "Total size of every file belonging to this model \u2014 all\nshards, and the projector when there is one. The number\nthat answers \"will this fit on the drive I am copying it\nto\", which is why it is a sum rather than the weights file\nalone.\n\nAbsent for `prepared`: the engine's own files are not read,\nso their size is not known, and the provenance file's few\nbytes are not the model's size.\n"
+            "description": "Total size of every file belonging to this model — all\nshards, and the projector when there is one. The number\nthat answers \"will this fit on the drive I am copying it\nto\", which is why it is a sum rather than the weights file\nalone.\n\nAbsent for `prepared`: the engine's own files are not read,\nso their size is not known, and the provenance file's few\nbytes are not the model's size.\n"
           },
           "fileCount": {
             "anyOf": [
@@ -1644,7 +1760,7 @@
               }
             ],
             "title": "Architecture",
-            "description": "Model architecture as the file declares it \u2014 `general.architecture`\nfor GGUF, `model_type` from `config.json` for safetensors.\nFree-form on purpose: new architectures ship constantly and\nan enum here would reject models that work fine.\n"
+            "description": "Model architecture as the file declares it — `general.architecture`\nfor GGUF, `model_type` from `config.json` for safetensors.\nFree-form on purpose: new architectures ship constantly and\nan enum here would reject models that work fine.\n"
           },
           "contextLength": {
             "anyOf": [
@@ -1657,7 +1773,7 @@
               }
             ],
             "title": "Contextlength",
-            "description": "Context length the **model** declares. Not what an engine\nwill serve \u2014 that depends on the launch flags and available\nmemory, and is reported by the agent as\n`RuntimeCapabilities.contextLength`. Both numbers are real\nand a UI that shows only this one tells a comfortable lie.\n"
+            "description": "Context length the **model** declares. Not what an engine\nwill serve — that depends on the launch flags and available\nmemory, and is reported by the agent as\n`RuntimeCapabilities.contextLength`. Both numbers are real\nand a UI that shows only this one tells a comfortable lie.\n"
           },
           "parameters": {
             "anyOf": [
@@ -1670,7 +1786,7 @@
               }
             ],
             "title": "Parameters",
-            "description": "Exact parameter count, when the format gives one. Safetensors\nheaders do (summed tensor shapes, from an ~11 KB read);\n**GGUF does not** \u2014 see `sizeLabel`. Optional because for\nmost local models it is genuinely unavailable, and a schema\nthat required it would be unfillable for every GGUF in\nexistence.\n"
+            "description": "Exact parameter count, when the format gives one. Safetensors\nheaders do (summed tensor shapes, from an ~11 KB read);\n**GGUF does not** — see `sizeLabel`. Optional because for\nmost local models it is genuinely unavailable, and a schema\nthat required it would be unfillable for every GGUF in\nexistence.\n"
           },
           "sizeLabel": {
             "anyOf": [
@@ -1682,7 +1798,7 @@
               }
             ],
             "title": "Sizelabel",
-            "description": "The author's own size label, e.g. `\"27B\"`\n(`general.size_label`). A display string, not a number, and\nnot always present or accurate \u2014 it is what the person who\nuploaded the file typed. For GGUF it is usually the only\nanswer available to \"how big is this model\".\n"
+            "description": "The author's own size label, e.g. `\"27B\"`\n(`general.size_label`). A display string, not a number, and\nnot always present or accurate — it is what the person who\nuploaded the file typed. For GGUF it is usually the only\nanswer available to \"how big is this model\".\n"
           },
           "capabilities": {
             "anyOf": [
@@ -1811,7 +1927,7 @@
               }
             ],
             "title": "Error",
-            "description": "Why this entry is `unreadable` \u2014 a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n"
+            "description": "Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n"
           }
         },
         "type": "object",
@@ -1823,7 +1939,7 @@
           "status"
         ],
         "title": "LibraryModel",
-        "description": "One launchable model on this host.\n\nThe format-independent facts are here; exactly one of `gguf`,\n`safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness \u2014 a\nquant tier is a GGUF concept and an exact parameter count is a\nsafetensors one, and flattening both into one object would\nproduce a schema half of whose fields are null for any given\nmodel."
+        "description": "One launchable model on this host.\n\nThe format-independent facts are here; exactly one of `gguf`,\n`safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness — a\nquant tier is a GGUF concept and an exact parameter count is a\nsafetensors one, and flattening both into one object would\nproduce a schema half of whose fields are null for any given\nmodel."
       },
       "MlxQuantization": {
         "properties": {
@@ -1856,7 +1972,7 @@
         },
         "type": "object",
         "title": "MlxQuantization",
-        "description": "Present when the directory's `config.json` carries an MLX-style\ntop-level `quantization` block \u2014 the marker `mlx_lm.convert`\nwrites and the one signal that distinguishes an MLX-converted\ndirectory from a vanilla HF safetensors export (which spells\nits quantization `quantization_config`, a different key).\nLoad-bearing for engine choice, because **safetensors alone\ndoes not prove MLX compatibility** and an MLX-quantized\ndirectory packs its weights as integer tensors that no other\nengine here can load.\n\nOne honest caveat, recorded rather than papered over: an\n*unquantized* MLX conversion carries no such block and reads as\na plain safetensors directory \u2014 absence means unknown, not\nincompatible. `parameters` for an MLX-quantized directory is the\nmodel's parameter count, recovered from the packed storage (each\nquantized module holds its `scales` times its group size); it\nis absent when a group size cannot be read. Until A4\n(2026-09-30) it counted packed storage elements instead, which\nread a 0.6B model as 93M."
+        "description": "Present when the directory's `config.json` carries an MLX-style\ntop-level `quantization` block — the marker `mlx_lm.convert`\nwrites and the one signal that distinguishes an MLX-converted\ndirectory from a vanilla HF safetensors export (which spells\nits quantization `quantization_config`, a different key).\nLoad-bearing for engine choice, because **safetensors alone\ndoes not prove MLX compatibility** and an MLX-quantized\ndirectory packs its weights as integer tensors that no other\nengine here can load.\n\nOne honest caveat, recorded rather than papered over: an\n*unquantized* MLX conversion carries no such block and reads as\na plain safetensors directory — absence means unknown, not\nincompatible. `parameters` for an MLX-quantized directory is the\nmodel's parameter count, recovered from the packed storage (each\nquantized module holds its `scales` times its group size); it\nis absent when a group size cannot be read. Until A4\n(2026-09-30) it counted packed storage elements instead, which\nread a 0.6B model as 93M."
       },
       "ModelCapabilities": {
         "properties": {
@@ -1870,7 +1986,7 @@
               }
             ],
             "title": "Chat",
-            "description": "Text generation \u2014 the default assumption for a causal model.\nFalse for an embedding model.\n"
+            "description": "Text generation — the default assumption for a causal model.\nFalse for an embedding model.\n"
           },
           "embedding": {
             "anyOf": [
@@ -1882,7 +1998,7 @@
               }
             ],
             "title": "Embedding",
-            "description": "The model is a dedicated embedding model (a pooling type in\nits metadata, or non-causal attention). Load-bearing rather\nthan informational: llama-server's own help says\n`--embedding` is \"for use only with dedicated embedding\nmodels\", and launching one of these as a chat model does not\nfail \u2014 it starts, serves, and returns nonsense.\n"
+            "description": "The model is a dedicated embedding model (a pooling type in\nits metadata, or non-causal attention). Load-bearing rather\nthan informational: llama-server's own help says\n`--embedding` is \"for use only with dedicated embedding\nmodels\", and launching one of these as a chat model does not\nfail — it starts, serves, and returns nonsense.\n"
           },
           "vision": {
             "anyOf": [
@@ -1918,7 +2034,7 @@
               }
             ],
             "title": "Decision",
-            "description": "A decision model: it answers typed questions with structured\nprobabilities through `POST /v1/systemone`, and it does not\nchat \u2014 `chat` is false whenever this is true, and offering\nit a conversation fails clearly instead of producing prose.\nTrue for a `kev_checkpoint`.\n"
+            "description": "A decision model: it answers typed questions with structured\nprobabilities through `POST /v1/systemone`, and it does not\nchat — `chat` is false whenever this is true, and offering\nit a conversation fails clearly instead of producing prose.\nTrue for a `kev_checkpoint`.\n"
           }
         },
         "type": "object",
@@ -1968,7 +2084,7 @@
           "other"
         ],
         "title": "ModelFileRole",
-        "description": "* `weights` \u2014 the file named on the launch line. Exactly one per\n  model: the single `.gguf`, the first shard of a split one, or\n  the primary safetensors file.\n* `shard` \u2014 the second through Nth part of a split model.\n* `projector` \u2014 a vision projector (`general.type: mmproj`),\n  which is why it is a role here and not a model of its own.\n* `config` / `tokenizer` / `index` \u2014 safetensors sidecars.\n* `other` \u2014 present in the model's directory, counted in\n  `sizeBytes`, not classified."
+        "description": "* `weights` — the file named on the launch line. Exactly one per\n  model: the single `.gguf`, the first shard of a split one, or\n  the primary safetensors file.\n* `shard` — the second through Nth part of a split model.\n* `projector` — a vision projector (`general.type: mmproj`),\n  which is why it is a role here and not a model of its own.\n* `config` / `tokenizer` / `index` — safetensors sidecars.\n* `other` — present in the model's directory, counted in\n  `sizeBytes`, not classified."
       },
       "ModelFormat": {
         "type": "string",
@@ -1979,7 +2095,7 @@
           "prepared"
         ],
         "title": "ModelFormat",
-        "description": "On-disk format of a model. A dimension of the data model rather\nthan an assumption (locked 2026-09-08), and the differences are\nload-bearing rather than cosmetic.\n\n* `gguf` \u2014 a single file, quantized, carrying its own metadata\n  and tokenizer. Large models may be **split** into\n  `\u2026-00001-of-0000N.gguf` shards, of which only the first is\n  named on a launch line. A multimodal GGUF ships its vision\n  projector as a separate file in the same directory, which is\n  not itself a model.\n* `safetensors` \u2014 a directory: `config.json` plus one or more\n  weight files plus tokenizer files. Unquantized in practice,\n  so **no quant tier** \u2014 a safetensors model is sized, not\n  tiered, and the quant fields exist only on the GGUF side.\n* `kev_checkpoint` \u2014 a directory holding a rank-limited LoRA\n  adapter (`adapter_config.json` + `adapter_model.safetensors`),\n  a pointer/decision head (`head.pt`), tokenizer files and\n  calibration/provenance artifacts (`provenance.json`), loaded\n  by Kev's own loader on top of a separately downloaded base\n  model named in the adapter config. Measured off the published\n  `jaredpalmer/kev-0.8b` checkpoint on 2026-09-22. **Not an\n  ordinary adapter**: a plain LoRA directory is skipped by the\n  scanner on purpose, and the decision head is what makes this\n  one a launchable model instead. Decision-only \u2014\n  `ModelCapabilities.decision`, never `chat`.\n* `prepared` \u2014 what one engine made for itself from another\n  model, in the engine's own format: Strata's expert pack,\n  lookup table and MTP helper, with its JSON configuration\n  (library-sources-and-engines.md \u00a74.5, Troy's L6). The library\n  does not read the engine's files; a small provenance file\n  beside them, `<name>.eugene-prepared.json`\n  (`PreparedProvenance`), names the engine, its entry file and\n  what it was made from, and is the model's path. Only the\n  engine it was prepared for loads it\n  (`ModelRequirement.preparedFor`).\n\nShared because it appears on both sides of a join: a library\nentry declares what a model *is*, and an engine's\n`ModelRequirement`s declare what it can *load*. The format is\nthe first term of that join, not the whole of it\n(library-sources-and-engines.md)."
+        "description": "On-disk format of a model. A dimension of the data model rather\nthan an assumption (locked 2026-09-08), and the differences are\nload-bearing rather than cosmetic.\n\n* `gguf` — a single file, quantized, carrying its own metadata\n  and tokenizer. Large models may be **split** into\n  `…-00001-of-0000N.gguf` shards, of which only the first is\n  named on a launch line. A multimodal GGUF ships its vision\n  projector as a separate file in the same directory, which is\n  not itself a model.\n* `safetensors` — a directory: `config.json` plus one or more\n  weight files plus tokenizer files. Unquantized in practice,\n  so **no quant tier** — a safetensors model is sized, not\n  tiered, and the quant fields exist only on the GGUF side.\n* `kev_checkpoint` — a directory holding a rank-limited LoRA\n  adapter (`adapter_config.json` + `adapter_model.safetensors`),\n  a pointer/decision head (`head.pt`), tokenizer files and\n  calibration/provenance artifacts (`provenance.json`), loaded\n  by Kev's own loader on top of a separately downloaded base\n  model named in the adapter config. Measured off the published\n  `jaredpalmer/kev-0.8b` checkpoint on 2026-09-22. **Not an\n  ordinary adapter**: a plain LoRA directory is skipped by the\n  scanner on purpose, and the decision head is what makes this\n  one a launchable model instead. Decision-only —\n  `ModelCapabilities.decision`, never `chat`.\n* `prepared` — what one engine made for itself from another\n  model, in the engine's own format: Strata's expert pack,\n  lookup table and MTP helper, with its JSON configuration\n  (library-sources-and-engines.md §4.5, Troy's L6). The library\n  does not read the engine's files; a small provenance file\n  beside them, `<name>.eugene-prepared.json`\n  (`PreparedProvenance`), names the engine, its entry file and\n  what it was made from, and is the model's path. Only the\n  engine it was prepared for loads it\n  (`ModelRequirement.preparedFor`).\n\nShared because it appears on both sides of a join: a library\nentry declares what a model *is*, and an engine's\n`ModelRequirement`s declare what it can *load*. The format is\nthe first term of that join, not the whole of it\n(library-sources-and-engines.md)."
       },
       "ModelProfile": {
         "properties": {
@@ -2142,7 +2258,7 @@
           "unreadable"
         ],
         "title": "ModelStatus",
-        "description": "* `present` \u2014 found on disk and readable.\n* `missing` \u2014 not found by the last scan, but profiles are\n  saved against it, so the entry survives. **Moving a model\n  produces this**, plus a new entry at the new path: nothing\n  guesses that a file which vanished from one root and appeared\n  in another is the same file, because a wrong guess silently\n  applies one model's tuning to another. The profiles stay here\n  to be copied across by hand.\n* `unreadable` \u2014 the files are there and something about them\n  did not work. `error` says what."
+        "description": "* `present` — found on disk and readable.\n* `missing` — not found by the last scan, but profiles are\n  saved against it, so the entry survives. **Moving a model\n  produces this**, plus a new entry at the new path: nothing\n  guesses that a file which vanished from one root and appeared\n  in another is the same file, because a wrong guess silently\n  applies one model's tuning to another. The profiles stay here\n  to be copied across by hand.\n* `unreadable` — the files are there and something about them\n  did not work. `error` says what."
       },
       "Operation": {
         "properties": {
@@ -2181,6 +2297,7 @@
               "checking",
               "awaiting-install",
               "installing",
+              "preparing",
               "settings",
               "launching",
               "loading",
@@ -2245,6 +2362,27 @@
               }
             ],
             "title": "Install"
+          },
+          "preparation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparationStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preparedFrom": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LibraryModel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The model a preparation started from; `model` is then the prepared one."
           },
           "profile": {
             "anyOf": [
@@ -2353,6 +2491,112 @@
         ],
         "title": "OperationList"
       },
+      "PreparationIntent": {
+        "properties": {
+          "engine": {
+            "$ref": "#/components/schemas/EngineKind"
+          },
+          "contextSize": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextsize",
+            "description": "The context the engine prepares for. Absent: the engine's own recommendation for the node."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "engine"
+        ],
+        "title": "PreparationIntent",
+        "description": "Prepare the model for an engine before running it (LS5). Asked for,\nnever implied: Run without it picks an engine that runs the model as it is."
+      },
+      "PreparationStatus": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "waiting",
+              "running",
+              "done",
+              "failed",
+              "cancelled"
+            ],
+            "title": "State"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step",
+            "description": "The recipe's own words for where it is."
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message",
+            "description": "Its last line of output."
+          },
+          "bytesWritten": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Byteswritten",
+            "description": "What it has written beside the model so far."
+          },
+          "bytesNeeded": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bytesneeded",
+            "description": "What it expects to write in all, when known."
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "description": "What the engine's own tools warned about."
+          }
+        },
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "title": "PreparationStatus",
+        "description": "Where a preparation is, as the engine's node reports it (LS5)."
+      },
       "PreparedDetail": {
         "properties": {
           "engine": {
@@ -2452,6 +2696,114 @@
         ],
         "title": "PreparedDetail",
         "description": "A prepared model's provenance, as its file\n(`PreparedProvenance`) says it, and what the library made of it.\nPresent iff `format` is `prepared` and the file could be read.\n\nThe engine's own files are not read (experimental-engines.md:\nprepared files stay usable without the library parsing them), so\na prepared model has no architecture, context, size or fit here:\nthe engine says what it loaded when it is ready\n(`RuntimeCapabilities`), and fit waits for the engine's own fit\nmodel (LS6). `files` lists the provenance file (`index`) and the\nentry file (`config`) when the library's host can see it."
+      },
+      "PreparedProvenance": {
+        "properties": {
+          "formatVersion": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Formatversion",
+            "description": "The layout of this file. Absent means 1, the only one so far."
+          },
+          "engine": {
+            "$ref": "#/components/schemas/EngineKind",
+            "description": "The engine it was prepared for. Only that engine loads it."
+          },
+          "entry": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Entry",
+            "description": "The engine's own entry file: for Strata, its JSON\nconfiguration, which names the pack, tokenizer and MTP files.\nRelative to the folder holding this file, or absolute. A\nrelative entry travels with the folder (through a node's\n`pathMappings`, like any model path); an absolute one is a\npath on the node that runs the model, used as written,\nbecause an engine's prepared files belong on that node's own\nfast drive.\n"
+          },
+          "recipe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipe",
+            "description": "The preparation that made it (`ModelPreparation.recipe`, e.g.\n`strata-prepare`). Absent: it was made outside Eugene and\nadopted as it is.\n"
+          },
+          "recipeVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipeversion",
+            "description": "The recipe's or engine's version that made it, e.g. Strata `v0.1.39`."
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparedSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "preparedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preparedat",
+            "description": "When this file was written."
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "engine",
+          "entry"
+        ],
+        "title": "PreparedProvenance",
+        "description": "The file `<name>.eugene-prepared.json` that makes an engine's\nprepared files a library model (`ModelFormat` `prepared`;\nlibrary-sources-and-engines.md §4.5, Troy's L6). A plain JSON\nfile in a Library folder, in the person's own layout like every\nother model file, and the prepared model's `LibraryModel.path`.\n\nWritten by the library's `POST /v1/models/prepared` when a person\nadopts a model prepared outside Eugene, and by a preparation job\n(LS5). Read by the library's scan, which lists a `prepared` model\nfrom it, and by the agent at every launch, which hands the engine\nits entry file. Nothing reads the engine's own files beyond what\nlaunching them needs: they stay usable without the library\nparsing them (experimental-engines.md).\n\nA reader keeps and ignores fields it does not know, so a newer\nEugene can add some; a `formatVersion` above the one it knows\nmeans the file was written by a newer Eugene, and the model is\nlisted as unreadable rather than guessed at."
+      },
+      "PreparedRequest": {
+        "properties": {
+          "lease": {
+            "type": "string",
+            "title": "Lease"
+          },
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+            "title": "Name"
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/PreparedProvenance",
+            "description": "`entry` is the engine's entry file as this library spells it, inside a Library folder."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "lease",
+          "name",
+          "provenance"
+        ],
+        "title": "PreparedRequest",
+        "description": "The engine's node has prepared the model: list it (LS5). The library\nwrites the provenance file beside the entry, as *Add a prepared model*\ndoes, and the operation goes on with the prepared model."
       },
       "PreparedSource": {
         "properties": {
@@ -2763,7 +3115,7 @@
               }
             ],
             "title": "Shardcount",
-            "description": "Number of `model-0000N-of-0000M.safetensors` files. Unlike\nGGUF, all of them are loaded together and none is \"the\"\nfile \u2014 the directory is the model.\n"
+            "description": "Number of `model-0000N-of-0000M.safetensors` files. Unlike\nGGUF, all of them are loaded together and none is \"the\"\nfile — the directory is the model.\n"
           },
           "repoId": {
             "anyOf": [
@@ -2804,7 +3156,7 @@
         },
         "type": "object",
         "title": "SafetensorsDetail",
-        "description": "Safetensors-specific metadata. Present iff `format` is\n`safetensors`. **No quant tier** \u2014 a safetensors model is\nsized, not tiered. The one exception to \"no quant fields\" is\n`mlxQuantization` below, which is a conversion marker rather\nthan a tier: it says which loader the directory was prepared\nfor, not how good the weights are."
+        "description": "Safetensors-specific metadata. Present iff `format` is\n`safetensors`. **No quant tier** — a safetensors model is\nsized, not tiered. The one exception to \"no quant fields\" is\n`mlxQuantization` below, which is a conversion marker rather\nthan a tier: it says which loader the directory was prepared\nfor, not how good the weights are."
       },
       "ValidationError": {
         "properties": {

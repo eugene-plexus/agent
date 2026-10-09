@@ -660,14 +660,22 @@ def test_the_engine_list_carries_accepts(tmp_path, monkeypatch) -> None:
 def test_the_engine_list_carries_what_each_adapter_publishes(tmp_path, monkeypatch) -> None:
     """LS4: the list is the adapter's, so it is there whether or not the
     engine is installed; an engine with none says nothing."""
-    from eugene_plexus_agent.engines import strata_models
+    from eugene_plexus_agent.engines import devices, strata_models
     from eugene_plexus_agent.runtimes import describe_engines
 
     monkeypatch.setenv("EUGENE_PLEXUS_AGENT_ENGINE_ROOT", str(tmp_path))
     monkeypatch.setenv("PATH", "")
+    # LS5: each preparation's disk, by setup's rule with this node's RAM.
+    monkeypatch.setattr(devices, "host_memory", lambda *a: (48 * 2**30, None))
     by_kind = {e.engine.value: e for e in describe_engines()}
     assert by_kind["strata"].available is False
-    assert by_kind["strata"].supportedModels == list(strata_models.SUPPORTED_MODELS)
+    listed = by_kind["strata"].supportedModels
+    assert [m.id for m in listed] == [m.id for m in strata_models.SUPPORTED_MODELS]
+    disk = {m.id: m.preparation.diskBytes for m in listed if m.preparation}
+    assert disk["IQ2_XS"] == 8_000_000_000  # 35.5 GB of experts and 10 to spare fit 48 GiB
+    assert disk["IQ3_S"] == 8_000_000_000 + 51_300_000_000  # 50.3 + 10 does not: low-RAM
+    assert disk["Q2_0"] == 48_000_000_000
+    assert disk["unsloth-UD-Q4_K_XL"] == 8_000_000_000  # a RAM budget, never the low-RAM file
     assert not by_kind["llama_cpp"].supportedModels
     wire = by_kind["strata"].model_dump(mode="json", exclude_none=True)["supportedModels"]
     assert wire[1]["source"] == {

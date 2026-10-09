@@ -524,6 +524,10 @@ class ModelRequirementAuthority(StrEnum):
     engine = 'engine'
 
 
+class Context(RootModel[int]):
+    root: int = Field(..., ge=1)
+
+
 class ModelPreparation(BaseModel):
     """
     A match that runs only after the engine prepares it (Strata builds
@@ -537,6 +541,15 @@ class ModelPreparation(BaseModel):
         ..., description="The adapter's name for the step, e.g. `strata-prepare`."
     )
     note: str | None = Field(None, description='What the step makes, in words.')
+    diskBytes: int | None = Field(
+        None,
+        description="About how much the preparation writes beside the files, by the\nengine's own rule on the node that reported it (LS5): set on an\nengine's `supportedModels`, where the model is known. Strata's\nsetup counts 8 GB, more when the node's RAM is short of the\nmodel's experts. The agent checks free space against it before\nthe preparation starts. Absent: not known.\n",
+        ge=0,
+    )
+    contexts: list[Context] | None = Field(
+        None,
+        description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
+    )
 
 
 class PreparedSource(BaseModel):

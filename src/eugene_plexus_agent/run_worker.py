@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -20,11 +22,14 @@ from fastapi import FastAPI, HTTPException
 
 from ._generated.models import RuntimeSpec
 from .admission import LibraryFitClient
+from .engines import adapter_for
 from .engines.devices import detect_devices
+from .model_paths import join_local, resolve_model_path
 from .node_work import launch_guard
+from .preparation import PreparationError, PreparationJobs, PreparationResult, Progress, Recipe
 from .routes import runtimes as actions
 from .runtime_context import NodeContext
-from .runtimes import describe_engines, installer_for
+from .runtimes import _configured_binary, describe_engines, installer_for
 
 log = logging.getLogger(__name__)
 
@@ -131,15 +136,122 @@ def _why_none(model: dict[str, Any], verdicts: list[dict[str, Any]], by_name: di
             how = acquisition.get("reason") or "is not installed here"
             words = [f"{v['engine']} {how}", manual.get("command"), manual.get("docsUrl")]
             parts.append(" ".join(filter(None, words)))
+        elif v["verdict"] == "after_preparation":
+            # Asked for, never implied (LS5, B54): name the action.
+            parts.append(
+                f"{v['engine']} can run it after preparing it: choose Prepare on the model's "
+                "Library page"
+            )
         else:
             parts.append(f"{v['engine']} {v['reason']}")
     name = model.get("name") or model["format"]
     return f"No installed or installable engine can run {name} on this node. " + "; ".join(parts)
 
 
+def _prepare_route(
+    model: dict[str, Any], verdicts: list[dict[str, Any]], by_name: dict, engine: str
+) -> dict[str, Any]:
+    """Where a run that asked for a preparation goes from checking (LS5): the
+    engine must prepare this model, and be here or installable here."""
+    name = model.get("name") or model["format"]
+    verdict = next((v for v in verdicts if v["engine"] == engine), None)
+    if verdict is None:
+        raise ValueError(f"This node has no engine {engine} to prepare {name}.")
+    if verdict["verdict"] != "after_preparation":
+        raise ValueError(
+            f"{engine} does not prepare {name}: {verdict.get('reason') or verdict['verdict']}"
+        )
+    if verdict["available"]:
+        return {"step": "preparing", "engine": engine}
+    acquisition = by_name.get(engine, {}).get("acquisition") or {}
+    if acquisition.get("installable"):
+        return {"step": "awaiting-install", "engine": engine}
+    how = acquisition.get("reason") or "is not installed here and cannot be installed by Eugene"
+    raise ValueError(f"{engine} would prepare {name}, but {how}.")
+
+
 class NodeActions:
     def __init__(self, app: FastAPI) -> None:
         self.app = app
+        # On the app, so uninstalling an engine can see a preparation using it.
+        jobs = getattr(app.state, "preparations", None)
+        if not isinstance(jobs, PreparationJobs):
+            jobs = app.state.preparations = PreparationJobs()
+        self.preparations: PreparationJobs = jobs
+
+    async def prepare(self, job: dict[str, Any]) -> Progress:
+        """The operation's preparation: planned and started (or waiting for
+        another) on first sight, its progress after (LS5)."""
+        progress = self.preparations.poll(job["id"])
+        if progress is not None:
+            return progress
+        wanted = job["intent"]["preparation"]
+        kind = actions._engine_kind(wanted["engine"])
+        adapter = adapter_for(kind)
+        if adapter is None:
+            raise ValueError(f"This agent has no engine {wanted['engine']}")
+        model = job["model"]
+        context = NodeContext(self.app)
+        await actions.refresh_library_folders(context)
+        rules = actions.effective_rules_for(context)
+        root = model.get("root")
+        if not root:
+            raise ValueError(f"The library did not say which Library folder holds {model['name']}.")
+        folder = resolve_model_path(root, rules).local_path
+        local = resolve_model_path(model["path"], rules).local_path
+        if not await asyncio.to_thread(Path(folder).is_dir):
+            # Said as what it is, not as a missing model file further down.
+            where = root if folder == root else f"{root} (here {folder})"
+            raise ValueError(
+                f"This node cannot reach the Library folder {where}: give the folder a "
+                "mount for this node under Library, Folders, then prepare it again."
+            )
+        state = self.app.state.agent_state
+        binary = await asyncio.to_thread(
+            adapter.discover, configured=_configured_binary(adapter, state.get_config)
+        )
+        if binary is None:
+            raise ValueError(f"{wanted['engine']} is not installed on this node.")
+
+        def plan() -> Recipe:
+            return adapter.plan_preparation(
+                binary=binary,
+                folder=Path(folder),
+                model=Path(local),
+                source_path=model["path"],
+                context=wanted.get("contextSize"),
+            )
+
+        try:
+            recipe = await asyncio.to_thread(plan)
+        except PreparationError as exc:
+            raise ValueError(str(exc)) from exc
+        return self.preparations.start(job["id"], recipe, engine=kind.value)
+
+    def prepared_body(self, job: dict[str, Any], result: PreparationResult) -> dict[str, Any]:
+        """`POST /v1/run-operations/{id}/prepared`: the entry as the library
+        spells it (under the Library folder it was written into), and its
+        provenance."""
+        root: str = job["model"]["root"]
+        rules = actions.effective_rules_for(NodeContext(self.app))
+        folder = resolve_model_path(root, rules).local_path
+        try:
+            inside = Path(os.path.relpath(result.entry, folder))
+        except ValueError as exc:  # another drive
+            raise ValueError(f"{result.entry} is not under the Library folder {folder}") from exc
+        if inside.parts[:1] == ("..",) or inside.is_absolute():
+            raise ValueError(f"{result.entry} is not under the Library folder {folder}")
+        entry = join_local(root, inside.parts)
+        return {
+            "name": result.name,
+            "provenance": {
+                "engine": job["intent"]["preparation"]["engine"],
+                "entry": entry,
+                "recipe": result.recipe,
+                "recipeVersion": result.recipe_version,
+                "source": result.source,
+            },
+        }
 
     async def engines(self) -> list[dict[str, Any]]:
         found = await asyncio.to_thread(
@@ -279,6 +391,10 @@ class RunWorker:
         listing = await library.operation_request(
             "GET", "/v1/run-operations/assigned", params=params
         )
+        # A preparation whose operation was cancelled (or ended) stops (B53).
+        self.actions.preparations.cancel_except(
+            {o["id"] for o in listing.get("operations", []) if o.get("step") == "preparing"}
+        )
         for brief in listing.get("operations", [])[:128]:
             base = f"/v1/run-operations/{quote(brief['id'], safe='')}"
             try:
@@ -304,6 +420,7 @@ class RunWorker:
                         "checking": "check",
                         "awaiting-install": "install",
                         "installing": "install",
+                        "preparing": "prepare",
                         "settings": "settings",
                         "launching": "launch",
                         "loading": "load",
@@ -330,6 +447,9 @@ class RunWorker:
             engines = await self.actions.engines()
             by_name = {e["engine"]: e for e in engines}
             verdicts = await judge(library, model, engines)
+            preparation = (job.get("intent") or {}).get("preparation")
+            if preparation:
+                return _prepare_route(model, verdicts, by_name, preparation["engine"])
             selected = next(
                 (v for v in verdicts if v["available"] and v["verdict"] in _RUNNABLE), None
             )
@@ -358,7 +478,10 @@ class RunWorker:
             }
         if step == "installing":
             install = await self.actions.install(engine, previous=job.get("install"))
-            return {"step": "settings" if install is None else "installing", "install": install}
+            after = "preparing" if (job.get("intent") or {}).get("preparation") else "settings"
+            return {"step": after if install is None else "installing", "install": install}
+        if step == "preparing":
+            return await self._prepare(library, base, job, params)
         if step == "settings":
             context = await self.actions.context_size(library, model, engine)
             await library.operation_request(
@@ -394,6 +517,41 @@ class RunWorker:
                 "runtimeStatus": result["status"],
             }
         raise ValueError(f"Unsupported run stage {step}")
+
+    async def _prepare(
+        self, library: LibraryFitClient, base: str, job: dict[str, Any], params: dict[str, str]
+    ) -> dict[str, Any]:
+        """The `preparing` step (LS5): start or follow the node's job; once it
+        is done the library lists the prepared model and the run goes on
+        with it."""
+        if job.get("preparedFrom") is not None:
+            # Listed already; only the checkpoint after it was lost.
+            self.actions.preparations.forget(job["id"])
+            return {"step": "settings"}
+        progress = await self.actions.prepare(job)
+        status = progress.snapshot()
+        if not progress.finished:
+            return {"step": "preparing", "preparation": status}
+        self.actions.preparations.forget(job["id"])
+        if progress.state != "done" or progress.result is None:
+            raise ValueError(progress.error or "The preparation stopped without saying why.")
+        body = self.actions.prepared_body(job, progress.result)
+        try:
+            await library.operation_request(
+                "POST", base + "/prepared", params=params, json={**body, "lease": job["lease"]}
+            )
+        except httpx.HTTPStatusError as exc:
+            if not 400 <= exc.response.status_code < 500:
+                raise
+            # The library's own words: the file it would not write, and why.
+            try:
+                detail = exc.response.json().get("detail")
+            except ValueError:
+                detail = None
+            raise ValueError(
+                f"The library could not list the prepared model: {detail or exc}"
+            ) from exc
+        return {"step": "settings", "preparation": status}
 
     async def run_forever(self) -> None:
         while True:

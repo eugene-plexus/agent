@@ -68,6 +68,7 @@ from ..engines.strata import StrataAdapter
 from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, resolve_model_path, rules_from_config
 from ..node_work import runtime_launch
+from ..preparation import PreparationJobs
 from ..reservations import ReservationLedger
 from ..runtime_context import RuntimeContext
 from ..runtimes import (
@@ -612,6 +613,16 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
             title="Engine is in use",
             detail="Finish or cancel installation and stop its runtimes first. "
             + ", ".join(active),
+        )
+    preparations = getattr(request.app.state, "preparations", None)
+    if isinstance(preparations, PreparationJobs) and preparations.busy_for(kind.value):
+        # Its own tools are preparing a model (LS5, B52).
+        raise _problem(
+            code=409,
+            slug="engine-in-use",
+            title="Engine is in use",
+            detail="It is preparing a model. Let the preparation finish, or cancel its run "
+            "operation, first.",
         )
     adapter = adapter_for(kind)
     assert adapter is not None

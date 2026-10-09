@@ -27,7 +27,9 @@ from .._generated.models import (
     PreparedProvenance,
     RuntimeCapabilities,
     RuntimeSpec,
+    SupportedModel,
 )
+from ..preparation import Recipe
 from ..supervisor import SpawnPlanError
 from .base import (
     PREPARED_SUFFIX,
@@ -40,7 +42,7 @@ from .base import (
     default_model_alias,
     probe_client,
 )
-from .strata_models import PREPARATION, STRATA_FILES, SUPPORTED_MODELS
+from .strata_models import PREPARATION, STRATA_FILES, SUPPORTED_MODELS, supported_here
 
 VERSION = "v0.1.39"
 COMMIT = "6f32ec070f23ced9f50e704d854d775da52591ab"
@@ -239,6 +241,39 @@ class StrataAdapter(EngineAdapter):
     #: What upstream's setup offers, as files on the hub (LS4).
     supported_models = SUPPORTED_MODELS
     experimental = True
+
+    def supported_models_here(self) -> tuple[SupportedModel, ...]:
+        """Each preparation's disk by setup's own rule with this node's RAM (B51)."""
+        from .devices import host_memory
+
+        total, _available = host_memory()
+        return supported_here(total)
+
+    def plan_preparation(
+        self,
+        *,
+        binary: DiscoveredBinary,
+        folder: Path,
+        model: Path,
+        source_path: str,
+        context: int | None,
+    ) -> Recipe:
+        """Upstream's setup, into `Strata-data` at the top of the Library
+        folder (B43, B45); see `strata_prepare`."""
+        from .devices import host_memory
+        from .strata_prepare import DATA_FOLDER, main_gpu, plan
+
+        total, _available = host_memory()
+        return plan(
+            root=binary.path.resolve().parent.parent,
+            gguf=model,
+            data_dir=folder / DATA_FOLDER,
+            source_path=source_path,
+            context=context,
+            ram_bytes=total,
+            gpu=main_gpu(),
+        )
+
     answers_while_loading = False
     startup_budget_seconds = 900.0
 
