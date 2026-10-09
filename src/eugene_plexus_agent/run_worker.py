@@ -48,6 +48,93 @@ def runtime_spec(model: dict[str, Any], profile: dict[str, Any], *, start: bool)
     )
 
 
+_RUNNABLE = ("runs", "may_run")
+
+
+def could_have_here(engine: dict[str, Any]) -> bool:
+    """The console's `offeredOnThisNode`, for an engine not installed: Eugene
+    installs it itself, or it is installable, or the agent wrote an install
+    command for this hardware. MLX on Windows is none of these."""
+    acquisition = engine.get("acquisition") or {}
+    return (
+        acquisition.get("policy") != "manual"
+        or bool(acquisition.get("installable"))
+        or bool((acquisition.get("manualInstall") or {}).get("command"))
+    )
+
+
+def eligibility_engine(engine: dict[str, Any]) -> dict[str, Any]:
+    """An engine as `POST /v1/eligibility` takes it. An agent older than
+    `accepts` reported only formats; those are whole rules of their own."""
+    accepts = engine.get("accepts")
+    if accepts is None:
+        accepts = [{"format": f} for f in engine.get("modelFormats") or []]
+    return {
+        "engine": engine["engine"],
+        "available": bool(engine.get("available")),
+        "installable": not engine.get("available") and could_have_here(engine),
+        "experimental": bool(engine.get("experimental")),
+        "accepts": accepts,
+    }
+
+
+def _by_format(model: dict[str, Any], engines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Verdicts as a library older than `/v1/eligibility` allowed: the format,
+    and the one MLX rule. Only for a root whose library lags this agent."""
+    marked = (model.get("safetensors") or {}).get("mlxQuantization") is not None
+    out = []
+    for e in engines:
+        fits = model["format"] in (e.get("modelFormats") or []) and (
+            not marked or e["engine"] == "mlx"
+        )
+        out.append(
+            {
+                "engine": e["engine"],
+                "available": bool(e.get("available")),
+                "verdict": "runs" if fits else "no",
+                "reason": "runs it as it is" if fits else f"does not load {model['format']}",
+            }
+        )
+    return sorted(out, key=lambda v: (not v["available"], v["verdict"] != "runs"))
+
+
+async def judge(
+    library: LibraryFitClient, model: dict[str, Any], engines: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Every engine's verdict on `model`, best first, from the library: the
+    one judge (library-sources-and-engines.md, LS1)."""
+    try:
+        answer = await library.operation_request(
+            "POST",
+            "/v1/eligibility",
+            json={"models": [model["id"]], "engines": [eligibility_engine(e) for e in engines]},
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
+        return _by_format(model, engines)
+    found = (answer or {}).get("models") or []
+    if not found:
+        raise ValueError(f"The library no longer knows {model.get('name') or model['id']}.")
+    verdicts: list[dict[str, Any]] = found[0]["engines"]
+    return verdicts
+
+
+def _why_none(model: dict[str, Any], verdicts: list[dict[str, Any]], by_name: dict) -> str:
+    parts = []
+    for v in verdicts:
+        acquisition = by_name.get(v["engine"], {}).get("acquisition") or {}
+        manual = acquisition.get("manualInstall") or {}
+        if v["verdict"] in _RUNNABLE:
+            how = acquisition.get("reason") or "is not installed here"
+            words = [f"{v['engine']} {how}", manual.get("command"), manual.get("docsUrl")]
+            parts.append(" ".join(filter(None, words)))
+        else:
+            parts.append(f"{v['engine']} {v['reason']}")
+    name = model.get("name") or model["format"]
+    return f"No installed or installable engine can run {name} on this node. " + "; ".join(parts)
+
+
 class NodeActions:
     def __init__(self, app: FastAPI) -> None:
         self.app = app
@@ -236,41 +323,28 @@ class RunWorker:
     ) -> dict[str, Any]:
         step, model, engine = job["step"], job["model"], job["engine"]
         if step == "checking":
-            engines = [
-                e
-                for e in await self.actions.engines()
-                if model["format"] in (e.get("modelFormats") or [])
-            ]
-            if (model.get("safetensors") or {}).get("mlxQuantization") is not None:
-                engines = [e for e in engines if e["engine"] == "mlx"]
-            selected = next((e for e in engines if e.get("available")), None)
+            # The library judges (LS1); its verdicts come best first:
+            # installed before not, runs before may_run, then preference.
+            engines = await self.actions.engines()
+            by_name = {e["engine"]: e for e in engines}
+            verdicts = await judge(library, model, engines)
+            selected = next(
+                (v for v in verdicts if v["available"] and v["verdict"] in _RUNNABLE), None
+            )
             if selected:
                 return {"step": "settings", "engine": selected["engine"]}
             selected = next(
-                (e for e in engines if (e.get("acquisition") or {}).get("installable")), None
+                (
+                    v
+                    for v in verdicts
+                    if not v["available"]
+                    and v["verdict"] in _RUNNABLE
+                    and (by_name[v["engine"]].get("acquisition") or {}).get("installable")
+                ),
+                None,
             )
             if selected is None:
-                reasons = "; ".join(
-                    " ".join(
-                        filter(
-                            None,
-                            [
-                                (e.get("acquisition") or {}).get("reason") or e["engine"],
-                                ((e.get("acquisition") or {}).get("manualInstall") or {}).get(
-                                    "command"
-                                ),
-                                ((e.get("acquisition") or {}).get("manualInstall") or {}).get(
-                                    "docsUrl"
-                                ),
-                            ],
-                        )
-                    )
-                    for e in engines
-                )
-                raise ValueError(
-                    f"No installed or installable engine can load {model['format']} "
-                    f"on this node. {reasons}"
-                )
+                raise ValueError(_why_none(model, verdicts, by_name))
             return {"step": "awaiting-install", "engine": selected["engine"]}
         if step == "awaiting-install":
             return {

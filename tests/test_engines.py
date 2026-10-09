@@ -624,3 +624,26 @@ def test_projector_uses_curated_flags_with_spaces(adapter, binary):
     )
     assert argv[argv.index("--mmproj") + 1] == "/models/my vision/mmproj.gguf"
     assert "--no-mmproj-offload" in argv
+
+
+def test_every_adapter_declares_what_it_accepts_and_old_formats_agree() -> None:
+    """`modelFormats` stays for consoles older than `accepts` (LS1): it is
+    the formats needing no preparation, so an older console never offers
+    Strata for every GGUF."""
+    from eugene_plexus_agent.engines import ADAPTERS
+
+    for kind, adapter in ADAPTERS.items():
+        assert adapter.accepts, f"{kind.value} declares nothing it accepts"
+        plain = {r.format for r in adapter.accepts if r.preparation is None}
+        assert set(adapter.model_formats) == plain, kind.value
+
+
+def test_the_engine_list_carries_accepts() -> None:
+    from eugene_plexus_agent.runtimes import describe_engines
+
+    by_kind = {e.engine.value: e for e in describe_engines()}
+    strata = by_kind["strata"].accepts or []
+    assert [r.architectures for r in strata] == [["qwen4exp"]]
+    assert strata[0].preparation is not None
+    vllm = by_kind["vllm"].accepts or []
+    assert vllm[0].mlxQuantization is not None and vllm[0].authority is not None

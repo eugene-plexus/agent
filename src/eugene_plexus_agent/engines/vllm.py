@@ -42,7 +42,10 @@ from .._generated.models import (
     FrameworkAccelerator,
     HostAccelerator,
     ManualInstall,
+    MlxQuantizationRule,
     ModelFormat,
+    ModelRequirement,
+    ModelRequirementAuthority,
     Origin,
     Os,
     Policy,
@@ -126,6 +129,17 @@ class VllmAdapter(EngineAdapter):
     # Listing `gguf` here would light up a launch button across the whole
     # GGUF population llama.cpp already serves properly.
     model_formats = (ModelFormat.safetensors,)
+    #: Not an MLX-quantized folder (integer-packed weights only MLX reads);
+    #: whether it knows the architecture, only vLLM's registry says, at load.
+    accepts = (
+        ModelRequirement(
+            format=ModelFormat.safetensors,
+            mlxQuantization=MlxQuantizationRule.forbidden,
+            authority=ModelRequirementAuthority.engine,
+            preference=20,
+            note="vLLM checks the architecture when it loads",
+        ),
+    )
 
     # The load-bearing difference from llama-server. vLLM binds its
     # listening socket before the engine initialises (upstream issue

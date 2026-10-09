@@ -13,7 +13,15 @@ from pathlib import Path
 
 import httpx
 
-from .._generated.models import ConfigSchema, EngineKind, RuntimeCapabilities, RuntimeSpec
+from .._generated.models import (
+    ConfigSchema,
+    EngineKind,
+    ModelFormat,
+    ModelPreparation,
+    ModelRequirement,
+    RuntimeCapabilities,
+    RuntimeSpec,
+)
 from ..supervisor import SpawnPlanError
 from .base import (
     DiscoveredBinary,
@@ -157,6 +165,20 @@ class StrataAdapter(EngineAdapter):
     binary_name = "strata-server"  # never mistake an arbitrary server.py on PATH for Strata
     configured_binary_key = "strataServer"
     model_formats = ()  # prepared configs, not arbitrary GGUF files from the Library
+    #: Qwen3.8-Flash-Next's GGUFs (`general.architecture` qwen4exp, read off
+    #: ISTA-DASLab's repo 2026-10-09), once Strata has prepared them. Its
+    #: prepared configs become Library models in LS3.
+    accepts = (
+        ModelRequirement(
+            format=ModelFormat.gguf,
+            architectures=["qwen4exp"],
+            preparation=ModelPreparation(
+                recipe="strata-prepare",
+                note="an expert pack, a lookup table and an MTP helper",
+            ),
+            preference=50,
+        ),
+    )
     experimental = True
     answers_while_loading = False
     startup_budget_seconds = 900.0

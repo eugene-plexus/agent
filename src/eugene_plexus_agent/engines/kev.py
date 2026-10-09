@@ -62,6 +62,7 @@ from .._generated.models import (
     HostAccelerator,
     ManualInstall,
     ModelFormat,
+    ModelRequirement,
     Origin,
     Policy,
     PythonEngine,
@@ -117,6 +118,7 @@ class KevAdapter(EngineAdapter):
     binary_name = "python"
 
     model_formats = (ModelFormat.kev_checkpoint,)
+    accepts = (ModelRequirement(format=ModelFormat.kev_checkpoint, preference=10),)
 
     #: Measured shape: the model (and on a first run, the base-model
     #: download) completes before the port binds, so a starting Kev is

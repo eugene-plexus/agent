@@ -33,6 +33,7 @@ from .._generated.models import (
     HostAccelerator,
     ManualInstall,
     ModelFormat,
+    ModelRequirement,
     Origin,
     Policy,
     PythonEngine,
@@ -171,6 +172,13 @@ class EngineAdapter(abc.ABC):
     #: support on the library would give the library a copy of it, and
     #: the copy would be the one that went stale.
     model_formats: tuple[ModelFormat, ...]
+
+    #: What this engine loads, as data the library judges
+    #: (`POST /v1/eligibility`; library-sources-and-engines.md, LS1).
+    #: Finer than `model_formats`, which stays for older consoles and is
+    #: the formats of the requirements that need no preparation (a test
+    #: holds the two together).
+    accepts: tuple[ModelRequirement, ...] = ()
 
     #: Whether the engine answers HTTP while its model loads.
     #:

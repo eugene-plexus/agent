@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from eugene_plexus_agent.companions import companion_name
@@ -93,27 +94,74 @@ async def test_a_new_approved_run_can_retry_an_old_failed_install(app, monkeypat
     assert attempts == ["llama_cpp"]
 
 
-@pytest.mark.asyncio
-async def test_worker_preserves_mlx_quantization_compatibility(app):
-    class FakeActions(NodeActions):
-        async def engines(self):
-            return [
-                {"engine": e, "available": True, "modelFormats": ["safetensors"]}
-                for e in ["vllm", "mlx"]
-            ]
+MLX_MODEL = {**MODEL, "format": "safetensors", "safetensors": {"mlxQuantization": {"bits": 4}}}
 
-    worker = RunWorker(app, node_actions=FakeActions(app))
-    job = {
-        "step": "checking",
-        "engine": None,
-        "model": {
-            **MODEL,
-            "format": "safetensors",
-            "safetensors": {"mlxQuantization": {"bits": 4}},
-        },
-    }
-    result = await worker.advance(None, "/unused", job, {})
+
+class _BothSafetensorsEngines(NodeActions):
+    async def engines(self):
+        return [
+            {"engine": e, "available": True, "modelFormats": ["safetensors"]}
+            for e in ["vllm", "mlx"]
+        ]
+
+
+class _Judge:
+    """A library that answers `POST /v1/eligibility` with given verdicts."""
+
+    def __init__(self, verdicts=None, *, status=None):
+        self.verdicts, self.status, self.asked = verdicts, status, []
+
+    async def operation_request(self, method, path, **kwargs):
+        self.asked.append((method, path, kwargs.get("json")))
+        if self.status:
+            request = httpx.Request(method, "http://library" + path)
+            raise httpx.HTTPStatusError(
+                "refused", request=request, response=httpx.Response(self.status, request=request)
+            )
+        return {"models": [{"modelId": "m", "level": "works_here", "engines": self.verdicts}]}
+
+
+def _verdict(engine, verdict, *, available=True, reason="runs it as it is"):
+    return {"engine": engine, "verdict": verdict, "available": available, "reason": reason}
+
+
+@pytest.mark.asyncio
+async def test_run_takes_the_engine_the_library_judges_best(app):
+    # The MLX rule lives in the library now (LS1); Run follows its order.
+    library = _Judge([_verdict("mlx", "runs"), _verdict("vllm", "no", reason="cannot load MLX")])
+    worker = RunWorker(app, node_actions=_BothSafetensorsEngines(app))
+    job = {"step": "checking", "engine": None, "model": MLX_MODEL}
+    result = await worker.advance(library, "/unused", job, {})
     assert result == {"step": "settings", "engine": "mlx"}
+    method, path, body = library.asked[0]
+    assert (method, path, body["models"]) == ("POST", "/v1/eligibility", ["m"])
+    # An engine reported without `accepts` is judged on its formats alone.
+    assert body["engines"][0]["accepts"] == [{"format": "safetensors"}]
+
+
+@pytest.mark.asyncio
+async def test_a_library_older_than_eligibility_keeps_the_mlx_rule(app):
+    # A container root updated after its workers answers 404 (2026-10-09).
+    worker = RunWorker(app, node_actions=_BothSafetensorsEngines(app))
+    job = {"step": "checking", "engine": None, "model": MLX_MODEL}
+    result = await worker.advance(_Judge(status=404), "/unused", job, {})
+    assert result == {"step": "settings", "engine": "mlx"}
+
+
+@pytest.mark.asyncio
+async def test_when_nothing_can_run_it_each_engine_says_why(app):
+    library = _Judge(
+        [
+            _verdict("vllm", "no", reason="cannot load MLX-quantized weights; only MLX reads them"),
+            _verdict("mlx", "runs", available=False),
+        ]
+    )
+    worker = RunWorker(app, node_actions=_BothSafetensorsEngines(app))
+    job = {"step": "checking", "engine": None, "model": MLX_MODEL}
+    with pytest.raises(ValueError) as refused:
+        await worker.advance(library, "/unused", job, {})
+    assert "vllm cannot load MLX-quantized weights" in str(refused.value)
+    assert "mlx is not installed here" in str(refused.value)
 
 
 @pytest.mark.asyncio

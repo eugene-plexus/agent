@@ -24,6 +24,7 @@ from .._generated.models import (
     EngineKind,
     HostAccelerator,
     ModelFormat,
+    ModelRequirement,
     Os,
     RuntimeCapabilities,
     RuntimeSpec,
@@ -136,6 +137,7 @@ class LlamaCppAdapter(EngineAdapter):
     # instead; the UI joins the two lists to decide which engine a
     # launch button offers.
     model_formats = (ModelFormat.gguf,)
+    accepts = (ModelRequirement(format=ModelFormat.gguf, preference=10),)
 
     # llama-server answers `/health` from the moment its socket is up
     # (503 + "loading model" while the weights are read), so readiness

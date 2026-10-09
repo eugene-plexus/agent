@@ -87,7 +87,10 @@ from .._generated.models import (
     EngineKind,
     HostAccelerator,
     ManualInstall,
+    MlxQuantizationRule,
     ModelFormat,
+    ModelRequirement,
+    ModelRequirementAuthority,
     Origin,
     Os,
     Policy,
@@ -178,6 +181,21 @@ class MlxAdapter(EngineAdapter):
     #: conversion; the library's `mlxQuantization` marker is the
     #: positive signal for a converted directory.
     model_formats = (ModelFormat.safetensors,)
+    #: An MLX-quantized folder outright; a plain Hugging Face folder only if
+    #: mlx-lm knows its architecture, which a load tells (A4, 2026-09-30).
+    accepts = (
+        ModelRequirement(
+            format=ModelFormat.safetensors,
+            mlxQuantization=MlxQuantizationRule.required,
+            preference=10,
+        ),
+        ModelRequirement(
+            format=ModelFormat.safetensors,
+            authority=ModelRequirementAuthority.engine,
+            preference=30,
+            note="mlx-lm checks the architecture when it loads",
+        ),
+    )
 
     #: True, and honestly so: the HTTP server really does answer while
     #: the model loads. This is NOT vLLM's case dressed differently —
