@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "files": {
     "contracts/run-operations.json": {
-      "sha256": "d1b4d9979a5081a4bdaf2ed3a40cc80fe81da6ed7f65aeb359945a2a05ff6b77"
+      "sha256": "03214360873e72b21e4ad4a43c58af851c9810a3220d36240f76a5fc6d137760"
     },
     "scripts/check-vendored.py": {
       "sha256": "e9427b74fb4194ecd1df1abf1d510a3df18606e3c07a2a60043e74bba7422d11"

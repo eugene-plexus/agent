@@ -279,6 +279,11 @@ class BackendKind(StrEnum):
     /v1/speak` to its text-to-speech route and `POST /v1/transcribe` to
     its speech-to-text route.
 
+    `gemini_api` is Google's own Gemini API (`generateContent`, keyed by
+    `x-goog-api-key`; `docs/design/gemini-provider.md`, G1): chat,
+    embeddings, images, Veo video, speech and transcription, translated
+    both ways, with each model's capabilities from Google's own listing.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -288,6 +293,7 @@ class BackendKind(StrEnum):
     openai_compat_http = 'openai_compat_http'
     systemone_http = 'systemone_http'
     elevenlabs_http = 'elevenlabs_http'
+    gemini_api = 'gemini_api'
 
 
 class ComponentKind(StrEnum):
@@ -465,17 +471,122 @@ class ModelFormat(StrEnum):
       `ModelCapabilities.decision`, never `chat`.
 
     Shared because it appears on both sides of a join: a library
-    entry declares what a model *is*, and
-    `EngineDescriptor.modelFormats` declares what an engine can
-    *load*. Nothing can serve a safetensors model until the vLLM
-    adapter lands, and that answer comes from the engine's
-    descriptor rather than from anything the library knows.
+    entry declares what a model *is*, and an engine's
+    `ModelRequirement`s declare what it can *load*. The format is
+    the first term of that join, not the whole of it
+    (library-sources-and-engines.md).
 
     """
 
     gguf = 'gguf'
     safetensors = 'safetensors'
     kev_checkpoint = 'kev_checkpoint'
+
+
+class MlxQuantizationRule(StrEnum):
+    """
+    The one marker the library reads that decides an engine: a
+    safetensors folder whose `config.json` carries MLX's
+    quantization block packs its weights as integers only MLX reads.
+    `required`: only such a folder matches; `forbidden`: never one.
+
+    """
+
+    required = 'required'
+    forbidden = 'forbidden'
+
+
+class ModelRequirementAuthority(StrEnum):
+    """
+    Who can say a match will load. Absent means `eugene`. `eugene`:
+    the fields above are the whole rule, so a match is `runs`. `engine`: the engine decides
+    when it loads (vLLM's model registry, for one), so a match is
+    only `may_run` (Troy's L4).
+
+    """
+
+    eugene = 'eugene'
+    engine = 'engine'
+
+
+class ModelPreparation(BaseModel):
+    """
+    A match that runs only after the engine prepares it (Strata builds
+    an expert pack, a lookup table and an MTP helper from a GGUF). The
+    verdict is `after_preparation`; the original file is never
+    changed.
+
+    """
+
+    recipe: str = Field(
+        ..., description="The adapter's name for the step, e.g. `strata-prepare`."
+    )
+    note: str | None = Field(None, description='What the step makes, in words.')
+
+
+class EngineVerdictKind(StrEnum):
+    """
+    One model against one engine. `runs`: a requirement with authority
+    `eugene` matches. `may_run`: only the engine can tell, at load.
+    `after_preparation`: it runs once the engine prepares it. `no`:
+    no requirement matches, and `reason` says which term failed.
+
+    """
+
+    runs = 'runs'
+    may_run = 'may_run'
+    after_preparation = 'after_preparation'
+    no = 'no'
+
+
+class EngineVerdict(BaseModel):
+    engine: EngineKind
+    verdict: EngineVerdictKind
+    available: bool
+    installable: bool | None = False
+    experimental: bool | None = False
+    reason: str = Field(
+        ..., description='The verdict in words, naming the term that decided it.'
+    )
+    preparation: ModelPreparation | None = None
+    preference: int | None = Field(
+        None, description='From the requirement that matched; absent on `no`.'
+    )
+
+
+class EligibilityLevel(StrEnum):
+    """
+    The one dot a model carries (Troy's L5, 2026-10-09), in his words:
+
+    * `works_here`: *Will work on this machine now*. An available
+      engine `runs` or `may_run` it.
+    * `other_engine`: *Will work with a different engine*. An engine
+      this node could install would run it, or an available engine
+      runs it after preparation.
+    * `not_here`: *Can not work on this machine*. No engine this
+      hardware can have accepts it.
+
+    Whether it fits in memory is a separate answer (`Fit`), until each
+    engine has its own fit (LS6).
+
+    """
+
+    works_here = 'works_here'
+    other_engine = 'other_engine'
+    not_here = 'not_here'
+
+
+class ModelEligibility(BaseModel):
+    modelId: str
+    level: EligibilityLevel
+    engines: list[EngineVerdict] = Field(
+        ...,
+        description='Every engine sent, best first: available before not, then\n`runs`, `may_run`, `after_preparation`, `no`, then\n`preference`. The first available `runs` or `may_run` is what\nRun would pick when the person has set no default.\n',
+    )
+
+
+class EligibilityList(BaseModel):
+    models: list[ModelEligibility]
 
 
 class RetryDisposition(StrEnum):
@@ -1343,6 +1454,69 @@ class ComputeDevice(BaseModel):
         None,
         description='True when this device has no memory of its own and computes\nout of the host\'s RAM: an integrated GPU (an Intel Arc or\nIris in a laptop or mini PC, an AMD Radeon 780M or Strix\nHalo), Apple silicon, NVIDIA\'s GB10. Then `memoryTotalBytes`\nis how much RAM the operating system lets the GPU address,\nplus any carve-out reserved for it at boot, and\n`memoryFreeBytes` is what is left of that. There is no second\npool for a partial offload to spill into, so a fit that also\ncounted host RAM would count the same memory twice.\n\nAbsent or false for a card with memory of its own. Added\n2026-09-27, when an Intel Arc mini PC read "no GPU" and the\nonly unified-memory case the install knew was a Mac.\n',
     )
+
+
+class ModelRequirement(BaseModel):
+    """
+    One kind of model an engine loads, declared by its adapter
+    (`EngineDescriptor.accepts`) and judged by the library
+    (`POST /v1/eligibility`). Data, not code (Troy's L3, 2026-10-09):
+    a model meets a requirement when every field present matches;
+    an absent field matches anything.
+
+    An engine lists several when it loads several kinds: MLX loads
+    an MLX-quantized folder outright, and a plain Hugging Face folder
+    only if mlx-lm knows its architecture, which only a load can
+    tell (`authority: engine`).
+
+    """
+
+    format: ModelFormat
+    architectures: list[str] | None = Field(
+        None,
+        description="The model's `architecture` must be one of these: GGUF's\n`general.architecture`, or a safetensors folder's\n`architectures[0]`. Absent means any.\n",
+    )
+    quantizations: list[str] | None = Field(
+        None,
+        description='The GGUF quantization must be one of these. Absent means any.',
+    )
+    mlxQuantization: MlxQuantizationRule | None = None
+    preparation: ModelPreparation | None = None
+    authority: ModelRequirementAuthority | None = None
+    preference: int | None = Field(
+        100,
+        description="Among the engines that run a model, lower is offered first and\nis what Run picks, unless the person has chosen a default\nengine for the format (Troy's L10).\n",
+    )
+    note: str | None = Field(
+        None,
+        description='Words for the person beside a match, in the engine\'s own terms:\n"vLLM checks the architecture when it loads".\n',
+    )
+
+
+class EligibilityEngine(BaseModel):
+    """
+    One engine as a node reported it, sent to the library to be judged
+    against. The caller sends what it holds (the console the picked
+    node's `GET /v1/engines`, the agent its own) so the library needs
+    no call to any agent.
+
+    """
+
+    engine: EngineKind
+    available: bool = Field(..., description='Installed and usable on that node now.')
+    installable: bool | None = Field(
+        False,
+        description='Not available, but this node could have it: Eugene can install\nit here, or the agent wrote an install command for this\nhardware. False for an engine that cannot run on this hardware.\n',
+    )
+    experimental: bool | None = False
+    accepts: list[ModelRequirement]
+
+
+class EligibilityRequest(BaseModel):
+    models: list[str] | None = Field(
+        None, description='Library model ids to judge. Absent means every model.'
+    )
+    engines: list[EligibilityEngine]
 
 
 class ConfigFieldStatus(BaseModel):
