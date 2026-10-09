@@ -38,8 +38,12 @@ questions rather than adding one here.
 
 ## What it never does
 
-It does not install anything, does not elevate, does not restart the
-agent on a schedule, and does not run at all off Windows. It is a
+It does not install anything, does not restart the agent on a schedule,
+and does not run at all off Windows. **It elevates for one thing only**:
+*Allow commands from Workbench* on a job site (2b.4, J30), J9's proof that an
+administrator consented, which Windows asks for with its own UAC prompt and
+which runs `eugene-plexus-agent site consent` elevated. Nothing else here
+asks for administrator. It is a
 remote control, and a remote control that can brick the television is a
 worse remote control.
 """
@@ -47,10 +51,12 @@ worse remote control.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 import time
 import webbrowser
+from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -65,6 +71,9 @@ _ID_OPEN = 1023
 _ID_STOP = 1024
 _ID_START = 1025
 _ID_QUIT = 1026
+_ID_COMMANDS = 1027
+#: How long the elevated `site consent` may take once Windows started it.
+CONSENT_SECONDS = 120
 
 
 class ServiceState:
@@ -243,7 +252,59 @@ def claim_single_instance(name: str = "EugenePlexusTray") -> bool:
         return True
 
 
-def menu_for(state: str) -> list[tuple[int, str, bool]]:
+def job_site_config() -> str | None:
+    """The install's `agent.yaml` when this machine is a job site, which is
+    when *Allow commands* means something; None otherwise. The tray runs as
+    the person, whose account the installer gave the config file's place."""
+    config = os.environ.get("EUGENE_PLEXUS_AGENT_CONFIG_FILE")
+    if not config:
+        return None
+    return config if (Path(config).parent / "site").is_dir() else None
+
+
+def consent_command(config_file: str) -> tuple[str, str]:
+    """The program and its arguments that record the consent, elevated:
+    the agent's own `site consent`, told where the install's configuration
+    is (an administrator's account may not carry that variable)."""
+    program = str(Path(sys.executable).with_name("eugene-plexus-agent.exe"))
+    return program, f'site consent --config-file "{config_file}"'
+
+
+def allow_commands(config_file: str) -> tuple[bool, str]:  # pragma: no cover - needs UAC
+    """Ask Windows for an administrator, through UAC, and record the
+    consent to commands with it (J30). `(ok, what to say)`."""
+    try:
+        import win32con
+        import win32event
+        import win32process
+        from win32com.shell import shell, shellcon
+    except ImportError:
+        return False, "The tray needs pywin32 to ask for an administrator."
+    program, arguments = consent_command(config_file)
+    try:
+        started = shell.ShellExecuteEx(
+            fMask=shellcon.SEE_MASK_NOCLOSEPROCESS,
+            lpVerb="runas",
+            lpFile=program,
+            lpParameters=arguments,
+            nShow=win32con.SW_HIDE,
+        )
+    except Exception as exc:
+        if getattr(exc, "winerror", None) == 1223:  # ERROR_CANCELLED
+            return False, "Commands were not allowed: the administrator prompt was cancelled."
+        return False, f"Windows did not start the administrator step ({exc})."
+    process = started["hProcess"]
+    if win32event.WaitForSingleObject(process, CONSENT_SECONDS * 1000) != win32event.WAIT_OBJECT_0:
+        return False, "The administrator step did not finish. Try again."
+    if win32process.GetExitCodeProcess(process) != 0:
+        return False, (
+            "Commands were not allowed. Run eugene-plexus-agent site consent as an "
+            "administrator to see why."
+        )
+    return True, "Commands from Workbench may run on this machine now, each signed by its person."
+
+
+def menu_for(state: str, job_site: bool = False) -> list[tuple[int, str, bool]]:
     """`(command id, label, enabled)` for the current state.
 
     Pure, so the whole of what a person is offered can be asserted
@@ -262,6 +323,10 @@ def menu_for(state: str) -> list[tuple[int, str, bool]]:
         (_ID_OPEN, "Open Eugene", True),
         (_ID_STOP, "Stop Eugene (frees the graphics card)", running),
         (_ID_START, "Start Eugene", stopped),
+        # J30: an administrator's consent later, for a person who did not
+        # give it at the join. Only on a job site; Windows asks for the
+        # administrator itself.
+        *([(_ID_COMMANDS, "Allow commands from Workbench...", True)] if job_site else []),
         # **Named for where it comes back from**, because this is the one
         # entry here that takes something away. Before the Start menu
         # entry existed it was a one-way door: hide the icon with Eugene

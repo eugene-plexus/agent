@@ -27,6 +27,7 @@ _ID_OPEN = tray._ID_OPEN
 _ID_STOP = tray._ID_STOP
 _ID_START = tray._ID_START
 _ID_QUIT = tray._ID_QUIT
+_ID_COMMANDS = tray._ID_COMMANDS
 
 #: How often the icon re-reads the service state, in milliseconds. Slow
 #: on purpose: this is a person's own desktop, the state changes when
@@ -65,7 +66,9 @@ def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
     def show_menu() -> None:
         state["value"] = tray.query_state()
         menu = win32gui.CreatePopupMenu()
-        for command, label, enabled in tray.menu_for(state["value"]):
+        for command, label, enabled in tray.menu_for(
+            state["value"], job_site=tray.job_site_config() is not None
+        ):
             flags = win32con.MF_STRING
             if not enabled:
                 flags |= win32con.MF_GRAYED
@@ -88,6 +91,28 @@ def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
             return
         if command == _ID_QUIT:
             win32gui.DestroyWindow(hwnd)
+            return
+        if command == _ID_COMMANDS:
+            config = tray.job_site_config()
+            if config is None:
+                return
+            ok, why = tray.allow_commands(config)
+            # Said either way: the person asked, and waited for Windows.
+            win32gui.Shell_NotifyIcon(
+                win32gui.NIM_MODIFY,
+                (
+                    hwnd,
+                    0,
+                    win32gui.NIF_INFO,
+                    _WM_TRAYICON,
+                    icon,
+                    tray.tooltip_for(state["value"]),
+                    200,
+                    "Eugene",
+                    why[:200],
+                    win32gui.NIIF_INFO if ok else win32gui.NIIF_WARNING,
+                ),
+            )
             return
         if command == _ID_STOP:
             ok, why = tray.stop_service()

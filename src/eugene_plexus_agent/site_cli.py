@@ -10,6 +10,7 @@
     eugene-plexus-agent site server add ID --name NAME --command PATH
         [--arg=A]... [--env K=V]... [--system]
     eugene-plexus-agent site server remove ID
+    eugene-plexus-agent site consent [--off]
 
 **Adding a local MCP server is the machine administrator's act**
 (`remote-nodes.md` §6.2): it names a program on this machine, so it is done
@@ -43,6 +44,14 @@ does on Linux (J36). Most people link on the page at the machine instead
 one is J9's gate: the administrator proves elevation here, and their consent
 is recorded with the program's hash. The host refuses to turn on a `system`
 server without that record.
+
+**`consent`** is J9's proof for commands (2b.4, J30, J89): an administrator,
+elevated here, allows Workbench to run commands on this machine, each as the
+person who signed it; `--off` takes that back. It is recorded in the same
+protected list, which the site host and every worker read and cannot write.
+`join` asks the same question on a service install, once the machine joined
+(`--commands` or `--no-commands` answers it ahead). The Windows tray's
+*Allow commands* runs it behind a UAC prompt.
 
 `status` and `audit` read what the host keeps (its policy and its audit
 log) from its own directory; they change nothing. The running agent picks up
@@ -133,6 +142,21 @@ def add_parser(sub: Any) -> None:
         action="store_true",
         help="Print the page where the owner adds their key, without opening it.",
     )
+    answer = joining.add_mutually_exclusive_group()
+    answer.add_argument(
+        "--commands",
+        dest="commands",
+        action="store_const",
+        const=True,
+        help="Allow Workbench to run commands here, each signed by its person (J9).",
+    )
+    answer.add_argument(
+        "--no-commands",
+        dest="commands",
+        action="store_const",
+        const=False,
+        help="Do not allow commands now; an administrator can allow them later.",
+    )
     joining.add_argument("--python", help=argparse.SUPPRESS)
     joining.add_argument("--data-dir", dest="data_dir", help=argparse.SUPPRESS)
     linking = actions.add_parser(
@@ -178,6 +202,19 @@ def add_parser(sub: Any) -> None:
     )
     remove = verbs.add_parser("remove", help="Remove a local MCP server.")
     remove.add_argument("id")
+    consent_parser = actions.add_parser(
+        "consent",
+        help="Allow Workbench to run commands on this machine (elevated, J9).",
+        description=(
+            "As this machine's administrator, allow Workbench to run commands here. Each "
+            "command runs as the person who signed it, with their own signature, in their own "
+            "workspaces whose rules ask about commands. --off takes it back."
+        ),
+    )
+    consent_parser.add_argument("--off", action="store_true", help="Take the consent back.")
+    # The tray's elevated run names the install's configuration: an
+    # administrator's own account may not carry the person's variable.
+    consent_parser.add_argument("--config-file", dest="config_file", help=argparse.SUPPRESS)
 
 
 def run(args: argparse.Namespace, settings: Settings) -> int:
@@ -195,6 +232,10 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
             print(status(config_dir))
         elif args.site_command == "audit":
             print(audit(config_dir, args.limit))
+        elif args.site_command == "consent":
+            if args.config_file:
+                config_dir = Path(args.config_file).resolve().parent
+            print(consent(config_dir, allow=not args.off))
         elif args.server_command == "add":
             print(
                 add_server(
@@ -218,25 +259,36 @@ def run(args: argparse.Namespace, settings: Settings) -> int:
 # --- the protected list ---------------------------------------------------------
 
 
-def read_servers(config_dir: Path) -> list[dict[str, Any]]:
+def read_list(config_dir: Path) -> dict[str, Any]:
+    """The protected list as it is (`SiteLocalServerList`): the servers, and
+    the administrator's consent to commands when given."""
     path = servers_path(config_dir)
     if not path.exists():
-        return []
+        return {"servers": []}
     try:
         value = SiteLocalServerList.model_validate(yaml.safe_load(path.read_text("utf-8")) or {})
     except (OSError, ValueError, ValidationError) as exc:
         raise SiteError(
             f"{path} could not be read ({type(exc).__name__}). Fix or remove it."
         ) from None
-    return [s.model_dump(mode="json", exclude_none=True) for s in value.servers]
+    return dict(value.model_dump(mode="json", exclude_none=True))
+
+
+def read_servers(config_dir: Path) -> list[dict[str, Any]]:
+    return list(read_list(config_dir).get("servers") or [])
 
 
 def write_servers(config_dir: Path, servers: list[dict[str, Any]]) -> None:
-    SiteLocalServerList.model_validate({"servers": servers})
+    """The servers, keeping the consent to commands as it is."""
+    write_list(config_dir, {**read_list(config_dir), "servers": servers})
+
+
+def write_list(config_dir: Path, value: dict[str, Any]) -> None:
+    SiteLocalServerList.model_validate(value)
     path = servers_path(config_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
-    data = yaml.safe_dump({"servers": servers}, sort_keys=False, allow_unicode=True).encode()
+    data = yaml.safe_dump(value, sort_keys=False, allow_unicode=True).encode()
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
@@ -323,6 +375,46 @@ def add_server(
             "will not run.",
         )
     return "\n".join(lines)
+
+
+def _administrator() -> str | None:
+    """Who consented, for display: the account running this."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return None
+
+
+def consent(config_dir: Path, *, allow: bool) -> str:
+    """J9's proof for commands (J30, J89): recorded only by an administrator,
+    elevated here, in the protected list."""
+    if sys.platform == "linux" and _system_install(config_dir):
+        raise SiteError(
+            "On a Linux system install root keeps this consent: run the installer again with "
+            "--site-commands (or --site-no-commands to take it back)."
+        )
+    if not elevated():
+        raise SiteError(
+            "Allowing commands lets programs run on this machine, so only its administrator "
+            "may. Run this again as an administrator (Windows) or as root."
+        )
+    value = read_list(config_dir)
+    if allow:
+        who = _administrator()
+        value["commands"] = {
+            "consentedAt": datetime.now(UTC).isoformat(),
+            **({"by": who} if who else {}),
+        }
+    else:
+        value.pop("commands", None)
+    write_list(config_dir, value)
+    if allow:
+        return (
+            "Commands from Workbench may run on this machine now. Each one runs as the person "
+            "who signed it, in their own workspaces whose rules ask about commands. Take it "
+            "back with --off, or the machine's owner can from Workbench."
+        )
+    return "Commands from Workbench no longer run on this machine."
 
 
 def remove_server(config_dir: Path, server_id: str) -> str:
@@ -505,10 +597,48 @@ def join(config_dir: Path, args: argparse.Namespace, *, port: int | None = None)
         raise SiteError((done.stderr or done.stdout).strip() or "The join did not finish.")
     _give_to_owner_of(data)
     said = [done.stdout.strip(), _link_owner(config_dir, data, args)]
+    said.append(_join_consent(config_dir, getattr(args, "commands", None)))
     if port is not None and not _system_install(config_dir):
         opened = not getattr(args, "no_browser", False)
         said.append(_key_page(f"http://127.0.0.1:{port}/link", opened=opened))
     return "\n".join(line for line in said if line)
+
+
+#: J30's one question at the join, asked of the administrator running it.
+CONSENT_QUESTION = "Allow tools that change this machine's settings or run programs? [y/N] "
+
+
+def _join_consent(config_dir: Path, answer: bool | None) -> str:
+    """J30: consent at the join, by the administrator running it, on an
+    install where that run is elevated (a service install). Asked at the
+    terminal unless answered ahead; a per-user install is never elevated, so
+    it says how an administrator can allow commands later."""
+    if not elevated():
+        return (
+            "Commands from Workbench do not run here until an administrator allows them: "
+            "eugene-plexus-agent site consent, run as an administrator."
+        )
+    if answer is None:
+        terminal = getattr(sys.stdin, "isatty", None)
+        if not (callable(terminal) and terminal()):
+            # Nobody to ask: no consent is given without an answer.
+            answer = False
+        else:
+            try:
+                answer = input(CONSENT_QUESTION).strip().lower() in {"y", "yes"}
+            except EOFError:
+                answer = False
+    if not answer:
+        later = (
+            "Allow commands in Eugene's tray icon"
+            if sys.platform == "win32"
+            else "eugene-plexus-agent site consent, as root"
+        )
+        return f"Commands from Workbench do not run here. To allow them later: {later}."
+    try:
+        return consent(config_dir, allow=True)
+    except SiteError as exc:
+        return str(exc)
 
 
 def _key_page(page: str, *, opened: bool) -> str:

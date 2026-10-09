@@ -71,7 +71,7 @@ RETIRED_ID = "node-files"
 PACKAGE = "eugene-plexus-site-host"
 ENTRY = "eugene_plexus_site_host"
 
-SITE_HOST_COMMIT = "26a4f0f292068a78251367a26066e2dec7db80e6"
+SITE_HOST_COMMIT = "db20f3eb7d1483ad24a043d9bdbd7f54ca34cb3a"
 SITE_HOST_SOURCE = f"https://github.com/eugene-plexus/site-host/archive/{SITE_HOST_COMMIT}.tar.gz"
 #: A checkout to install instead, for development and the acceptance runs.
 SOURCE_OVERRIDE = "EUGENE_PLEXUS_AGENT_SITE_HOST_SOURCE"

@@ -143,22 +143,36 @@
 
   // --- the approval page: sign what the site host holds ------------------------------
 
+  // What each kind of item is, and what its button does (J14b: a call from
+  // Workbench runs once signed; a window lets the tools a person's rules
+  // allow run without a signature each, for an hour).
+  const KINDS = {
+    "rules.confirm": ["Approve this machine's rules", "Approve these rules"],
+    call: ["A call from Workbench, waiting for your signature", "Sign: let it run"],
+    "window.open": ["Workbench asks for a window", "Sign: open the window"],
+  };
+
   function card(item) {
     const box = document.createElement("section");
     box.className = "held";
+    const [heading, action] = KINDS[item.action] || ["A change from Workbench", "Approve"];
     const title = document.createElement("h2");
-    title.textContent =
-      item.action === "rules.confirm" ? "Approve this machine's rules" : "A change from Workbench";
+    title.textContent = heading;
     box.append(title);
     const list = document.createElement("div");
     for (const line of item.words || []) {
       const p = document.createElement("p");
       p.textContent = line;
+      if (item.action === "call") {
+        // The call exactly, as this machine will run it.
+        p.style.whiteSpace = "pre-wrap";
+        p.style.fontFamily = "ui-monospace, Consolas, monospace";
+      }
       list.append(p);
     }
     box.append(list);
     const approve = document.createElement("button");
-    approve.textContent = item.action === "rules.confirm" ? "Approve these rules" : "Approve";
+    approve.textContent = action;
     approve.dataset.approve = item.id;
     box.append(approve);
     if (item.action !== "rules.confirm") {
@@ -214,6 +228,19 @@
     }
 
     let items = await load();
+    let busy = false;
+    // A call Workbench sends while this page is open shows without a reload.
+    setInterval(async () => {
+      if (busy || document.hidden) return;
+      const before = items.map((i) => i.id).join(",");
+      const fresh = await fetch(`/link/approve/items?key=${held.id}`, {
+        credentials: "same-origin",
+        cache: "no-store",
+      }).catch(() => null);
+      if (!fresh || !fresh.ok || busy) return;
+      const value = await fresh.json();
+      if ((value.items || []).map((i) => i.id).join(",") !== before) items = await load();
+    }, 5000);
     list.addEventListener("click", async (event) => {
       const target = event.target;
       if (!(target instanceof HTMLButtonElement)) return;
@@ -221,6 +248,7 @@
       const rejectId = target.dataset.reject;
       const id = approveId || rejectId;
       if (!id) return;
+      busy = true;
       for (const button of list.querySelectorAll("button")) button.disabled = true;
       let answer;
       if (approveId) {
@@ -239,6 +267,7 @@
         answer = await post(`/link/approve/items/${encodeURIComponent(id)}/reject`, csrf, {});
       }
       items = await load();
+      busy = false;
       if (!answer.ok || (answer.value.status && answer.value.status !== "done")) {
         say(state, answer.value.message || answer.value.detail || "That did not go through.");
       }

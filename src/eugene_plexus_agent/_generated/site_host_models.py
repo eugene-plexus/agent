@@ -9,6 +9,24 @@ from typing import Any, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
+class SiteCommandConsent(BaseModel):
+    """
+    An administrator's consent to commands on this machine (J9, J89),
+    recorded only by an elevated process at the machine: the join's
+    question, the Windows tray behind UAC, the one-liner again, or the
+    elevated `site consent` CLI.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    consentedAt: AwareDatetime
+    by: str | None = Field(
+        None, description="The administrator's account, for display.", max_length=256
+    )
+
+
 class Arg(RootModel[str]):
     root: str = Field(..., max_length=4096)
 
@@ -74,6 +92,35 @@ class SiteHostProtocol(StrEnum):
     """
 
     mcp_2026_07_28 = 'mcp-2026-07-28'
+
+
+class SiteCommands(BaseModel):
+    """
+    Whether this machine runs commands from Workbench (2b.4, J9, J30, J89).
+    An administrator consents at the machine; the site's owner may take it
+    back from Workbench. Absent from a site older than 2b.4.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    allowed: bool = Field(
+        ...,
+        description="Commands may run here now (each still under its person's rules and signature).",
+    )
+    consentedAt: AwareDatetime | None = Field(
+        None, description='When an administrator consented at the machine.'
+    )
+    withdrawnAt: AwareDatetime | None = Field(
+        None,
+        description="When the site's owner took the consent back; a later consent at the machine replaces it.",
+    )
+    reason: str | None = Field(
+        None,
+        description="Why not, and how to give consent, in the site's words.",
+        max_length=1024,
+    )
 
 
 class SiteFolderPerson(BaseModel):
@@ -146,14 +193,26 @@ class SiteTool(BaseModel):
     )
 
 
+class SiteCommandDecision(StrEnum):
+    """
+    What a rule says of running commands (2b.4, J88): `ask`, each command
+    runs only with its person's own signature over it (J47: never `allow`);
+    `deny`, never offered.
+
+    """
+
+    ask = 'ask'
+    deny = 'deny'
+
+
 class SiteDecision(StrEnum):
     """
     What a rule says of a group of tools (J70). `allow`: runs without
-    asking. `ask`: Workbench asks the person who made the call, and the site
-    runs it only when the call says they approved (`SiteCall.asked`, J72);
-    until person-held call signatures (J14b) the site cannot check that they
-    did, and its audit log says the approval was claimed. `deny`: never
-    offered, and refused.
+    asking; for a person with a key, only inside a window they opened with
+    it (J14b, J81). `ask`: runs only with the person's signature over the
+    call when they have a key (J14b); for a person without one, when the
+    call says they approved (`SiteCall.asked`, J72), which the audit log
+    records as claimed. `deny`: never offered, and refused.
 
     """
 
@@ -188,6 +247,29 @@ class InstallModeName(StrEnum):
 
     production = 'production'
     dev = 'dev'
+
+
+class SiteCallApproval(BaseModel):
+    """
+    A held call sent again (J14b). With `held` alone, it runs if it was
+    signed at the machine. With a passkey assertion over one of its
+    envelopes (as `SitePasskeyApproval` describes), the site checks it and
+    runs it.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    held: str = Field(..., pattern='^[a-z0-9]{1,32}$')
+    envelope: str | None = Field(None, max_length=262144, min_length=2)
+    key: str | None = Field(None, pattern='^[a-f0-9]{32}$')
+    credentialId: str | None = Field(
+        None, max_length=1366, min_length=1, pattern='^[A-Za-z0-9_-]+$'
+    )
+    authenticatorData: str | None = Field(None, max_length=4096, min_length=1)
+    clientDataJSON: str | None = Field(None, max_length=8192, min_length=1)
+    signature: str | None = Field(None, max_length=1024, min_length=1)
 
 
 class SiteGrantHint(BaseModel):
@@ -265,6 +347,9 @@ class SiteAnswerStatus(StrEnum):
     acted. `held` (J14a, J50): a change that gives access, from a person who
     has a key pinned at the machine; the site keeps it until they approve it
     there with that key, and `message` says where. Nothing changed yet.
+    Since J14b (J86), also a tool call from a person with a key that needs
+    their signature (an `ask` rule, a command) or an open window (an `allow`
+    rule): `held` (`SiteHeldCall`) says what to sign. Nothing ran.
 
     """
 
@@ -272,6 +357,23 @@ class SiteAnswerStatus(StrEnum):
     failed = 'failed'
     uncertain = 'uncertain'
     held = 'held'
+
+
+class Word(RootModel[str]):
+    root: str = Field(..., max_length=1024)
+
+
+class SiteHeldCallKind(StrEnum):
+    """
+    `call`: this one tool call, signed per call (an `ask` rule, or a
+    command). `window`: a window of `minutes` in which every `allow` tool of
+    the person's runs without a signature each (J81, J90); the call that
+    asked for it runs once it is open.
+
+    """
+
+    call = 'call'
+    window = 'window'
 
 
 class SitePersonKeyAlg(StrEnum):
@@ -328,9 +430,9 @@ class SiteManageAction(StrEnum):
     Who may ask for what. Eugene's owner never (J6b).
     - **A linked person, for their own items** (2b.3b, J67; the owner
       too): `workspace.add`, `workspace.remove`, `rules.set`,
-      `workspace.list`, `audit.read` (J80), and the passkey actions
-      (`passkey.pair`, `held.list`, `held.approve`, `held.reject`,
-      `passkey.remove`).
+      `workspace.list`, `audit.read` (J80), `window.close` (J14b), and
+      the passkey actions (`passkey.pair`, `held.list`, `held.approve`,
+      `held.reject`, `passkey.remove`).
       A change that gives access is held until they approve it with
       their own key, and never applied on the root's word: with no key
       yet, it waits for one (J68). The site's owner keeps J52's way: with
@@ -338,7 +440,8 @@ class SiteManageAction(StrEnum):
       approve them as a whole.
     - **The site's owner alone**, the owner this site recorded at its
       join: `workspace.people`, `access.set`, `server.enable`,
-      `settings.set`, and, for a root from before 2b.3b,
+      `settings.set`, `commands.withdraw` (2b.4), and, for a root from
+      before 2b.3b,
       `folder.add`, `folder.remove` and `folder.people`, which act on the
       owner's workspaces.
 
@@ -397,6 +500,13 @@ class SiteManageAction(StrEnum):
     - `audit.read` (`SiteAuditRead`): since 2b.3b, the lines that belong
       to the asking person (J80), from anyone linked; the owner's include
       the local servers, sharing and settings.
+    - `window.close` (`SiteWindowClose`, J14b): close the asking
+      person's window now. It only takes access away, so it needs no
+      signature (J90).
+    - `commands.withdraw` (`SiteCommandsWithdraw`, 2b.4, J89): the
+      site's owner takes back the administrator's consent to commands
+      here. It only takes access away; a later consent at the machine
+      gives it again.
 
     """
 
@@ -417,6 +527,8 @@ class SiteManageAction(StrEnum):
     workspace_people = 'workspace.people'
     rules_set = 'rules.set'
     workspace_list = 'workspace.list'
+    window_close = 'window.close'
+    commands_withdraw = 'commands.withdraw'
 
 
 class SiteManage(BaseModel):
@@ -462,7 +574,7 @@ class SiteEditEnvelope(BaseModel):
     key: str = Field(..., pattern='^[a-f0-9]{32}$')
     act: str = Field(
         ...,
-        description='A `SiteManageAction` that changes something, or `rules.confirm` (J52), whose `args` are `{"digest"}`, the SHA-256 of the rules the person\'s key approves (since 2b.3b, that person\'s own, J67).',
+        description='A `SiteManageAction` that changes something, or `rules.confirm`\n(J52), whose `args` are `{"digest"}`, the SHA-256 of the rules the\nperson\'s key approves (since 2b.3b, that person\'s own, J67). Since\nJ14b also `call`, whose `args` are `{"server", "tool",\n"arguments"}`, one tool call; and `window.open`, whose `args` are\n`{"minutes"}`.\n',
     )
     args: dict[str, Any]
     seq: int = Field(
@@ -471,16 +583,16 @@ class SiteEditEnvelope(BaseModel):
     iat: int = Field(..., description='Unix seconds.')
 
 
-class Word(RootModel[str]):
-    root: str = Field(..., max_length=1024)
-
-
 class SiteHeldEdit(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
     id: str = Field(..., pattern='^[a-z0-9]{1,32}$')
-    action: str = Field(..., max_length=64)
+    action: str = Field(
+        ...,
+        description="The held change's action; `call` or `window.open` for a held call (J14b).",
+        max_length=64,
+    )
     words: list[Word] = Field(
         ...,
         description="The change in the site host's own words, line by line, as the page shows it.",
@@ -765,6 +877,26 @@ class SiteAuditRead(BaseModel):
     limit: int | None = Field(50, ge=1, le=200)
 
 
+class SiteWindowClose(BaseModel):
+    """
+    `window.close` takes no arguments.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+
+
+class SiteCommandsWithdraw(BaseModel):
+    """
+    `commands.withdraw` takes no arguments.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+
+
 class SiteAuditDecision(StrEnum):
     allowed = 'allowed'
     refused = 'refused'
@@ -802,6 +934,10 @@ class SiteLocalServerList(BaseModel):
         extra='forbid',
     )
     servers: list[SiteLocalServer] = Field(..., max_length=32)
+    commands: SiteCommandConsent | None = Field(
+        None,
+        description="The administrator's consent to commands here (2b.4, J89); absent, none.",
+    )
 
 
 class SiteEnrollmentRequest(BaseModel):
@@ -953,6 +1089,10 @@ class SitePersonLink(BaseModel):
         ge=0,
         le=64,
     )
+    windowUntil: AwareDatetime | None = Field(
+        None,
+        description="When this person's open window ends (J14b, J81); null when none is open. Absent from an older site.",
+    )
 
 
 class SiteServer(BaseModel):
@@ -1016,9 +1156,10 @@ class SiteRules(BaseModel):
     """
     One person's rules in one workspace, per group of tools (J70). `read`:
     `list_directory`, `read_text`, `glob` and `grep`. `change`: `write_text`
-    and `edit_text`. The site stores them per tool, so commands (2b.4) add a
-    group of their own. `change` cannot be looser than `deny` in a workspace
-    registered read-only (`writable: false`).
+    and `edit_text`. `command` (2b.4, J88): `run_command`, in a workspace
+    the person holds; absent reads `deny`, as it does for a workspace from
+    before 2b.4. `change` and `command` cannot be looser than `deny` in a
+    workspace registered read-only (`writable: false`).
 
     """
 
@@ -1027,6 +1168,7 @@ class SiteRules(BaseModel):
     )
     read: SiteDecision
     change: SiteDecision
+    command: SiteCommandDecision | None = None
 
 
 class SiteToolGrant(BaseModel):
@@ -1036,7 +1178,7 @@ class SiteToolGrant(BaseModel):
     name: str = Field(..., max_length=128, min_length=1)
     decision: SiteGrantDecision | None = Field(
         None,
-        description='2b.3b (J70, J78): `allow`, the tool runs without asking; `ask`, it\nruns once the person who made the call approved it in Workbench\n(`SiteCall.asked`, J72). Absent: `allow` for a tool the site does not\ntreat as destructive, or one granted `standing`; `ask` otherwise.\nA tool not granted is denied: it is never offered.\n',
+        description="2b.3b (J70, J78): `allow`, the tool runs without asking; `ask`, it\nruns once the person who made the call approved it: with their\nsignature over the call when they have a key (J14b), else on\nWorkbench's word (`SiteCall.asked`, J72). Absent: `allow` for a tool the site does not\ntreat as destructive, or one granted `standing`; `ask` otherwise.\nA tool not granted is denied: it is never offered.\n",
     )
     standing: bool | None = Field(
         False,
@@ -1084,22 +1226,47 @@ class McpRequest(BaseModel):
     params: dict[str, Any] | None = None
 
 
-class SiteResult(BaseModel):
+class SiteHeldCall(BaseModel):
     """
-    A site's answer to an operation it claimed (`POST /v1/sites/operations/{id}/result`).
+    A tool call the site holds for its person's signature (J14b, J86). The
+    person signs at the machine, on its page, which lists it with the held
+    changes, or from Workbench with a passkey over one of `envelopes`. Either
+    way the call runs only when Workbench sends it again with `approval`
+    naming this id, before `expiresAt`.
+
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    status: SiteAnswerStatus
-    message: str | None = Field(None, max_length=1024)
-    result: dict[str, Any] | None = Field(
-        None, description="A management action's result."
-    )
-    response: McpResponse | None = Field(
+    id: str = Field(..., pattern='^[a-z0-9]{1,32}$')
+    kind: SiteHeldCallKind
+    minutes: int | None = Field(
         None,
-        description="An MCP request's JSON-RPC response, as the site's server answered it after its policy filtered it.",
+        description='For `window`, how long it stays open once signed.',
+        ge=1,
+        le=60,
+    )
+    words: list[Word] = Field(
+        ...,
+        description="What is signed, in the site's own words, line by line.",
+        max_length=64,
+    )
+    expiresAt: AwareDatetime = Field(
+        ..., description='When the site drops it unsigned.'
+    )
+    approved: bool | None = Field(
+        False,
+        description='Signed at the machine already; sending the call again with this id runs it.',
+    )
+    envelopes: dict[str, str] | None = Field(
+        None,
+        description="For each of the person's passkeys here, by key id, the canonical `SiteEditEnvelope` to sign.",
+    )
+    approvePage: str | None = Field(
+        None,
+        description='Where the person signs it at the machine (`SiteSigning.approvePage`).',
+        max_length=256,
     )
 
 
@@ -1164,7 +1331,11 @@ class SiteCall(BaseModel):
     installMode: InstallModeName
     asked: bool | None = Field(
         False,
-        description='Workbench says the person approved this call (J72). A tool whose\nrule is `ask` is refused without it. The site cannot check it\nuntil person-held call signatures (J14b), and its audit log says\nthe approval was claimed.\n',
+        description='Workbench says the person approved this call (J72). For a person\nwith no key, a tool whose rule is `ask` is refused without it; the\nsite cannot check it, and its audit log says the approval was\nclaimed. For a person with a key it means nothing: their\nsignature does (J14b).\n',
+    )
+    approval: SiteCallApproval | None = Field(
+        None,
+        description='A held call sent again (J14b, J86), with its signature when made with a passkey.',
     )
 
 
@@ -1349,7 +1520,12 @@ class SiteAuditEntry(BaseModel):
     )
     asked: bool | None = Field(
         None,
-        description='For a tool call under an `ask` rule, whether the call said the person\napproved it. Claimed, not checked, until person-held call signatures\n(J14b).\n',
+        description='For a tool call under an `ask` rule from a person with no key,\nwhether the call said they approved it: claimed, not checked.\n',
+    )
+    signed: str | None = Field(
+        None,
+        description='For a call from a person with a key (J14b, J91): which of their keys\nsigned it and where, or the window it ran in.\n',
+        max_length=256,
     )
 
 
@@ -1457,6 +1633,10 @@ class SiteOperation(BaseModel):
         False,
         description="For `mcp`, Workbench's word that the person approved this call (`SiteCall.asked`, J72).",
     )
+    approval: SiteCallApproval | None = Field(
+        None,
+        description="For `mcp`, the person's approval of a held call (J14b, `SiteCallApproval`), carried as Workbench sent it.",
+    )
     action: str | None = Field(None, description='For `manage`, the action.')
     arguments: dict[str, Any] | None = Field(
         None, description='For `manage`, its arguments.'
@@ -1466,6 +1646,33 @@ class SiteOperation(BaseModel):
         description="For `manage`, how the root names each person the arguments name, by\nid. Display only: a site shows them on a held change marked as the\nroot's names (J54), and decides nothing by them.\n",
     )
     installMode: InstallModeName
+
+
+class SiteResult(BaseModel):
+    """
+    A site's answer to an operation it claimed (`POST /v1/sites/operations/{id}/result`).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    status: SiteAnswerStatus
+    message: str | None = Field(None, max_length=1024)
+    result: dict[str, Any] | None = Field(
+        None, description="A management action's result."
+    )
+    response: McpResponse | None = Field(
+        None,
+        description="An MCP request's JSON-RPC response, as the site's server answered it after its policy filtered it.",
+    )
+    held: SiteHeldCall | None = Field(
+        None,
+        description='With `held` for an MCP request (J86), what the person signs for it to run.',
+    )
+    windowUntil: AwareDatetime | None = Field(
+        None,
+        description='For an MCP request from a person with a key, when their open window ends; null when none is open (J81).',
+    )
 
 
 class SiteAccountLink(BaseModel):
@@ -1591,6 +1798,7 @@ class SiteSummary(BaseModel):
         description='Whether this site can serve anyone but its owner. False on macOS,\nwhich has no folder boundary yet (§2.6). Absent means true.\n',
     )
     signing: SiteSigning | None = None
+    commands: SiteCommands | None = None
 
 
 class SiteLinkFile(BaseModel):
