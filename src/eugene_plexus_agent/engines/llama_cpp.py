@@ -25,13 +25,14 @@ from .._generated.models import (
     HostAccelerator,
     ModelFormat,
     ModelRequirement,
+    ModelRequirementAuthority,
     Os,
     RuntimeCapabilities,
     RuntimeSpec,
     Secondary,
 )
 from ..child_env import child_environment
-from . import gpu_probe
+from . import gpu_probe, llama_architectures
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -137,7 +138,47 @@ class LlamaCppAdapter(EngineAdapter):
     # instead; the UI joins the two lists to decide which engine a
     # launch button offers.
     model_formats = (ModelFormat.gguf,)
-    accepts = (ModelRequirement(format=ModelFormat.gguf, preference=10),)
+    #: A GGUF of an architecture llama.cpp names. Without a build in hand:
+    #: the list Eugene ships runs, and any other may (`llama_architectures`).
+    accepts = (
+        ModelRequirement(
+            format=ModelFormat.gguf,
+            architectures=list(llama_architectures.shipped().names),
+            preference=10,
+        ),
+        ModelRequirement(
+            format=ModelFormat.gguf,
+            authority=ModelRequirementAuthority.engine,
+            preference=10,
+            note=(
+                f"not an architecture llama.cpp {llama_architectures.shipped().tag} names; "
+                "the build decides when it loads"
+            ),
+        ),
+    )
+
+    def accepts_for(self, found: DiscoveredBinary | None) -> tuple[ModelRequirement, ...]:
+        """The installed build's own list once it has been read; until then,
+        and with nothing installed, the list Eugene ships (LS2, call B8)."""
+        tag = llama_architectures.build_tag(found.version) if found is not None else None
+        own = self.installed_lists().get(tag) if tag is not None else None
+        if own is None:
+            return self.accepts
+        return (
+            ModelRequirement(format=ModelFormat.gguf, architectures=list(own.names), preference=10),
+        )
+
+    def installed_lists(self) -> llama_architectures.InstalledLists:
+        """Each build's architecture list, kept beside the builds by tag.
+        Built once per engine root: the root can move under a test."""
+        directory = self.managed_store().directory / "architectures"
+        if self._lists is None or self._lists_dir != directory:
+            self._lists = llama_architectures.InstalledLists(directory)
+            self._lists_dir = directory
+        return self._lists
+
+    _lists: llama_architectures.InstalledLists | None = None
+    _lists_dir: Path | None = None
 
     # llama-server answers `/health` from the moment its socket is up
     # (503 + "loading model" while the weights are read), so readiness

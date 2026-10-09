@@ -180,6 +180,13 @@ class EngineAdapter(abc.ABC):
     #: holds the two together).
     accepts: tuple[ModelRequirement, ...] = ()
 
+    def accepts_for(self, found: DiscoveredBinary | None) -> tuple[ModelRequirement, ...]:
+        """What this engine loads as `found` (None: not installed) reports it.
+
+        `accepts` for every engine whose rules are not its build's; llama.cpp's
+        architectures are (LS2)."""
+        return self.accepts
+
     #: Whether the engine answers HTTP while its model loads.
     #:
     #: llama-server does: 503 plus a loading status from the moment its

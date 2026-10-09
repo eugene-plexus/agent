@@ -638,10 +638,15 @@ def test_every_adapter_declares_what_it_accepts_and_old_formats_agree() -> None:
         assert set(adapter.model_formats) == plain, kind.value
 
 
-def test_the_engine_list_carries_accepts() -> None:
+def test_the_engine_list_carries_accepts(tmp_path, monkeypatch) -> None:
+    from eugene_plexus_agent.engines import llama_architectures
     from eugene_plexus_agent.runtimes import describe_engines
 
+    monkeypatch.setenv("EUGENE_PLEXUS_AGENT_ENGINE_ROOT", str(tmp_path))
+    monkeypatch.setenv("PATH", "")
     by_kind = {e.engine.value: e for e in describe_engines()}
+    llama = by_kind["llama_cpp"].accepts or []
+    assert llama[0].architectures == list(llama_architectures.shipped().names)
     strata = by_kind["strata"].accepts or []
     assert [r.architectures for r in strata] == [["qwen4exp"]]
     assert strata[0].preparation is not None
