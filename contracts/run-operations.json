@@ -1299,7 +1299,7 @@
           "strata"
         ],
         "title": "EngineKind",
-        "description": "Which engine adapter constructs the argv and interprets\nreadiness. Deliberately a closed enum rather than a free string:\nan engine is supported exactly when an adapter exists for it,\nand without an adapter there is nothing that knows how to start\nit or tell when it is ready.\n\n`strata` is experimental. It launches Strata's Python HTTP\nserver and native engine together, using a prepared Strata JSON\nconfiguration as `RuntimeSpec.modelPath`. It does not accept an\narbitrary GGUF or prepare model weights automatically.\n\n`kev` drives upstream `python -m kev.serve` and loads Kev\ndecision checkpoints (`kev_checkpoint` format) \u2014 a decision\nmodel, not a chat model: its server speaks the System One\nprotocol and its companion driver serves `POST /v1/decide`,\nnever completions. Like vLLM it loads the model *before*\nbinding its port (read off `kev/serve.py` at the pinned commit\nand observed live 2026-09-22), so alive-and-refusing is\n`loading`; unlike every other engine it handles one request at\na time, which its driver advertises as a concurrency limit.\nIts bind is hardcoded to loopback upstream, which is the\nposture Eugene wants: the gateway is the authenticated front\ndoor.\n\n`llama_cpp` drives upstream `llama-server` and loads GGUF.\n`vllm` drives upstream `vllm serve` and loads safetensors.\n`mlx` drives upstream `mlx_lm.server` and loads MLX-format\nsafetensors, on Apple silicon only; not experimental since its\nrun on GitHub's macOS runners (A4, 2026-09-30). We never ship an engine \u2014 every\none of them is an upstream project we wrap and track.\n\nThey differ in far more than argv, and that is why readiness\nis per-adapter rather than one shared TCP check:\n`llama-server` answers `/health` while it loads and reports that\nit is loading, whereas vLLM binds its port *before* loading the\nmodel and refuses connections until the model is in memory \u2014 so\nfor minutes it is indistinguishable, over the network alone,\nfrom a process that died. `mlx_lm.server` is a third mechanism\nagain and the most awkward: it serves HTTP immediately, and at\nthe pinned release its `/health` answers a hardcoded\n`{\"status\": \"ok\"}` while the model is still loading on another\nthread, so **no read-only probe can tell loading from ready**.\nIts adapter proves residency by asking for one token, once per\nprocess, and only then treats the health endpoint as evidence.\n(Upstream `main` has since taught `/health` to answer 503\n`unavailable` while loading; the adapter reads that as loading\ntoo, so a future pin gets the cheap probe for free.) They\ndiffer in acquisition too: a llama.cpp build is fetched and\nverified by us, while vLLM and mlx-lm are Python packages the\noperator installs themselves. See `EngineAcquisition.policy`.\n\nLives here rather than on the agent because two components\nreference it: the agent's engines and runtimes, and a\nlibrary `ModelProfile`, which names the engine its launch flags\nare written for."
+        "description": "Which engine adapter constructs the argv and interprets\nreadiness. Deliberately a closed enum rather than a free string:\nan engine is supported exactly when an adapter exists for it,\nand without an adapter there is nothing that knows how to start\nit or tell when it is ready.\n\n`strata` is experimental. It launches Strata's Python HTTP\nserver and native engine together, and loads a model Strata\nprepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`\nnames that model's provenance file (`PreparedProvenance`), whose\n`entry` is Strata's own JSON configuration. A runtime declared\nbefore LS3 may name the JSON configuration itself; that still\nlaunches. It does not accept an arbitrary GGUF, and does not yet\nprepare one itself (LS5).\n\n`kev` drives upstream `python -m kev.serve` and loads Kev\ndecision checkpoints (`kev_checkpoint` format) \u2014 a decision\nmodel, not a chat model: its server speaks the System One\nprotocol and its companion driver serves `POST /v1/decide`,\nnever completions. Like vLLM it loads the model *before*\nbinding its port (read off `kev/serve.py` at the pinned commit\nand observed live 2026-09-22), so alive-and-refusing is\n`loading`; unlike every other engine it handles one request at\na time, which its driver advertises as a concurrency limit.\nIts bind is hardcoded to loopback upstream, which is the\nposture Eugene wants: the gateway is the authenticated front\ndoor.\n\n`llama_cpp` drives upstream `llama-server` and loads GGUF.\n`vllm` drives upstream `vllm serve` and loads safetensors.\n`mlx` drives upstream `mlx_lm.server` and loads MLX-format\nsafetensors, on Apple silicon only; not experimental since its\nrun on GitHub's macOS runners (A4, 2026-09-30). We never ship an engine \u2014 every\none of them is an upstream project we wrap and track.\n\nThey differ in far more than argv, and that is why readiness\nis per-adapter rather than one shared TCP check:\n`llama-server` answers `/health` while it loads and reports that\nit is loading, whereas vLLM binds its port *before* loading the\nmodel and refuses connections until the model is in memory \u2014 so\nfor minutes it is indistinguishable, over the network alone,\nfrom a process that died. `mlx_lm.server` is a third mechanism\nagain and the most awkward: it serves HTTP immediately, and at\nthe pinned release its `/health` answers a hardcoded\n`{\"status\": \"ok\"}` while the model is still loading on another\nthread, so **no read-only probe can tell loading from ready**.\nIts adapter proves residency by asking for one token, once per\nprocess, and only then treats the health endpoint as evidence.\n(Upstream `main` has since taught `/health` to answer 503\n`unavailable` while loading; the adapter reads that as loading\ntoo, so a future pin gets the cheap probe for free.) They\ndiffer in acquisition too: a llama.cpp build is fetched and\nverified by us, while vLLM and mlx-lm are Python packages the\noperator installs themselves. See `EngineAcquisition.policy`.\n\nLives here rather than on the agent because two components\nreference it: the agent's engines and runtimes, and a\nlibrary `ModelProfile`, which names the engine its launch flags\nare written for."
       },
       "GgufDetail": {
         "properties": {
@@ -1547,7 +1547,7 @@
           "path": {
             "type": "string",
             "title": "Path",
-            "description": "Absolute path, verbatim, in the operator's own layout \u2014 the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors. This is what goes on a runtime's\n`modelPath`.\n\n**A path on the host this library runs on** \u2014 inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n"
+            "description": "Absolute path, verbatim, in the operator's own layout \u2014 the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors, the provenance file\n(`<name>.eugene-prepared.json`) for `prepared`. This is what\ngoes on a runtime's `modelPath`.\n\n**A path on the host this library runs on** \u2014 inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n"
           },
           "root": {
             "anyOf": [
@@ -1567,7 +1567,7 @@
           "name": {
             "type": "string",
             "title": "Name",
-            "description": "The filename with its extension stripped, or the directory\nname for safetensors. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to \u2014 so\nplainly-named files mean the obvious name is already the\nright one.\n"
+            "description": "The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to \u2014 so\nplainly-named files mean the obvious name is already the\nright one.\n"
           },
           "displayName": {
             "anyOf": [
@@ -1595,7 +1595,7 @@
               }
             ],
             "title": "Sizebytes",
-            "description": "Total size of every file belonging to this model \u2014 all\nshards, and the projector when there is one. The number\nthat answers \"will this fit on the drive I am copying it\nto\", which is why it is a sum rather than the weights file\nalone.\n"
+            "description": "Total size of every file belonging to this model \u2014 all\nshards, and the projector when there is one. The number\nthat answers \"will this fit on the drive I am copying it\nto\", which is why it is a sum rather than the weights file\nalone.\n\nAbsent for `prepared`: the engine's own files are not read,\nso their size is not known, and the provenance file's few\nbytes are not the model's size.\n"
           },
           "fileCount": {
             "anyOf": [
@@ -1715,6 +1715,16 @@
               }
             ]
           },
+          "prepared": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparedDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "profileCount": {
             "anyOf": [
               {
@@ -1789,7 +1799,7 @@
           "status"
         ],
         "title": "LibraryModel",
-        "description": "One launchable model on this host.\n\nThe format-independent facts are here; exactly one of `gguf` or\n`safetensors` carries the rest. That split is not tidiness \u2014 a\nquant tier is a GGUF concept and an exact parameter count is a\nsafetensors one, and flattening both into one object would\nproduce a schema half of whose fields are null for any given\nmodel."
+        "description": "One launchable model on this host.\n\nThe format-independent facts are here; exactly one of `gguf`,\n`safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness \u2014 a\nquant tier is a GGUF concept and an exact parameter count is a\nsafetensors one, and flattening both into one object would\nproduce a schema half of whose fields are null for any given\nmodel."
       },
       "MlxQuantization": {
         "properties": {
@@ -1941,10 +1951,11 @@
         "enum": [
           "gguf",
           "safetensors",
-          "kev_checkpoint"
+          "kev_checkpoint",
+          "prepared"
         ],
         "title": "ModelFormat",
-        "description": "On-disk format of a model. A dimension of the data model rather\nthan an assumption (locked 2026-09-08), and the differences are\nload-bearing rather than cosmetic.\n\n* `gguf` \u2014 a single file, quantized, carrying its own metadata\n  and tokenizer. Large models may be **split** into\n  `\u2026-00001-of-0000N.gguf` shards, of which only the first is\n  named on a launch line. A multimodal GGUF ships its vision\n  projector as a separate file in the same directory, which is\n  not itself a model.\n* `safetensors` \u2014 a directory: `config.json` plus one or more\n  weight files plus tokenizer files. Unquantized in practice,\n  so **no quant tier** \u2014 a safetensors model is sized, not\n  tiered, and the quant fields exist only on the GGUF side.\n* `kev_checkpoint` \u2014 a directory holding a rank-limited LoRA\n  adapter (`adapter_config.json` + `adapter_model.safetensors`),\n  a pointer/decision head (`head.pt`), tokenizer files and\n  calibration/provenance artifacts (`provenance.json`), loaded\n  by Kev's own loader on top of a separately downloaded base\n  model named in the adapter config. Measured off the published\n  `jaredpalmer/kev-0.8b` checkpoint on 2026-09-22. **Not an\n  ordinary adapter**: a plain LoRA directory is skipped by the\n  scanner on purpose, and the decision head is what makes this\n  one a launchable model instead. Decision-only \u2014\n  `ModelCapabilities.decision`, never `chat`.\n\nShared because it appears on both sides of a join: a library\nentry declares what a model *is*, and an engine's\n`ModelRequirement`s declare what it can *load*. The format is\nthe first term of that join, not the whole of it\n(library-sources-and-engines.md)."
+        "description": "On-disk format of a model. A dimension of the data model rather\nthan an assumption (locked 2026-09-08), and the differences are\nload-bearing rather than cosmetic.\n\n* `gguf` \u2014 a single file, quantized, carrying its own metadata\n  and tokenizer. Large models may be **split** into\n  `\u2026-00001-of-0000N.gguf` shards, of which only the first is\n  named on a launch line. A multimodal GGUF ships its vision\n  projector as a separate file in the same directory, which is\n  not itself a model.\n* `safetensors` \u2014 a directory: `config.json` plus one or more\n  weight files plus tokenizer files. Unquantized in practice,\n  so **no quant tier** \u2014 a safetensors model is sized, not\n  tiered, and the quant fields exist only on the GGUF side.\n* `kev_checkpoint` \u2014 a directory holding a rank-limited LoRA\n  adapter (`adapter_config.json` + `adapter_model.safetensors`),\n  a pointer/decision head (`head.pt`), tokenizer files and\n  calibration/provenance artifacts (`provenance.json`), loaded\n  by Kev's own loader on top of a separately downloaded base\n  model named in the adapter config. Measured off the published\n  `jaredpalmer/kev-0.8b` checkpoint on 2026-09-22. **Not an\n  ordinary adapter**: a plain LoRA directory is skipped by the\n  scanner on purpose, and the decision head is what makes this\n  one a launchable model instead. Decision-only \u2014\n  `ModelCapabilities.decision`, never `chat`.\n* `prepared` \u2014 what one engine made for itself from another\n  model, in the engine's own format: Strata's expert pack,\n  lookup table and MTP helper, with its JSON configuration\n  (library-sources-and-engines.md \u00a74.5, Troy's L6). The library\n  does not read the engine's files; a small provenance file\n  beside them, `<name>.eugene-prepared.json`\n  (`PreparedProvenance`), names the engine, its entry file and\n  what it was made from, and is the model's path. Only the\n  engine it was prepared for loads it\n  (`ModelRequirement.preparedFor`).\n\nShared because it appears on both sides of a join: a library\nentry declares what a model *is*, and an engine's\n`ModelRequirement`s declare what it can *load*. The format is\nthe first term of that join, not the whole of it\n(library-sources-and-engines.md)."
       },
       "ModelProfile": {
         "properties": {
@@ -2317,6 +2328,162 @@
           "operations"
         ],
         "title": "OperationList"
+      },
+      "PreparedDetail": {
+        "properties": {
+          "engine": {
+            "$ref": "#/components/schemas/EngineKind"
+          },
+          "entry": {
+            "type": "string",
+            "title": "Entry",
+            "description": "The entry file as the provenance file writes it."
+          },
+          "entryPath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entrypath",
+            "description": "`entry` resolved against the folder holding the provenance\nfile, on this library's host; the same as `entry` when that\nis absolute.\n"
+          },
+          "entryFound": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entryfound",
+            "description": "Whether this library's host sees the entry file. A relative\nentry that is not there makes the model `unreadable`. An\nabsolute entry not seen here is not an error: it is a path on\nthe node that runs the model (an engine's prepared files\nbelong on that node's own fast drive, which only its agent\nsees), and the agent checks it when the model starts, naming\nany missing file.\n"
+          },
+          "recipe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipe",
+            "description": "As `PreparedProvenance.recipe`; absent means prepared outside Eugene."
+          },
+          "recipeVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Recipeversion"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparedSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "sourceModelId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcemodelid",
+            "description": "The library model it was prepared from, when `source.path`\nnames one this library lists. Absent when it does not, or\nnames none.\n"
+          },
+          "preparedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preparedat"
+          }
+        },
+        "type": "object",
+        "required": [
+          "engine",
+          "entry"
+        ],
+        "title": "PreparedDetail",
+        "description": "A prepared model's provenance, as its file\n(`PreparedProvenance`) says it, and what the library made of it.\nPresent iff `format` is `prepared` and the file could be read.\n\nThe engine's own files are not read (experimental-engines.md:\nprepared files stay usable without the library parsing them), so\na prepared model has no architecture, context, size or fit here:\nthe engine says what it loaded when it is ready\n(`RuntimeCapabilities`), and fit waits for the engine's own fit\nmodel (LS6). `files` lists the provenance file (`index`) and the\nentry file (`config`) when the library's host can see it."
+      },
+      "PreparedSource": {
+        "properties": {
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path",
+            "description": "The source model's `LibraryModel.path`, when it is a library\nmodel. The library links the two by it (`PreparedDetail.sourceModelId`).\n"
+          },
+          "repoId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repoid",
+            "description": "The hub repo it came from, e.g. `ISTA-DASLab/Qwen3.8-Flash-Next-GGUF`."
+          },
+          "file": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File",
+            "description": "The repo-relative file, for a GGUF (its first shard when split)."
+          },
+          "revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revision",
+            "description": "The repo commit."
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "PreparedSource",
+        "description": "What a prepared model was made from, as far as it is known. Every\nfield is optional: a model adopted from outside Eugene may say\nnothing, and \"not known\" is shown as such."
       },
       "ProfileBuiltAccuracy": {
         "type": "string",

@@ -384,9 +384,13 @@ class EngineKind(StrEnum):
     it or tell when it is ready.
 
     `strata` is experimental. It launches Strata's Python HTTP
-    server and native engine together, using a prepared Strata JSON
-    configuration as `RuntimeSpec.modelPath`. It does not accept an
-    arbitrary GGUF or prepare model weights automatically.
+    server and native engine together, and loads a model Strata
+    prepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`
+    names that model's provenance file (`PreparedProvenance`), whose
+    `entry` is Strata's own JSON configuration. A runtime declared
+    before LS3 may name the JSON configuration itself; that still
+    launches. It does not accept an arbitrary GGUF, and does not yet
+    prepare one itself (LS5).
 
     `kev` drives upstream `python -m kev.serve` and loads Kev
     decision checkpoints (`kev_checkpoint` format) — a decision
@@ -469,6 +473,16 @@ class ModelFormat(StrEnum):
       scanner on purpose, and the decision head is what makes this
       one a launchable model instead. Decision-only —
       `ModelCapabilities.decision`, never `chat`.
+    * `prepared` — what one engine made for itself from another
+      model, in the engine's own format: Strata's expert pack,
+      lookup table and MTP helper, with its JSON configuration
+      (library-sources-and-engines.md §4.5, Troy's L6). The library
+      does not read the engine's files; a small provenance file
+      beside them, `<name>.eugene-prepared.json`
+      (`PreparedProvenance`), names the engine, its entry file and
+      what it was made from, and is the model's path. Only the
+      engine it was prepared for loads it
+      (`ModelRequirement.preparedFor`).
 
     Shared because it appears on both sides of a join: a library
     entry declares what a model *is*, and an engine's
@@ -481,6 +495,7 @@ class ModelFormat(StrEnum):
     gguf = 'gguf'
     safetensors = 'safetensors'
     kev_checkpoint = 'kev_checkpoint'
+    prepared = 'prepared'
 
 
 class MlxQuantizationRule(StrEnum):
@@ -522,6 +537,32 @@ class ModelPreparation(BaseModel):
         ..., description="The adapter's name for the step, e.g. `strata-prepare`."
     )
     note: str | None = Field(None, description='What the step makes, in words.')
+
+
+class PreparedSource(BaseModel):
+    """
+    What a prepared model was made from, as far as it is known. Every
+    field is optional: a model adopted from outside Eugene may say
+    nothing, and "not known" is shown as such.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    path: str | None = Field(
+        None,
+        description="The source model's `LibraryModel.path`, when it is a library\nmodel. The library links the two by it (`PreparedDetail.sourceModelId`).\n",
+    )
+    repoId: str | None = Field(
+        None,
+        description='The hub repo it came from, e.g. `ISTA-DASLab/Qwen3.8-Flash-Next-GGUF`.',
+    )
+    file: str | None = Field(
+        None,
+        description='The repo-relative file, for a GGUF (its first shard when split).',
+    )
+    revision: str | None = Field(None, description='The repo commit.')
 
 
 class EligibilityCandidate(BaseModel):
@@ -1529,6 +1570,10 @@ class ModelRequirement(BaseModel):
         description='The GGUF quantization must be one of these. Absent means any.',
     )
     mlxQuantization: MlxQuantizationRule | None = None
+    preparedFor: EngineKind | None = Field(
+        None,
+        description="For `format: prepared` only: the engine a prepared model must\nhave been prepared for (`PreparedProvenance.engine`). Absent:\nthe engine declaring this requirement. A prepared model never\nmeets a requirement of an engine it was not prepared for,\nsince its files are in that engine's own format.\n",
+    )
     preparation: ModelPreparation | None = None
     authority: ModelRequirementAuthority | None = None
     preference: int | None = Field(
@@ -1538,6 +1583,59 @@ class ModelRequirement(BaseModel):
     note: str | None = Field(
         None,
         description='Words for the person beside a match, in the engine\'s own terms:\n"vLLM checks the architecture when it loads".\n',
+    )
+
+
+class PreparedProvenance(BaseModel):
+    """
+    The file `<name>.eugene-prepared.json` that makes an engine's
+    prepared files a library model (`ModelFormat` `prepared`;
+    library-sources-and-engines.md §4.5, Troy's L6). A plain JSON
+    file in a Library folder, in the person's own layout like every
+    other model file, and the prepared model's `LibraryModel.path`.
+
+    Written by the library's `POST /v1/models/prepared` when a person
+    adopts a model prepared outside Eugene, and by a preparation job
+    (LS5). Read by the library's scan, which lists a `prepared` model
+    from it, and by the agent at every launch, which hands the engine
+    its entry file. Nothing reads the engine's own files beyond what
+    launching them needs: they stay usable without the library
+    parsing them (experimental-engines.md).
+
+    A reader keeps and ignores fields it does not know, so a newer
+    Eugene can add some; a `formatVersion` above the one it knows
+    means the file was written by a newer Eugene, and the model is
+    listed as unreadable rather than guessed at.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    formatVersion: int | None = Field(
+        None,
+        description='The layout of this file. Absent means 1, the only one so far.',
+        ge=1,
+    )
+    engine: EngineKind = Field(
+        ..., description='The engine it was prepared for. Only that engine loads it.'
+    )
+    entry: str = Field(
+        ...,
+        description="The engine's own entry file: for Strata, its JSON\nconfiguration, which names the pack, tokenizer and MTP files.\nRelative to the folder holding this file, or absolute. A\nrelative entry travels with the folder (through a node's\n`pathMappings`, like any model path); an absolute one is a\npath on the node that runs the model, used as written,\nbecause an engine's prepared files belong on that node's own\nfast drive.\n",
+        min_length=1,
+    )
+    recipe: str | None = Field(
+        None,
+        description='The preparation that made it (`ModelPreparation.recipe`, e.g.\n`strata-prepare`). Absent: it was made outside Eugene and\nadopted as it is.\n',
+    )
+    recipeVersion: str | None = Field(
+        None,
+        description="The recipe's or engine's version that made it, e.g. Strata `v0.1.39`.",
+    )
+    source: PreparedSource | None = None
+    preparedAt: AwareDatetime | None = Field(
+        None, description='When this file was written.'
     )
 
 

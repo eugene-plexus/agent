@@ -601,9 +601,13 @@ class EngineKind(StrEnum):
     it or tell when it is ready.
 
     `strata` is experimental. It launches Strata's Python HTTP
-    server and native engine together, using a prepared Strata JSON
-    configuration as `RuntimeSpec.modelPath`. It does not accept an
-    arbitrary GGUF or prepare model weights automatically.
+    server and native engine together, and loads a model Strata
+    prepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`
+    names that model's provenance file (`PreparedProvenance`), whose
+    `entry` is Strata's own JSON configuration. A runtime declared
+    before LS3 may name the JSON configuration itself; that still
+    launches. It does not accept an arbitrary GGUF, and does not yet
+    prepare one itself (LS5).
 
     `kev` drives upstream `python -m kev.serve` and loads Kev
     decision checkpoints (`kev_checkpoint` format) — a decision
@@ -686,6 +690,16 @@ class ModelFormat(StrEnum):
       scanner on purpose, and the decision head is what makes this
       one a launchable model instead. Decision-only —
       `ModelCapabilities.decision`, never `chat`.
+    * `prepared` — what one engine made for itself from another
+      model, in the engine's own format: Strata's expert pack,
+      lookup table and MTP helper, with its JSON configuration
+      (library-sources-and-engines.md §4.5, Troy's L6). The library
+      does not read the engine's files; a small provenance file
+      beside them, `<name>.eugene-prepared.json`
+      (`PreparedProvenance`), names the engine, its entry file and
+      what it was made from, and is the model's path. Only the
+      engine it was prepared for loads it
+      (`ModelRequirement.preparedFor`).
 
     Shared because it appears on both sides of a join: a library
     entry declares what a model *is*, and an engine's
@@ -698,6 +712,7 @@ class ModelFormat(StrEnum):
     gguf = 'gguf'
     safetensors = 'safetensors'
     kev_checkpoint = 'kev_checkpoint'
+    prepared = 'prepared'
 
 
 class MlxQuantizationRule(StrEnum):
@@ -739,6 +754,32 @@ class ModelPreparation(BaseModel):
         ..., description="The adapter's name for the step, e.g. `strata-prepare`."
     )
     note: str | None = Field(None, description='What the step makes, in words.')
+
+
+class PreparedSource(BaseModel):
+    """
+    What a prepared model was made from, as far as it is known. Every
+    field is optional: a model adopted from outside Eugene may say
+    nothing, and "not known" is shown as such.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    path: str | None = Field(
+        None,
+        description="The source model's `LibraryModel.path`, when it is a library\nmodel. The library links the two by it (`PreparedDetail.sourceModelId`).\n",
+    )
+    repoId: str | None = Field(
+        None,
+        description='The hub repo it came from, e.g. `ISTA-DASLab/Qwen3.8-Flash-Next-GGUF`.',
+    )
+    file: str | None = Field(
+        None,
+        description='The repo-relative file, for a GGUF (its first shard when split).',
+    )
+    revision: str | None = Field(None, description='The repo commit.')
 
 
 class EligibilityCandidate(BaseModel):
@@ -3410,6 +3451,10 @@ class ModelRequirement(BaseModel):
         description='The GGUF quantization must be one of these. Absent means any.',
     )
     mlxQuantization: MlxQuantizationRule | None = None
+    preparedFor: EngineKind | None = Field(
+        None,
+        description="For `format: prepared` only: the engine a prepared model must\nhave been prepared for (`PreparedProvenance.engine`). Absent:\nthe engine declaring this requirement. A prepared model never\nmeets a requirement of an engine it was not prepared for,\nsince its files are in that engine's own format.\n",
+    )
     preparation: ModelPreparation | None = None
     authority: ModelRequirementAuthority | None = None
     preference: int | None = Field(
@@ -3419,6 +3464,59 @@ class ModelRequirement(BaseModel):
     note: str | None = Field(
         None,
         description='Words for the person beside a match, in the engine\'s own terms:\n"vLLM checks the architecture when it loads".\n',
+    )
+
+
+class PreparedProvenance(BaseModel):
+    """
+    The file `<name>.eugene-prepared.json` that makes an engine's
+    prepared files a library model (`ModelFormat` `prepared`;
+    library-sources-and-engines.md §4.5, Troy's L6). A plain JSON
+    file in a Library folder, in the person's own layout like every
+    other model file, and the prepared model's `LibraryModel.path`.
+
+    Written by the library's `POST /v1/models/prepared` when a person
+    adopts a model prepared outside Eugene, and by a preparation job
+    (LS5). Read by the library's scan, which lists a `prepared` model
+    from it, and by the agent at every launch, which hands the engine
+    its entry file. Nothing reads the engine's own files beyond what
+    launching them needs: they stay usable without the library
+    parsing them (experimental-engines.md).
+
+    A reader keeps and ignores fields it does not know, so a newer
+    Eugene can add some; a `formatVersion` above the one it knows
+    means the file was written by a newer Eugene, and the model is
+    listed as unreadable rather than guessed at.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    formatVersion: int | None = Field(
+        None,
+        description='The layout of this file. Absent means 1, the only one so far.',
+        ge=1,
+    )
+    engine: EngineKind = Field(
+        ..., description='The engine it was prepared for. Only that engine loads it.'
+    )
+    entry: str = Field(
+        ...,
+        description="The engine's own entry file: for Strata, its JSON\nconfiguration, which names the pack, tokenizer and MTP files.\nRelative to the folder holding this file, or absolute. A\nrelative entry travels with the folder (through a node's\n`pathMappings`, like any model path); an absolute one is a\npath on the node that runs the model, used as written,\nbecause an engine's prepared files belong on that node's own\nfast drive.\n",
+        min_length=1,
+    )
+    recipe: str | None = Field(
+        None,
+        description='The preparation that made it (`ModelPreparation.recipe`, e.g.\n`strata-prepare`). Absent: it was made outside Eugene and\nadopted as it is.\n',
+    )
+    recipeVersion: str | None = Field(
+        None,
+        description="The recipe's or engine's version that made it, e.g. Strata `v0.1.39`.",
+    )
+    source: PreparedSource | None = None
+    preparedAt: AwareDatetime | None = Field(
+        None, description='When this file was written.'
     )
 
 
@@ -3687,7 +3785,7 @@ class RuntimeSpec(BaseModel):
     engine: EngineKind
     modelPath: str = Field(
         ...,
-        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor `strata`, this is a prepared Strata JSON configuration\nin a Library folder on the target node. It references the\nexisting weights, pack, tokenizer and optional MTP assets.\nIt is not copied into the node's model cache. The adapter\nwrites a private launch config and preserves this original.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
+        description="Absolute path to the model on this host — a `.gguf` file, or\na directory for multi-file formats. **The operator's own\npath, in the operator's own layout.** We never relocate,\nrename, or hash-address a model file; a runtime points at\nwhere the user put it.\n\nFor `strata`, this is a prepared model's provenance file\n(`<name>.eugene-prepared.json`, `PreparedProvenance`), the\n`path` of a `prepared` library model; at every launch the\nagent reads it and resolves its `entry`, Strata's JSON\nconfiguration, which references the existing weights, pack,\ntokenizer and optional MTP assets. A declaration from before\nLS3 may name that JSON configuration directly, and still\nlaunches. Neither is copied into the node's model cache. The\nadapter writes a private launch config and preserves the\noriginals.\n\nFor a sharded GGUF this is the *first* shard\n(`…-00001-of-0000N.gguf`), which is what the engine expects.\nWhen a runtime is created from the library, this is the\n`path` off a `LibraryModel` and the `flags` are a\n`ModelProfile` — but nothing here depends on the library\nexisting, and a hand-written runtime is still a runtime.\n\n**When the library is on another host, this is still the\nlibrary's spelling** (M11). The node resolves where the same\nfile is on its own disk through the Library folder's\n`mounts` and its own `pathMappings` overrides, at every\nspawn and never onto this field — so the declaration keeps\nlinking to its library entry (`GET /v1/models?path=` is keyed\nto the library's own path), and a changed mapping takes\neffect at the next start with nothing re-declared. What was\nactually opened is reported as `Runtime.localPath`.\n",
     )
     modelAlias: str | None = Field(
         None,
@@ -4655,7 +4753,7 @@ class EngineDescriptor(BaseModel):
     )
     modelFormats: list[ModelFormat] = Field(
         ...,
-        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`strata` lists no catalogue model formats: it requires a\nprepared JSON configuration and is offered through the\nexperimental prepared-model form, not arbitrary GGUF launch.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n\n**Kept for consoles older than `accepts`;** it is the formats\nof the requirements in `accepts` that need no preparation, so\nan older console never offers Strata for every GGUF.\n",
+        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`strata` lists only `prepared`: it loads models it prepared,\nnever an arbitrary GGUF, so a console that knows no\n`prepared` model offers it for none.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n\n**Kept for consoles older than `accepts`;** it is the formats\nof the requirements in `accepts` that need no preparation, so\nan older console never offers Strata for every GGUF.\n",
     )
     accepts: list[ModelRequirement] | None = Field(
         None,
