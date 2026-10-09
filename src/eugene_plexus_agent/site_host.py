@@ -545,7 +545,11 @@ class SiteHostSupervisor:
             answer.raise_for_status()
         except httpx.HTTPError as exc:
             log.debug("could not tell the root which site this node hosts: %s", exc)
-            return
+            refused = isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500
+            if not refused:
+                return
+            # The root answered and said no: one older than this agent has no
+            # such route. Ask again at the usual interval, not every 5 s.
         self._reported, self._report_at = key, time.perf_counter() + 600
 
     async def step(self) -> None:

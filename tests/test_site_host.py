@@ -188,6 +188,35 @@ async def test_the_node_says_which_site_it_hosts(app: FastAPI) -> None:
     ]
 
 
+@pytest.mark.parametrize(("status", "asks"), [(404, 1), (503, 2)])
+async def test_a_root_without_the_route_is_not_asked_every_five_seconds(
+    app: FastAPI, status: int, asks: int
+) -> None:
+    """A v0.1.0 root has no hosted-sites route; a newer node asked it on
+    every 5 s step, a 404 in the root's log each time. A refusal waits the
+    usual interval; a root that could not answer (5xx) is asked again."""
+    supervisor = SiteHostSupervisor(app)
+    sent: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        sent.append(request.url.path)
+        return httpx.Response(status)
+
+    app.state.node_identity = SimpleNamespace(
+        record=SimpleNamespace(enrolled=True, control_url="http://root", name="amish")
+    )
+    app.state.auth_state = SimpleNamespace(trust=SimpleNamespace(agent_token=lambda audience: "t"))
+    supervisor._root = "http://root"
+    supervisor._root_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        await supervisor._report()
+        await supervisor._report()
+    finally:
+        await supervisor._root_client.aclose()
+        await supervisor._host.aclose()
+    assert len(sent) == asks
+
+
 def test_join_runs_the_site_hosts_own_join_with_the_password_piped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
