@@ -1281,7 +1281,10 @@ def validate_spec(spec: RuntimeSpec, get_config: ConfigGetter | None = None) -> 
                 "are not supported"
             )
         if Path(spec.modelPath).suffix.lower() != ".json":
-            return "Strata modelPath must name a prepared Strata JSON config, not a GGUF"
+            return (
+                "Strata loads a prepared model: modelPath must name its provenance file "
+                "(.eugene-prepared.json) or a Strata JSON config, not a GGUF"
+            )
     if spec.engine is EngineKind.kev and spec.host not in (None, "127.0.0.1", "localhost"):
         # Upstream hardcodes the bind to loopback (no --host flag at the
         # pinned commit), so honouring this host is not in our power and

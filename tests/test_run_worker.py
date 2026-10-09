@@ -140,11 +140,13 @@ async def test_run_takes_the_engine_the_library_judges_best(app):
 
 
 @pytest.mark.asyncio
-async def test_a_library_older_than_eligibility_keeps_the_mlx_rule(app):
-    # A container root updated after its workers answers 404 (2026-10-09).
+@pytest.mark.parametrize("status", [404, 422])
+async def test_a_library_older_than_eligibility_keeps_the_mlx_rule(app, status):
+    # A container root updated after its workers answers 404 (2026-10-09);
+    # one older than LS3 refuses Strata's `prepared` requirement with 422.
     worker = RunWorker(app, node_actions=_BothSafetensorsEngines(app))
     job = {"step": "checking", "engine": None, "model": MLX_MODEL}
-    result = await worker.advance(_Judge(status=404), "/unused", job, {})
+    result = await worker.advance(_Judge(status=status), "/unused", job, {})
     assert result == {"step": "settings", "engine": "mlx"}
 
 

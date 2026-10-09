@@ -110,7 +110,9 @@ async def judge(
             json={"models": [model["id"]], "engines": [eligibility_engine(e) for e in engines]},
         )
     except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 404:
+        # 404: a library older than the judge. 422: one older than a value
+        # this agent's engines declare (LS3's `prepared`), which it rejects.
+        if exc.response.status_code not in (404, 422):
             raise
         return _by_format(model, engines)
     found = (answer or {}).get("models") or []

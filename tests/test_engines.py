@@ -647,8 +647,11 @@ def test_the_engine_list_carries_accepts(tmp_path, monkeypatch) -> None:
     by_kind = {e.engine.value: e for e in describe_engines()}
     llama = by_kind["llama_cpp"].accepts or []
     assert llama[0].architectures == list(llama_architectures.shipped().names)
-    strata = by_kind["strata"].accepts or []
-    assert [r.architectures for r in strata] == [["qwen4exp"]]
-    assert strata[0].preparation is not None
+    strata = {r.format.value: r for r in by_kind["strata"].accepts or []}
+    assert strata["gguf"].architectures == ["qwen4exp"]
+    assert strata["gguf"].preparation is not None
+    # And the models it prepared, Library models since LS3.
+    assert strata["prepared"].preparedFor is not None
+    assert strata["prepared"].preparation is None
     vllm = by_kind["vllm"].accepts or []
     assert vllm[0].mlxQuantization is not None and vllm[0].authority is not None

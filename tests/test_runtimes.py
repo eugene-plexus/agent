@@ -100,7 +100,7 @@ def test_model_formats_do_not_depend_on_availability(authed_client: TestClient) 
     load."""
     for engine in authed_client.get("/v1/engines").json()["engines"]:
         if engine["engine"] == "strata":
-            assert engine["modelFormats"] == []  # prepared configs, not arbitrary GGUFs
+            assert engine["modelFormats"] == ["prepared"]  # never an arbitrary GGUF
             continue
         assert engine["modelFormats"], f"{engine['engine']} declared no formats"
 

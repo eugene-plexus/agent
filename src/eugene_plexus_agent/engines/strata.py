@@ -2,6 +2,11 @@
 
 The HTTP server owns the native child. Only text, one request at a time;
 weights/tokenizers/MTP packs stay in the operator's model folder.
+
+Since LS3 a prepared model is a Library model (library-sources-and-engines.md
+§4.5): its path is a provenance file, `<name>.eugene-prepared.json`, whose
+`entry` is Strata's JSON configuration. A runtime declared before LS3 names
+that configuration directly, and still launches.
 """
 
 from __future__ import annotations
@@ -9,9 +14,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import httpx
+from pydantic import ValidationError
 
 from .._generated.models import (
     ConfigSchema,
@@ -19,11 +25,13 @@ from .._generated.models import (
     ModelFormat,
     ModelPreparation,
     ModelRequirement,
+    PreparedProvenance,
     RuntimeCapabilities,
     RuntimeSpec,
 )
 from ..supervisor import SpawnPlanError
 from .base import (
+    PREPARED_SUFFIX,
     DiscoveredBinary,
     EngineAdapter,
     Loading,
@@ -72,6 +80,48 @@ OWNED_KEYS = {"exe", "cwd", "model_name", "log", "port", "host", "lib_dirs", "al
 # Setup-only bookkeeping. The selected GPU and prepared MTP files already
 # carry these choices; the HTTP server does not read either field.
 SETUP_KEYS = {"gpus_asked", "draft_vocab"}
+
+
+#: The provenance layout this agent reads.
+PROVENANCE_VERSION = 1
+
+
+def prepared_entry(path: Path) -> Path:
+    """Strata's configuration for a model path: the provenance file's
+    `entry`, or the path itself when it names a configuration directly
+    (a declaration from before LS3). Read at every launch, so a prepared
+    model re-adopted with a new entry starts from the new one."""
+    if not path.name.lower().endswith(PREPARED_SUFFIX):
+        return path
+    where = f"Prepared model {path}"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except OSError as exc:
+        raise SpawnPlanError(f"{where}: cannot read its provenance file: {exc}") from exc
+    except ValueError as exc:
+        raise SpawnPlanError(f"{where}: its provenance file is not JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise SpawnPlanError(f"{where}: its provenance file is not a JSON object")
+    version = raw.get("formatVersion", PROVENANCE_VERSION)
+    if isinstance(version, int) and version > PROVENANCE_VERSION:
+        raise SpawnPlanError(
+            f"{where}: its provenance file was written by a newer Eugene (formatVersion "
+            f"{version}); update this node's agent"
+        )
+    try:
+        provenance = PreparedProvenance.model_validate(raw)
+    except ValidationError as exc:
+        raise SpawnPlanError(f"{where}: its provenance file is not valid: {exc}") from exc
+    if provenance.engine is not EngineKind.strata:
+        raise SpawnPlanError(
+            f"{where} was prepared for {provenance.engine.value}, not Strata; "
+            "only the engine it was prepared for can load it"
+        )
+    entry = provenance.entry
+    if PurePosixPath(entry).is_absolute() or PureWindowsPath(entry).is_absolute():
+        # A path on this node, used as written.
+        return Path(entry)
+    return path.parent / entry
 
 
 def runtime_lib_dirs(root: Path) -> list[str]:
@@ -164,11 +214,17 @@ class StrataAdapter(EngineAdapter):
     kind = EngineKind.strata
     binary_name = "strata-server"  # never mistake an arbitrary server.py on PATH for Strata
     configured_binary_key = "strataServer"
-    model_formats = ()  # prepared configs, not arbitrary GGUF files from the Library
+    #: What it loads as it is: models it prepared, never an arbitrary GGUF.
+    model_formats = (ModelFormat.prepared,)
     #: Qwen3.8-Flash-Next's GGUFs (`general.architecture` qwen4exp, read off
-    #: ISTA-DASLab's repo 2026-10-09), once Strata has prepared them. Its
-    #: prepared configs become Library models in LS3.
+    #: ISTA-DASLab's repo 2026-10-09), once Strata has prepared them; and the
+    #: models it prepared, which are Library models since LS3.
     accepts = (
+        ModelRequirement(
+            format=ModelFormat.prepared,
+            preparedFor=EngineKind.strata,
+            preference=50,
+        ),
         ModelRequirement(
             format=ModelFormat.gguf,
             architectures=["qwen4exp"],
@@ -190,7 +246,7 @@ class StrataAdapter(EngineAdapter):
         if not python.is_file():
             raise SpawnPlanError(f"Strata's isolated Python is missing: {python}")
         return prepared_config(
-            Path(spec.modelPath),
+            prepared_entry(Path(spec.modelPath)),
             alias=spec.modelAlias or default_model_alias(spec.modelPath),
             root=root,
         )

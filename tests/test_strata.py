@@ -142,9 +142,89 @@ def test_no_automatic_eviction_or_arbitrary_gguf():
         name="strata", engine="strata", modelPath="prepared.json", startOnDemand=True
     )
     assert "explicit start/stop" in validate_spec(spec)
-    assert "prepared Strata JSON" in validate_spec(
+    assert "Strata loads a prepared model" in validate_spec(
         spec.model_copy(update={"startOnDemand": False, "modelPath": "file.gguf"})
     )
+    library = spec.model_copy(
+        update={"startOnDemand": False, "modelPath": "/m/qwen.eugene-prepared.json"}
+    )
+    assert validate_spec(library) is None
+
+
+# --- a prepared model from the Library (LS3) -----------------------------------
+
+
+def _provenance(folder: Path, **body) -> Path:
+    path = folder / "qwen-flash.eugene-prepared.json"
+    path.write_text(json.dumps({"engine": "strata", **body}), encoding="utf-8")
+    return path
+
+
+def test_a_library_model_launches_its_entry_under_its_own_name(prepared, tmp_path):
+    _, server, config, _ = prepared
+    library = tmp_path / "library"
+    library.mkdir()
+    provenance = _provenance(library, entry=str(config))
+    beside = _provenance(config.parent, entry=config.name)
+    for path in (provenance, beside):
+        spec = RuntimeSpec(name="q", engine="strata", modelPath=str(path))
+        argv = strata.StrataAdapter().build_argv(
+            spec, DiscoveredBinary(server, Origin.configured), 1
+        )
+        saved = json.loads(Path(argv[argv.index("--config") + 1]).read_text())
+        # The Library's name for it, not the provenance file's.
+        assert saved["model_name"] == "qwen-flash"
+        assert Path(saved["args"][1]) == config.parent / "pack"
+
+
+@pytest.mark.parametrize(
+    "body,said",
+    [
+        ({"engine": "kev", "entry": "qwen.json"}, "prepared for kev, not Strata"),
+        ({"engine": "strata", "entry": "qwen.json", "formatVersion": 2}, "newer Eugene"),
+        ({"engine": "strata"}, "not valid"),
+        ({"engine": "strata", "entry": "elsewhere.json"}, "elsewhere.json"),
+    ],
+)
+def test_a_provenance_file_that_cannot_launch_says_why(prepared, body, said):
+    root, _, config, _ = prepared
+    path = config.parent / "qwen-flash.eugene-prepared.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    spec = RuntimeSpec(name="q", engine="strata", modelPath=str(path))
+    with pytest.raises(SpawnPlanError, match=said):
+        strata.StrataAdapter().prepare_config(
+            spec, DiscoveredBinary(root / "serve/server.py", Origin.configured)
+        )
+
+
+def test_strata_declares_the_prepared_models_it_loads():
+    loads = [r for r in strata.StrataAdapter.accepts if r.format.value == "prepared"]
+    assert len(loads) == 1 and loads[0].preparedFor is EngineKind.strata
+    assert loads[0].preparation is None
+    # Older consoles see only `prepared`, so never Strata for every GGUF (B6).
+    assert [f.value for f in strata.StrataAdapter.model_formats] == ["prepared"]
+
+
+def test_admission_reads_the_entry_through_the_nodes_mapping(authed_client, prepared):
+    _, server, config, cfg = prepared
+    _provenance(config.parent, entry=config.name)
+    authed_client.patch(
+        "/v1/config",
+        json={
+            "strataServer": str(server),
+            "pathMappings": [{"from": "/remote/models", "to": str(config.parent)}],
+        },
+    )
+    model = "/remote/models/qwen-flash.eugene-prepared.json"
+    request = {"name": "a", "engine": "strata", "modelPath": model}
+    body = authed_client.post("/v1/runtimes/admission", json=request).json()
+    assert body["decision"] == "admit", body
+    assert body["fit"] == "unknown"
+    cfg["args"] += ["--mtp", "missing-mtp-pack"]
+    config.write_text(json.dumps(cfg))
+    body = authed_client.post("/v1/runtimes/admission", json=request).json()
+    assert body["decision"] == "refuse"
+    assert "missing-mtp-pack" in body["reason"]
 
 
 def test_uninstall_preserves_borrowed_models_and_ignores_unowned_dirs(tmp_path):

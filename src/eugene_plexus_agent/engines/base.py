@@ -611,6 +611,10 @@ def interpret_readiness(
     return Loading(detail=detail, past_budget=past_budget)
 
 
+#: A prepared model's provenance file, `<name>.eugene-prepared.json` (LS3).
+PREPARED_SUFFIX = ".eugene-prepared.json"
+
+
 def default_model_alias(model_path: str) -> str:
     """Filename with its extension stripped.
 
@@ -631,6 +635,9 @@ def default_model_alias(model_path: str) -> str:
     """
     trimmed = model_path.rstrip("\\/")
     last = trimmed.replace("\\", "/").rsplit("/", 1)[-1] or trimmed
+    if last.lower().endswith(PREPARED_SUFFIX):
+        # A prepared model is called as the Library calls it (LS3).
+        return last[: -len(PREPARED_SUFFIX)]
     path = Path(last)
     if path.suffix.lower() == ".gguf":
         return path.stem

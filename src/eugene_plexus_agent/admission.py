@@ -1018,7 +1018,7 @@ async def check_admission(
             fit=AdmissionFit.unknown,
             basis=AdmissionBasis.file_size,
             blockers=[],
-            reason="Prepared Strata config found; memory requirements are unknown.",
+            reason="Prepared Strata model found; its memory needs are not estimated yet.",
             warning=(
                 "Experimental engine: check RAM/VRAM availability before starting. "
                 "Config size is not model size."
