@@ -282,3 +282,70 @@ async def test_immediate_cancel_is_reported(tmp_path):
     installer = EngineInstaller(ManagedStore(tmp_path, EngineKind.strata), EngineKind.strata)
     installer.start(AcquisitionPlan("v1", "test", (), "server.py"))
     assert (await installer.cancel()).state == "cancelled"
+
+
+def test_the_service_makes_stratas_venv_with_an_interpreter_that_can_run_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under the Windows service `sys.executable` is pythonservice.exe, which
+    prints its usage for `-m venv` and exits: Strata's install failed on a
+    service install (Amish_Station, 2026-10-09). The venv is made, for real,
+    with the service venv's own python.exe."""
+    import sys
+
+    if sys.platform != "win32":
+        pytest.skip("Windows service interpreter")
+    from eugene_plexus_agent.engines import strata_install
+    from eugene_plexus_agent.engines.acquisition import _Progress
+
+    monkeypatch.setattr(sys, "executable", str(Path(sys.prefix) / "pythonservice.exe"))
+    command = strata_install._venv_command(tmp_path / ".venv")
+    assert Path(command[0]) == Path(sys.prefix) / "Scripts" / "python.exe"
+    strata_install._run_command(command, _Progress(EngineKind.strata), tmp_path)
+    assert (tmp_path / ".venv" / "Scripts" / "python.exe").is_file()
+
+
+def test_a_service_without_its_interpreter_says_which_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from eugene_plexus_agent.engines import strata_install
+    from eugene_plexus_agent.engines.acquisition import AcquisitionError
+
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "pythonservice.exe"))
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    with pytest.raises(AcquisitionError, match="interpreter is missing"):
+        strata_install._venv_command(tmp_path / ".venv")
+
+
+def test_a_failed_setup_command_is_named_with_its_exit_code(tmp_path: Path) -> None:
+    import sys
+
+    from eugene_plexus_agent.engines import strata_install
+    from eugene_plexus_agent.engines.acquisition import AcquisitionError, _Progress
+
+    command = [sys.executable, "-c", "print('some usage text'); raise SystemExit(3)"]
+    with pytest.raises(AcquisitionError) as failed:
+        strata_install._run_command(command, _Progress(EngineKind.strata), tmp_path)
+    said = str(failed.value)
+    assert f"`{Path(sys.executable).name} -c" in said and "exited 3" in said, said
+    assert "some usage text" in said
+
+
+def test_a_failed_setup_command_that_speaks_utf16_is_readable(tmp_path: Path) -> None:
+    """pythonservice.exe writes its usage in UTF-16; read as UTF-8 it put a
+    NUL (a box on screen) between every letter of the path (Troy, 2026-10-09)."""
+    import sys
+
+    from eugene_plexus_agent.engines import strata_install
+    from eugene_plexus_agent.engines.acquisition import _Progress
+
+    said_by = "import sys; sys.stdout.buffer.write('usage: -debug servicename'.encode('utf-16-le'))"
+    command = [sys.executable, "-c", said_by + "; raise SystemExit(2)"]
+    with pytest.raises(AcquisitionError) as failed:
+        strata_install._run_command(command, _Progress(EngineKind.strata), tmp_path)
+    said = str(failed.value)
+    assert "usage: -debug servicename" in said and "\x00" not in said, repr(said)
+    # UTF-8 output, the ordinary case, is unchanged.
+    assert strata_install._readable("pip: ok — done".encode()) == "pip: ok — done"

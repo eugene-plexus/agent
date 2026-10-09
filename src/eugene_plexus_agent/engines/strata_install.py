@@ -6,12 +6,12 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 from .._generated.models import HostAccelerator, State
 from ..child_env import child_environment
+from ..interpreter import command_python
 from .acquisition import (
     AcquisitionError,
     AcquisitionPlan,
@@ -73,6 +73,22 @@ def plan(
     return AcquisitionPlan(VERSION, "windows-x64-cuda13", (SOURCE, NATIVE), "server.py")
 
 
+def _readable(raw: bytes) -> str:
+    """A child's output as a person can read it.
+
+    pip writes UTF-8, but some Windows programs write UTF-16: read as UTF-8,
+    pythonservice.exe's usage put a NUL between every letter, shown as a
+    box (2026-10-09). A byte-order mark, or a NUL in every other byte, is
+    UTF-16; stray NULs are dropped either way.
+    """
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace").replace("\x00", "")
+    odd = raw[1::2]
+    if odd and odd.count(0) * 2 >= len(odd):
+        return raw.decode("utf-16-le", errors="replace").replace("\x00", "")
+    return raw.decode("utf-8", errors="replace").replace("\x00", "")
+
+
 def _run_command(argv: list[str], progress: _Progress, cwd: Path) -> None:
     # Output is captured in a bounded tail on failure; no visible console and
     # no shell. Wheel-only pip does not spawn compiler/build subprocesses.
@@ -117,11 +133,24 @@ def _run_command(argv: list[str], progress: _Progress, cwd: Path) -> None:
                     process.kill()
                     process.wait()
     if process.returncode:
+        # Name the command and its exit code: the output alone may be
+        # another program's usage text (pythonservice.exe's, 2026-10-09).
         raise AcquisitionError(
-            "Strata environment setup failed: "
-            + log.read_text(encoding="utf-8", errors="replace")[-3000:]
+            f"Strata environment setup failed: `{Path(argv[0]).name} {' '.join(argv[1:3])}` "
+            f"exited {process.returncode}: " + _readable(log.read_bytes())[-3000:]
         )
     log.unlink(missing_ok=True)
+
+
+def _venv_command(target: Path) -> list[str]:
+    """`python -m venv`, with an interpreter that can run it: under the
+    Windows service `sys.executable` is pythonservice.exe, which cannot
+    (found installing Strata on a service install, 2026-10-09)."""
+    try:
+        python = command_python()
+    except FileNotFoundError as e:
+        raise AcquisitionError(str(e)) from e
+    return [python, "-m", "venv", str(target)]
 
 
 class StrataInstaller(EngineInstaller):
@@ -157,7 +186,7 @@ class StrataInstaller(EngineInstaller):
         shutil.copytree(native.parent, root / "engine", dirs_exist_ok=True)
         _remove_quietly(staging / "native")
         progress.message = "creating Strata's isolated Python environment"
-        _run_command([sys.executable, "-m", "venv", str(root / ".venv")], progress, root)
+        _run_command(_venv_command(root / ".venv"), progress, root)
         python = root / ".venv" / "Scripts" / "python.exe"
         progress.message = (
             "installing Strata's Python and CUDA dependencies (model files are separate)"

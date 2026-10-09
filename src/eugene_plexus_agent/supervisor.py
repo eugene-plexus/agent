@@ -35,14 +35,12 @@ import contextlib
 import logging
 import os
 import re
-import sys
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 from urllib.parse import urlparse
 
@@ -54,6 +52,7 @@ from ._http import internal_client
 from .auth_state import AuthState
 from .child_env import child_environment, reserved_override
 from .exit_codes import explain_windows_exit
+from .interpreter import command_python
 
 # How long an exiting child gets to finish flushing before we SIGKILL it
 # during agent shutdown. Long enough for a /v1/admin/restart-style
@@ -317,17 +316,12 @@ class SpawnPlanner(Protocol):
 
 
 def _component_python() -> str:
-    """Use this venv's interpreter when hosted by the Windows service.
-
-    pythonservice.exe embeds Python but cannot execute ``-m`` commands.
-    Never substitute an unrelated interpreter from PATH.
-    """
-    if Path(sys.executable).name.lower() != "pythonservice.exe":
-        return sys.executable
-    python = Path(sys.prefix) / "Scripts" / "python.exe"
-    if not python.is_file():
-        raise SpawnPlanError(f"The service's Python interpreter is missing: {python}")
-    return str(python)
+    """Use this venv's interpreter when hosted by the Windows service
+    (`interpreter.command_python`)."""
+    try:
+        return command_python()
+    except FileNotFoundError as e:
+        raise SpawnPlanError(str(e)) from e
 
 
 class _ComponentPlanner:
