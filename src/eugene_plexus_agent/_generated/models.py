@@ -782,6 +782,82 @@ class PreparedSource(BaseModel):
     revision: str | None = Field(None, description='The repo commit.')
 
 
+class SupportedModel(BaseModel):
+    """
+    One model an engine's adapter publishes as supported
+    (library-sources-and-engines.md §4.4, LS4): which files on a hub,
+    and what the engine does with them. Read off the engine's own
+    documentation and setup at the version the adapter pins, never
+    written from memory. The list ships with the adapter in the agent
+    (Troy's L7, `EngineDescriptor.supportedModels`), so a new engine
+    brings its own and a node's list is the one its adapter would
+    prepare and run. A caller hands it to the library's search
+    (`EngineModelList`), which shows it as one source among the others
+    (`CatalogueSourceKind` `engine_list`).
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Unique within the engine's list and stable across versions of\nit, e.g. Strata's own name for the choice (`coder-IQ1_M`).\n",
+        min_length=1,
+    )
+    title: str = Field(
+        ..., description='What to call it, e.g. `Qwen3.8-Flash-Next IQ2_XS`.'
+    )
+    about: str | None = Field(
+        None, description="The engine's own words for it, from its documentation."
+    )
+    publisher: str | None = Field(
+        None,
+        description='Who made the files, e.g. `Qwen; GSQ-RCO quants by ISTA-DASLab`.',
+    )
+    license: str | None = Field(
+        None,
+        description="When the files carry a licence of their own the person should\nread before downloading, the engine's words for it.\n",
+    )
+    format: ModelFormat
+    architecture: str | None = Field(
+        None,
+        description='As the hub reads the files (`general.architecture` for a GGUF).',
+    )
+    quantization: str | None = Field(
+        None, description="The engine's name for the size, e.g. `IQ2_XS`."
+    )
+    source: PreparedSource = Field(
+        ...,
+        description="Where the files are, all three named: `repoId`, `file` (a\nGGUF's first shard, repo-relative) and the `revision` the engine\npins. What a preparation records as its source (LS5).\n",
+    )
+    sizeBytes: int | None = Field(
+        None,
+        description='Every file of it summed, as the hub lists them at `source.revision`.',
+        ge=0,
+    )
+    preparation: ModelPreparation | None = Field(
+        None,
+        description='What the engine does to the files before it runs them, if anything.',
+    )
+    recommended: bool | None = Field(
+        False, description="The engine's own documentation recommends it."
+    )
+    experimental: bool | None = Field(
+        False, description="The engine's own documentation calls it experimental."
+    )
+
+
+class EngineModelList(BaseModel):
+    """
+    One engine's `supportedModels`, as a caller sends it to the
+    library's search (`CatalogueSearchRequest.engines`): the console the
+    picked node's, as it sends that node's `accepts` to the judge, so the
+    library calls no agent.
+
+    """
+
+    engine: EngineKind
+    models: list[SupportedModel]
+
+
 class EligibilityCandidate(BaseModel):
     """
     A model not in the library yet, judged by its facts
@@ -812,6 +888,10 @@ class EligibilityCandidate(BaseModel):
     quantization: str | None = Field(
         None,
         description="The GGUF quantization, from the file's name (the scan's own fallback).",
+    )
+    file: str | None = Field(
+        None,
+        description="The file's name without its folder: a GGUF's first shard\n(`ModelRequirement.files`, LS4). Absent: not known yet, as on a\nsearch row, which names a repo rather than a file.\n",
     )
     mlxQuantized: bool | None = Field(
         None,
@@ -1082,6 +1162,19 @@ class ConfigValueType(StrEnum):
     to open a directory picker or an address field. UIs render it as
     an add/remove list of text fields.
 
+    `catalogue_sources` (LS4, 2026-10-09) is an ordered JSON array of
+    the library's `CatalogueSource` — `{"id", "kind", "label",
+    "enabled", "address", "token", "engine"}`: where Discover finds
+    models (library-sources-and-engines.md §4.4). Its one user is the
+    library's `catalogueSources`, which replaced the single hub
+    address and token. Like `share_credentials`, entries hold a
+    secret: an `hf_hub` entry's `token` is redacted in `GET` (as
+    `null`, with `hasToken` saying whether one is stored), accepted in
+    `PATCH`, and an entry that omits it keeps the token stored under
+    the same `id`; `""` clears it. UIs render it as rows of a source,
+    with the token a password input, and must not display a redacted
+    token as though none were stored.
+
     """
 
     string = 'string'
@@ -1102,6 +1195,7 @@ class ConfigValueType(StrEnum):
     library_folders = 'library_folders'
     share_credentials = 'share_credentials'
     string_list = 'string_list'
+    catalogue_sources = 'catalogue_sources'
 
 
 class ConfigFieldStatusLevel(StrEnum):
@@ -3450,6 +3544,10 @@ class ModelRequirement(BaseModel):
         None,
         description='The GGUF quantization must be one of these. Absent means any.',
     )
+    files: list[str] | None = Field(
+        None,
+        description="The model's file must have one of these names: a GGUF's first\nshard, as the hub and the disk both name it, without its\nfolder. Absent means any. For an engine that runs only the files\nit names (LS4): Strata's own setup accepts a GGUF by its name\nand refuses every other one of the same architecture, so its\nadapter fills this from its `supportedModels`, and a Flash-Next\nK-quant from another publisher is `no`, naming the list.\n",
+    )
     mlxQuantization: MlxQuantizationRule | None = None
     preparedFor: EngineKind | None = Field(
         None,
@@ -4758,6 +4856,10 @@ class EngineDescriptor(BaseModel):
     accepts: list[ModelRequirement] | None = Field(
         None,
         description="What this engine loads, as data the library judges\n(`POST /v1/eligibility`; library-sources-and-engines.md, LS1).\nFiner than `modelFormats`: the MLX marker, architectures, a\npreparation step, and whether only the engine can tell. A\nproperty of the engine, and for llama.cpp of its build: the\narchitectures its installed build knows, read from upstream's\nsource at that build's tag once and kept; until then, or for\na build not installed, the list Eugene ships with *may run*\nfor the rest (LS2).\n",
+    )
+    supportedModels: list[SupportedModel] | None = Field(
+        None,
+        description="The models this adapter publishes as supported (LS4,\nlibrary-sources-and-engines.md §4.4): each names its files on a\nhub at a pinned revision, and the preparation they need. A\nproperty of the adapter, not of this host: listed whether or\nnot the engine is installed, so Discover can show what an\nengine would run before it is. Read off the engine's own setup\nat the version the adapter pins (Strata v0.1.39: nine choices).\nEmpty for an engine that loads whatever its requirements\naccept. The console sends it to the library's search\n(`POST /v1/catalogue/search`), which lists it as a source.\n",
     )
     experimental: bool | None = Field(
         False,

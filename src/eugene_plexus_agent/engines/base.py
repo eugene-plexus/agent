@@ -39,6 +39,7 @@ from .._generated.models import (
     PythonEngine,
     RuntimeCapabilities,
     RuntimeSpec,
+    SupportedModel,
 )
 from .._http import shared_internal_client
 from .acquisition import ManagedStore, engine_root
@@ -179,6 +180,12 @@ class EngineAdapter(abc.ABC):
     #: the formats of the requirements that need no preparation (a test
     #: holds the two together).
     accepts: tuple[ModelRequirement, ...] = ()
+
+    #: The models this adapter publishes as supported (LS4, design §4.4):
+    #: named files on a hub at a pinned revision, read off the engine's own
+    #: setup. Empty for an engine that loads whatever its requirements
+    #: accept. Discover lists them as a source of their own.
+    supported_models: tuple[SupportedModel, ...] = ()
 
     def accepts_for(self, found: DiscoveredBinary | None) -> tuple[ModelRequirement, ...]:
         """What this engine loads as `found` (None: not installed) reports it.

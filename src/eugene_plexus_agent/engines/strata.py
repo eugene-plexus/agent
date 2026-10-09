@@ -23,7 +23,6 @@ from .._generated.models import (
     ConfigSchema,
     EngineKind,
     ModelFormat,
-    ModelPreparation,
     ModelRequirement,
     PreparedProvenance,
     RuntimeCapabilities,
@@ -41,6 +40,7 @@ from .base import (
     default_model_alias,
     probe_client,
 )
+from .strata_models import PREPARATION, STRATA_FILES, SUPPORTED_MODELS
 
 VERSION = "v0.1.39"
 COMMIT = "6f32ec070f23ced9f50e704d854d775da52591ab"
@@ -216,9 +216,11 @@ class StrataAdapter(EngineAdapter):
     configured_binary_key = "strataServer"
     #: What it loads as it is: models it prepared, never an arbitrary GGUF.
     model_formats = (ModelFormat.prepared,)
-    #: Qwen3.8-Flash-Next's GGUFs (`general.architecture` qwen4exp, read off
-    #: ISTA-DASLab's repo 2026-10-09), once Strata has prepared them; and the
-    #: models it prepared, which are Library models since LS3.
+    #: The models it prepared, which are Library models since LS3; and the
+    #: Qwen3.8-Flash-Next GGUFs on its own list (`general.architecture`
+    #: qwen4exp, read off ISTA-DASLab's repo 2026-10-09), once Strata has
+    #: prepared them. Only those by name (LS4): upstream's setup refuses any
+    #: other GGUF of the same architecture, an Unsloth K-quant for one.
     accepts = (
         ModelRequirement(
             format=ModelFormat.prepared,
@@ -228,13 +230,14 @@ class StrataAdapter(EngineAdapter):
         ModelRequirement(
             format=ModelFormat.gguf,
             architectures=["qwen4exp"],
-            preparation=ModelPreparation(
-                recipe="strata-prepare",
-                note="an expert pack, a lookup table and an MTP helper",
-            ),
+            files=list(STRATA_FILES),
+            preparation=PREPARATION,
             preference=50,
+            note="Strata's setup prepares only the files on its own list",
         ),
     )
+    #: What upstream's setup offers, as files on the hub (LS4).
+    supported_models = SUPPORTED_MODELS
     experimental = True
     answers_while_loading = False
     startup_budget_seconds = 900.0

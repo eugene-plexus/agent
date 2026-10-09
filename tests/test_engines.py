@@ -655,3 +655,23 @@ def test_the_engine_list_carries_accepts(tmp_path, monkeypatch) -> None:
     assert strata["prepared"].preparation is None
     vllm = by_kind["vllm"].accepts or []
     assert vllm[0].mlxQuantization is not None and vllm[0].authority is not None
+
+
+def test_the_engine_list_carries_what_each_adapter_publishes(tmp_path, monkeypatch) -> None:
+    """LS4: the list is the adapter's, so it is there whether or not the
+    engine is installed; an engine with none says nothing."""
+    from eugene_plexus_agent.engines import strata_models
+    from eugene_plexus_agent.runtimes import describe_engines
+
+    monkeypatch.setenv("EUGENE_PLEXUS_AGENT_ENGINE_ROOT", str(tmp_path))
+    monkeypatch.setenv("PATH", "")
+    by_kind = {e.engine.value: e for e in describe_engines()}
+    assert by_kind["strata"].available is False
+    assert by_kind["strata"].supportedModels == list(strata_models.SUPPORTED_MODELS)
+    assert not by_kind["llama_cpp"].supportedModels
+    wire = by_kind["strata"].model_dump(mode="json", exclude_none=True)["supportedModels"]
+    assert wire[1]["source"] == {
+        "repoId": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+        "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+        "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+    }

@@ -873,6 +873,18 @@
             "type": "string",
             "title": "Repo"
           },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source",
+            "description": "The `hf_hub` source it fetches from (LS4). Absent on a record\nfrom before LS4, or when none was named: the first enabled\n`hf_hub` source.\n"
+          },
           "revision": {
             "anyOf": [
               {
@@ -1193,6 +1205,18 @@
             "type": "string",
             "title": "Repo",
             "description": "Upstream repo id."
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source",
+            "description": "The `hf_hub` source to fetch from (`CatalogueSource.id`, a\nsearch result's `hubSource`, LS4). Absent: the first enabled\n`hf_hub` source. Kept on the record, so a resume asks the same\nhub with the same token.\n"
           },
           "revision": {
             "anyOf": [

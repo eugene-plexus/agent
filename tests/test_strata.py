@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from eugene_plexus_agent._generated.models import EngineKind, HostAccelerator, Origin, RuntimeSpec
-from eugene_plexus_agent.engines import strata
+from eugene_plexus_agent.engines import strata, strata_models
 from eugene_plexus_agent.engines.acquisition import (
     AcquisitionError,
     AcquisitionPlan,
@@ -203,6 +203,46 @@ def test_strata_declares_the_prepared_models_it_loads():
     assert loads[0].preparation is None
     # Older consoles see only `prepared`, so never Strata for every GGUF (B6).
     assert [f.value for f in strata.StrataAdapter.model_formats] == ["prepared"]
+
+
+def test_stratas_list_is_upstream_setups_nine_choices():
+    """LS4: read off setup.py at the pinned commit. Nine choices, each a
+    named first shard at a pinned revision, needing preparation."""
+    models = strata_models.SUPPORTED_MODELS
+    assert [m.id for m in models] == [
+        "Q2_0",
+        "IQ2_XS",
+        "IQ3_XXS",
+        "IQ3_S",
+        "swift-IQ2_XS",
+        "swift-IQ3_XXS",
+        "coder-IQ1_M",
+        "unsloth-UD-IQ4_XS",
+        "unsloth-UD-Q4_K_XL",
+    ]
+    for m in models:
+        assert m.format.value == "gguf" and m.architecture == "qwen4exp"
+        assert m.source.repoId and m.source.file
+        assert "-00001-of-0000" in m.source.file and m.source.file.endswith(".gguf")
+        assert m.source.revision and len(m.source.revision) == 40
+        assert m.preparation is not None and m.preparation.recipe == "strata-prepare"
+        assert m.sizeBytes and m.sizeBytes > 50_000_000_000
+        assert m.quantization and m.quantization in m.source.file
+    assert [m.id for m in models if m.recommended] == ["IQ2_XS"]
+    assert [m.id for m in models if m.experimental] == ["unsloth-UD-Q4_K_XL"]
+    assert [m.id for m in models if m.license] == ["swift-IQ2_XS", "swift-IQ3_XXS"]
+
+
+def test_strata_prepares_only_the_ggufs_on_its_list():
+    """Upstream's setup accepts a GGUF by name: the requirement names the
+    list's first shards, so another publisher's qwen4exp GGUF is not one."""
+    gguf = next(r for r in strata.StrataAdapter.accepts if r.format.value == "gguf")
+    assert gguf.files == [
+        Path(m.source.file).name for m in strata_models.SUPPORTED_MODELS if m.source.file
+    ]
+    assert "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf" not in gguf.files
+    assert gguf.preparation == strata_models.PREPARATION
+    assert strata.StrataAdapter.supported_models == strata_models.SUPPORTED_MODELS
 
 
 def test_admission_reads_the_entry_through_the_nodes_mapping(authed_client, prepared):
