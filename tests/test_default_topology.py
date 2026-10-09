@@ -79,7 +79,13 @@ def _names(client: TestClient) -> list[str]:
     return sorted(c["name"] for c in client.get("/v1/components").json()["components"])
 
 
-def test_first_boot_declares_control_gateway_and_library(tmp_path: Path) -> None:
+def test_first_boot_declares_control_gateway_and_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The defaults as declared on a machine where they are free. A real Eugene
+    # on this machine (a warm standby holds 8083 on a node) would move one, as
+    # it should, which is not what this asks.
+    monkeypatch.setattr(default_topology.ports, "first_free", lambda port, **_: port)
     settings = _seeding_settings(tmp_path)
     client, _ = _boot(settings)
     with client:
