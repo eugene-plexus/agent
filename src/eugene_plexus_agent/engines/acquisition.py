@@ -40,6 +40,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -788,6 +789,9 @@ class EngineInstaller:
     def __init__(self, store: ManagedStore, engine: EngineKind) -> None:
         self._store = store
         self._engine = engine
+        #: Words added to a finished install's message, asked at the end
+        #: (Strata's: when this node's copy folder is on a slow drive, LS7).
+        self.finish_note: Callable[[], str | None] | None = None
         self._progress: _Progress | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -850,7 +854,8 @@ class EngineInstaller:
                 progress.message = "cancelled"
             else:
                 progress.state = State.done
-                progress.message = f"installed {plan.version}"
+                note = self.finish_note() if self.finish_note is not None else None
+                progress.message = f"installed {plan.version}" + (f"; {note}" if note else "")
         except asyncio.CancelledError:
             progress.cancelled.set()
             # Cancelling to_thread does not stop its OS thread. Wait until it

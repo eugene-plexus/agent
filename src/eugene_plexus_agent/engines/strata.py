@@ -12,6 +12,7 @@ that configuration directly, and still launches.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -301,6 +302,51 @@ class StrataAdapter(EngineAdapter):
 
         total, _available = host_memory()
         return supported_here(total)
+
+    def prepared_files(self, provenance: Path) -> list[Path] | None:
+        """The provenance file, Strata's configuration, and every file the
+        configuration names (`PATH_ARGS` and the tokenizer; a folder by every
+        file in it; a GGUF by all its shards), as `prepared_config` resolves
+        them. Setup's intermediates it does not name (the MTP helper's
+        `tensors/`) stay where they are."""
+        from ..model_copies import shards_of
+
+        try:
+            entry = prepared_entry(provenance)
+            cfg = json.loads(entry.read_text(encoding="utf-8-sig"))
+        except (SpawnPlanError, OSError, ValueError):
+            return None
+        if not isinstance(cfg, dict):
+            return None
+        base = entry.parent
+        named: list[str] = []
+        args = cfg.get("args")
+        if isinstance(args, list):
+            for flag, value in itertools.pairwise(args):
+                if flag in PATH_ARGS and isinstance(value, str):
+                    named.append(value)
+        tokenizer = cfg.get("tokenizer")
+        if isinstance(tokenizer, str):
+            named.append(tokenizer)
+        files: list[Path] = [provenance, entry]
+        for value in named:
+            path = Path(os.path.expanduser(value))
+            path = path if path.is_absolute() else base / path
+            path = Path(os.path.normpath(path))
+            if path.is_dir():
+                files += sorted(p for p in path.rglob("*") if p.is_file())
+            elif path.is_file():
+                files += [Path(s) for s in shards_of(str(path))]
+            else:
+                return None
+        seen: set[str] = set()
+        out: list[Path] = []
+        for path in files:
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen:
+                seen.add(key)
+                out.append(path)
+        return out
 
     def fit_model_here(self, devices: DevicesReader) -> EngineFitModel | None:
         """Setup's own answer for each model on its list, on this node's

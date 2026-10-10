@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -162,16 +163,120 @@ def relative_name(declared: str, rules: Sequence[PathRule]) -> str:
 
 
 @dataclass(frozen=True)
-class CopyPlan:
-    """One model file, where it is now and where its copy belongs."""
+class CopyMember:
+    """One file of a model's copy: where it is now and where it belongs."""
 
-    declared: str
     source: str
     destination: str
 
     @property
     def partial(self) -> str:
         return self.destination + PARTIAL_SUFFIX
+
+
+@dataclass(frozen=True)
+class CopyPlan:
+    """One model, where it is now and where its copy belongs.
+
+    `source` and `destination` are the file the runtime opens (a GGUF's
+    first shard, a prepared model's provenance file). `members` is every
+    file the model is made of, that one first (LS7, agent#12 and #10): a
+    split GGUF's shards, or a prepared model's set, each kept at its place
+    relative to its Library folder so the relative paths between them still
+    hold in the copy. Empty means the one file alone.
+    """
+
+    declared: str
+    source: str
+    destination: str
+    members: tuple[CopyMember, ...] = ()
+
+    @property
+    def partial(self) -> str:
+        return self.destination + PARTIAL_SUFFIX
+
+    @property
+    def files(self) -> tuple[CopyMember, ...]:
+        return self.members or (CopyMember(self.source, self.destination),)
+
+    @property
+    def destinations(self) -> tuple[str, ...]:
+        return tuple(member.destination for member in self.files)
+
+
+#: A split GGUF's shard name (`-00001-of-00004.gguf`), as llama.cpp names them.
+_SHARD = re.compile(r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})\.gguf$", re.IGNORECASE)
+#: A prepared model's provenance file (LS3).
+PREPARED_SUFFIX = ".eugene-prepared.json"
+#: How long a model's member list is reused before the share is read again:
+#: the runtime list is polled, and a prepared model's list reads JSON and
+#: walks folders on what may be a network share.
+MEMBERS_SECONDS = 30.0
+_members_cache: dict[str, tuple[float, tuple[str, ...] | None]] = {}
+
+
+def shards_of(path: str) -> tuple[str, ...]:
+    """Every shard of a split GGUF, the first first; the file alone when it
+    is not one."""
+    folder, name = os.path.split(path)
+    found = _SHARD.match(name)
+    if found is None:
+        return (path,)
+    total = int(found.group("total"))
+    width = len(found.group("index"))
+    stem = found.group("stem")
+    return tuple(
+        os.path.join(folder, f"{stem}-{i:0{width}d}-of-{found.group('total')}.gguf")
+        for i in range(1, total + 1)
+    )
+
+
+def _read_members(source: str) -> tuple[str, ...] | None:
+    lowered = source.lower()
+    if lowered.endswith(PREPARED_SUFFIX):
+        return _prepared_members(source)
+    if lowered.endswith(".json"):
+        # An engine configuration declared directly (before LS3): not a
+        # model this node can copy whole.
+        return None
+    files = shards_of(source)
+    if len(files) > 1 and not all(os.path.isfile(f) for f in files):
+        return None
+    return files
+
+
+def _prepared_members(source: str) -> tuple[str, ...] | None:
+    """The files a prepared model is made of, from its engine's adapter,
+    which alone knows what its configuration names."""
+    import json
+
+    from ._generated.models import EngineKind
+    from .engines import ADAPTERS
+
+    try:
+        raw = json.loads(Path(source).read_text(encoding="utf-8-sig"))
+        engine = raw.get("engine") if isinstance(raw, dict) else None
+        kind = EngineKind(engine) if isinstance(engine, str) else None
+    except (OSError, ValueError):
+        return None
+    adapter = ADAPTERS.get(kind) if kind is not None else None
+    if adapter is None:
+        return None
+    files = adapter.prepared_files(Path(source))
+    return tuple(str(f) for f in files) if files else None
+
+
+def members_of(source: str) -> tuple[str, ...] | None:
+    """Every file the model at `source` is made of, `source` first, or None
+    when the set cannot be read (the model is then not copied, and runs
+    from where it is)."""
+    now = time.perf_counter()
+    cached = _members_cache.get(source)
+    if cached is not None and now - cached[0] <= MEMBERS_SECONDS:
+        return cached[1]
+    found = _read_members(source)
+    _members_cache[source] = (now, found)
+    return found
 
 
 def plan_for(
@@ -188,10 +293,6 @@ def plan_for(
     that is **already inside the copy directory**. Without it, a restart
     after a copy would plan to copy the copy onto itself.
     """
-    if declared.lower().endswith(".json"):
-        # Prepared engine configurations refer to other model assets. Copying
-        # only this tiny file would break relative paths and misreport progress.
-        return None
     if not settings.usable:
         return None
     assert settings.directory is not None
@@ -202,7 +303,27 @@ def plan_for(
     destination = os.path.join(settings.directory, *relative.split("/"))
     if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(destination)):
         return None
-    return CopyPlan(declared=declared, source=source, destination=destination)
+    files = members_of(source)
+    if files is None:
+        return None
+    # The Library folder as this node reaches it: the source less the part
+    # the copy is named by, so every member keeps its place beside the rest.
+    depth = len(relative.split("/"))
+    root = str(Path(source).parents[depth - 1]) if depth > 0 else os.path.dirname(source)
+    members: list[CopyMember] = []
+    for path in files:
+        inside = os.path.relpath(path, root)
+        if os.path.isabs(inside) or inside == ".." or inside.startswith(".." + os.sep):
+            # A file outside the model's Library folder cannot keep its
+            # place in the copy: the model runs from where it is.
+            return None
+        members.append(CopyMember(path, os.path.join(settings.directory, inside)))
+    return CopyPlan(
+        declared=declared,
+        source=source,
+        destination=destination,
+        members=tuple(members) if len(members) > 1 else (),
+    )
 
 
 def wanted(
@@ -243,6 +364,17 @@ def _stat(path: str) -> Stat | None:
 
 
 def copy_is_current(plan: CopyPlan, *, mtime_tolerance: float = 2.0) -> bool:
+    """Every file of the copy is current (`member_is_current`)."""
+    return all(member_is_current(m, mtime_tolerance=mtime_tolerance) for m in plan.files)
+
+
+def total_size(plan: CopyPlan) -> int:
+    """Every file of the model summed, as the share has them; raises
+    OSError when one cannot be read."""
+    return sum(os.path.getsize(member.source) for member in plan.files)
+
+
+def member_is_current(member: CopyMember, *, mtime_tolerance: float = 2.0) -> bool:
     """Size and mtime against the source (§4.3).
 
     **The tradeoff is stated rather than hidden:** a GGUF edited in place
@@ -255,8 +387,8 @@ def copy_is_current(plan: CopyPlan, *, mtime_tolerance: float = 2.0) -> bool:
     come back with an mtime a second off its source and re-copying 25 GB
     over that would be worse than the problem.
     """
-    source = _stat(plan.source)
-    destination = _stat(plan.destination)
+    source = _stat(member.source)
+    destination = _stat(member.destination)
     if source is None or destination is None:
         return False
     if source.size != destination.size:
@@ -313,6 +445,8 @@ class CopyState:
     destination: str
     total_bytes: int | None
     bytes_copied: int = 0
+    files: int = 1
+    files_copied: int = 0
     _window: tuple[float, int] = field(default=(0.0, 0), repr=False)
     _rate: float | None = field(default=None, repr=False)
 
@@ -342,7 +476,7 @@ def copy_file(
     *,
     should_cancel: Callable[[], bool] | None = None,
 ) -> None:
-    """Copy source to destination, leaving nothing behind if it fails.
+    """Copy every file of the model, leaving nothing partial behind.
 
     Blocking; the caller runs it in a thread. Raises `CopyAborted` with
     a plain-language reason, or an OSError for anything the OS refused.
@@ -352,13 +486,40 @@ def copy_file(
     it. A breach aborts and removes the partial, because the alternative
     is a feature meant to speed up a node being the reason its disk
     filled up.
+
+    A file already current is kept (a copy stopped halfway carries on),
+    and counts as copied; the runtime opens the copy only once every file
+    is (`copy_is_current`), so a set is never used half made.
     """
-    os.makedirs(os.path.dirname(plan.destination) or ".", exist_ok=True)
-    partial = plan.partial
+    files = plan.files
+    state.files = len(files)
     copied = 0
+    for member in files:
+        if member_is_current(member):
+            st = _stat(member.destination)
+            copied += st.size if st is not None else 0
+            state.files_copied += 1
+            state.note(copied, time.perf_counter())
+            continue
+        copied = _copy_one(member, settings, state, copied, should_cancel)
+        state.files_copied += 1
+
+
+def _copy_one(
+    member: CopyMember,
+    settings: CopySettings,
+    state: CopyState,
+    copied: int,
+    should_cancel: Callable[[], bool] | None,
+) -> int:
+    """One file, from a temp name renamed after fsync; `copied` is the
+    set's running total, returned grown by this file."""
+    os.makedirs(os.path.dirname(member.destination) or ".", exist_ok=True)
+    partial = member.partial
     started = time.perf_counter()
+    first = copied
     try:
-        with open(plan.source, "rb") as src, open(partial, "wb") as dst:
+        with open(member.source, "rb") as src, open(partial, "wb") as dst:
             chunks = 0
             while True:
                 if should_cancel is not None and should_cancel():
@@ -372,7 +533,7 @@ def copy_file(
                 state.note(copied, time.perf_counter())
                 if chunks % HEADROOM_CHECK_EVERY == 0:
                     remaining = (state.total_bytes or copied) - copied
-                    free = free_bytes(os.path.dirname(plan.destination) or ".")
+                    free = free_bytes(os.path.dirname(member.destination) or ".")
                     if free is not None and free - remaining < settings.min_free_bytes:
                         raise CopyAborted(
                             "stopped copying to keep "
@@ -386,16 +547,17 @@ def copy_file(
     # mtime carried over so `copy_is_current` can compare it, and because
     # a copy that claims to be newer than its source is a lie about a
     # file the operator may well go looking at in a file manager.
-    shutil.copystat(plan.source, partial)
-    os.replace(partial, plan.destination)
+    shutil.copystat(member.source, partial)
+    os.replace(partial, member.destination)
     state.note(copied, time.perf_counter())
     log.info(
         "copied %s to %s (%.1f GB in %.0fs)",
-        plan.source,
-        plan.destination,
-        copied / GIB,
+        member.source,
+        member.destination,
+        (copied - first) / GIB,
         time.perf_counter() - started,
     )
+    return copied
 
 
 def _remove_quietly(path: str) -> bool:

@@ -8,7 +8,6 @@ folder, `.done` marks beside the shards. No real Strata, model or GPU.
 
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import os
@@ -21,7 +20,6 @@ from pathlib import Path
 import pytest
 
 from eugene_plexus_agent.engines import strata_prepare
-from eugene_plexus_agent.engines.acquisition import ReleaseAsset
 from eugene_plexus_agent.engines.strata_models import (
     SETUP_CHOICES,
     SUPPORTED_MODELS,
@@ -259,6 +257,8 @@ def test_a_preparation_makes_a_launchable_model_in_strata_data(build, monkeypatc
     # the expert profile copied beside the pack, the start script gone.
     cfg = json.loads(result.entry.read_text(encoding="utf-8"))
     assert "cwd" not in cfg
+    # LS7: node-neutral, since any node may launch it from the Library.
+    assert not {"exe", "log", "lib_dirs", "port", "model_name", "open_browser"} & set(cfg)
     args = cfg["args"]
     assert args[args.index("--pack") + 1] == "packs/iq2_xs"
     assert (
@@ -358,53 +358,43 @@ def _archive() -> bytes:
     return buffer.getvalue()
 
 
-def test_tools_unpack_only_what_setup_reads(tmp_path, monkeypatch):
-    payload = _archive()
-    asset = ReleaseAsset(
-        "llama.cpp.zip",
-        "https://example.invalid/llama.zip",
-        len(payload),
-        "sha256:" + hashlib.sha256(payload).hexdigest(),
-    )
-    monkeypatch.setattr(strata_prepare, "LLAMA_CPP", asset)
-    fetched: list[str] = []
+def test_the_install_unpacks_only_what_setup_reads(tmp_path):
+    """The preparation tools come with Strata's install (LS7, B47 reversed),
+    unpacked only as far as setup reads them: Windows' 260-character limit."""
+    from eugene_plexus_agent.engines import strata_install
 
-    def download(asset, target, progress):
-        fetched.append(asset.url)
-        progress.check_cancelled()
-        target.write_bytes(payload)
-
-    monkeypatch.setattr(strata_prepare, "_download", download)
+    archive = tmp_path / "llama.cpp.zip"
+    archive.write_bytes(_archive())
     root = tmp_path / "root"
     root.mkdir()
-    strata_prepare.ensure_tools(root, Progress())
+    assert not strata_install.tools_installed(root)
     llama = root / "third_party" / "llama.cpp"
+    strata_install.unpack_llama_parts(archive, llama)
     assert (llama / "ggml" / "CMakeLists.txt").read_text() == "cmake"
     assert (llama / "gguf-py" / "gguf" / "__init__.py").is_file()
     assert not (llama / "examples").exists() and not (llama / "tools").exists()
     assert not (root / "third_party" / ".eugene-llama").exists()
-    # Present: not fetched again.
-    strata_prepare.ensure_tools(root, Progress())
-    assert len(fetched) == 1
+    assert strata_install.tools_installed(root)
 
 
-def test_tools_that_fail_verification_are_not_kept(tmp_path, monkeypatch):
-    payload = _archive()
-    asset = ReleaseAsset("llama.cpp.zip", "https://example.invalid/x", 1, "sha256:" + "0" * 64)
-    monkeypatch.setattr(strata_prepare, "LLAMA_CPP", asset)
-    monkeypatch.setattr(
-        strata_prepare, "_download", lambda a, target, p: target.write_bytes(payload)
+def test_the_install_downloads_the_tools_with_the_engine():
+    """setup.py's LLAMA_CPP_COMMIT at the pinned Strata commit, in the plan."""
+    from eugene_plexus_agent._generated.models import HostAccelerator
+    from eugene_plexus_agent.engines import strata_install
+
+    assert strata_install.LLAMA_CPP_COMMIT in strata_install.LLAMA_CPP.url
+    host = HostAccelerator.model_validate(
+        {"os": "windows", "arch": "x64", "accelerator": "cuda", "acceleratorVersion": "13.0"}
     )
+    plan = strata_install.plan(host, None, None)
+    assert strata_install.LLAMA_CPP in plan.assets  # type: ignore[union-attr]
+
+
+def test_a_preparation_without_the_tools_names_the_reinstall(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
-    with pytest.raises(PreparationError, match="failed verification"):
-        strata_prepare.ensure_tools(root, Progress())
-    assert not (root / "third_party" / "llama.cpp").exists()
-
-
-def test_the_pinned_tools_are_setups_own():
-    """setup.py's LLAMA_CPP_COMMIT at the pinned Strata commit."""
-    assert strata_prepare.LLAMA_CPP_COMMIT in strata_prepare.LLAMA_CPP.url
+    with pytest.raises(PreparationError, match="Reinstall Strata"):
+        strata_prepare.check_tools(root)
 
 
 # --- jobs (B52, B53) ------------------------------------------------------------

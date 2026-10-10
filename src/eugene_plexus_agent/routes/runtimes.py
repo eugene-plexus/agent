@@ -21,7 +21,7 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import install_proxy, library_folders
+from .. import install_proxy, library_folders, model_copies
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import (
     Admission,
@@ -418,8 +418,15 @@ async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[A
             binary = adapter.resolve_binary(
                 spec, configured=_configured_binary(adapter, state.get_config)
             )
-            local = resolve_model_path(spec.modelPath, rules).local_path
-            adapter.prepare_config(spec.model_copy(update={"modelPath": local}), binary)
+            # The file the launch would open: this node's copy when it holds
+            # a current one (LS7), as admission and the spawn resolve it.
+            local = (
+                model_copies.resolve_local_path(spec.modelPath, rules, supervisor.copy_settings())
+                if supervisor is not None
+                else resolve_model_path(spec.modelPath, rules)
+            )
+            path = local.path if isinstance(local, model_copies.LocalPath) else local.local_path
+            adapter.prepare_config(spec.model_copy(update={"modelPath": path}), binary)
 
         try:
             await asyncio.to_thread(preflight)

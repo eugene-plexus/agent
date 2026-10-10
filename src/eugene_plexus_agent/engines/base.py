@@ -195,6 +195,14 @@ class EngineAdapter(abc.ABC):
     #: fit is *not estimated* and admission admits on faith.
     fit_model: EngineFitModel | None = None
 
+    def prepared_files(self, provenance: Path) -> list[Path] | None:
+        """Every file a model this engine prepared is made of, as this node
+        reaches them: the provenance file, the engine's own entry file and
+        every file that names (LS7, agent#12), so a node's copy carries the
+        whole set. None: the engine prepares nothing, or the set cannot be
+        read, and the model runs from where it is."""
+        return None
+
     def fit_model_here(self, devices: DevicesReader) -> EngineFitModel | None:
         """`fit_model` as this node reports it: an engine whose fit is its
         own table fills it in for this node's memory (Strata, LS6).

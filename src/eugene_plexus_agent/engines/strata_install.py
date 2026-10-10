@@ -7,7 +7,8 @@ import os
 import shutil
 import subprocess
 import time
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 
 from .._generated.models import HostAccelerator, State
 from ..child_env import child_environment
@@ -21,6 +22,7 @@ from .acquisition import (
     _download,
     _extract,
     _find_binary,
+    _guard_members,
     _Progress,
     _remove_quietly,
     _verify,
@@ -39,8 +41,28 @@ NATIVE = ReleaseAsset(
     123629160,
     "sha256:a862bcfa2330cd1c23f9b5d6e49f4027da8f8313842bd62e858ec6cd4533813a",
 )
+#: setup.py `LLAMA_CPP_COMMIT` at the pinned Strata commit: the source its
+#: preparation reads (`gguf-py`). Since LS7 it comes with the install, not the
+#: first preparation (Troy reversed B47: Strata runs only prepared models, so
+#: preparing is part of using it). Setup unpacks the whole archive under its
+#: own folder, where the deepest path is about 281 characters on a Windows
+#: install, past the 260 Windows allows; only what the preparation reads is
+#: unpacked, which setup then finds and keeps.
+LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
+LLAMA_CPP = ReleaseAsset(
+    "llama.cpp.zip",
+    f"https://codeload.github.com/ggml-org/llama.cpp/zip/{LLAMA_CPP_COMMIT}",
+    39_564_399,
+    "sha256:cbe23c594282ead2937abb3f008e51fcec4609d9256652fff42c7cc1c21ea47b",
+)
+#: `gguf-py/` for the tools (`STRATA_GGUF_PY`); `ggml/` because setup's
+#: `get_llama_cpp` takes the source as there only when `ggml/CMakeLists.txt` is.
+LLAMA_CPP_PARTS = ("gguf-py/", "ggml/")
+#: Upstream's own pinned list (#214) of what its setup and tools need beside
+#: the server: installed with the engine since LS7.
+SETUP_REQUIREMENTS = "requirements.txt"
+
 # Runtime subset of upstream requirements.txt and setup.py CUDA_WHEELS.
-# Conversion/build tools are unnecessary for already prepared model assets.
 REQUIREMENTS = [
     "jinja2==3.1.6",
     "markupsafe==3.0.3",
@@ -70,7 +92,40 @@ def plan(
         )
     if version not in (None, VERSION) or variant not in (None, "windows-x64-cuda13"):
         return Unavailable(f"This experimental recipe supports {VERSION}, windows-x64-cuda13 only.")
-    return AcquisitionPlan(VERSION, "windows-x64-cuda13", (SOURCE, NATIVE), "server.py")
+    return AcquisitionPlan(VERSION, "windows-x64-cuda13", (SOURCE, NATIVE, LLAMA_CPP), "server.py")
+
+
+def tools_installed(root: Path) -> bool:
+    """Whether this install carries the preparation tools (LS7)."""
+    llama = root / "third_party" / "llama.cpp"
+    return (llama / "ggml" / "CMakeLists.txt").is_file() and (llama / "gguf-py").is_dir()
+
+
+def unpack_llama_parts(archive: Path, destination: Path) -> None:
+    """Only `LLAMA_CPP_PARTS` of llama.cpp's source archive, into
+    `destination` (`third_party/llama.cpp`), replacing what is there."""
+    work = destination.parent / ".eugene-llama"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        with zipfile.ZipFile(archive) as zf:
+            _guard_members(archive, zf.namelist())
+            for info in zf.infolist():
+                _top, _, rest = info.filename.partition("/")
+                if info.is_dir() or not rest.startswith(LLAMA_CPP_PARTS):
+                    continue
+                target = work.joinpath(*PurePosixPath(rest).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info) as source, target.open("wb") as out:
+                    shutil.copyfileobj(source, out)
+        if not (work / "ggml" / "CMakeLists.txt").is_file():
+            raise AcquisitionError("llama.cpp's source archive has no ggml/CMakeLists.txt")
+        shutil.rmtree(destination, ignore_errors=True)
+        work.replace(destination)
+    except zipfile.BadZipFile as exc:
+        raise AcquisitionError(f"llama.cpp's source archive could not be read: {exc}") from exc
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def _readable(raw: bytes) -> str:
@@ -164,6 +219,7 @@ class StrataInstaller(EngineInstaller):
             raise AcquisitionError(f"{final} already exists without a complete install receipt")
         _remove_quietly(staging)
         staging.mkdir(parents=True, exist_ok=True)
+        llama_archive: Path | None = None
         for asset in plan.assets:
             progress.check_cancelled()
             progress.state = State.downloading
@@ -172,6 +228,9 @@ class StrataInstaller(EngineInstaller):
             _download(asset, archive, progress)
             progress.state = State.verifying
             _verify(asset, archive)
+            if asset.name == LLAMA_CPP.name:
+                llama_archive = archive  # unpacked into the source, below
+                continue
             progress.state = State.extracting
             destination = staging / ("source" if asset.name == SOURCE.name else "native")
             _extract(archive, destination)
@@ -185,6 +244,11 @@ class StrataInstaller(EngineInstaller):
             raise AcquisitionError("Strata native archive does not contain strata.exe")
         shutil.copytree(native.parent, root / "engine", dirs_exist_ok=True)
         _remove_quietly(staging / "native")
+        if llama_archive is not None:
+            progress.state = State.extracting
+            progress.message = f"Strata's preparation tools: llama.cpp at {LLAMA_CPP_COMMIT[:7]}"
+            unpack_llama_parts(llama_archive, root / "third_party" / "llama.cpp")
+            llama_archive.unlink(missing_ok=True)
         progress.message = "creating Strata's isolated Python environment"
         _run_command(_venv_command(root / ".venv"), progress, root)
         python = root / ".venv" / "Scripts" / "python.exe"
@@ -206,6 +270,24 @@ class StrataInstaller(EngineInstaller):
             progress,
             root,
         )
+        if (root / SETUP_REQUIREMENTS).is_file():
+            progress.message = "installing what Strata's setup prepares models with"
+            _run_command(
+                [
+                    str(python),
+                    "-m",
+                    "pip",
+                    "--isolated",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--only-binary=:all:",
+                    "--no-cache-dir",
+                    "-r",
+                    str(root / SETUP_REQUIREMENTS),
+                ],
+                progress,
+                root,
+            )
         _run_command([str(python), str(server), "--help"], progress, root)
         progress.message = "checking Strata's native executable and CUDA libraries"
         _run_command([str(root / "engine" / "strata.exe"), "--help"], progress, root)
@@ -220,6 +302,10 @@ class StrataInstaller(EngineInstaller):
             "assets": [{"url": a.url, "sha256": a.sha256} for a in plan.assets],
             "packages": REQUIREMENTS,
             "modelsIncluded": False,
+            "preparationTools": {
+                "llamaCpp": LLAMA_CPP_COMMIT,
+                "requirements": SETUP_REQUIREMENTS,
+            },
         }
         receipt.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         staging.replace(final)

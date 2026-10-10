@@ -1060,6 +1060,12 @@ def strata_admission(
         f"device {card.index} ({card.name or card.kind.value})" if card is not None else "no card"
     )
 
+    from . import drives
+
+    slow_drive = drives.strata_run_warning(location.localPath or spec.modelPath)
+    if slow_drive is not None:
+        warnings = [slow_drive, *warnings]
+
     def answer(
         decision: AdmissionDecision, fit: AdmissionFit, reason: str, warning: str | None = None
     ) -> Admission:

@@ -2897,10 +2897,14 @@ class CopyProgress(BaseModel):
     would make every consumer invent the distinction, and this
     project has already paid for that once.
 
-    It reports the copy of ONE model file — the file this runtime
-    points at. Several runtimes over one file (M6 replicas) copy it
-    once, so the second and third report the same copy while it runs
-    and none of them afterwards.
+    It reports the copy of one model: every file the runtime's model
+    is made of (LS7, agent#12 and #10): a GGUF with all its shards, or
+    a prepared model's set (its provenance file, the engine's
+    configuration and every file that names, the source GGUF's shards
+    included), each kept at its place relative to its Library folder.
+    `bytesCopied` and `totalBytes` count the whole set. Several runtimes
+    over one model (M6 replicas) copy it once, so the second and third
+    report the same copy while it runs and none of them afterwards.
 
     """
 
@@ -2917,7 +2921,13 @@ class CopyProgress(BaseModel):
     )
     destination: str | None = Field(
         None,
-        description='Where the copy is being written, on this host. Reported\nbecause the operator picked the directory and the commonest\nquestion about a long copy is which disk is filling up.\n\nThis is the **final** path, not the temporary name the bytes\nare actually landing in: a partial copy never carries the\nname an engine would open (§3.3 of the design), and naming\nthe temp file here would invite someone to go looking for a\nfile that exists only until the rename.\n',
+        description="Where the copy is being written, on this host. Reported\nbecause the operator picked the directory and the commonest\nquestion about a long copy is which disk is filling up.\n\nThis is the **final** path, not the temporary name the bytes\nare actually landing in: a partial copy never carries the\nname an engine would open (§3.3 of the design), and naming\nthe temp file here would invite someone to go looking for a\nfile that exists only until the rename. For a set, the file the\nruntime opens (a GGUF's first shard, a prepared model's\nprovenance file).\n",
+    )
+    files: int | None = Field(
+        None, description="How many files the model's copy is made of (LS7).", ge=1
+    )
+    filesCopied: int | None = Field(
+        None, description="How many of them are whole on this node's disk so far.", ge=0
     )
 
 

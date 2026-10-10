@@ -9,8 +9,8 @@ folder) and writes `strata-<tag>.json` and a start script into its own
 folder. With `--yes` it asks nothing and takes its own recommendation for
 every question; Eugene reimplements none of them (B45).
 
-What this adds around it: the preparation tools setup would fetch in a way
-Windows cannot unpack under the engine's folder (B47), a fresh settings
+What this adds around it: a check that the install brought setup's
+preparation tools (B47 reversed in LS7: they come with the engine), a fresh settings
 folder per run so setup never moves a person's own Strata files (B45), the
 engine-files marker (B44), and afterwards the configuration moved into the
 data folder with its paths relative (B48), checked the way a launch checks
@@ -25,9 +25,8 @@ import re
 import shutil
 import subprocess
 import tempfile
-import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from .._generated.models import SupportedModel
 from ..child_env import child_environment
@@ -39,8 +38,8 @@ from ..preparation import (
     run_process,
 )
 from ..supervisor import SpawnPlanError
-from .acquisition import AcquisitionError, ReleaseAsset, _download, _guard_members, _verify
-from .strata import PATH_ARGS, VERSION, prepared_config, runtime_lib_dirs
+from .strata import OWNED_KEYS, PATH_ARGS, SETUP_KEYS, VERSION, prepared_config, runtime_lib_dirs
+from .strata_install import LLAMA_CPP_COMMIT, tools_installed
 from .strata_models import SETUP_CONTEXTS, SetupChoice, choice_for_file, disk_needed
 
 RECIPE = "strata-prepare"
@@ -55,21 +54,6 @@ MARKER_TEXT = (
     "The Library lists the *.eugene-prepared.json files in this folder and reads nothing else\n"
     "here. Deleting a model's .eugene-prepared.json removes it from the Library.\n"
 )
-
-#: setup.py `LLAMA_CPP_COMMIT` at the pinned Strata commit. Setup unpacks the
-#: whole archive under its own folder, where the deepest path is about 281
-#: characters on a Windows install, past the 260 Windows allows; only what the
-#: preparation reads is unpacked here, which setup then finds and keeps.
-LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
-LLAMA_CPP = ReleaseAsset(
-    "llama.cpp.zip",
-    f"https://codeload.github.com/ggml-org/llama.cpp/zip/{LLAMA_CPP_COMMIT}",
-    39_564_399,
-    "sha256:cbe23c594282ead2937abb3f008e51fcec4609d9256652fff42c7cc1c21ea47b",
-)
-#: `gguf-py/` for the tools (`STRATA_GGUF_PY`); `ggml/` because setup's
-#: `get_llama_cpp` takes the source as there only when `ggml/CMakeLists.txt` is.
-LLAMA_CPP_PARTS = ("gguf-py/", "ggml/")
 
 #: setup.py `CONTEXTS`: the sizes it offers.
 CONTEXTS = SETUP_CONTEXTS
@@ -192,53 +176,16 @@ def venv_python(root: Path) -> Path:
     return root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-class _Fetch:
-    """What `_download` writes progress into; only cancellation matters here."""
-
-    def __init__(self, progress: Progress) -> None:
-        self._progress = progress
-        self.bytes_downloaded = 0
-
-    def check_cancelled(self) -> None:
-        self._progress.check_cancelled()
-
-
-def ensure_tools(root: Path, progress: Progress) -> None:
-    """llama.cpp's source at the commit Strata pins, as setup's preparation
-    reads it (B47). Skipped when setup's own check would find it."""
-    llama = root / "third_party" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").is_file() and (llama / "gguf-py").is_dir():
-        return
-    progress.step = "Getting Strata's preparation tools"
-    progress.message = f"llama.cpp's gguf-py at {LLAMA_CPP_COMMIT[:7]}, as Strata pins it"
-    work = root / "third_party" / ".eugene-llama"
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
-    try:
-        archive = work / LLAMA_CPP.name
-        _download(LLAMA_CPP, archive, _Fetch(progress))  # type: ignore[arg-type]
-        _verify(LLAMA_CPP, archive)
-        unpacked = work / "llama.cpp"
-        with zipfile.ZipFile(archive) as zf:
-            _guard_members(archive, zf.namelist())
-            for info in zf.infolist():
-                _top, _, rest = info.filename.partition("/")
-                if info.is_dir() or not rest.startswith(LLAMA_CPP_PARTS):
-                    continue
-                target = unpacked.joinpath(*PurePosixPath(rest).parts)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with zf.open(info) as source, target.open("wb") as out:
-                    shutil.copyfileobj(source, out)
-        if not (unpacked / "ggml" / "CMakeLists.txt").is_file():
-            raise PreparationError("llama.cpp's source archive has no ggml/CMakeLists.txt")
-        shutil.rmtree(llama, ignore_errors=True)
-        unpacked.replace(llama)
-    except AcquisitionError as exc:
-        raise PreparationError(f"Getting Strata's preparation tools failed: {exc}") from exc
-    except (OSError, zipfile.BadZipFile) as exc:
-        raise PreparationError(f"Unpacking Strata's preparation tools failed: {exc}") from exc
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+def check_tools(root: Path) -> None:
+    """The preparation tools came with this install (LS7, B47 reversed), or
+    the preparation stops naming the fix: no fetch halfway through."""
+    if not tools_installed(root):
+        raise PreparationError(
+            "Strata on this node was installed before its preparation tools came with it "
+            f"(llama.cpp's gguf-py at {LLAMA_CPP_COMMIT[:7]} and setup's packages). Reinstall "
+            "Strata from Backends: uninstall it, then install it again; prepared models in "
+            "your Library folders are kept."
+        )
 
 
 @dataclass
@@ -325,7 +272,7 @@ class StrataPreparation:
         ]
 
     def run(self, progress: Progress) -> PreparationResult:
-        ensure_tools(self.root, progress)
+        check_tools(self.root)
         progress.check_cancelled()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         marker = self.data_dir / ENGINE_FILES_MARKER
@@ -449,7 +396,11 @@ class StrataPreparation:
         cfg["args"] = args
         if isinstance(cfg.get("tokenizer"), str):
             cfg["tokenizer"] = self._relative(cfg["tokenizer"])
-        cfg.pop("cwd", None)
+        # Node-neutral (Troy, LS7): this file lives in the Library and any
+        # node may launch it, so nothing of the node that prepared it stays.
+        # A launch writes its own exe, log, libraries, port and name.
+        for key in (*OWNED_KEYS, *SETUP_KEYS, "open_browser"):
+            cfg.pop(key, None)
         target = self.data_dir / self.config_name
         partial = target.with_name(target.name + ".partial")
         partial.write_text(json.dumps(cfg, indent=1), encoding="utf-8", newline="\n")

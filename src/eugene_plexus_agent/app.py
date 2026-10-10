@@ -109,6 +109,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         config_error = state.load_or_degrade()
     app.state.agent_state = state
     app.state.safe_mode = settings.safe_mode
+    # Strata's install says when this node's copy folder is on a slow drive
+    # (LS7): its installer is one per engine, so it learns the config once.
+    from ._generated.models import EngineKind as _EngineKind
+    from .runtimes import installer_for as _installer_for
+
+    _installer_for(_EngineKind.strata, state.get_config)
     app.state.config_error = config_error
 
     # This host's identity in the install (M7): node.yaml beside

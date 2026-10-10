@@ -173,6 +173,15 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
                 level=ConfigFieldStatusLevel.warning,
                 text="Copying is on, but with no folder nothing is copied.",
             )
+        elif live["copy_dir"]:
+            # Which drive the folder is on (LS7): the point of a copy is a
+            # fast local drive, and Strata reads from it while it answers.
+            from .. import drives
+
+            found = drives.copy_folder_status(str(live["copy_dir"]))
+            if found is not None:
+                level, text = found
+                update["status"] = ConfigFieldStatus(level=ConfigFieldStatusLevel(level), text=text)
     elif key == "securityMode":
         status = _security_mode_status(live)
         if status is not None:

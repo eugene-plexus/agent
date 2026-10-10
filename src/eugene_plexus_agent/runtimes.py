@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import shutil
 import time
 from collections.abc import Callable
@@ -493,7 +492,7 @@ class RuntimeSupervisor:
             self._copy_notes.pop(spec.name, None)
             return None
         try:
-            size = os.path.getsize(plan.source)
+            size = model_copies.total_size(plan)
         except OSError as exc:
             # Not an error here: the model may be on a share that is
             # down, in which case the launch is about to fail for a
@@ -509,7 +508,10 @@ class RuntimeSupervisor:
             # for. Never evicts to make room for a copy of something
             # else: only copies no runtime here points at any more.
             evicted = model_copies.evict_for_headroom(
-                settings.directory, settings, in_use=self._copies_in_use(), keep=[plan.destination]
+                settings.directory,
+                settings,
+                in_use=self._copies_in_use(),
+                keep=list(plan.destinations),
             )
             if evicted.deleted:
                 self._log.info(
@@ -544,14 +546,16 @@ class RuntimeSupervisor:
                 continue
             plan = model_copies.plan_for(planner.spec.modelPath, rules, settings)
             if plan is not None:
-                in_use[plan.destination] = name
+                for destination in plan.destinations:
+                    in_use[destination] = name
         # A copy being written counts as in use, and it is not the
         # partial that needs protecting -- that name is skipped
         # everywhere -- but the destination it is about to become. Clear
         # would otherwise delete a file seconds before the rename put it
         # back, and report it as freed space that never came back.
         for name, job in self._copy_jobs.items():
-            in_use[job.plan.destination] = name
+            for destination in job.plan.destinations:
+                in_use[destination] = name
         return in_use
 
     async def _copy_then_spawn(
@@ -609,10 +613,11 @@ class RuntimeSupervisor:
         if not settings.usable:
             return
         keep = [
-            plan.destination
+            destination
             for plan in model_copies.wanted(
                 [s.modelPath for s in specs], self._rules(), settings
             ).values()
+            for destination in plan.destinations
         ]
         model_copies.remove_unwanted(settings.directory, keep, in_use=self._copies_in_use())
 
@@ -837,6 +842,8 @@ class RuntimeSupervisor:
                     totalBytes=job.state.total_bytes,
                     bytesPerSecond=job.state.bytes_per_second,
                     destination=job.plan.destination,
+                    files=job.state.files,
+                    filesCopied=job.state.files_copied,
                 )
                 if job is not None
                 else None
@@ -1000,20 +1007,36 @@ class RuntimeSupervisor:
 _INSTALLERS: dict[EngineKind, EngineInstaller] = {}
 
 
-def installer_for(kind: EngineKind) -> EngineInstaller | None:
+def installer_for(
+    kind: EngineKind, get_config: ConfigGetter | None = None
+) -> EngineInstaller | None:
     adapter = adapter_for(kind)
     if adapter is None:
         return None
     existing = _INSTALLERS.get(kind)
+    if existing is not None and kind is EngineKind.strata and get_config is not None:
+        existing.finish_note = _strata_finish_note(get_config)
     if existing is None:
         if kind is EngineKind.strata:
             from .engines.strata_install import StrataInstaller
 
             existing = StrataInstaller(adapter.managed_store(), kind)
+            if get_config is not None:
+                existing.finish_note = _strata_finish_note(get_config)
         else:
             existing = EngineInstaller(adapter.managed_store(), kind)
         _INSTALLERS[kind] = existing
     return existing
+
+
+def _strata_finish_note(get_config: ConfigGetter) -> Callable[[], str | None]:
+    def note() -> str | None:
+        from . import drives
+
+        settings = model_copies.settings_from_config(get_config)
+        return drives.strata_install_note(settings.directory if settings.usable else None)
+
+    return note
 
 
 async def close_installers() -> None:
