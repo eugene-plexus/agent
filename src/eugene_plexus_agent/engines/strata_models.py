@@ -87,7 +87,11 @@ def _entry(
     recommended: bool = False,
     experimental: bool = False,
     license: str | None = None,
+    min_engine: str | None = None,
 ) -> SupportedModel:
+    preparation = PREPARATION
+    if min_engine is not None:
+        preparation = preparation.model_copy(update={"minEngineVersion": min_engine})
     return SupportedModel(
         id=id,
         title=title,
@@ -99,7 +103,7 @@ def _entry(
         quantization=quantization,
         source=PreparedSource(repoId=repo, file=file, revision=_REVISIONS[repo]),
         sizeBytes=size,
-        preparation=PREPARATION,
+        preparation=preparation,
         recommended=recommended,
         experimental=experimental,
     )
@@ -201,6 +205,8 @@ SUPPORTED_MODELS: tuple[SupportedModel, ...] = (
             "PC with less than ~80 GB of RAM part of its experts are read from the SSD"
         ),
         size=93_682_584_224,
+        # setup.py MODELS["UD-IQ4_XS"]["engine"]: (0, 1, 38) (LS7, B30).
+        min_engine="v0.1.38",
     ),
     _entry(
         id="unsloth-UD-Q4_K_XL",
@@ -310,7 +316,8 @@ def supported_here(ram_bytes: int | None) -> tuple[SupportedModel, ...]:
     out = []
     for model in SUPPORTED_MODELS:
         need = disk_needed(SETUP_CHOICES[model.id], ram_bytes)
-        preparation = PREPARATION.model_copy(update={"diskBytes": need})
+        assert model.preparation is not None
+        preparation = model.preparation.model_copy(update={"diskBytes": need})
         out.append(model.model_copy(update={"preparation": preparation}))
     return tuple(out)
 

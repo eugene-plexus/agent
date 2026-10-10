@@ -41,6 +41,8 @@ from .base import (
     EngineAdapter,
     Loading,
     NotAnswering,
+    PreparedFacts,
+    PreparedInspectError,
     Readiness,
     Ready,
     default_model_alias,
@@ -81,6 +83,12 @@ VALUE_ARGS = {
     "--pcie-frac",
 }
 BOOL_ARGS = {"--resident-experts", "--mmap-experts"}
+#: The arguments naming the source model's own files, its GGUF shards: a
+#: node copies them as that model's, and a provenance file does not list them.
+SOURCE_ARGS = frozenset({"--native", "--ple-gguf"})
+#: Files every model setup prepared in one data folder uses (setup fetches
+#: the MTP helper once per data folder): kept while any of them is (LS7).
+SHARED_ARGS = frozenset({"--mtp"})
 PASS_KEYS = {
     "sampling",
     "reasoning_budget_tokens",
@@ -160,6 +168,120 @@ def choice_of_runtime(path: Path) -> SetupChoice | None:
         tag = name[len("strata-") : -len(".json")]
         return next((c for c in SETUP_CHOICES.values() if c.tag == tag), None)
     return None
+
+
+def read_config(entry: Path) -> dict[str, object]:
+    """Strata's configuration as a JSON object with its `args`, or why not."""
+    try:
+        cfg = json.loads(entry.read_text(encoding="utf-8-sig"))
+    except OSError as exc:
+        raise PreparedInspectError(f"cannot read {entry}: {exc}") from exc
+    except ValueError as exc:
+        raise PreparedInspectError(f"{entry} is not JSON: {exc}") from exc
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("args"), list):
+        raise PreparedInspectError(
+            f"{entry} is not one of Strata's configurations: it has no `args` list"
+        )
+    return cfg
+
+
+def named_paths(entry: Path, cfg: dict[str, object]) -> list[tuple[str, Path]]:
+    """Each path the configuration names, as (its argument, the path as
+    `prepared_config` resolves it: beside the configuration when relative).
+    The tokenizer is named by its key."""
+    named: list[tuple[str, str]] = []
+    args = cfg.get("args")
+    if isinstance(args, list):
+        for flag, value in itertools.pairwise(args):
+            if flag in PATH_ARGS and isinstance(value, str):
+                named.append((str(flag), value))
+    tokenizer = cfg.get("tokenizer")
+    if isinstance(tokenizer, str):
+        named.append(("tokenizer", tokenizer))
+    out = []
+    for flag, value in named:
+        path = Path(os.path.expanduser(value))
+        path = path if path.is_absolute() else entry.parent / path
+        out.append((flag, Path(os.path.normpath(path))))
+    return out
+
+
+def files_of(path: Path) -> list[Path] | None:
+    """A named path as files: a folder by every file in it, a GGUF by all
+    its shards. None when it is not there."""
+    from ..model_copies import shards_of
+
+    if path.is_dir():
+        return sorted(p for p in path.rglob("*") if p.is_file())
+    if path.is_file():
+        return [Path(s) for s in shards_of(str(path))]
+    return None
+
+
+def run_mode(args: list[str]) -> str:
+    """How the configuration has Strata hold the model's experts, in the
+    words setup uses for its modes (setup.py: `--resident-budget-gib`,
+    the low-RAM mode's `--resident-experts` and `--mmap-experts`)."""
+    if "--resident-budget-gib" in args:
+        at = args.index("--resident-budget-gib")
+        budget = args[at + 1] if at + 1 < len(args) else "?"
+        return f"a RAM budget of {budget} GiB of its experts, the rest read from the SSD"
+    if "--resident-experts" in args:
+        return "the low-RAM mode: the experts the GPU does not hold copied into RAM once"
+    if "--mmap-experts" in args:
+        return "the low-RAM mode: the experts the GPU does not hold read from the SSD as needed"
+    return "every expert in RAM"
+
+
+def inspect_config(entry: Path) -> PreparedFacts:
+    """What Strata's configuration at `entry` says about the model it runs
+    (LS7, B22 replaced and B26): the GGUF it was made from (`--native`),
+    which entry on setup's list that is, the context it was prepared for
+    (`--max-context`), how it holds the experts, and every file beside the
+    source model, the MTP helper's marked shared. A file it names that is
+    not there is named."""
+    cfg = read_config(entry)
+    raw = cfg["args"]
+    args = [str(a) for a in raw] if isinstance(raw, list) else []
+    named = named_paths(entry, cfg)
+    source = next((path for flag, path in named if flag == "--native"), None)
+    files: list[tuple[Path, bool]] = [(entry, False)]
+    for flag, path in named:
+        found = files_of(path)
+        if found is None:
+            raise PreparedInspectError(
+                f"{entry} names {path} ({flag}), which is not there: the model is not whole"
+            )
+        if flag in SOURCE_ARGS:
+            continue
+        files += [(f, flag in SHARED_ARGS) for f in found]
+    seen: set[str] = set()
+    unique = []
+    for path, shared in files:
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            unique.append((path, shared))
+    context: int | None = None
+    if "--max-context" in args:
+        at = args.index("--max-context")
+        try:
+            context = int(args[at + 1]) if at + 1 < len(args) else None
+        except ValueError:
+            context = None
+    listed = choice_for_file(str(source)) if source is not None else None
+    model = listed[0] if listed else None
+    return PreparedFacts(
+        source_file=source,
+        repo_id=model.source.repoId if model else None,
+        hub_file=model.source.file if model else None,
+        title=model.title if model else None,
+        architecture=model.architecture if model else None,
+        quantization=model.quantization if model else None,
+        context_length=context if context and context > 0 else None,
+        mode=run_mode(args),
+        files=tuple(unique),
+    )
 
 
 def runtime_lib_dirs(root: Path) -> list[str]:
@@ -309,36 +431,17 @@ class StrataAdapter(EngineAdapter):
         file in it; a GGUF by all its shards), as `prepared_config` resolves
         them. Setup's intermediates it does not name (the MTP helper's
         `tensors/`) stay where they are."""
-        from ..model_copies import shards_of
-
         try:
             entry = prepared_entry(provenance)
-            cfg = json.loads(entry.read_text(encoding="utf-8-sig"))
-        except (SpawnPlanError, OSError, ValueError):
+            cfg = read_config(entry)
+        except (SpawnPlanError, PreparedInspectError):
             return None
-        if not isinstance(cfg, dict):
-            return None
-        base = entry.parent
-        named: list[str] = []
-        args = cfg.get("args")
-        if isinstance(args, list):
-            for flag, value in itertools.pairwise(args):
-                if flag in PATH_ARGS and isinstance(value, str):
-                    named.append(value)
-        tokenizer = cfg.get("tokenizer")
-        if isinstance(tokenizer, str):
-            named.append(tokenizer)
         files: list[Path] = [provenance, entry]
-        for value in named:
-            path = Path(os.path.expanduser(value))
-            path = path if path.is_absolute() else base / path
-            path = Path(os.path.normpath(path))
-            if path.is_dir():
-                files += sorted(p for p in path.rglob("*") if p.is_file())
-            elif path.is_file():
-                files += [Path(s) for s in shards_of(str(path))]
-            else:
+        for _flag, path in named_paths(entry, cfg):
+            found = files_of(path)
+            if found is None:
                 return None
+            files += found
         seen: set[str] = set()
         out: list[Path] = []
         for path in files:
@@ -347,6 +450,9 @@ class StrataAdapter(EngineAdapter):
                 seen.add(key)
                 out.append(path)
         return out
+
+    def inspect_prepared(self, entry: Path) -> PreparedFacts:
+        return inspect_config(entry)
 
     def fit_model_here(self, devices: DevicesReader) -> EngineFitModel | None:
         """Setup's own answer for each model on its list, on this node's

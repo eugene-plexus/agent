@@ -283,6 +283,15 @@ def test_a_preparation_makes_a_launchable_model_in_strata_data(build, monkeypatc
     assert progress.warnings == ["Windows' page file is 1.0 GB"]
     assert progress.bytes_written and progress.bytes_written >= 6000
     assert (data / "strata-iq2_xs.setup.log").is_file()
+    # LS7b: what the configuration says of the model, for its provenance.
+    facts = result.facts
+    assert facts["title"] == "Qwen3.8-Flash-Next IQ2_XS"
+    assert facts["architecture"] == "qwen4exp" and facts["quantization"] == "IQ2_XS"
+    assert facts["mode"]
+    files = {f["path"]: f for f in facts["files"]}
+    assert files["strata-iq2_xs.json"]["sizeBytes"] == result.entry.stat().st_size
+    assert files["packs/iq2_xs/expert-profile.bin"]["sizeBytes"] == 64
+    assert not any(FIRST in path for path in files)  # the source model's own
 
 
 def test_setups_failure_is_the_cause(build, monkeypatch):

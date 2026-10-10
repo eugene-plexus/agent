@@ -51,6 +51,10 @@ class PreparationResult:
     recipe_version: str
     #: `PreparedSource`: what it was made from.
     source: dict[str, Any]
+    #: What the engine's own files say of it (LS7: title, architecture,
+    #: quantization, contextLength, mode, files), as provenance fields with
+    #: the files relative to the entry's folder.
+    facts: dict[str, Any] = field(default_factory=dict)
 
 
 class Recipe(Protocol):

@@ -550,6 +550,31 @@ class ModelPreparation(BaseModel):
         None,
         description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
     )
+    minEngineVersion: str | None = Field(
+        None,
+        description="The oldest version of the engine that prepares this model, as\nthe engine's own setup states it (LS7, B30): e.g. Strata's\n`v0.1.38` for UD-IQ4_XS. Absent: any version the adapter runs.\n",
+    )
+    engineTooOld: str | None = Field(
+        None,
+        description='Set by the node that reported it when its installed engine is\nolder than `minEngineVersion` (LS7, B30): the installed\nversion, so the console says *needs Strata vX: update Strata on\nthis node* before a preparation would fail halfway. Absent: the\ninstalled engine can prepare it, or none is installed.\n',
+    )
+
+
+class PreparedFile(BaseModel):
+    """
+    One file a prepared model is made of (LS7).
+    """
+
+    path: str = Field(
+        ...,
+        description='Relative to the folder holding the provenance file, with `/`.',
+        min_length=1,
+    )
+    sizeBytes: int | None = Field(None, ge=0)
+    shared: bool | None = Field(
+        False,
+        description="Used by other models the same engine prepared in this folder too\n(Strata's MTP helper): kept while any of them is.\n",
+    )
 
 
 class PreparedSource(BaseModel):
@@ -1843,6 +1868,31 @@ class PreparedProvenance(BaseModel):
     source: PreparedSource | None = None
     preparedAt: AwareDatetime | None = Field(
         None, description='When this file was written.'
+    )
+    title: str | None = Field(
+        None,
+        description="What it is, in the engine's list's words when it came from the\nlist (`SupportedModel.title`), e.g. `Qwen3.8-Flash-Next IQ2_XS`\n(LS7, B22 replaced).\n",
+    )
+    architecture: str | None = Field(
+        None,
+        description='The architecture of the model it was made from, as the hub or\nthe source file read it (`qwen4exp`): kept for when the source\nmodel is no longer in the Library.\n',
+    )
+    quantization: str | None = Field(
+        None,
+        description="The engine's name for the size it was made from, e.g. `IQ2_XS`.",
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context, in tokens, it was prepared for: an engine that fixes\nthe context when it prepares (Strata's `--max-context`).\n",
+        ge=1,
+    )
+    mode: str | None = Field(
+        None,
+        description="How the engine runs it on the node that prepared it, in the\nengine's own words (Strata: *every expert in RAM*, *a RAM budget\nof its experts, the rest from the SSD*, *the low-RAM mode*).\n",
+    )
+    files: list[PreparedFile] | None = Field(
+        None,
+        description="Every file the model is made of beside its source model and\nthis provenance file, the entry first, as the engine's adapter\nread them off its entry file: what is the model's own on disk.\nThe source model's files are its own model's, not listed.\n",
     )
 
 

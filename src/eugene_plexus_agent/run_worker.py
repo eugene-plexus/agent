@@ -264,6 +264,9 @@ class NodeActions:
                 "recipe": result.recipe,
                 "recipeVersion": result.recipe_version,
                 "source": result.source,
+                # The library writes the provenance beside the entry, so the
+                # files' places relative to the entry's folder are theirs.
+                **result.facts,
             },
         }
 

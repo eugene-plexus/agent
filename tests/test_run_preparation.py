@@ -144,6 +144,11 @@ def _done(entry: Path) -> Progress:
         recipe="strata-prepare",
         recipe_version="v0.1.39",
         source={"path": GGUF["path"], "repoId": "ISTA-DASLab/repo"},
+        facts={
+            "title": "Qwen3.8-Flash-Next IQ2_XS",
+            "contextLength": 131072,
+            "files": [{"path": "mtp/rt/experts.bin", "sizeBytes": 20, "shared": True}],
+        },
     )
     return progress
 
@@ -169,6 +174,10 @@ async def test_done_lists_the_prepared_model_as_the_library_spells_it(app, monke
     assert body["provenance"]["engine"] == "strata"
     assert body["provenance"]["recipe"] == "strata-prepare"
     assert body["provenance"]["source"]["path"] == GGUF["path"]
+    # What the engine's files say of it goes into the provenance (LS7b).
+    assert body["provenance"]["title"] == "Qwen3.8-Flash-Next IQ2_XS"
+    assert body["provenance"]["contextLength"] == 131072
+    assert body["provenance"]["files"][0]["shared"] is True
 
 
 @pytest.mark.asyncio

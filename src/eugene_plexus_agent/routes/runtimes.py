@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
@@ -33,6 +34,8 @@ from .._generated.models import (
     EngineList,
     ModelCopyClearResult,
     ModelCopySkipped,
+    PreparedInspectRequest,
+    PreparedProvenance,
     Runtime,
     RuntimeList,
     RuntimeSpec,
@@ -591,6 +594,44 @@ async def cancel_engine_install(engine: str) -> EngineInstall:
     snapshot = await installer.cancel()
     assert snapshot is not None  # running implies a snapshot exists
     return snapshot
+
+
+@router.post(
+    "/v1/engines/{engine}/prepared/inspect",
+    response_model=PreparedProvenance,
+    response_model_exclude_none=True,
+    tags=["engines"],
+    dependencies=_write_auth,
+)
+async def inspect_prepared_model(
+    request: Request, engine: str, body: PreparedInspectRequest
+) -> PreparedProvenance:
+    """What a model this engine prepared is, read off its own files (LS7,
+    B22 replaced and B26): a draft of its provenance file for *Add a
+    prepared model*. Only a file in a Library folder, as a launch is."""
+    from ..engines import adapter_for
+    from ..engines.base import PreparedInspectError
+    from ..prepared_facts import draft
+
+    kind = _engine_kind(engine)
+    adapter = adapter_for(kind)
+    assert adapter is not None
+    await refresh_library_folders(request)
+    require_library_folder(request, body.entry)
+    local = Path(resolve_model_path(body.entry, effective_rules_for(request)).local_path)
+    try:
+        facts = await asyncio.to_thread(adapter.inspect_prepared, local)
+        answer = await asyncio.to_thread(
+            draft, facts, engine=kind.value, entry_local=local, entry_declared=body.entry
+        )
+    except PreparedInspectError as exc:
+        raise _problem(
+            code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            slug="prepared-unreadable",
+            title="Not a model this engine prepared",
+            detail=str(exc),
+        ) from exc
+    return PreparedProvenance.model_validate(answer)
 
 
 # --------------------------------------------------------------------------- #

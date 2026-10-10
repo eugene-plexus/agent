@@ -61,7 +61,7 @@ from .engines.acquisition import (
     Release,
     Unavailable,
 )
-from .engines.base import DiscoveredBinary
+from .engines.base import DiscoveredBinary, with_engine_version
 from .engines.devices import DeviceSnapshot, DevicesReader, detect_devices
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
@@ -1292,7 +1292,7 @@ def describe_engines(
                 available=True,
                 modelFormats=list(adapter.model_formats),
                 accepts=list(adapter.accepts_for(found)),
-                supportedModels=list(adapter.supported_models_here()),
+                supportedModels=with_engine_version(adapter.supported_models_here(), found.version),
                 fit=fit,
                 experimental=adapter.experimental,
                 binaryPath=str(found.path),

@@ -2687,6 +2687,86 @@
               }
             ],
             "title": "Preparedat"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title",
+            "description": "From the provenance file (LS7)."
+          },
+          "contextLength": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextlength",
+            "description": "The context it was prepared for, from the provenance file (LS7)."
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode",
+            "description": "How the engine runs it, in the engine's words, from the provenance file (LS7)."
+          },
+          "files": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PreparedFile"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files",
+            "description": "The files it is made of beside its source model, each measured\non this host where the Library sees it (LS7).\n"
+          },
+          "diskBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Diskbytes",
+            "description": "What its own files take on disk, the shared ones counted too,\nmeasured on this host (LS7). Absent when they are not on the\nLibrary's machine.\n"
+          },
+          "missing": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PreparedFactMissing"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Missing",
+            "description": "Each fact the Library could not give, and why (LS7, Troy: the\nLibrary imparts what is known, and names what is not).\n"
           }
         },
         "type": "object",
@@ -2695,7 +2775,68 @@
           "entry"
         ],
         "title": "PreparedDetail",
-        "description": "A prepared model's provenance, as its file\n(`PreparedProvenance`) says it, and what the library made of it.\nPresent iff `format` is `prepared` and the file could be read.\n\nThe engine's own files are not read (experimental-engines.md:\nprepared files stay usable without the library parsing them), so\na prepared model has no architecture, context, size or fit here:\nthe engine says what it loaded when it is ready\n(`RuntimeCapabilities`), and fit waits for the engine's own fit\nmodel (LS6). `files` lists the provenance file (`index`) and the\nentry file (`config`) when the library's host can see it."
+        "description": "A prepared model's provenance, as its file\n(`PreparedProvenance`) says it, and what the library made of it.\nPresent iff `format` is `prepared` and the file could be read.\n\nThe library does not read the engine's own files\n(experimental-engines.md: prepared files stay usable without the\nlibrary parsing them). What it knows of a prepared model (LS7,\nB22 replaced: the Library imparts what is known and names what is\nnot) is what the engine's adapter read off those files when it\nwas prepared or added and the provenance file records (`title`,\n`contextLength`, `mode`, `files`), measured on this host; what it\ninherits from the model it was made from when the library lists\nthat (`LibraryModel.architecture`, `parameters`, `sizeLabel`);\nand in `missing`, each fact it cannot give, with why. Fit is the\nengine's own (LS6). `LibraryModel.files` lists the provenance\nfile (`index`), the entry file (`config`) and the files it\nrecords, and `LibraryModel.sizeBytes` is `diskBytes`."
+      },
+      "PreparedFactMissing": {
+        "properties": {
+          "fact": {
+            "type": "string",
+            "title": "Fact",
+            "description": "Which (`architecture`, `contextLength`, `diskBytes`, `source`, ...)."
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "fact",
+          "reason"
+        ],
+        "title": "PreparedFactMissing",
+        "description": "A fact about a prepared model the Library could not give, and why."
+      },
+      "PreparedFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Path",
+            "description": "Relative to the folder holding the provenance file, with `/`."
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sizebytes"
+          },
+          "shared": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Shared",
+            "description": "Used by other models the same engine prepared in this folder too\n(Strata's MTP helper): kept while any of them is.\n",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "PreparedFile",
+        "description": "One file a prepared model is made of (LS7)."
       },
       "PreparedProvenance": {
         "properties": {
@@ -2768,6 +2909,82 @@
             ],
             "title": "Preparedat",
             "description": "When this file was written."
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title",
+            "description": "What it is, in the engine's list's words when it came from the\nlist (`SupportedModel.title`), e.g. `Qwen3.8-Flash-Next IQ2_XS`\n(LS7, B22 replaced).\n"
+          },
+          "architecture": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Architecture",
+            "description": "The architecture of the model it was made from, as the hub or\nthe source file read it (`qwen4exp`): kept for when the source\nmodel is no longer in the Library.\n"
+          },
+          "quantization": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quantization",
+            "description": "The engine's name for the size it was made from, e.g. `IQ2_XS`."
+          },
+          "contextLength": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextlength",
+            "description": "The context, in tokens, it was prepared for: an engine that fixes\nthe context when it prepares (Strata's `--max-context`).\n"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode",
+            "description": "How the engine runs it on the node that prepared it, in the\nengine's own words (Strata: *every expert in RAM*, *a RAM budget\nof its experts, the rest from the SSD*, *the low-RAM mode*).\n"
+          },
+          "files": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PreparedFile"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files",
+            "description": "Every file the model is made of beside its source model and\nthis provenance file, the entry first, as the engine's adapter\nread them off its entry file: what is the model's own on disk.\nThe source model's files are its own model's, not listed.\n"
           }
         },
         "additionalProperties": true,

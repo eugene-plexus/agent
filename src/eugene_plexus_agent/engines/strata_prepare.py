@@ -37,8 +37,18 @@ from ..preparation import (
     folder_bytes,
     run_process,
 )
+from ..prepared_facts import facts_fields
 from ..supervisor import SpawnPlanError
-from .strata import OWNED_KEYS, PATH_ARGS, SETUP_KEYS, VERSION, prepared_config, runtime_lib_dirs
+from .base import PreparedInspectError
+from .strata import (
+    OWNED_KEYS,
+    PATH_ARGS,
+    SETUP_KEYS,
+    VERSION,
+    inspect_config,
+    prepared_config,
+    runtime_lib_dirs,
+)
 from .strata_install import LLAMA_CPP_COMMIT, tools_installed
 from .strata_models import SETUP_CONTEXTS, SetupChoice, choice_for_file, disk_needed
 
@@ -304,6 +314,10 @@ class StrataPreparation:
         progress.step = "Making it a Library model"
         progress.message = None
         entry = self._adopt_config()
+        try:
+            facts = facts_fields(inspect_config(entry), folder=entry.parent)
+        except PreparedInspectError as exc:
+            raise PreparationError(f"Strata's setup left the model incomplete: {exc}") from exc
         return PreparationResult(
             entry=entry,
             name=self.choice.model_name,
@@ -315,6 +329,7 @@ class StrataPreparation:
                 "file": self.supported.source.file,
                 "revision": self.supported.source.revision,
             },
+            facts=facts,
         )
 
     # --- setup's output ---------------------------------------------------

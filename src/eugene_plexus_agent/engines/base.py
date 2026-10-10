@@ -21,7 +21,9 @@ than by what they mean. They are defined by meaning now — see
 from __future__ import annotations
 
 import abc
+import itertools
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -78,6 +80,64 @@ class DiscoveredBinary:
     #: For a Python-package engine, the environment the console script
     #: belongs to. None for a self-contained binary such as llama-server.
     python: PythonEngine | None = None
+
+
+@dataclass(frozen=True)
+class PreparedFacts:
+    """What an engine's adapter reads off its own entry file (LS7, B22
+    replaced and B26): the facts a provenance file records, with paths as
+    this node reaches them. Each is None when the file does not say."""
+
+    #: The source model's first file, as this node reaches it.
+    source_file: Path | None = None
+    #: Where the source model came from on a hub, when it is on the engine's list.
+    repo_id: str | None = None
+    hub_file: str | None = None
+    title: str | None = None
+    architecture: str | None = None
+    quantization: str | None = None
+    context_length: int | None = None
+    mode: str | None = None
+    #: Every file the model is made of beside its source model and the
+    #: provenance file, the entry first: (path, shared with the engine's
+    #: other models in that folder).
+    files: tuple[tuple[Path, bool], ...] = ()
+
+
+class PreparedInspectError(ValueError):
+    """An entry file the adapter cannot read as one its engine prepared, and why."""
+
+
+def version_tuple(version: str | None) -> tuple[int, ...] | None:
+    """`v0.1.38` as (0, 1, 38); None when it has no numbers to compare."""
+    if not version:
+        return None
+    parts = []
+    for piece in version.strip().lstrip("vV").split("."):
+        digits = "".join(itertools.takewhile(str.isdigit, piece))
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) or None
+
+
+def with_engine_version(
+    models: Sequence[SupportedModel], installed: str | None
+) -> list[SupportedModel]:
+    """Each model whose preparation needs a newer engine than the one
+    installed says so (`engineTooOld`, LS7 B30): the node that reports the
+    list judges its own install, so two nodes on different versions answer
+    differently, and the console names the node to update."""
+    have = version_tuple(installed)
+    out = []
+    for model in models:
+        prep = model.preparation
+        need = version_tuple(prep.minEngineVersion) if prep is not None else None
+        if prep is not None and have is not None and need is not None and have < need:
+            prep = prep.model_copy(update={"engineTooOld": installed})
+            model = model.model_copy(update={"preparation": prep})
+        out.append(model)
+    return out
 
 
 class EngineUnavailableError(Exception):
@@ -202,6 +262,13 @@ class EngineAdapter(abc.ABC):
         whole set. None: the engine prepares nothing, or the set cannot be
         read, and the model runs from where it is."""
         return None
+
+    def inspect_prepared(self, entry: Path) -> PreparedFacts:
+        """What a model this engine prepared is, read off its entry file as
+        this node reaches it (LS7): the source model it names, the context
+        it was prepared for, how the engine runs it and every file it is
+        made of. Raises `PreparedInspectError` naming why it cannot."""
+        raise PreparedInspectError(f"{self.kind.value} prepares no models of its own")
 
     def fit_model_here(self, devices: DevicesReader) -> EngineFitModel | None:
         """`fit_model` as this node reports it: an engine whose fit is its
