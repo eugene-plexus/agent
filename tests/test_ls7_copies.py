@@ -129,7 +129,7 @@ def test_a_prepared_model_is_copied_whole_and_launches_from_the_copy(tmp_path: P
     # The copy is whole: its relative paths still hold, so Strata launches it.
     entry = prepared_entry(Path(local.path))
     engine = tmp_path / "engine"
-    _write(engine / "engine" / "strata.exe", b"")
+    _write(engine / "engine" / ("strata.exe" if os.name == "nt" else "strata"), b"")
     launched = prepared_config(entry, alias="q", root=engine)
     args = launched["args"]
     assert isinstance(args, list)

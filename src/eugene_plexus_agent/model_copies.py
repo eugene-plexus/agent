@@ -306,10 +306,17 @@ def plan_for(
     files = members_of(source)
     if files is None:
         return None
+    if len(files) <= 1:
+        return CopyPlan(declared=declared, source=source, destination=destination)
     # The Library folder as this node reaches it: the source less the part
     # the copy is named by, so every member keeps its place beside the rest.
     depth = len(relative.split("/"))
-    root = str(Path(source).parents[depth - 1]) if depth > 0 else os.path.dirname(source)
+    # In the source's own convention: a node reaching a share by a drive
+    # letter is Windows-shaped wherever this check runs.
+    parents = (PureWindowsPath if is_windows_shaped(source) else PurePosixPath)(source).parents
+    if not 0 < depth <= len(parents):
+        return None
+    root = str(parents[depth - 1])
     members: list[CopyMember] = []
     for path in files:
         inside = os.path.relpath(path, root)
@@ -319,10 +326,7 @@ def plan_for(
             return None
         members.append(CopyMember(path, os.path.join(settings.directory, inside)))
     return CopyPlan(
-        declared=declared,
-        source=source,
-        destination=destination,
-        members=tuple(members) if len(members) > 1 else (),
+        declared=declared, source=source, destination=destination, members=tuple(members)
     )
 
 
