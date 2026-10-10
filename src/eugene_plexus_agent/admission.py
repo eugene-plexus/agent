@@ -1212,22 +1212,7 @@ async def check_admission(
             running=running,
             warnings=warnings,
         )
-    if declared is None:
-        return Admission(
-            decision=AdmissionDecision.admit,
-            fit=AdmissionFit.unknown,
-            basis=AdmissionBasis.file_size,
-            contextLength=context_length,
-            blockers=[],
-            location=location,
-            reason=(
-                f"admit on faith: {engine_name(spec.engine)} has no memory estimate in Eugene "
-                f"yet, so {spec.modelPath} was not measured; never another engine's "
-                "arithmetic in its place."
-            ),
-            warning="; ".join(warnings) or f"{engine_name(spec.engine)}'s fit is not estimated",
-        )
-    shares = declared.kind is FitModelKind.reserved_share
+    shares = declared is not None and declared.kind is FitModelKind.reserved_share
     if shares:
         # vLLM's context is its own flag, `maxModelLen`; unset, it takes the
         # model's own, which the library then measures.
@@ -1284,6 +1269,29 @@ async def check_admission(
     blockers = _blockers(spec, targets, snapshot, running)
     full_offload = wants_full_offload(spec, engine_places=engine_places)
     engine_spills = not full_offload and (spec.flags or {}).get("gpuLayers") is None
+
+    # No fit model (MLX, Kev): nothing measured, but the answer still names
+    # the device it would run on, what is free there and what holds it.
+    if declared is None:
+        return Admission(
+            decision=AdmissionDecision.admit,
+            fit=AdmissionFit.unknown,
+            basis=AdmissionBasis.file_size,
+            freeBytes=free,
+            reservedBytes=reserved or None,
+            totalBytes=total,
+            device=device,
+            devices=list(placement.devices) if placement.spread else None,
+            contextLength=context_length,
+            blockers=blockers,
+            location=location,
+            reason=(
+                f"admit on faith: {engine_name(spec.engine)} has no memory estimate in Eugene "
+                f"yet, so {spec.modelPath} was not measured; never another engine's "
+                "arithmetic in its place."
+            ),
+            warning="; ".join(warnings) or f"{engine_name(spec.engine)}'s fit is not estimated",
+        )
 
     # Required bytes: the library when it answers, the file otherwise.
     required: int | None = None

@@ -233,6 +233,10 @@ async def test_an_engine_with_no_fit_model_is_never_measured_by_another(tmp_path
         answer = await check_admission(spec, snapshot=fake_devices(), library=library, running=[])
         assert answer.decision is AdmissionDecision.admit and answer.fit is AdmissionFit.unknown
         assert "no memory estimate" in answer.reason
+        # Not measured, but still named: the device it would run on (A4's
+        # check 42 on a Mac's Metal device).
+        assert answer.device is not None and answer.device.index == 0
+        assert answer.freeBytes == 24 * GIB
     assert library.calls == []
 
 
