@@ -38,7 +38,9 @@ from .._generated.models import (
     ConfigField,
     ConfigSchema,
     ConfigValueType,
+    EngineFitModel,
     EngineKind,
+    FitModelKind,
     FrameworkAccelerator,
     HostAccelerator,
     ManualInstall,
@@ -119,6 +121,23 @@ _VENV_FIRST = (
 )
 
 
+def model_length(flags: dict[str, object]) -> int | None:
+    """The context this launch asks vLLM for (`maxModelLen`), or None: then
+    vLLM takes the model's own, and admission measures that (LS6)."""
+    value = flags.get("maxModelLen")
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    if isinstance(value, str) and value.isdigit() and int(value) > 0:
+        return int(value)
+    return None
+
+
+#: vLLM's own `CacheConfig.gpu_memory_utilization` default (upstream main,
+#: 2026-10-09; 0.9 in releases before it): the share of each card it takes
+#: when a launch sets none.
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.92
+
+
 class VllmAdapter(EngineAdapter):
     kind = EngineKind.vllm
     binary_name = "vllm"
@@ -139,6 +158,14 @@ class VllmAdapter(EngineAdapter):
             preference=20,
             note="vLLM checks the architecture when it loads",
         ),
+    )
+    #: Its share of each card's total memory, taken at start; it refuses to
+    #: start with less free, splits the model evenly across the cards it
+    #: uses and moves nothing to system memory (LS6; vLLM's own
+    #: `request_memory`). The share when a launch sets none is vLLM's
+    #: default, 0.92 on upstream main (0.9 before).
+    fit_model = EngineFitModel(
+        kind=FitModelKind.reserved_share, gpuMemoryUtilization=DEFAULT_GPU_MEMORY_UTILIZATION
     )
 
     # The load-bearing difference from llama-server. vLLM binds its

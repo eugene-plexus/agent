@@ -183,6 +183,18 @@ async def test_experts_context_uses_free_memory_on_the_target_node(app, monkeypa
     assert await NodeActions(app).context_size(Library(), MODEL, "llama_cpp") == 40960
 
 
+@pytest.mark.asyncio
+async def test_a_run_suggests_vllm_no_context_it_would_refuse(app, monkeypatch):
+    """A profile carrying `contextSize` is refused for vLLM at launch (LS6,
+    library#9): Run measures nothing and suggests nothing for it."""
+
+    async def admission(context, spec):
+        raise AssertionError("vLLM's context was measured for a flag it refuses")
+
+    monkeypatch.setattr(runtimes, "_admission_for", admission)
+    assert await NodeActions(app).context_size(object(), MODEL, "vllm") is None
+
+
 def test_runtime_composition_keeps_profile_flags_env_and_arguments():
     profile = {
         **PROFILE,

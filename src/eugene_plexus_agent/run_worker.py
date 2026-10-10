@@ -20,7 +20,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException
 
-from ._generated.models import RuntimeSpec
+from ._generated.models import EngineKind, RuntimeSpec
 from .admission import LibraryFitClient
 from .engines import adapter_for
 from .engines.devices import detect_devices
@@ -54,6 +54,20 @@ def runtime_spec(model: dict[str, Any], profile: dict[str, Any], *, start: bool)
 
 
 _RUNNABLE = ("runs", "may_run")
+
+
+def takes_context_size(engine: str) -> bool:
+    """Whether the engine's launch flags have `contextSize`, the one a Run
+    writes into the profile it makes."""
+    from .engines import ADAPTERS
+
+    try:
+        adapter = ADAPTERS.get(EngineKind(engine))
+    except ValueError:
+        return False
+    if adapter is None:
+        return False
+    return any(field.key == "contextSize" for field in adapter.flag_schema().fields)
 
 
 def could_have_here(engine: dict[str, Any]) -> bool:
@@ -290,6 +304,11 @@ class NodeActions:
     async def context_size(
         self, library: LibraryFitClient, model: dict[str, Any], engine: str
     ) -> int | None:
+        if not takes_context_size(engine):
+            # vLLM's context is its own flag (`maxModelLen`), and a profile
+            # carrying `contextSize` is refused at launch: it then takes the
+            # model's own, which admission measures by its share (LS6).
+            return None
         spec = RuntimeSpec.model_validate(
             {
                 "name": "context-probe",

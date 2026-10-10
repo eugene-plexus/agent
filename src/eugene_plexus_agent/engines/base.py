@@ -29,6 +29,7 @@ import httpx
 
 from .._generated.models import (
     ConfigSchema,
+    EngineFitModel,
     EngineKind,
     HostAccelerator,
     ManualInstall,
@@ -44,6 +45,7 @@ from .._generated.models import (
 from .._http import shared_internal_client
 from ..preparation import PreparationError, Recipe
 from .acquisition import ManagedStore, engine_root
+from .devices import DevicesReader
 
 
 def probe_client() -> httpx.AsyncClient:
@@ -187,6 +189,17 @@ class EngineAdapter(abc.ABC):
     #: setup. Empty for an engine that loads whatever its requirements
     #: accept. Discover lists them as a source of their own.
     supported_models: tuple[SupportedModel, ...] = ()
+
+    #: How this engine uses memory (LS6, Troy's L11: `EngineDescriptor.fit`),
+    #: declared beside `accepts`. None: the engine has no fit model, so its
+    #: fit is *not estimated* and admission admits on faith.
+    fit_model: EngineFitModel | None = None
+
+    def fit_model_here(self, devices: DevicesReader) -> EngineFitModel | None:
+        """`fit_model` as this node reports it: an engine whose fit is its
+        own table fills it in for this node's memory (Strata, LS6).
+        `devices` reads this node's devices, once, only if asked."""
+        return self.fit_model
 
     def accepts_for(self, found: DiscoveredBinary | None) -> tuple[ModelRequirement, ...]:
         """What this engine loads as `found` (None: not installed) reports it.

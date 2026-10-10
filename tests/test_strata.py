@@ -332,7 +332,10 @@ def test_prepared_config_size_is_never_a_memory_estimate(authed_client, prepared
     body = response.json()
     assert body["decision"] == "admit" and body["fit"] == "unknown"
     assert body.get("requiredBytes") is None
-    assert "Config size is not model size" in body["warning"]
+    # A configuration that names no model on Strata's list: its setup's
+    # table cannot say what it needs (LS6), and its size is never a guess.
+    assert body["basis"] == "engine_table"
+    assert "Strata's list" in body["reason"]
     assert not (strata.StrataAdapter().managed_store().directory / ".launch").exists()
 
 

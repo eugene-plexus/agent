@@ -20,7 +20,10 @@ import httpx
 from pydantic import ValidationError
 
 from .._generated.models import (
+    ComputeDevice,
+    ComputeDeviceKind,
     ConfigSchema,
+    EngineFitModel,
     EngineKind,
     ModelFormat,
     ModelRequirement,
@@ -42,7 +45,17 @@ from .base import (
     default_model_alias,
     probe_client,
 )
-from .strata_models import PREPARATION, STRATA_FILES, SUPPORTED_MODELS, supported_here
+from .devices import DeviceSnapshot, DevicesReader
+from .strata_models import (
+    PREPARATION,
+    SETUP_CHOICES,
+    STRATA_FILES,
+    SUPPORTED_MODELS,
+    SetupChoice,
+    choice_for_file,
+    fit_table,
+    supported_here,
+)
 
 VERSION = "v0.1.39"
 COMMIT = "6f32ec070f23ced9f50e704d854d775da52591ab"
@@ -124,6 +137,28 @@ def prepared_entry(path: Path) -> Path:
         # A path on this node, used as written.
         return Path(entry)
     return path.parent / entry
+
+
+def choice_of_runtime(path: Path) -> SetupChoice | None:
+    """Which of setup's choices a runtime's model is (LS6), for its fit: a
+    provenance file names the file it was made from (`source.file`), and a
+    configuration from before LS3 is setup's own `strata-<tag>.json`. None
+    for a model made outside Eugene that names no source on the list, or a
+    file that cannot be read: its fit is then not estimated."""
+    name = path.name.lower()
+    if name.endswith(PREPARED_SUFFIX):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return None
+        source = raw.get("source") if isinstance(raw, dict) else None
+        file = source.get("file") if isinstance(source, dict) else None
+        found = choice_for_file(file) if isinstance(file, str) and file else None
+        return found[1] if found else None
+    if name.startswith("strata-") and name.endswith(".json"):
+        tag = name[len("strata-") : -len(".json")]
+        return next((c for c in SETUP_CHOICES.values() if c.tag == tag), None)
+    return None
 
 
 def runtime_lib_dirs(root: Path) -> list[str]:
@@ -212,6 +247,24 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
         raise SpawnPlanError(f"Strata prepared config {path}: {exc}") from exc
 
 
+#: The cards Strata runs on: NVIDIA, and AMD through its HIP engine.
+STRATA_CARDS = (ComputeDeviceKind.cuda, ComputeDeviceKind.rocm)
+
+
+def strata_card(snapshot: DeviceSnapshot) -> ComputeDevice | None:
+    """The card Strata's setup would take alone: the most memory, then the
+    lowest number (setup.py `choose_gpus`, as `strata_prepare.main_gpu`).
+    None when there is no card it runs on, or none says its size."""
+    cards = [
+        d
+        for d in snapshot.devices
+        if d.kind in STRATA_CARDS and not d.sharedMemory and (d.memoryTotalBytes or 0) > 0
+    ]
+    if not cards:
+        return None
+    return min(cards, key=lambda d: (-round((d.memoryTotalBytes or 0) / 2**30), d.index or 0))
+
+
 class StrataAdapter(EngineAdapter):
     kind = EngineKind.strata
     binary_name = "strata-server"  # never mistake an arbitrary server.py on PATH for Strata
@@ -248,6 +301,15 @@ class StrataAdapter(EngineAdapter):
 
         total, _available = host_memory()
         return supported_here(total)
+
+    def fit_model_here(self, devices: DevicesReader) -> EngineFitModel | None:
+        """Setup's own answer for each model on its list, on this node's
+        total RAM and the card it would use (LS6)."""
+        snapshot = devices()
+        card = strata_card(snapshot)
+        return fit_table(
+            snapshot.ram_total_bytes, card.memoryTotalBytes if card is not None else None
+        )
 
     def plan_preparation(
         self,

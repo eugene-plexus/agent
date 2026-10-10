@@ -689,6 +689,11 @@ class EligibilityCandidate(BaseModel):
         None,
         description="The file's name without its folder: a GGUF's first shard\n(`ModelRequirement.files`, LS4). Absent: not known yet, as on a\nsearch row, which names a repo rather than a file.\n",
     )
+    sizeBytes: int | None = Field(
+        None,
+        description="The weights' size: every file the engine loads, shards included,\nwithout a separate vision projector, as the hub lists them (LS6,\nfor an engine's fit). Absent: not known yet, as on a search row,\nand then no engine's fit is estimated for it.\n",
+        ge=0,
+    )
     mlxQuantized: bool | None = Field(
         None,
         description="Whether the folder's `config.json` carries MLX's quantization\nblock (`MlxQuantizationRule`). Absent: not known.\n",
@@ -715,21 +720,6 @@ class EngineVerdictKind(StrEnum):
     no = 'no'
 
 
-class EngineVerdict(BaseModel):
-    engine: EngineKind
-    verdict: EngineVerdictKind
-    available: bool
-    installable: bool | None = False
-    experimental: bool | None = False
-    reason: str = Field(
-        ..., description='The verdict in words, naming the term that decided it.'
-    )
-    preparation: ModelPreparation | None = None
-    preference: int | None = Field(
-        None, description='From the requirement that matched; absent on `no`.'
-    )
-
-
 class EligibilityLevel(StrEnum):
     """
     The one dot a model carries (Troy's L5, 2026-10-09), in his words:
@@ -740,10 +730,14 @@ class EligibilityLevel(StrEnum):
       this node could install would run it, or an available engine
       runs it after preparation.
     * `not_here`: *Can not work on this machine*. No engine this
-      hardware can have accepts it.
+      hardware can have accepts it, or (when the request asked for fit,
+      LS6) every engine that would run it says it does not fit
+      (`EngineFit.verdict` `no`).
 
-    Whether it fits in memory is a separate answer (`Fit`), until each
-    engine has its own fit (LS6).
+    An engine whose fit is `no` counts as one that cannot run the
+    model, so a model too large for llama.cpp that Strata runs after
+    preparing it is `other_engine`. A fit that is *not estimated*, or
+    `unknown`, never counts against a model: only a measured `no` does.
 
     """
 
@@ -752,23 +746,125 @@ class EligibilityLevel(StrEnum):
     not_here = 'not_here'
 
 
-class ModelEligibility(BaseModel):
-    modelId: str = Field(
-        ..., description="A library model's id, or an `EligibilityCandidate`'s `id`."
+class FitModelKind(StrEnum):
+    """
+    How an engine uses memory, so its fit is its own (LS6, Troy's L11;
+    library-sources-and-engines.md §6.1). Engines differ in both
+    directions, so one engine's arithmetic is never another's answer.
+
+    * `spill` (llama.cpp): weights, the KV cache for the context and an
+      overhead allowance against the cards' free memory; what does not
+      fit moves to system memory, experts first on a mixture-of-experts
+      model (`FitOffload`). The library's arithmetic since M3.
+    * `reserved_share` (vLLM): the engine takes a share of each card's
+      **total** memory when it starts (`gpuMemoryUtilization`) and
+      refuses to start when less than that is free; weights and
+      overhead come out of the share and the KV cache must hold the
+      whole context in what is left. The model is split evenly across
+      the cards it uses (tensor parallel). Nothing spills to system
+      memory, so there is no `split`. Read off vLLM's own
+      `request_memory` (upstream main, 2026-10-09).
+    * `engine_table`: the engine's own table of what each model it runs
+      needs, applied to this node by its adapter (`EngineFitModel.table`):
+      Strata's setup's RAM figures and its low-RAM and RAM-budget modes.
+
+    """
+
+    spill = 'spill'
+    reserved_share = 'reserved_share'
+    engine_table = 'engine_table'
+
+
+class FitQuestion(BaseModel):
+    """
+    Ask the judge for each engine's fit as well (LS6): the node's
+    memory as the caller measured it (the console the picked node's
+    devices, as for `GET /v1/models/{id}/fit`), and the context to score
+    at. A sum over cards is spread evenly across `gpuCount` of them.
+
+    """
+
+    contextLength: int | None = Field(
+        None, description="Absent: the library's `guidanceContextLength`.", ge=1
     )
-    level: EligibilityLevel
-    approximate: bool | None = Field(
-        False,
-        description='The facts were a guess (`EligibilityCandidate.approximate`), or\na term could not be checked. Said beside the dot, never hidden.\n',
+    vramFreeBytes: int | None = Field(
+        None, description="Free memory on the node's cards, summed.", ge=0
     )
-    engines: list[EngineVerdict] = Field(
-        ...,
-        description='Every engine sent, best first: available before not, then\n`runs`, `may_run`, `after_preparation`, `no`, then\n`preference`. The first available `runs` or `may_run` is what\nRun would pick when the person has set no default.\n',
+    vramTotalBytes: int | None = Field(
+        None,
+        description="Their total memory, summed. A share-taking engine's share is of\nthis (`reserved_share`). Absent: taken as `vramFreeBytes`.\n",
+        ge=0,
+    )
+    gpuCount: int | None = Field(
+        None,
+        description='How many cards the sums cover. Absent: one when there is VRAM, none otherwise.',
+        ge=0,
+    )
+    ramAvailableBytes: int | None = Field(None, ge=0)
+    ramTotalBytes: int | None = Field(None, ge=0)
+    unifiedMemory: bool | None = Field(
+        None,
+        description='One pool shared with system memory (`MemoryBudget.unifiedMemory`).',
     )
 
 
-class EligibilityList(BaseModel):
-    models: list[ModelEligibility]
+class FitVerdict(StrEnum):
+    """
+    Lives here since LS6, because an engine's fit (`EngineFit`) uses it
+    as well as the library's `Fit`. For a `spill` engine:
+
+    * `fits` — inside **free** VRAM. Fully offloaded, no host memory
+      in the generation path.
+    * `tight` — inside total VRAM but not free VRAM. It would fit on
+      an idle GPU; something is holding memory right now, and
+      closing it is the operator's call.
+    * `split` — needs host memory as well. Runnable with partial
+      offload, and a decision rather than a failure. How much slower
+      depends on what moves, which `Fit.offload` says: experts (a
+      MoE model, little slower) or whole layers (much slower).
+    * `no` — larger than VRAM and RAM together.
+    * `unknown` — there is a GPU here and we could not read how much
+      memory it has, so no comparison against it can be made. Added
+      2026-09-18 (roadmap R2.3, review §6.2 #28) because the
+      alternative was worse than silence: `_intel_gpus` reports
+      `vramTotalBytes: 0` for a card whose size `xpu-smi` will not
+      state, the verdict then took the *no accelerator* branch,
+      compared the weights against host memory, and told a 16 GB Arc
+      owner that a 30 GB model **fits** — with `gpuCount: 1` printed
+      beside it. Wrong in the direction that runs out of memory at
+      load.
+
+      It is a property of the machine and not of the model, so every
+      candidate on such a host reports it, including small ones: a
+      favourable answer computed against a number we do not have is
+      right by luck.
+
+    For a `reserved_share` engine: `fits` when the model and the
+    context's cache fit its share and the share is free; `tight` when
+    they fit the share but less than the share is free now (the engine
+    refuses to start until it is); `no` when they do not fit the share.
+    Never `split`.
+
+    For an `engine_table` engine, the engine's own words map onto these:
+    Strata's *fits* and RAM-budget mode are `fits`; its low-RAM mode
+    (part of the experts on the card, the rest from the SSD) is `split`;
+    *tight* (a few GB short, so the system pages) is `tight`; *does not
+    fit* is `no`; a node with no graphics card it can read is `unknown`.
+
+    Five values rather than a percentage because a percentage of
+    *what* — VRAM, or VRAM plus RAM? — is precisely the ambiguity
+    the operator is trying to resolve, and because they have
+    different advice. `tight` and `split` are the two the field
+    usually collapses into "won't fit", and they are the two worth
+    naming.
+
+    """
+
+    fits = 'fits'
+    tight = 'tight'
+    split = 'split'
+    no = 'no'
+    unknown = 'unknown'
 
 
 class RetryDisposition(StrEnum):
@@ -1750,35 +1846,54 @@ class PreparedProvenance(BaseModel):
     )
 
 
-class EligibilityEngine(BaseModel):
+class EngineFit(BaseModel):
     """
-    One engine as a node reported it, sent to the library to be judged
-    against. The caller sends what it holds (the console the picked
-    node's `GET /v1/engines`, the agent its own) so the library needs
-    no call to any agent.
+    One engine's answer to *does it fit in this node's memory*, by that
+    engine's own fit model (LS6, Troy's L11). Shown with the engine's
+    name beside it; the library's detailed arithmetic for a library
+    model is `GET /v1/models/{id}/fit` with the same `fitModel`.
 
     """
 
-    engine: EngineKind
-    available: bool = Field(..., description='Installed and usable on that node now.')
-    installable: bool | None = Field(
+    estimated: bool = Field(
+        ...,
+        description="False: *Fit not estimated*. The engine declares no fit model, its\ntable has no row for this model, or the model's size is not known\nyet. Never counts against the model.\n",
+    )
+    verdict: FitVerdict | None = Field(None, description='Present when `estimated`.')
+    model: FitModelKind | None = None
+    reason: str = Field(
+        ...,
+        description="The answer in words, in the engine's own terms: what it needs and\nwhat this node has, or why there is no estimate.\n",
+    )
+    requiredBytes: int | None = Field(
+        None,
+        description='`spill` and `reserved_share`: the weights, the KV cache at\n`contextLength` and the overhead allowance, on the cards.\n',
+        ge=0,
+    )
+    shareBytes: int | None = Field(
+        None,
+        description="`reserved_share`: what the engine takes, its share of the cards'\ntotal memory summed.\n",
+        ge=0,
+    )
+    ramBytes: int | None = Field(
+        None,
+        description="`engine_table`: the system memory the engine's own table asks for\n(Strata's setup's `ram_gb`, in its GB of 2^30 bytes).\n",
+        ge=0,
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context this answer is for. Absent where the engine's table does not depend on it.",
+        ge=1,
+    )
+    maxContextLength: int | None = Field(
+        None,
+        description='`spill`: the longest context that fits in free memory;\n`reserved_share`: the longest the KV cache in the share holds.\n',
+        ge=0,
+    )
+    approximate: bool | None = Field(
         False,
-        description='Not available, but this node could have it: Eugene can install\nit here, or the agent wrote an install command for this\nhardware. False for an engine that cannot run on this hardware.\n',
+        description='The KV cache was a rough share of the weights (no layer\nmetadata), or the facts were a guess: as `Fit.basis` `estimate`.\n',
     )
-    experimental: bool | None = False
-    accepts: list[ModelRequirement]
-
-
-class EligibilityRequest(BaseModel):
-    models: list[str] | None = Field(
-        None,
-        description='Library model ids to judge. Absent means every model, unless\n`candidates` are sent: then none.\n',
-    )
-    candidates: list[EligibilityCandidate] | None = Field(
-        None,
-        description='Models not in the library yet, judged by their facts (LS2).\nAnswered after `models`, in the order sent.\n',
-    )
-    engines: list[EligibilityEngine]
 
 
 class ConfigFieldStatus(BaseModel):
@@ -1833,6 +1948,60 @@ class ChatLogprobs(BaseModel):
 
     content: list[ChatTokenLogprob] | None = None
     refusal: list[ChatTokenLogprob] | None = None
+
+
+class EngineVerdict(BaseModel):
+    engine: EngineKind
+    verdict: EngineVerdictKind
+    available: bool
+    installable: bool | None = False
+    experimental: bool | None = False
+    reason: str = Field(
+        ..., description='The verdict in words, naming the term that decided it.'
+    )
+    preparation: ModelPreparation | None = None
+    preference: int | None = Field(
+        None, description='From the requirement that matched; absent on `no`.'
+    )
+    fit: EngineFit | None = Field(
+        None,
+        description="This engine's fit on the node, by its own fit model (LS6).\nPresent when the request carried `fit` and the verdict is not\n`no`.\n",
+    )
+
+
+class ModelEligibility(BaseModel):
+    modelId: str = Field(
+        ..., description="A library model's id, or an `EligibilityCandidate`'s `id`."
+    )
+    level: EligibilityLevel
+    approximate: bool | None = Field(
+        False,
+        description='The facts were a guess (`EligibilityCandidate.approximate`), or\na term could not be checked. Said beside the dot, never hidden.\n',
+    )
+    engines: list[EngineVerdict] = Field(
+        ...,
+        description='Every engine sent, best first: available before not, then\n`runs`, `may_run`, `after_preparation`, `no`, then\n`preference`. The first available `runs` or `may_run` is what\nRun would pick when the person has set no default.\n',
+    )
+
+
+class EligibilityList(BaseModel):
+    models: list[ModelEligibility]
+
+
+class EngineTableFit(BaseModel):
+    """
+    One row of an engine's own fit table, as its adapter applied it to one node.
+    """
+
+    file: str = Field(
+        ...,
+        description="The model's file as `ModelRequirement.files` names it: a GGUF's\nfirst shard, without its folder, compared ignoring case. A\nprepared model is matched by the file it was made from\n(`PreparedSource.file`).\n",
+        min_length=1,
+    )
+    supportedModel: str | None = Field(
+        None, description='The `SupportedModel.id` this row is for.'
+    )
+    fit: EngineFit
 
 
 class ConfigField(BaseModel):
@@ -1984,6 +2153,30 @@ class DirectoryListing(BaseModel):
     )
 
 
+class EngineFitModel(BaseModel):
+    """
+    How one engine uses memory, declared by its adapter beside `accepts`
+    (`EngineDescriptor.fit`; LS6, Troy's L11: data where it can be). The
+    library applies it (`POST /v1/eligibility` with `fit`,
+    `GET /v1/models/{id}/fit` with `fitModel`). An engine that declares
+    none has its fit *not estimated*, never another engine's number in
+    its place.
+
+    """
+
+    kind: FitModelKind
+    gpuMemoryUtilization: float | None = Field(
+        None,
+        description="`reserved_share`: the share of each card's total memory the\nengine takes when a launch sets none, its own default (vLLM's is\n0.92 on upstream main; it was 0.9 before).\n",
+        gt=0.0,
+        le=1.0,
+    )
+    table: list[EngineTableFit] | None = Field(
+        None,
+        description="`engine_table`: the engine's answer for each model it runs, on\nthe node that reported it.\n",
+    )
+
+
 class MessageContent1(
     RootModel[
         list[
@@ -1997,6 +2190,45 @@ class MessageContent1(
         ...,
         description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
         min_length=1,
+    )
+
+
+class EligibilityEngine(BaseModel):
+    """
+    One engine as a node reported it, sent to the library to be judged
+    against. The caller sends what it holds (the console the picked
+    node's `GET /v1/engines`, the agent its own) so the library needs
+    no call to any agent.
+
+    """
+
+    engine: EngineKind
+    available: bool = Field(..., description='Installed and usable on that node now.')
+    installable: bool | None = Field(
+        False,
+        description='Not available, but this node could have it: Eugene can install\nit here, or the agent wrote an install command for this\nhardware. False for an engine that cannot run on this hardware.\n',
+    )
+    experimental: bool | None = False
+    accepts: list[ModelRequirement]
+    fit: EngineFitModel | None = Field(
+        None,
+        description='How this engine uses memory, as the node reported it\n(`EngineDescriptor.fit`, LS6). Absent: the engine has no fit\nmodel, and its fit is *not estimated*.\n',
+    )
+
+
+class EligibilityRequest(BaseModel):
+    models: list[str] | None = Field(
+        None,
+        description='Library model ids to judge. Absent means every model, unless\n`candidates` are sent: then none.\n',
+    )
+    candidates: list[EligibilityCandidate] | None = Field(
+        None,
+        description='Models not in the library yet, judged by their facts (LS2).\nAnswered after `models`, in the order sent.\n',
+    )
+    engines: list[EligibilityEngine]
+    fit: FitQuestion | None = Field(
+        None,
+        description="Ask for each engine's fit too (LS6): every verdict but `no`\nthen carries its engine's `fit`, and a model that fits no engine\nthat would run it is `not_here`. Absent: no fit is computed, and\nthe level is about engines alone, as before LS6.\n",
     )
 
 

@@ -20,11 +20,17 @@ Moving the Strata pin means reading these again from the new setup.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 
 from .._generated.models import (
     Context,
+    EngineFit,
+    EngineFitModel,
+    EngineTableFit,
+    FitModelKind,
+    FitVerdict,
     ModelFormat,
     ModelPreparation,
     PreparedSource,
@@ -222,14 +228,16 @@ STRATA_FILES: tuple[str, ...] = tuple(
 class SetupChoice:
     """How upstream's setup names a choice and sizes it (LS5): `--family` and
     `--model`, `FAMILIES[f]["name"]` (the start of its `model_name`), and from
-    `MODELS[m]` the experts' size in RAM (`arena_gb`) and whether it keeps a
-    RAM budget of them instead (`budget`, Unsloth's two)."""
+    `MODELS[m]` the experts' size in RAM (`arena_gb`), whether it keeps a
+    RAM budget of them instead (`budget`, Unsloth's two), and the RAM setup
+    says it needs (`ram_gb`, LS6)."""
 
     family: str
     model: str
     name: str
     arena_gb: float
     budget: bool = False
+    ram_gb: float = 0.0
 
     @property
     def tag(self) -> str:
@@ -244,25 +252,34 @@ class SetupChoice:
         return f"{self.name}-{self.model.lower()}"
 
 
-#: setup.py `FAMILIES[f]["name"]` and `MODELS[m]["arena_gb"]`, by list id.
+#: setup.py `FAMILIES[f]["name"]`, and `MODELS[m]["arena_gb"]` and
+#: `["ram_gb"]`, by list id.
 SETUP_CHOICES: dict[str, SetupChoice] = {
-    "Q2_0": SetupChoice("qwen", "Q2_0", "qwen3.8-flash-next", 34.0),
-    "IQ2_XS": SetupChoice("qwen", "IQ2_XS", "qwen3.8-flash-next", 35.5),
-    "IQ3_XXS": SetupChoice("qwen", "IQ3_XXS", "qwen3.8-flash-next", 42.9),
-    "IQ3_S": SetupChoice("qwen", "IQ3_S", "qwen3.8-flash-next", 50.3),
-    "swift-IQ2_XS": SetupChoice("swift", "IQ2_XS", "swift-1.5", 35.5),
-    "swift-IQ3_XXS": SetupChoice("swift", "IQ3_XXS", "swift-1.5", 42.9),
-    "coder-IQ1_M": SetupChoice("coder", "IQ1_M", "qwen3.8-flash-next-coder", 23.4),
+    "Q2_0": SetupChoice("qwen", "Q2_0", "qwen3.8-flash-next", 34.0, ram_gb=48),
+    "IQ2_XS": SetupChoice("qwen", "IQ2_XS", "qwen3.8-flash-next", 35.5, ram_gb=48),
+    "IQ3_XXS": SetupChoice("qwen", "IQ3_XXS", "qwen3.8-flash-next", 42.9, ram_gb=60),
+    "IQ3_S": SetupChoice("qwen", "IQ3_S", "qwen3.8-flash-next", 50.3, ram_gb=62),
+    "swift-IQ2_XS": SetupChoice("swift", "IQ2_XS", "swift-1.5", 35.5, ram_gb=48),
+    "swift-IQ3_XXS": SetupChoice("swift", "IQ3_XXS", "swift-1.5", 42.9, ram_gb=60),
+    "coder-IQ1_M": SetupChoice("coder", "IQ1_M", "qwen3.8-flash-next-coder", 23.4, ram_gb=32),
     "unsloth-UD-IQ4_XS": SetupChoice(
-        "unsloth", "UD-IQ4_XS", "qwen3.8-flash-next-unsloth", 59.5, budget=True
+        "unsloth", "UD-IQ4_XS", "qwen3.8-flash-next-unsloth", 59.5, budget=True, ram_gb=48
     ),
     "unsloth-UD-Q4_K_XL": SetupChoice(
-        "unsloth", "UD-Q4_K_XL", "qwen3.8-flash-next-unsloth", 77.0, budget=True
+        "unsloth", "UD-Q4_K_XL", "qwen3.8-flash-next-unsloth", 77.0, budget=True, ram_gb=48
     ),
 }
 
 #: setup.py `LOW_RAM_HEADROOM_GB`: RAM it keeps beside the experts.
 LOW_RAM_HEADROOM_GB = 10
+#: setup.py `UNSLOTH_RAM_LEFT_GB`: RAM beside a RAM budget of experts.
+UNSLOTH_RAM_LEFT_GB = 24
+#: setup.py `--check`: within this much of its `ram_gb` a model is *tight*
+#: (the system pages it), not *does not fit*.
+TIGHT_GB = 8
+#: setup.py: under this much VRAM "Strata will run, but most experts stay on
+#: the CPU and it will be slow".
+SLOW_VRAM_GB = 11
 #: setup.py's own allowance beside the model files (the pack, the MTP helper).
 SETUP_DISK_GB = 8
 #: Q2_0's experts repacked for an AVX-512 CPU, which setup writes once.
@@ -307,3 +324,147 @@ def choice_for_file(path: str) -> tuple[SupportedModel, SetupChoice] | None:
         if model.source.file and PurePosixPath(model.source.file).name.lower() == wanted:
             return model, SETUP_CHOICES[model.id]
     return None
+
+
+# --- fit: setup's own table, applied to this node (LS6) ---------------------
+
+
+@dataclass(frozen=True)
+class SetupFit:
+    """Setup's answer for one choice on one PC, as its `--check` gives it."""
+
+    verdict: FitVerdict
+    words: str
+    #: The mode it would run in: `ram` (every expert in RAM), `budget` (a RAM
+    #: budget of them, the rest from the SSD), `low_ram` (the low-RAM mode) or
+    #: `paged` (short of RAM: the system pages them). None when unknown or no.
+    mode: str | None = None
+
+
+def resident_budget_gib(choice: SetupChoice, ram_gib: float) -> int:
+    """setup.py `resident_budget_gib`: the GiB of experts a RAM-budget model
+    keeps in RAM, the RAM less what it leaves beside them."""
+    gib = round(ram_gib) - UNSLOTH_RAM_LEFT_GB
+    return max(8, min(gib, int(choice.arena_gb / 1.073741824)))
+
+
+def low_ram_needed(choice: SetupChoice, ram_gib: float) -> bool:
+    """setup.py `low_ram_needed`: the experts do not fit RAM with room beside them."""
+    return ram_gib < choice.arena_gb + LOW_RAM_HEADROOM_GB
+
+
+def low_ram_gpu_gb(choice: SetupChoice, vram_gib: float) -> float:
+    """setup.py `low_ram_gpu_gb` at its default 32K context: the experts the
+    card's cache holds, its VRAM less ~5 GB for the rest."""
+    return max(0.0, min(choice.arena_gb, vram_gib - 5))
+
+
+def low_ram_fits(choice: SetupChoice, ram_gib: float, vram_gib: float) -> bool:
+    """setup.py `low_ram_fits`: the experts the card does not hold fit the RAM
+    left beside the rest."""
+    return ram_gib - 6 + max(0.0, vram_gib - 5) >= choice.arena_gb
+
+
+def low_ram_resident(choice: SetupChoice, ram_gib: float, vram_gib: float) -> bool:
+    """setup.py `low_ram_resident`: the rest fits RAM with the usual room."""
+    rest = choice.arena_gb - low_ram_gpu_gb(choice, vram_gib)
+    return ram_gib >= rest + LOW_RAM_HEADROOM_GB
+
+
+def setup_fit(choice: SetupChoice, ram_gib: float, vram_gib: float | None) -> SetupFit:
+    """Setup's `--check` verdict for one choice (setup.py at the commit the
+    adapter pins), mapped onto the fit words: *fits* and the RAM-budget mode
+    are `fits`, the low-RAM mode `split`, *tight* `tight`, *does not fit*
+    `no`. `ram_gib` is the PC's total RAM in setup's GB (2^30 bytes), as its
+    `ram_gb()` reads it; `vram_gib` the card it would use, None when there is
+    none it can use: then `unknown`, since setup's rule is about one."""
+    have = f"this machine has {ram_gib:.0f} GB"
+    need = f"about {choice.ram_gb:g} GB of RAM"
+    if vram_gib is None:
+        return SetupFit(
+            FitVerdict.unknown,
+            "no graphics card Strata can use was found here, and its setup's rule is about one",
+        )
+    slow = (
+        "; with under 12 GB of graphics memory most experts stay on the CPU, so it will be slow"
+        if vram_gib < SLOW_VRAM_GB
+        else ""
+    )
+    if choice.budget:
+        if ram_gib >= choice.ram_gb:
+            budget = resident_budget_gib(choice, ram_gib)
+            return SetupFit(
+                FitVerdict.fits,
+                f"Strata keeps {budget} GiB of its {choice.arena_gb:g} GB of experts in RAM "
+                f"and reads the rest from the SSD as it answers ({have}){slow}",
+                "budget",
+            )
+        return SetupFit(
+            FitVerdict.no,
+            f"Strata needs {choice.ram_gb:g} GB of RAM or more for this model, and {have}",
+        )
+    if low_ram_needed(choice, ram_gib) and low_ram_fits(choice, ram_gib, vram_gib):
+        share = low_ram_gpu_gb(choice, vram_gib) / choice.arena_gb
+        rest = (
+            "the rest stay in RAM"
+            if low_ram_resident(choice, ram_gib, vram_gib)
+            else "the rest are read from the SSD as needed"
+        )
+        return SetupFit(
+            FitVerdict.split,
+            f"fits in Strata's low-RAM mode: the card holds about {share:.0%} of its "
+            f"experts and {rest} ({have}){slow}",
+            "low_ram",
+        )
+    if ram_gib >= choice.ram_gb:
+        return SetupFit(
+            FitVerdict.fits,
+            f"Strata keeps its {choice.arena_gb:g} GB of experts in RAM: it needs {need}, "
+            f"and {have}{slow}",
+            "ram",
+        )
+    if ram_gib >= choice.ram_gb - TIGHT_GB:
+        return SetupFit(
+            FitVerdict.tight,
+            f"Strata needs {need} and {have}: the system will page part of its experts "
+            "from disk, which is much slower, and it may not start",
+            "paged",
+        )
+    return SetupFit(FitVerdict.no, f"Strata needs {need} for this model, and {have}")
+
+
+def engine_fit_of(choice: SetupChoice, ram_gib: float, vram_gib: float | None) -> EngineFit:
+    answer = setup_fit(choice, ram_gib, vram_gib)
+    return EngineFit(
+        estimated=True,
+        verdict=answer.verdict,
+        model=FitModelKind.engine_table,
+        reason=answer.words,
+        ramBytes=int(choice.ram_gb * 2**30),
+    )
+
+
+def fit_table(ram_bytes: int | None, vram_bytes: int | None) -> EngineFitModel:
+    """Setup's answer for every model on the list, on this node (LS6): its
+    total RAM, and the card it would use (`vram_bytes`; None: none it can
+    use). A node whose RAM could not be read has every row *not estimated*."""
+    rows: list[EngineTableFit] = []
+    vram_gib = vram_bytes / 2**30 if vram_bytes is not None else None
+    for model in SUPPORTED_MODELS:
+        choice = SETUP_CHOICES[model.id]
+        if ram_bytes is None:
+            fit = EngineFit(
+                estimated=False,
+                model=FitModelKind.engine_table,
+                reason="this machine's RAM could not be read, and Strata's setup sizes by it",
+            )
+        else:
+            fit = engine_fit_of(choice, ram_bytes / 2**30, vram_gib)
+        file = PurePosixPath(model.source.file).name if model.source.file else model.id
+        rows.append(EngineTableFit(file=file, supportedModel=model.id, fit=fit))
+    return EngineFitModel(kind=FitModelKind.engine_table, table=rows)
+
+
+def experts_in_ram_bytes(choice: SetupChoice) -> int:
+    """What the `ram` mode copies into RAM: the experts, in setup's GB."""
+    return math.ceil(choice.arena_gb * 1e9)

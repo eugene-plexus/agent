@@ -70,7 +70,9 @@ from ._generated.models import (
     AdmissionFit,
     ComputeDevice,
     ComputeDeviceKind,
+    EngineFitModel,
     EngineKind,
+    FitModelKind,
     ModelLocation,
     RuntimeSpec,
     RuntimeStatus,
@@ -183,6 +185,9 @@ class FitSource(Protocol):
         ram_bytes: int | None,
         unified_memory: bool = False,
         gpu_count: int = 1,
+        fit_model: str | None = None,
+        gpu_memory_utilization: float | None = None,
+        vram_total_bytes: int | None = None,
     ) -> LibraryFit | None: ...
 
 
@@ -291,6 +296,9 @@ class LibraryFitClient:
         ram_bytes: int | None,
         unified_memory: bool = False,
         gpu_count: int = 1,
+        fit_model: str | None = None,
+        gpu_memory_utilization: float | None = None,
+        vram_total_bytes: int | None = None,
     ) -> LibraryFit | None:
         try:
             client = self._client()
@@ -323,6 +331,14 @@ class LibraryFitClient:
                 params["unifiedMemory"] = "true"
             if gpu_count > 1:
                 params["gpuCount"] = gpu_count
+            # The engine's own fit model (LS6); absent, the library's
+            # arithmetic is `spill`, llama.cpp's.
+            if fit_model is not None:
+                params["fitModel"] = fit_model
+            if gpu_memory_utilization is not None:
+                params["gpuMemoryUtilization"] = gpu_memory_utilization
+            if vram_total_bytes is not None:
+                params["vramTotalBytes"] = vram_total_bytes
             response = await client.get(
                 f"{self._base}/v1/models/{quote(str(model['id']), safe='')}/fit",
                 params=params,
@@ -956,6 +972,178 @@ def _gib(count: int | None) -> str:
     return f"{count / (1024**3):.1f} GiB"
 
 
+# --- each engine's own fit model (LS6) --------------------------------------
+
+
+def engine_fit_model(kind: EngineKind) -> EngineFitModel | None:
+    """What the engine's adapter declares (`EngineDescriptor.fit`); None: it
+    has no fit model, and its fit is not estimated."""
+    from .engines import ADAPTERS  # the adapters import the supervisor
+
+    adapter = ADAPTERS.get(kind)
+    return adapter.fit_model if adapter is not None else None
+
+
+def engine_name(kind: EngineKind) -> str:
+    return _ENGINE_NAMES.get(kind, kind.value)
+
+
+_ENGINE_NAMES = {
+    EngineKind.llama_cpp: "llama.cpp",
+    EngineKind.vllm: "vLLM",
+    EngineKind.mlx: "MLX",
+    EngineKind.kev: "Kev",
+    EngineKind.strata: "Strata",
+}
+
+
+def share_of(spec: RuntimeSpec, declared: EngineFitModel) -> float | None:
+    """A share-taking engine's share of each card: the launch's own
+    (`gpuMemoryUtilization`), else the engine's default."""
+    asked = (spec.flags or {}).get("gpuMemoryUtilization")
+    if isinstance(asked, int | float) and not isinstance(asked, bool) and 0 < asked <= 1:
+        return float(asked)
+    return declared.gpuMemoryUtilization
+
+
+#: Strata's own words mapped to admission's (`FitVerdict` in common.yaml).
+_STRATA_FIT = {
+    "fits": AdmissionFit.fits,
+    "tight": AdmissionFit.tight,
+    "split": AdmissionFit.split,
+    "no": AdmissionFit.no,
+    "unknown": AdmissionFit.unknown,
+}
+
+
+def strata_admission(
+    spec: RuntimeSpec,
+    *,
+    snapshot: DeviceSnapshot,
+    location: ModelLocation,
+    reservations: Sequence[Reservation],
+    running: list[RunningRuntime],
+    warnings: list[str],
+) -> Admission:
+    """Strata by its setup's own table for this model on this node (LS6).
+
+    Its setup's verdict (`strata_models.setup_fit`) on this node's total RAM
+    and the card it would use: *fits* and its RAM-budget mode admit, its
+    low-RAM mode (`split`) admits, *tight* (the system would page its
+    experts) and *does not fit* refuse, as setup stops by default. Then what
+    is free now: in the mode that copies every expert into RAM, less RAM free
+    than the experts is `tight`, since the system would page them.
+
+    Strata fills its card's free memory with its expert cache, so the ledger
+    holds that card's free memory while it loads (`requiredBytes`): a second
+    launch on the card in that window is refused, not starved.
+    """
+    from .engines.strata import choice_of_runtime, strata_card
+    from .engines.strata_models import experts_in_ram_bytes, setup_fit
+
+    card = strata_card(snapshot)
+    choice = choice_of_runtime(Path(location.localPath or spec.modelPath))
+    held = (
+        held_bytes(
+            reservations,
+            device_index=card.index,
+            exclude=spec.name,
+            device_kind=card.kind.value,
+        )
+        if card is not None
+        else 0
+    )
+    free = card.memoryFreeBytes if card is not None else None
+    room = max(0, free - held) if free is not None else None
+    blockers = _blockers(spec, [card], snapshot, running) if card is not None else []
+    where = (
+        f"device {card.index} ({card.name or card.kind.value})" if card is not None else "no card"
+    )
+
+    def answer(
+        decision: AdmissionDecision, fit: AdmissionFit, reason: str, warning: str | None = None
+    ) -> Admission:
+        return Admission(
+            decision=decision,
+            fit=fit,
+            basis=AdmissionBasis.engine_table,
+            # Nothing measured, nothing held: an unknown never refuses.
+            requiredBytes=room if fit is not AdmissionFit.unknown else None,
+            freeBytes=free,
+            reservedBytes=held or None,
+            totalBytes=card.memoryTotalBytes if card is not None else None,
+            device=card,
+            blockers=blockers,
+            location=location,
+            reason=reason,
+            warning=warning if warning is not None else ("; ".join(warnings) or None),
+        )
+
+    if choice is None:
+        return answer(
+            AdmissionDecision.admit,
+            AdmissionFit.unknown,
+            f"admit on faith: {spec.modelPath} names no model on Strata's list (made "
+            "outside Eugene, or its source is not known), so its setup's table cannot say "
+            "what it needs.",
+            "; ".join(warnings) or "Strata's fit is not estimated for this model",
+        )
+    ram_total = snapshot.ram_total_bytes
+    if ram_total is None:
+        return answer(
+            AdmissionDecision.admit,
+            AdmissionFit.unknown,
+            f"admit on faith: this machine's RAM could not be read, and Strata's setup "
+            f"sizes {choice.model} by it.",
+            "; ".join(warnings) or "RAM could not be read",
+        )
+    vram_gib = (card.memoryTotalBytes or 0) / 2**30 if card is not None else None
+    verdict = setup_fit(choice, ram_total / 2**30, vram_gib)
+    fit = _STRATA_FIT[verdict.verdict.value]
+    words = verdict.words
+    available = snapshot.ram_available_bytes
+    experts = experts_in_ram_bytes(choice)
+    if (
+        fit is AdmissionFit.fits
+        and verdict.mode == "ram"
+        and available is not None
+        and available < experts
+    ):
+        fit = AdmissionFit.tight
+        words = (
+            f"Strata copies its {choice.arena_gb:g} GB of experts into RAM, and "
+            f"{_gib(available)} of RAM is free now: the system would page them"
+        )
+    if fit is AdmissionFit.unknown:
+        return answer(
+            AdmissionDecision.admit,
+            fit,
+            f"admit on faith: {words}.",
+            "; ".join(warnings) or "Strata's fit is not estimated here",
+        )
+    fills = (
+        f" It fills the free memory of {where} with its expert cache: "
+        f"{_gib(room)} held while it loads."
+        if room is not None
+        else ""
+    )
+    if fit in (AdmissionFit.fits, AdmissionFit.split):
+        return answer(
+            AdmissionDecision.admit,
+            fit,
+            f"admit: {choice.model} on Strata, by its setup's table: {words}.{fills}",
+        )
+    fix = (
+        "Close what holds RAM, pick a smaller size from Strata's list, or pass "
+        "?force=true to start anyway."
+    )
+    return answer(
+        AdmissionDecision.refuse,
+        fit,
+        f"refuse: {choice.model} on Strata, by its setup's table: {words}. {fix}",
+    )
+
+
 # --- the decision -----------------------------------------------------------
 
 
@@ -1012,18 +1200,40 @@ async def check_admission(
             folders_unread=folders_unread,
         )
 
+    # Each engine by its own fit model (LS6, Troy's L11): never another
+    # engine's arithmetic in its place.
+    declared = engine_fit_model(spec.engine)
     if spec.engine is EngineKind.strata:
+        return strata_admission(
+            spec,
+            snapshot=snapshot,
+            location=location,
+            reservations=reservations,
+            running=running,
+            warnings=warnings,
+        )
+    if declared is None:
         return Admission(
             decision=AdmissionDecision.admit,
             fit=AdmissionFit.unknown,
             basis=AdmissionBasis.file_size,
+            contextLength=context_length,
             blockers=[],
-            reason="Prepared Strata model found; its memory needs are not estimated yet.",
-            warning=(
-                "Experimental engine: check RAM/VRAM availability before starting. "
-                "Config size is not model size."
+            location=location,
+            reason=(
+                f"admit on faith: {engine_name(spec.engine)} has no memory estimate in Eugene "
+                f"yet, so {spec.modelPath} was not measured; never another engine's "
+                "arithmetic in its place."
             ),
+            warning="; ".join(warnings) or f"{engine_name(spec.engine)}'s fit is not estimated",
         )
+    shares = declared.kind is FitModelKind.reserved_share
+    if shares:
+        # vLLM's context is its own flag, `maxModelLen`; unset, it takes the
+        # model's own, which the library then measures.
+        from .engines.vllm import model_length
+
+        context_length = model_length(flags)
 
     if not targets:
         return Admission(
@@ -1079,6 +1289,7 @@ async def check_admission(
     required: int | None = None
     basis = AdmissionBasis.file_size
     fit = AdmissionFit.unknown
+    utilization = share_of(spec, declared) if shares else None
     if library is not None:
         answer = await library.fit(
             spec.modelPath,
@@ -1087,6 +1298,9 @@ async def check_admission(
             ram_bytes=ram_available if spillover_device else None,
             unified_memory=unified,
             gpu_count=cards,
+            fit_model=declared.kind.value if shares else None,
+            gpu_memory_utilization=utilization,
+            vram_total_bytes=total if shares else None,
         )
         if answer is not None:
             required = answer.required_bytes
@@ -1114,6 +1328,18 @@ async def check_admission(
             warnings.append(f"{spec.modelPath} could not be sized on disk")
 
     decision = decide(fit, full_offload=full_offload)
+    # A share-taking engine takes its whole share when it starts, whatever
+    # the model needs inside it, so that is what it holds on the cards and
+    # what the ledger promises (LS6).
+    share_text = ""
+    if shares and utilization is not None and total:
+        taken = int(total * utilization)
+        share_text = (
+            f" {engine_name(spec.engine)} takes {utilization:.0%} of the cards' total memory "
+            f"({_gib(taken)}) when it starts and refuses to start with less free."
+        )
+        if required is not None and basis is AdmissionBasis.metadata:
+            required = max(required, taken)
     where = (
         f"{cards} cards ("
         + ", ".join(f"device {d.index} {d.name or d.kind.value}" for d in placement.devices)
@@ -1196,7 +1422,7 @@ async def check_admission(
                 if not full_offload and fit is not AdmissionFit.fits
                 else ""
             )
-            + f". {held}{slot_text}"
+            + f".{share_text} {held}{slot_text}"
         )
         warning = "; ".join(warnings) or None
     else:
@@ -1210,18 +1436,34 @@ async def check_admission(
         # so it goes first, or they go looking for memory they are about
         # to be given back.
         waiting = "Wait for the launch already under way, " if reserved else ""
-        rest = (
-            f"stop one of them, {lower}, set gpuLayers below full for partial offload, "
-            "or pass ?force=true to launch anyway."
-            if blockers
-            else f"{lower}, set gpuLayers below full for partial offload, "
-            "pick a smaller quant, or pass ?force=true to launch anyway."
-        )
+        if shares:
+            # Nothing moves to system memory: the remedies are its context,
+            # its share, and what else holds the cards.
+            lower = (
+                f"set maxModelLen to {max_context_length} or below"
+                if max_context_length
+                else "lower maxModelLen"
+            )
+            rest = (
+                f"stop one of them, {lower}, change gpuMemoryUtilization, "
+                "or pass ?force=true to launch anyway."
+                if blockers
+                else f"{lower}, change gpuMemoryUtilization, pick a smaller model, "
+                "or pass ?force=true to launch anyway."
+            )
+        else:
+            rest = (
+                f"stop one of them, {lower}, set gpuLayers below full for partial offload, "
+                "or pass ?force=true to launch anyway."
+                if blockers
+                else f"{lower}, set gpuLayers below full for partial offload, "
+                "pick a smaller quant, or pass ?force=true to launch anyway."
+            )
         fix = waiting + rest if waiting else f"{rest[0].upper()}{rest[1:]}"
         reason = (
             f"refuse: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) but "
             f"{where} {has} {_gib(free)} free of {_gib(total)}{between};{reserved_text} "
-            f"verdict {fit.value}.{fits_up_to} "
+            f"verdict {fit.value}.{share_text}{fits_up_to} "
             f"{held}{slot_text} {fix}"
         )
         warning = "; ".join(warnings) or None

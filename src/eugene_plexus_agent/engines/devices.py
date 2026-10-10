@@ -81,6 +81,11 @@ class DeviceSnapshot:
         return next((d for d in self.devices if d.kind is ComputeDeviceKind.cpu), None)
 
 
+#: Reads this node's devices: an engine's fit table needs its RAM and card
+#: (LS6). Called at most once per engine listing.
+DevicesReader = Callable[[], DeviceSnapshot]
+
+
 def _run(argv: list[str]) -> str | None:
     """Run a vendor probe; its stdout, or None if it did not work.
 

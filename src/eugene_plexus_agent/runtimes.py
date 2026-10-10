@@ -18,6 +18,7 @@ import contextlib
 import logging
 import os
 import shutil
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -62,6 +63,7 @@ from .engines.acquisition import (
     Unavailable,
 )
 from .engines.base import DiscoveredBinary
+from .engines.devices import DeviceSnapshot, DevicesReader, detect_devices
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
 from .engines.llama_cpp import alternatives as llama_alternatives
@@ -1180,7 +1182,25 @@ def _managed_for(adapter: EngineAdapter) -> ManagedEngine | None:
     )
 
 
-def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescriptor]:
+#: How long the devices an engine's fit table reads stay fresh (LS6). Their
+#: totals do not move, and `GET /v1/engines` is polled.
+FIT_DEVICES_SECONDS = 60.0
+_fit_devices: tuple[float, DeviceSnapshot] | None = None
+
+
+def devices_for_fit() -> DeviceSnapshot:
+    """This node's devices for an engine's fit table, read at most once a
+    minute."""
+    global _fit_devices
+    now = time.perf_counter()
+    if _fit_devices is None or now - _fit_devices[0] > FIT_DEVICES_SECONDS:
+        _fit_devices = (now, detect_devices())
+    return _fit_devices[1]
+
+
+def describe_engines(
+    get_config: ConfigGetter | None = None, devices: DevicesReader | None = None
+) -> list[EngineDescriptor]:
     """What this agent knows how to start, and what it found on disk.
 
     Backs `GET /v1/engines`. Note what `available` does and does not mean:
@@ -1195,8 +1215,10 @@ def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescr
     # `detect_host()` calls per request, each one up to two subprocess
     # probes at a 5 s cap, on a route two pollers hit continuously.
     host = detect_host()
+    read = devices or devices_for_fit
     out: list[EngineDescriptor] = []
     for kind, adapter in ADAPTERS.items():
+        fit = adapter.fit_model_here(read)
         acquisition = _acquisition_for(kind, host)
         managed = _managed_for(adapter)
 
@@ -1232,6 +1254,7 @@ def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescr
                     modelFormats=list(adapter.model_formats),
                     accepts=list(adapter.accepts_for(None)),
                     supportedModels=list(adapter.supported_models_here()),
+                    fit=fit,
                     experimental=adapter.experimental,
                     error=error,
                     flagSchema=adapter.flag_schema(),
@@ -1247,6 +1270,7 @@ def describe_engines(get_config: ConfigGetter | None = None) -> list[EngineDescr
                 modelFormats=list(adapter.model_formats),
                 accepts=list(adapter.accepts_for(found)),
                 supportedModels=list(adapter.supported_models_here()),
+                fit=fit,
                 experimental=adapter.experimental,
                 binaryPath=str(found.path),
                 version=found.version,

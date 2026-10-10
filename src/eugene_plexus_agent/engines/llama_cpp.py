@@ -21,7 +21,9 @@ from .._generated.models import (
     ConfigField,
     ConfigSchema,
     ConfigValueType,
+    EngineFitModel,
     EngineKind,
+    FitModelKind,
     HostAccelerator,
     ModelFormat,
     ModelRequirement,
@@ -156,6 +158,11 @@ class LlamaCppAdapter(EngineAdapter):
             ),
         ),
     )
+
+    #: Weights, cache and buffers against the cards' free memory; what does
+    #: not fit moves to system memory, experts first (LS6). The library's
+    #: arithmetic since M3.
+    fit_model = EngineFitModel(kind=FitModelKind.spill)
 
     def accepts_for(self, found: DiscoveredBinary | None) -> tuple[ModelRequirement, ...]:
         """The installed build's own list once it has been read; until then,
