@@ -298,6 +298,11 @@ class StrataAdapter(EngineAdapter):
         key = hashlib.sha256(spec.name.encode()).hexdigest()
         launch = self.managed_store().directory / ".launch" / f"{key}.json"
         launch.parent.mkdir(parents=True, exist_ok=True)
+        # The native engine's own log. Without it Strata's server says only
+        # "the engine exited before it was ready"; with it, that error carries
+        # the engine's last lines (its `start_log_tail`), which `explain_exit`
+        # hands on as the runtime's lastError (LS5's real run, 2026-10-09).
+        config["log"] = str(launch.with_suffix(".log"))
         temporary = launch.with_suffix(".tmp")
         temporary.write_text(json.dumps(config, indent=2), encoding="utf-8")
         temporary.replace(launch)
@@ -313,6 +318,21 @@ class StrataAdapter(EngineAdapter):
             "--port",
             str(port),
         ]
+
+    def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        """Strata's server ends a failed start with `RuntimeError: the engine
+        exited before it was ready (see <log>)` and the engine's own last lines
+        under it: that is the cause, said by the engine."""
+        marker = "RuntimeError: "
+        at = output_tail.rfind(marker)
+        if at < 0:
+            return None
+        said = output_tail[at + len(marker) :].strip()
+        if not said:
+            return None
+        if len(said) > 1500:
+            said = "..." + said[-1500:]
+        return f"Strata stopped before its model was ready: {said}"
 
     def companion_overrides(self, spec: RuntimeSpec) -> dict[str, object]:
         return {"provider": "strata_local", "slotPinning": False}

@@ -469,3 +469,27 @@ def test_a_failed_setup_command_that_speaks_utf16_is_readable(tmp_path: Path) ->
     assert "usage: -debug servicename" in said and "\x00" not in said, repr(said)
     # UTF-8 output, the ordinary case, is unchanged.
     assert strata_install._readable("pip: ok — done".encode()) == "pip: ok — done"
+
+
+def test_a_failed_start_names_the_engines_own_reason(prepared):
+    """LS5's real run: a prepared model whose pack was empty failed with only
+    "exited with code 1". Strata's server can say why only when its launch
+    configuration names a log; with one, its error carries the engine's lines."""
+    _root, server, config, _ = prepared
+    adapter = strata.StrataAdapter()
+    spec = RuntimeSpec(name="broken", engine="strata", modelPath=str(config))
+    argv = adapter.build_argv(spec, DiscoveredBinary(server, Origin.configured), 8123)
+    launch = Path(argv[argv.index("--config") + 1])
+    assert json.loads(launch.read_text())["log"] == str(launch.with_suffix(".log"))
+    tail = (
+        "loading the model (the first start takes a minute or two) ...\n"
+        "Traceback (most recent call last):\n"
+        '  File "server.py", line 478, in __init__\n'
+        "RuntimeError: the engine exited before it was ready (see x.log)\n"
+        "strata: cannot open pack index: empty-pack/index.txt\n"
+    )
+    said = adapter.explain_exit(1, tail)
+    assert said is not None
+    assert said.startswith("Strata stopped before its model was ready: the engine exited")
+    assert "cannot open pack index" in said
+    assert adapter.explain_exit(1, "a different failure\n") is None
