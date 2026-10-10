@@ -15,6 +15,13 @@ folder per run so setup never moves a person's own Strata files (B45), the
 engine-files marker (B44), and afterwards the configuration moved into the
 data folder with its paths relative (B48), checked the way a launch checks
 it, before the library lists it.
+
+Where it runs (LS10, §6.13): in a folder of this node's that stands for the
+Library folder, its layout the same (B101), so setup writes nothing in the
+Library folder and the configuration's relative paths are the Library's. The
+GGUF stays where it is: its shards appear there as links (B102), which setup
+reads and leaves its `.done` marks beside. What the model is made of is then
+sent to the library, which writes it into the Library folder itself.
 """
 
 from __future__ import annotations
@@ -24,7 +31,10 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -45,7 +55,9 @@ from .strata import (
     PATH_ARGS,
     SETUP_KEYS,
     VERSION,
+    files_of,
     inspect_config,
+    named_paths,
     prepared_config,
     runtime_lib_dirs,
 )
@@ -71,6 +83,8 @@ CONTEXTS = SETUP_CONTEXTS
 _STEP = re.compile(r"^=== Step (\d+): (.+?) ===$")
 _SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+#: A copy of a shard, when it can be neither linked nor used in place.
+_COPY_CHUNK = 16 * 1024 * 1024
 
 
 def shards_of(first: Path) -> list[Path]:
@@ -93,6 +107,89 @@ def free_bytes(path: Path) -> int | None:
             except OSError:
                 return None
     return None
+
+
+def _under(path: Path, folder: Path) -> bool:
+    """`path` at or below `folder`, compared as the OS compares names."""
+    try:
+        inside = os.path.relpath(path, folder)
+    except ValueError:  # another drive
+        return False
+    return not (inside == ".." or inside.startswith(".." + os.sep) or os.path.isabs(inside))
+
+
+def _place(make: Callable[[Path, Path], None], source: Path, link: Path) -> None:
+    """`link` stands for `source` (B102): kept when it already does (a link
+    to it, or a whole copy of it from an earlier preparation), made by
+    `make` otherwise."""
+    if link.is_symlink():
+        try:
+            if os.path.samefile(link, source):
+                return
+        except OSError:
+            pass
+        link.unlink()
+    elif link.is_file():
+        if link.stat().st_size == source.stat().st_size:
+            return
+        link.unlink()
+    make(source, link)
+
+
+def _symlink(source: Path, link: Path) -> None:
+    os.symlink(source, link)
+
+
+def _hardlink(source: Path, link: Path) -> None:
+    os.link(source, link)
+
+
+def _junction(view: Path, folder: Path) -> bool:
+    """On Windows, `view` made a junction to the local folder `folder`, which
+    needs no privilege a symlink needs (never to a share: Windows refuses)."""
+    if sys.platform != "win32" or str(folder).startswith("\\\\"):
+        return False
+    import _winapi
+
+    if os.path.isjunction(view):
+        if os.path.samefile(view, folder):
+            return True
+        os.rmdir(view)
+    try:
+        if view.is_dir():
+            view.rmdir()  # empty, or not a candidate
+        _winapi.CreateJunction(str(folder), str(view))
+    except OSError:
+        return False
+    return True
+
+
+def _writable(folder: Path) -> bool:
+    """Whether this node can make a file in `folder` (setup's marks)."""
+    probe = folder / f".eugene-write-check-{uuid.uuid4().hex}"
+    try:
+        with open(probe, "x"):
+            pass
+    except OSError:
+        return False
+    probe.unlink(missing_ok=True)
+    return True
+
+
+def _copy(source: Path, target: Path, progress: Progress) -> None:
+    """A shard copied whole, or not under its own name at all."""
+    size = source.stat().st_size
+    if target.is_file() and not target.is_symlink() and target.stat().st_size == size:
+        progress.bytes_written = (progress.bytes_written or 0) + size
+        return
+    partial = target.with_name(target.name + ".partial")
+    with open(source, "rb") as reading, open(partial, "wb") as writing:
+        while block := reading.read(_COPY_CHUNK):
+            progress.check_cancelled()
+            writing.write(block)
+            progress.bytes_written = (progress.bytes_written or 0) + len(block)
+    target.unlink(missing_ok=True)
+    os.replace(partial, target)
 
 
 def main_gpu() -> int | None:
@@ -125,7 +222,8 @@ def plan(
     *,
     root: Path,
     gguf: Path,
-    data_dir: Path,
+    folder: Path,
+    work: Path,
     source_path: str,
     context: int | None,
     ram_bytes: int | None,
@@ -134,9 +232,9 @@ def plan(
     """Check what can be checked before anything starts (B51), or say why not.
 
     `root` is the Strata build's source folder (`setup.py` and `serve/`),
-    `gguf` the first shard as this node reaches it, `data_dir` the Strata
-    data folder as this node reaches it, `source_path` the GGUF as the
-    library spells it."""
+    `gguf` the first shard and `folder` the Library folder holding it, both
+    as this node reaches them, `work` this node's folder standing for that
+    Library folder (LS10), `source_path` the GGUF as the library spells it."""
     found = choice_for_file(str(gguf))
     if found is None:
         raise PreparationError(
@@ -161,18 +259,25 @@ def plan(
             f"Strata needs every file of {gguf.name} beside it in {gguf.parent}; missing: "
             + ", ".join(missing)
         )
+    try:
+        inside = Path(os.path.relpath(gguf.parent, folder))
+    except ValueError:  # another drive
+        inside = Path("..")
+    if inside.parts[:1] == ("..",) or inside.is_absolute():
+        raise PreparationError(f"{gguf} is not inside the Library folder {folder}.")
     need = disk_needed(choice, ram_bytes)
-    free = free_bytes(data_dir)
+    free = free_bytes(work)
     if free is not None and free < need:
         raise PreparationError(
-            f"Strata's setup needs about {need / 1e9:.0f} GB free beside the model, by its own "
-            f"rule, and {data_dir.anchor or data_dir} has {free / 1e9:.0f} GB free. Make room, "
-            "then prepare it again."
+            f"Strata's setup needs about {need / 1e9:.0f} GB free on this node, by its own "
+            f"rule, where it prepares the model ({work.anchor or work}), and that drive has "
+            f"{free / 1e9:.0f} GB free. Make room, then prepare it again."
         )
     return StrataPreparation(
         root=root,
         gguf=gguf,
-        data_dir=data_dir,
+        folder=folder,
+        work=work,
         choice=choice,
         supported=supported,
         context=context,
@@ -204,7 +309,10 @@ class StrataPreparation:
 
     root: Path
     gguf: Path
-    data_dir: Path
+    #: The Library folder holding the GGUF, as this node reaches it.
+    folder: Path
+    #: This node's folder standing for it (LS10, B101).
+    work: Path
     choice: SetupChoice
     supported: SupportedModel
     context: int | None
@@ -213,10 +321,29 @@ class StrataPreparation:
     bytes_needed: int | None
     _failure: list[str] = field(default_factory=list)
     _pending: str = ""
+    #: The folder setup is given as the GGUF's (B102).
+    _gguf_dir: Path | None = None
+    #: Shards copied because no link could be made: removed after listing.
+    _copies: list[Path] = field(default_factory=list)
+
+    @property
+    def data_dir(self) -> Path:
+        """`Strata-data`, in this node's folder (B43, B101)."""
+        return self.work / DATA_FOLDER
+
+    @property
+    def view(self) -> Path:
+        """Where the GGUF's shards appear in this node's folder: their place
+        in the Library folder."""
+        return self.work / os.path.relpath(self.gguf.parent, self.folder)
 
     @property
     def output(self) -> Path:
         return self.data_dir
+
+    @property
+    def log_path(self) -> Path:
+        return self.data_dir / f"strata-{self.choice.tag}.setup.log"
 
     @property
     def config_name(self) -> str:
@@ -231,7 +358,7 @@ class StrataPreparation:
             "--model",
             self.choice.model,
             "--gguf-dir",
-            str(self.gguf.parent),
+            str(self._gguf_dir or self.view),
             "--data-dir",
             str(self.data_dir),
             "--vision",
@@ -290,12 +417,16 @@ class StrataPreparation:
             marker.write_text(MARKER_TEXT, encoding="utf-8", newline="\n")
         for leftover in self._produced():
             leftover.unlink(missing_ok=True)
+        self._gguf_dir = self._sources(progress)
         baseline = folder_bytes(self.data_dir)
 
         def measure() -> None:
             progress.bytes_written = max(0, folder_bytes(self.data_dir) - baseline)
 
         progress.step = "Starting Strata's setup"
+        progress.bytes_written = None
+        progress.log_file = self.log_path
+        progress.log_name = self.log_path.relative_to(self.work).as_posix()
         with tempfile.TemporaryDirectory(
             prefix="eugene-strata-setup-", ignore_cleanup_errors=True
         ) as settings:
@@ -303,7 +434,7 @@ class StrataPreparation:
                 self.argv(),
                 cwd=self.root,
                 env=self.environment(Path(settings)),
-                log_path=self.data_dir / f"strata-{self.choice.tag}.setup.log",
+                log_path=self.log_path,
                 progress=progress,
                 on_output=lambda text: self._read(text, progress),
                 measure=measure,
@@ -318,6 +449,7 @@ class StrataPreparation:
             facts = facts_fields(inspect_config(entry), folder=entry.parent)
         except PreparedInspectError as exc:
             raise PreparationError(f"Strata's setup left the model incomplete: {exc}") from exc
+        files = self._made(entry)
         return PreparationResult(
             entry=entry,
             name=self.choice.model_name,
@@ -330,7 +462,73 @@ class StrataPreparation:
                 "revision": self.supported.source.revision,
             },
             facts=facts,
+            root=self.work,
+            files=files,
+            # B107: the MTP helper (once per data folder, ~7 GB with setup's
+            # intermediates) stays for the next preparation on this node.
+            discard=(
+                *(f for f in files if not f.is_relative_to(self.data_dir / "mtp")),
+                *self._copies,
+            ),
         )
+
+    # --- the GGUF, read where it is (B102) --------------------------------
+
+    def _sources(self, progress: Progress) -> Path:
+        """This node's view of the GGUF's folder, given to setup as it: each
+        shard a link to the Library's file (B102), a symbolic link, or a
+        hard link on the same drive; on Windows without either, the folder
+        joined to the Library's when that is on a local drive this node can
+        write (setup's marks then go beside the shards); copies otherwise,
+        said as they go, and removed once the library lists the model."""
+        progress.step = "Finding the model's files"
+        shards = shards_of(self.gguf)
+        view = self.view
+        if os.path.isjunction(view) and _junction(view, self.gguf.parent):
+            return view
+        view.mkdir(parents=True, exist_ok=True)
+        why: OSError | None = None
+        for make in (_symlink, _hardlink):
+            try:
+                for shard in shards:
+                    _place(make, shard, view / shard.name)
+                return view
+            except OSError as exc:
+                why = why or exc
+        if _writable(self.gguf.parent) and _junction(view, self.gguf.parent):
+            return view
+        view.mkdir(parents=True, exist_ok=True)
+        total = sum(s.stat().st_size for s in shards)
+        reason = (why.strerror or str(why)) if why is not None else "unknown"
+        progress.step = (
+            f"Copying {self.gguf.name} to this node: it cannot link to the Library's file "
+            f"here ({reason})"
+        )
+        progress.bytes_needed, progress.bytes_written = total, 0
+        for shard in shards:
+            _copy(shard, view / shard.name, progress)
+            self._copies.append(view / shard.name)
+        progress.bytes_needed = self.bytes_needed
+        return view
+
+    def _made(self, entry: Path) -> tuple[Path, ...]:
+        """What the library must hold for the model (B103): the configuration,
+        every file it names that setup made (the GGUF is the Library's own),
+        and setup's log."""
+        cfg = json.loads(entry.read_text(encoding="utf-8"))
+        found: list[Path] = [entry]
+        for _flag, path in named_paths(entry, cfg):
+            found += files_of(path) or []
+        found.append(self.log_path)
+        out: list[Path] = []
+        seen: set[str] = set()
+        for path in found:
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen or path.is_symlink() or not path.is_relative_to(self.data_dir):
+                continue
+            seen.add(key)
+            out.append(path)
+        return tuple(out)
 
     # --- setup's output ---------------------------------------------------
 
@@ -362,22 +560,26 @@ class StrataPreparation:
     def _stopped(self, code: int, progress: Progress) -> str:
         if self._failure:
             return "Strata's setup stopped: " + " ".join(self._failure)
+        # Where its whole output is, the run worker says: the library's copy
+        # of the log when it could be sent (B106).
         last = progress.message or "it printed nothing"
-        log = self.data_dir / f"strata-{self.choice.tag}.setup.log"
-        return f"Strata's setup exited {code}: {last} (its whole output: {log})"
+        return f"Strata's setup exited {code}: {last}"
 
     # --- afterwards -------------------------------------------------------
 
     def _relative(self, value: str) -> str:
-        """A path setup wrote, relative to the data folder when it can be (on
-        the same drive), so the folder travels (B43); as written otherwise."""
+        """A path setup wrote, relative to the data folder, so the folder
+        travels (B43): its place in this node's folder is its place in the
+        Library folder (B101)."""
         path = Path(value)
         if not path.is_absolute():
             path = self.root / path
-        try:
-            return Path(os.path.relpath(path, self.data_dir)).as_posix()
-        except ValueError:
-            return str(path)
+        if not _under(path, self.work):
+            raise PreparationError(
+                f"Strata's setup named {value}, which is not among the model's files in the "
+                f"Library folder {self.folder}: Eugene cannot list a model made of it."
+            )
+        return Path(os.path.relpath(path, self.data_dir)).as_posix()
 
     def _adopt_config(self) -> Path:
         """Setup's configuration, moved into the data folder (B48), and

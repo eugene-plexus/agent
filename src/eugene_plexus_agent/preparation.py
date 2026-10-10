@@ -6,6 +6,10 @@ this runs it in a thread, one at a time per node (B52), says where it is
 run worker starts and polls a job from the operation's `preparing` step,
 keyed by the operation's id; nothing here talks to the library.
 
+A recipe writes only into a folder of this node's (LS10, B101): the files it
+made go to the library afterwards (`preparation_send`), which writes them into
+the Library folder itself.
+
 A job lives in memory only. An agent that restarts mid-preparation starts
 the recipe again at the next claim, and the recipe is written so that a
 second run skips what the first finished (Strata's setup keeps its own marks).
@@ -43,7 +47,7 @@ class PreparationCancelled(PreparationError):
 class PreparationResult:
     """What a finished preparation made, for the library to list."""
 
-    #: The engine's entry file, as this node reaches it.
+    #: The engine's entry file, in this node's folder for the preparation.
     entry: Path
     #: The prepared model's name: its provenance file is `<name>.eugene-prepared.json`.
     name: str
@@ -55,6 +59,15 @@ class PreparationResult:
     #: quantization, contextLength, mode, files), as provenance fields with
     #: the files relative to the entry's folder.
     facts: dict[str, Any] = field(default_factory=dict)
+    #: This node's folder standing for the Library folder (LS10): `entry`
+    #: and `files` sit at the places relative to it that they take there.
+    root: Path | None = None
+    #: What the library must hold for the model, beside what it has: every
+    #: file the engine made that the model is made of, inside `root`.
+    files: tuple[Path, ...] = ()
+    #: What to remove from this node once the library lists the model: the
+    #: files sent, but not what a next preparation here would use again.
+    discard: tuple[Path, ...] = ()
 
 
 class Recipe(Protocol):
@@ -97,6 +110,10 @@ class Progress:
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
     result: PreparationResult | None = None
+    #: The recipe's own log, and where the library would hold it (relative
+    #: to the Library folder), so a failure names a file the person can open.
+    log_file: Path | None = None
+    log_name: str | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
 
     def check_cancelled(self) -> None:
@@ -277,10 +294,12 @@ class PreparationJobs:
             return job.progress
 
     def busy_for(self, engine: str) -> bool:
-        """A preparation by `engine` is running or waiting: it must stay installed."""
+        """A preparation by `engine` is running or waiting, or its files are
+        still being sent to the library (LS10): it must stay installed."""
         with self._lock:
             return any(
-                j.engine == engine and (j.alive or not j.progress.finished)
+                j.engine == engine
+                and (j.alive or not j.progress.finished or j.progress.state == "done")
                 for j in self._jobs.values()
             )
 

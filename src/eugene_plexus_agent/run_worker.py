@@ -9,9 +9,11 @@ leases fence stale workers; the existing node launch guard still owns admission.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -23,10 +25,12 @@ from fastapi import FastAPI, HTTPException
 from ._generated.models import EngineKind, RuntimeSpec
 from .admission import LibraryFitClient
 from .engines import adapter_for
+from .engines.acquisition import engine_root
 from .engines.devices import detect_devices
 from .model_paths import join_local, resolve_model_path
 from .node_work import launch_guard
 from .preparation import PreparationError, PreparationJobs, PreparationResult, Progress, Recipe
+from .preparation_send import CHUNK_BYTES, REQUEST_TIMEOUT, Sender, detail_of
 from .routes import runtimes as actions
 from .runtime_context import NodeContext
 from .runtimes import _configured_binary, describe_engines, installer_for
@@ -131,6 +135,14 @@ def _why_none(model: dict[str, Any], verdicts: list[dict[str, Any]], by_name: di
     return f"No installed or installable engine can run {name} on this node. " + "; ".join(parts)
 
 
+def preparation_folder(engine: str, library_folder: str) -> Path:
+    """This node's folder standing for one Library folder while `engine`
+    prepares a model in it (LS10, B101): under the engines' own folder, and
+    named for the Library folder as the library spells it."""
+    key = hashlib.sha256(library_folder.encode("utf-8")).hexdigest()[:16]
+    return engine_root() / "preparing" / engine / key
+
+
 def _prepare_route(
     model: dict[str, Any], verdicts: list[dict[str, Any]], by_name: dict, engine: str
 ) -> dict[str, Any]:
@@ -153,6 +165,19 @@ def _prepare_route(
     raise ValueError(f"{engine} would prepare {name}, but {how}.")
 
 
+def _discard(paths: tuple[Path, ...]) -> None:
+    """What a listed preparation sent, gone from this node (B107); what
+    cannot be removed now is left for the next preparation to replace."""
+    for path in paths:
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.info("left %s on this node: %s", path, exc)
+
+
 class NodeActions:
     def __init__(self, app: FastAPI) -> None:
         self.app = app
@@ -161,6 +186,8 @@ class NodeActions:
         if not isinstance(jobs, PreparationJobs):
             jobs = app.state.preparations = PreparationJobs()
         self.preparations: PreparationJobs = jobs
+        #: Each finished preparation's files on their way to the library.
+        self.senders: dict[str, Sender] = {}
 
     async def prepare(self, job: dict[str, Any]) -> Progress:
         """The operation's preparation: planned and started (or waiting for
@@ -200,6 +227,7 @@ class NodeActions:
             return adapter.plan_preparation(
                 binary=binary,
                 folder=Path(folder),
+                work=preparation_folder(kind.value, root),
                 model=Path(local),
                 source_path=model["path"],
                 context=wanted.get("contextSize"),
@@ -213,17 +241,17 @@ class NodeActions:
 
     def prepared_body(self, job: dict[str, Any], result: PreparationResult) -> dict[str, Any]:
         """`POST /v1/run-operations/{id}/prepared`: the entry as the library
-        spells it (under the Library folder it was written into), and its
-        provenance."""
+        spells it (its place in this node's folder for the preparation is
+        its place in the Library folder, LS10), and its provenance."""
         root: str = job["model"]["root"]
-        rules = actions.effective_rules_for(NodeContext(self.app))
-        folder = resolve_model_path(root, rules).local_path
+        if result.root is None:
+            raise ValueError("The preparation did not say which folder stands for the Library's.")
         try:
-            inside = Path(os.path.relpath(result.entry, folder))
+            inside = Path(os.path.relpath(result.entry, result.root))
         except ValueError as exc:  # another drive
-            raise ValueError(f"{result.entry} is not under the Library folder {folder}") from exc
+            raise ValueError(f"{result.entry} is not under {result.root}") from exc
         if inside.parts[:1] == ("..",) or inside.is_absolute():
-            raise ValueError(f"{result.entry} is not under the Library folder {folder}")
+            raise ValueError(f"{result.entry} is not under {result.root}")
         entry = join_local(root, inside.parts)
         return {
             "name": result.name,
@@ -523,9 +551,23 @@ class RunWorker:
         status = progress.snapshot()
         if not progress.finished:
             return {"step": "preparing", "preparation": status}
-        self.actions.preparations.forget(job["id"])
         if progress.state != "done" or progress.result is None:
-            raise ValueError(progress.error or "The preparation stopped without saying why.")
+            where = await self._send_log(library, base, job, params, progress)
+            self.actions.preparations.forget(job["id"])
+            error = progress.error or "The preparation stopped without saying why."
+            raise ValueError(error + (f" (its whole output: {where})" if where else ""))
+        # LS10: the library writes the files into the Library folder.
+        sender = self.actions.senders.get(job["id"])
+        if sender is None:
+            sender = self.actions.senders[job["id"]] = Sender(progress.result)
+        try:
+            sent = await sender.send(library, base, params, job["lease"])
+        except ValueError:
+            self.actions.senders.pop(job["id"], None)
+            self.actions.preparations.forget(job["id"])
+            raise
+        if not sent:
+            return {"step": "preparing", "preparation": sender.status(status)}
         body = self.actions.prepared_body(job, progress.result)
         try:
             await library.operation_request(
@@ -542,7 +584,60 @@ class RunWorker:
             raise ValueError(
                 f"The library could not list the prepared model: {detail or exc}"
             ) from exc
+        self.actions.senders.pop(job["id"], None)
+        self.actions.preparations.forget(job["id"])
+        await asyncio.to_thread(_discard, progress.result.discard)
         return {"step": "settings", "preparation": status}
+
+    async def _send_log(
+        self,
+        library: LibraryFitClient,
+        base: str,
+        job: dict[str, Any],
+        params: dict[str, str],
+        progress: Progress,
+    ) -> str | None:
+        """A failed preparation's log, sent to the library (B106), so the
+        failure names a file the person can open beside their models: where
+        it is then, as this node reaches the Library folder; this node's own
+        copy when it could not be sent."""
+        local, name = progress.log_file, progress.log_name
+        if local is None or name is None or not local.is_file():
+            return None
+        try:
+            data = await asyncio.to_thread(local.read_bytes)
+            data = data[-CHUNK_BYTES:]  # its end says why it stopped
+            lease = job["lease"]
+            await library.operation_request(
+                "PUT",
+                base + "/files",
+                params={**params, "path": name, "offset": "0", "lease": lease},
+                content=data,
+                headers={"content-type": "application/octet-stream"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            await library.operation_request(
+                "POST",
+                base + "/files/complete",
+                params=params,
+                json={
+                    "lease": lease,
+                    "path": name,
+                    "sizeBytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+        except httpx.HTTPStatusError as exc:
+            log.warning("could not send the preparation's log: %s", detail_of(exc))
+            return str(local)
+        except httpx.HTTPError as exc:
+            log.warning("could not send the preparation's log: %s", exc)
+            return str(local)
+        root = job["model"]["root"]
+        rules = actions.effective_rules_for(NodeContext(self.app))
+        folder = resolve_model_path(root, rules).local_path
+        return join_local(folder, tuple(name.split("/")))
 
     async def run_forever(self) -> None:
         while True:

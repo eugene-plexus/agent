@@ -613,6 +613,259 @@
           }
         }
       }
+    },
+    "/v1/run-operations/{id}/files/state": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Prepared File State",
+        "description": "What the library holds of one file of the preparation: whole (its\nsize and SHA-256), and what has arrived of a send not complete.",
+        "operationId": "prepared_file_state_v1_run_operations__id__files_state_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreparedFileRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreparedFileState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}/files": {
+      "put": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Prepared File Chunk",
+        "description": "One chunk of a file of the preparation, at `offset`: what has arrived\nso far, or 0 to start the file again (B104).",
+        "operationId": "prepared_file_chunk_v1_run_operations__id__files_put",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "title": "Path"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "lease",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Lease"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreparedFileState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/run-operations/{id}/files/complete": {
+      "post": {
+        "tags": [
+          "run operations"
+        ],
+        "summary": "Prepared File Complete",
+        "description": "Every byte is sent: checked against the size and SHA-256 the node\nstates, then under its own name. Again for a file in place: no change.",
+        "operationId": "prepared_file_complete_v1_run_operations__id__files_complete_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Id"
+            }
+          },
+          {
+            "name": "node",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Node"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreparedFileComplete"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreparedFileState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2801,6 +3054,110 @@
         ],
         "title": "PreparedFile",
         "description": "One file a prepared model is made of (LS7)."
+      },
+      "PreparedFileComplete": {
+        "properties": {
+          "lease": {
+            "type": "string",
+            "title": "Lease"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path",
+            "description": "Where it goes, relative to the run's Library folder with `/` between folders: inside an engine's own folder at its top (`Strata-data/...`)."
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Sizebytes"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "lease",
+          "path",
+          "sizeBytes",
+          "sha256"
+        ],
+        "title": "PreparedFileComplete",
+        "description": "Every byte of the file has been sent: check it, then put it in place."
+      },
+      "PreparedFileRequest": {
+        "properties": {
+          "lease": {
+            "type": "string",
+            "title": "Lease"
+          },
+          "path": {
+            "type": "string",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path",
+            "description": "Where it goes, relative to the run's Library folder with `/` between folders: inside an engine's own folder at its top (`Strata-data/...`)."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "lease",
+          "path"
+        ],
+        "title": "PreparedFileRequest",
+        "description": "A file of the prepared model, which the library writes itself (LS10):\nthe engine's node prepares it in a folder of its own and sends it."
+      },
+      "PreparedFileState": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sizebytes",
+            "description": "The whole file under its own name, when there is one."
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256",
+            "description": "Its SHA-256, in hex."
+          },
+          "receivedBytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Receivedbytes",
+            "description": "What has arrived of a send that is not complete yet."
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "receivedBytes"
+        ],
+        "title": "PreparedFileState",
+        "description": "What the library holds at one path of a preparation."
       },
       "PreparedProvenance": {
         "properties": {

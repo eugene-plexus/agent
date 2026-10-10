@@ -466,20 +466,22 @@ class StrataAdapter(EngineAdapter):
         *,
         binary: DiscoveredBinary,
         folder: Path,
+        work: Path,
         model: Path,
         source_path: str,
         context: int | None,
     ) -> Recipe:
-        """Upstream's setup, into `Strata-data` at the top of the Library
-        folder (B43, B45); see `strata_prepare`."""
+        """Upstream's setup, into `Strata-data` in this node's folder for the
+        Library folder (B43, B45, B101); see `strata_prepare`."""
         from .devices import host_memory
-        from .strata_prepare import DATA_FOLDER, main_gpu, plan
+        from .strata_prepare import main_gpu, plan
 
         total, _available = host_memory()
         return plan(
             root=binary.path.resolve().parent.parent,
             gguf=model,
-            data_dir=folder / DATA_FOLDER,
+            folder=folder,
+            work=work,
             source_path=source_path,
             context=context,
             ram_bytes=total,

@@ -440,3 +440,30 @@ async def test_the_library_client_reads_max_context_off_the_fit_response() -> No
     assert answer is not None
     assert answer.max_context_length == 90112
     assert answer.context_length == 262144
+
+
+@pytest.mark.asyncio
+async def test_run_work_sends_its_own_headers_beside_the_credential():
+    """LS10: a preparation's file chunk names its type; the credential is
+    still sent, and cannot be replaced by a caller's header."""
+    import httpx
+
+    from eugene_plexus_agent.admission import LibraryFitClient
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={"receivedBytes": 3})
+
+    client = LibraryFitClient("http://library", "tok", transport=httpx.MockTransport(handler))
+    answer = await client.operation_request(
+        "PUT",
+        "/v1/run-operations/op/files",
+        content=b"abc",
+        headers={"content-type": "application/octet-stream", "Authorization": "Bearer other"},
+    )
+    assert answer == {"receivedBytes": 3}
+    assert seen[0].headers["content-type"] == "application/octet-stream"
+    assert seen[0].headers["authorization"] == "Bearer tok"
+    assert seen[0].content == b"abc"

@@ -295,14 +295,18 @@ class EngineAdapter(abc.ABC):
         *,
         binary: DiscoveredBinary,
         folder: Path,
+        work: Path,
         model: Path,
         source_path: str,
         context: int | None,
     ) -> Recipe:
-        """Plan preparing `model` into the Library folder `folder`, both as
-        this node reaches them, with the engine's own tools (LS5); or say,
-        in a `PreparationError`, why it cannot start. `source_path` is the
-        model as the library spells it. An engine that prepares nothing says so."""
+        """Plan preparing `model`, in the Library folder `folder` (both as
+        this node reaches them), with the engine's own tools (LS5); or say,
+        in a `PreparationError`, why it cannot start. The recipe writes only
+        into `work`, this node's folder standing for `folder` (LS10): the
+        library writes the result into the Library folder. `source_path` is
+        the model as the library spells it. An engine that prepares nothing
+        says so."""
         raise PreparationError(f"{self.kind.value} prepares no models")
 
     #: Whether the engine answers HTTP while its model loads.

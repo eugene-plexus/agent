@@ -237,9 +237,12 @@ class LibraryFitClient:
         return self._base
 
     async def operation_request(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Authenticated, fresh-token transport for assigned durable run work."""
+        """Authenticated, fresh-token transport for assigned durable run work.
+        A caller's own headers (a preparation's file chunk names its type,
+        LS10) go beside the credential, never in place of it."""
+        headers = {**(kwargs.pop("headers", None) or {}), **self._headers}
         response = await self._client().request(
-            method, f"{self._base}{path}", headers=self._headers, **kwargs
+            method, f"{self._base}{path}", headers=headers, **kwargs
         )
         response.raise_for_status()
         return response.json() if response.content else None

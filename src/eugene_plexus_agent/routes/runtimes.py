@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -63,7 +64,7 @@ from ..dependencies import (
     require_operator_or_service,
     require_operator_session,
 )
-from ..engines.acquisition import AcquisitionError, Unavailable
+from ..engines.acquisition import AcquisitionError, Unavailable, engine_root
 from ..engines.base import EngineUnavailableError
 from ..engines.devices import detect_devices
 from ..engines.llama_cpp import LlamaCppAdapter, places_by_itself
@@ -678,6 +679,9 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
         # Synchronous intentionally: no start/install request can interleave
         # between the in-use check and removal on this agent's event loop.
         adapter.managed_store().remove_builds()
+        # Its preparations' folders on this node go with it (LS10, B107):
+        # what they made is in the Library folders.
+        shutil.rmtree(engine_root() / "preparing" / kind.value, ignore_errors=True)
     except (AcquisitionError, OSError) as exc:
         raise _problem(
             code=409, slug="engine-removal-failed", title="Engine removal failed", detail=str(exc)

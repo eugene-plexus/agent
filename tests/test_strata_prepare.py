@@ -4,6 +4,9 @@ A stand-in `setup.py` takes upstream's arguments and writes what upstream's
 writes, where it writes it: the pack, tokenizer and MTP helper into the data
 folder, `strata-<tag>.json` (absolute paths) and a start script into its own
 folder, `.done` marks beside the shards. No real Strata, model or GPU.
+
+Since LS10 (§6.13) all of it happens in this node's folder standing for the
+Library folder: nothing is written in the Library folder.
 """
 
 from __future__ import annotations
@@ -82,7 +85,8 @@ rt.mkdir(parents=True, exist_ok=True)
 shards = sorted(gguf.glob("*-of-*.gguf"))
 for s in shards:
     s.with_name(s.name + ".done").write_text("whole")
-args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(shards[-1]),
+ple = os.environ.get("FAKE_SETUP_OUTSIDE") or str(shards[-1])
+args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", ple,
         "--expert-profile", str(ROOT / "data" / "expert-profile.bin"), "--expert-cache", "auto",
         "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
         "--max-context", str(a.context or 65536), "--kv", "int8"]
@@ -123,12 +127,22 @@ def build(tmp_path, monkeypatch):
     return root, folder, repo / FIRST
 
 
+def _work(build) -> Path:
+    """This node's folder standing for the Library folder (LS10)."""
+    return build[1].parent / "node" / "preparing" / "strata" / "k"
+
+
+def _library_files(folder: Path) -> list[str]:
+    return sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*"))
+
+
 def _plan(build, **kw):
     root, folder, gguf = build
     args = {
         "root": root,
         "gguf": gguf,
-        "data_dir": folder / "Strata-data",
+        "folder": folder,
+        "work": _work(build),
         "source_path": "/models/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/" + FIRST,
         "context": None,
         "ram_bytes": 64 * 2**30,
@@ -229,8 +243,10 @@ def test_the_arguments_are_setups_non_interactive_ones(build):
     assert argv[1].endswith("setup.py")
     pairs = dict(zip(argv[2::2], argv[3::2], strict=False))
     assert pairs["--family"] == "qwen" and pairs["--model"] == "IQ2_XS"
-    assert Path(pairs["--gguf-dir"]) == build[2].parent
-    assert Path(pairs["--data-dir"]) == build[1] / "Strata-data"
+    # LS10: this node's folder, laid out as the Library folder is.
+    work = _work(build)
+    assert Path(pairs["--gguf-dir"]) == work / build[2].parent.relative_to(build[1])
+    assert Path(pairs["--data-dir"]) == work / "Strata-data"
     assert "--yes" in argv and "--no-start" in argv and "--no-browser" in argv
     assert argv[argv.index("--vision") + 1] == "no"
     assert argv[argv.index("--experimental-speed-projection") + 1] == "off"
@@ -242,12 +258,15 @@ def test_the_arguments_are_setups_non_interactive_ones(build):
 # --- the run --------------------------------------------------------------------
 
 
-def test_a_preparation_makes_a_launchable_model_in_strata_data(build, monkeypatch):
+def test_a_preparation_makes_a_launchable_model_in_strata_data(build, monkeypatch, tmp_path):
     root, folder, gguf = build
-    monkeypatch.setenv("APPDATA", str(folder / "persons-own-appdata"))
+    appdata = tmp_path / "persons-own-appdata"
+    monkeypatch.setenv("APPDATA", str(appdata))
+    before = _library_files(folder)
     progress = Progress()
     result = _plan(build).run(progress)
-    data = folder / "Strata-data"
+    work = _work(build)
+    data = work / "Strata-data"
     assert result.entry == data / "strata-iq2_xs.json"
     assert result.name == "qwen3.8-flash-next-iq2_xs"
     assert result.recipe == "strata-prepare" and result.recipe_version == "v0.1.39"
@@ -269,15 +288,36 @@ def test_a_preparation_makes_a_launchable_model_in_strata_data(build, monkeypatc
     assert (data / "packs" / "iq2_xs" / "expert-profile.bin").read_bytes() == b"\1" * 64
     assert cfg["tokenizer"] == "packs/iq2_xs/tokenizer"
     assert not list(root.glob("strata-*.json")) and not list(root.glob("run-*.bat"))
-    # B44: the marker is there; B46: the GGUF is unchanged, setup's marks beside it.
+    # B44: the marker is there; B46: the GGUF is unchanged.
     assert (data / ".eugene-engine-files").is_file()
     assert gguf.read_bytes() == b"GGUF first"
-    assert gguf.with_name(FIRST + ".done").is_file()
+    # LS10 (B101, B102): setup's marks are beside this node's links to the
+    # shards, and nothing at all was written in the Library folder.
+    view = work / gguf.parent.relative_to(folder)
+    assert (view / (FIRST + ".done")).is_file()
+    assert os.path.samefile(view / FIRST, gguf)
+    assert _library_files(folder) == before
+    # B103: what the library must hold is inside Strata-data, the GGUF not
+    # among it; the MTP helper stays here after the listing (B107).
+    assert result.root == work
+    sent = {p.relative_to(work).as_posix() for p in result.files}
+    assert {
+        "Strata-data/strata-iq2_xs.json",
+        "Strata-data/packs/iq2_xs/expert-profile.bin",
+        "Strata-data/packs/iq2_xs/tokenizer/vocab.json",
+        "Strata-data/mtp/rt/experts.bin",
+        "Strata-data/strata-iq2_xs.setup.log",
+    } <= sent
+    assert all(p.startswith("Strata-data/") for p in sent)
+    assert "Strata-data/fake-setup-call.json" not in sent
+    discard = {p.relative_to(work).as_posix() for p in result.discard}
+    assert "Strata-data/strata-iq2_xs.json" in discard
+    assert not any(p.startswith("Strata-data/mtp/") for p in discard)
     # B45: setup ran with its own settings folder, never the person's.
     call = json.loads((data / "fake-setup-call.json").read_text())
-    assert call["appdata"] != str(folder / "persons-own-appdata")
+    assert call["appdata"] != str(appdata)
     assert call["appdata"] == call["xdg"] and call["utf8"] == "1"
-    assert not (folder / "persons-own-appdata").exists()
+    assert not appdata.exists()
     assert not Path(call["appdata"]).exists()  # gone with the run
     # B56: its steps in its own words, its warnings kept, what it wrote measured.
     assert progress.warnings == ["Windows' page file is 1.0 GB"]
@@ -324,7 +364,7 @@ def test_cancel_stops_setup_and_what_it_started(build, monkeypatch):
 
     thread = threading.Thread(target=run)
     thread.start()
-    pid_file = build[1] / "Strata-data" / "fake-setup.pid"
+    pid_file = _work(build) / "Strata-data" / "fake-setup.pid"
     for _ in range(300):
         if pid_file.is_file() and pid_file.read_text():
             break
@@ -335,6 +375,81 @@ def test_cancel_stops_setup_and_what_it_started(build, monkeypatch):
     assert not thread.is_alive()
     assert isinstance(failure[0], PreparationCancelled)
     assert not _alive(pid)
+
+
+# --- the GGUF, read where it is (LS10, B102) --------------------------------------
+
+
+def _refuse(_source: Path, _link: Path) -> None:
+    raise OSError(1314, "A required privilege is not held by the client")
+
+
+def test_without_symbolic_links_the_shards_are_hard_links(build, monkeypatch):
+    _root, folder, gguf = build
+    monkeypatch.setattr(strata_prepare, "_symlink", _refuse)
+    result = _plan(build).run(Progress())
+    view = _work(build) / gguf.parent.relative_to(folder)
+    assert not (view / FIRST).is_symlink()
+    assert os.path.samefile(view / FIRST, gguf)
+    assert view / FIRST not in result.discard
+
+
+def test_with_no_link_at_all_the_shards_are_copied_and_removed_after(build, monkeypatch):
+    _root, folder, gguf = build
+    monkeypatch.setattr(strata_prepare, "_symlink", _refuse)
+    monkeypatch.setattr(strata_prepare, "_hardlink", _refuse)
+    monkeypatch.setattr(strata_prepare, "_junction", lambda _view, _folder: False)
+    before = _library_files(folder)
+    result = _plan(build).run(Progress())
+    view = _work(build) / gguf.parent.relative_to(folder)
+    assert (view / FIRST).read_bytes() == b"GGUF first"
+    assert not os.path.samefile(view / FIRST, gguf)
+    assert {view / FIRST, view / SECOND} <= set(result.discard)
+    assert _library_files(folder) == before
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a junction is Windows'")
+def test_on_windows_without_links_a_local_folder_is_joined(build, monkeypatch):
+    _root, folder, gguf = build
+    monkeypatch.setattr(strata_prepare, "_symlink", _refuse)
+    monkeypatch.setattr(strata_prepare, "_hardlink", _refuse)
+    result = _plan(build).run(Progress())
+    view = _work(build) / gguf.parent.relative_to(folder)
+    assert os.path.isjunction(view)
+    # The same machine's own folder: setup's marks go beside the shards.
+    assert gguf.with_name(FIRST + ".done").is_file()
+    args = json.loads(result.entry.read_text(encoding="utf-8"))["args"]
+    assert (
+        args[args.index("--native") + 1]
+        == f"../ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/{FIRST}"
+    )
+
+
+def test_a_path_outside_the_models_files_is_refused(build, monkeypatch, tmp_path):
+    outside = tmp_path / "elsewhere.gguf"
+    outside.write_bytes(b"GGUF")
+    monkeypatch.setenv("FAKE_SETUP_OUTSIDE", str(outside))
+    with pytest.raises(PreparationError, match="not among the model's files"):
+        _plan(build).run(Progress())
+
+
+def test_a_shard_outside_the_library_folder_is_refused(build, tmp_path):
+    other = tmp_path / "another-library-folder"
+    other.mkdir()
+    with pytest.raises(PreparationError, match="not inside the Library folder"):
+        _plan(build, folder=other)
+
+
+def test_a_failed_setup_says_where_its_log_is_kept(build, monkeypatch):
+    monkeypatch.setenv("FAKE_SETUP_FAIL", "1")
+    progress = Progress()
+    with pytest.raises(PreparationError) as stopped:
+        _plan(build).run(progress)
+    # The run worker sends it and names the Library's copy (B106).
+    assert "its whole output" not in str(stopped.value)
+    assert progress.log_name == "Strata-data/strata-iq2_xs.setup.log"
+    assert progress.log_file == _work(build) / "Strata-data" / "strata-iq2_xs.setup.log"
+    assert progress.log_file.is_file()
 
 
 def _alive(pid: int) -> bool:
@@ -462,6 +577,19 @@ def test_a_cancelled_operation_stops_its_job_and_a_waiting_one_never_runs():
     assert not waiting.ran
     jobs.cancel_except(set())
     assert jobs.poll("a") is None and jobs.poll("b") is None
+
+
+def test_a_done_preparation_keeps_its_engine_until_its_files_are_sent():
+    jobs = PreparationJobs()
+    gate = threading.Event()
+    gate.set()
+    progress = jobs.start("a", _Recipe(gate), engine="strata")
+    _wait(progress)
+    assert progress.state == "done"
+    # LS10: its files are on their way to the library from its folder.
+    assert jobs.busy_for("strata")
+    jobs.forget("a")
+    assert not jobs.busy_for("strata")
 
 
 def test_a_recipe_failure_is_the_jobs_error():
