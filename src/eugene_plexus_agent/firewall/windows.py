@@ -279,6 +279,47 @@ def _remedy(port: int) -> str:
     return rule_command((port,))
 
 
+def rule_ports() -> tuple[int, ...] | None:
+    """The ports this install's own rule allows, or None when there is no
+    such rule: the person never let Eugene through, which stays theirs to
+    decide (the reach card)."""
+    policy = _policy()
+    if policy is None:
+        return None
+    ours = [r for r in _read_rules(policy) if r.name == RULE_NAME and r.action == _ACTION_ALLOW]
+    if not ours:
+        return None
+    return tuple(sorted({port for rule in ours for port in rule.ports}))
+
+
+def set_rule_ports(ports: tuple[int, ...], *, timeout: float = 30.0) -> tuple[bool, str]:
+    """This install's own rule, set to allow exactly `ports` (elevated only:
+    a service install always is). The rule keeps its name and profiles."""
+    import subprocess
+
+    if not elevated():
+        return False, "This agent is not elevated, so it cannot change the firewall itself."
+    joined = ",".join(str(p) for p in ports)
+    command = f'Set-NetFirewallRule -DisplayName "{RULE_NAME}" -LocalPort {joined}'
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"Could not run `{command}`: {exc}"
+    if proc.returncode != 0:
+        said = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return False, f"`{command}` failed: {said[0] if said else f'exit {proc.returncode}'}"
+    return True, f"{RULE_NAME} now allows TCP {joined}."
+
+
 def _third_party() -> list[str]:
     """Firewalls registered with Security Center that are not Defender.
 

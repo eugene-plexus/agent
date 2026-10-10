@@ -486,6 +486,10 @@ async def take_trust_bundle(request: Request, body: SignedTrustBundle) -> NodeId
 
 
 def _listeners(request: Request) -> list[reach.Listener]:
+    return listeners_of(request.app)
+
+
+def listeners_of(app: Any) -> list[reach.Listener]:
     """This install's processes on this host, and the interface each one
     was actually started on.
 
@@ -495,18 +499,18 @@ def _listeners(request: Request) -> list[reach.Listener]:
     "what it would bind if it started" is a guess, and this object
     exists to hold facts.
     """
-    settings = request.app.state.settings
+    settings = app.state.settings
     out = [
         reach.Listener(
             process="agent",
             port=int(settings.bind_port),
-            bind_host=getattr(request.app.state, "bind_host", None) or settings.bind_host,
+            bind_host=getattr(app.state, "bind_host", None) or settings.bind_host,
         )
     ]
-    state: AgentState = request.app.state.agent_state
+    state: AgentState = app.state.agent_state
     # Apps listen too, on their own ports, and a phone opening a chat app
     # needs the same three things a phone opening the console does.
-    manager = getattr(request.app.state, "apps", None)
+    manager = getattr(app.state, "apps", None)
     if manager is not None:
         for record in manager.store.installed():
             if not manager.supervisor.is_running(record.id):
@@ -518,7 +522,7 @@ def _listeners(request: Request) -> list[reach.Listener]:
                     bind_host=manager.supervisor.bind_host(record.id),
                 )
             )
-    supervisor = getattr(request.app.state, "supervisor", None)
+    supervisor = getattr(app.state, "supervisor", None)
     if supervisor is None:
         return out
     for entry in state.list_topology_entries():

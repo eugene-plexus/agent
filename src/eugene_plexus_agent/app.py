@@ -33,6 +33,7 @@ from . import (
     companions,
     default_topology,
     enrollment,
+    firewall_follow,
     host_allowlist,
     install_info,
     install_permissions,
@@ -491,10 +492,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.safe_mode
         else asyncio.create_task(sign_in_refresh.run(app), name="sign-in-addresses")
     )
+    # This install's own firewall rule follows its listeners (2026-10-10).
+    firewall_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(
+            firewall_follow.run(lambda: node_routes.listeners_of(app)), name="firewall-follow"
+        )
+    )
     try:
         yield
     finally:
-        for task in (approval_task, sign_in_task):
+        for task in (approval_task, sign_in_task, firewall_task):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
