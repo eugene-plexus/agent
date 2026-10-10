@@ -301,6 +301,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             log=log,
             get_config=state.get_config,
             inherited_rules=folders_cache.inherited_rules,
+            stop_memory=state,
         )
         owns_runtimes = True
     else:
@@ -408,7 +409,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if created:
             log.info("declared %d companion driver(s) at boot: %s", len(created), created)
         for spec in state.list_runtime_specs():
-            runtime_supervisor.add_and_start(spec)
+            runtime_supervisor.start_at_boot(spec)
         await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
 
     # Apps last, and in the background: each start resolves the gateway,

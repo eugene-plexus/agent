@@ -21,7 +21,7 @@ import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from . import model_copies
 from ._generated.models import (
@@ -345,6 +345,19 @@ class _CopyJob:
             self.task.cancel()
 
 
+class StopMemory(Protocol):
+    """Where a person's Stop is kept across agent restarts (agent#11).
+
+    `AgentState`, which writes it to `agent.yaml` beside the declarations.
+    """
+
+    def remembered_stops(self) -> set[str]: ...
+
+    def remember_stop(self, name: str) -> None: ...
+
+    def forget_stop(self, name: str) -> None: ...
+
+
 class RuntimeSupervisor:
     """Owns every engine process plus a background readiness-poll task."""
 
@@ -353,8 +366,13 @@ class RuntimeSupervisor:
         log: logging.Logger | None = None,
         get_config: ConfigGetter | None = None,
         inherited_rules: RulesProvider | None = None,
+        stop_memory: StopMemory | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
+        # A person's Stop outlives the agent: before agent#11 every runtime
+        # with `autoStart` came back at the next boot, so a model stopped to
+        # free the GPU took it back after every update and reboot.
+        self._stop_memory = stop_memory
         # Read live at plan time, so an operator who sets `vllmBinary` in
         # the UI gets the new path on the next spawn without restarting
         # the agent.
@@ -378,8 +396,9 @@ class RuntimeSupervisor:
         #: loading and would otherwise inherit the old proof.
         self._proved_ready: dict[str, datetime] = {}
         # Why a stopped runtime is stopped — an observation, reported on
-        # `Runtime.stopReason` and never persisted or replicated. Cleared
-        # the moment the runtime is started.
+        # `Runtime.stopReason` and never replicated. Cleared the moment the
+        # runtime is started. Only `operator` is also persisted, through
+        # `_stop_memory`.
         self._stop_reasons: dict[str, StopReason] = {}
         # Bytes-read samples per runtime; see `process_io`. Sampled
         # when a view is built rather than on a loop, because a
@@ -408,6 +427,21 @@ class RuntimeSupervisor:
         self.node_name_provider: Callable[[], str | None] | None = None
 
     # --- collection management --------------------------------------------
+
+    def start_at_boot(self, spec: RuntimeSpec) -> None:
+        """What the agent does with each declaration when it starts: what
+        `add_and_start` does, unless someone stopped the runtime, which
+        keeps it stopped (agent#11)."""
+        if self._stop_memory is not None and spec.name in self._stop_memory.remembered_stops():
+            self._planners.pop(spec.name, None)
+            self._stop_reasons[spec.name] = StopReason.operator
+            self._log.info("runtime %s stays stopped: someone stopped it", spec.name)
+            return
+        self.add_and_start(spec)
+
+    def _forget_stop(self, name: str) -> None:
+        if self._stop_memory is not None:
+            self._stop_memory.forget_stop(name)
 
     def add_and_start(self, spec: RuntimeSpec) -> None:
         """Begin supervising a runtime. Declared-but-not-started when
@@ -447,6 +481,7 @@ class RuntimeSupervisor:
             # is not `starting`.
             self._copy_jobs[spec.name] = job
             self._stop_reasons.pop(spec.name, None)
+            self._forget_stop(spec.name)
             job.task = asyncio.create_task(
                 self._copy_then_spawn(spec, adapter, job), name=f"copy:{spec.name}"
             )
@@ -463,6 +498,7 @@ class RuntimeSupervisor:
         self._planners[spec.name] = planner
         self._processes[spec.name] = sp
         self._stop_reasons.pop(spec.name, None)
+        self._forget_stop(spec.name)
         sp.start()
 
     # --- the local copy ---------------------------------------------------
@@ -642,6 +678,7 @@ class RuntimeSupervisor:
         self._readiness.pop(name, None)
         self._proved_ready.pop(name, None)
         self._stop_reasons.pop(name, None)
+        self._forget_stop(name)
         self._copy_notes.pop(name, None)
         self._load_progress.forget(name)
         if sp is not None:
@@ -680,6 +717,11 @@ class RuntimeSupervisor:
         memory: an operator who wants the VRAM back needs a stop that is
         neither a delete nor a crash. `reason` is recorded so the
         dashboard can say *why* — `idle` when the gateway unloaded it.
+
+        A person's stop (`operator`) is also remembered, which keeps it
+        stopped across agent restarts until something starts it. A restart
+        that stops only to start again leaves nothing behind: the start
+        forgets it.
         """
         await self._cancel_copy(name)
         sp = self._processes.pop(name, None)
@@ -687,6 +729,8 @@ class RuntimeSupervisor:
         self._readiness.pop(name, None)
         self._proved_ready.pop(name, None)
         self._stop_reasons[name] = reason
+        if self._stop_memory is not None and reason is StopReason.operator:
+            self._stop_memory.remember_stop(name)
         if sp is not None:
             await sp.stop()
 

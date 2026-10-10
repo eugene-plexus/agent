@@ -38,6 +38,7 @@ from .._generated.models import (
     PreparedInspectRequest,
     PreparedProvenance,
     Runtime,
+    RuntimeAutoStart,
     RuntimeList,
     RuntimeSpec,
     StopReason,
@@ -1035,6 +1036,27 @@ async def start_declared_runtime(
             else f"Start scheduled for engine runtime {name!r}."
         ),
     )
+
+
+@router.put(
+    "/v1/runtimes/{name}/auto-start",
+    response_model=Runtime,
+    tags=["runtimes"],
+    dependencies=_write_auth,
+)
+async def set_runtime_auto_start(request: Request, name: str, body: RuntimeAutoStart) -> Runtime:
+    """`autoStart` alone, and no restart (agent#11).
+
+    `PATCH` replaces the whole declaration and restarts the engine,
+    because every other field is on its command line. This one is read
+    only at boot, so a running engine keeps running and a stopped one
+    stays stopped.
+    """
+    state: AgentState = request.app.state.agent_state
+    updated = state.set_runtime_auto_start(name, body.autoStart)
+    if updated is None:
+        raise _not_found(name)
+    return _compose(updated, _supervisor(request))
 
 
 @router.post(

@@ -524,6 +524,11 @@ class AgentState:
         # component's declarative shape — see the agent spec's
         # components-vs-runtimes table.
         self._runtimes: dict[str, RuntimeSpec] = {}
+        # Runtimes a person stopped, persisted under `stoppedRuntimes:` so
+        # the stop outlives the agent (agent#11). Not part of a declaration:
+        # `autoStart` is what the person asked for at boot, and this is what
+        # they did since.
+        self._stopped: set[str] = set()
         # v0.2 auth block. Persisted to disk under `auth:` in agent.yaml.
         # passphraseHash: Argon2id-PHC string (verifiable, not reversible)
         # masterSalt:     base64-encoded 16-byte salt used to derive the
@@ -570,12 +575,18 @@ class AgentState:
                 for entry in runtimes_raw:
                     spec = RuntimeSpec.model_validate(entry)
                     self._runtimes[spec.name] = spec
+                self._stopped = {
+                    name
+                    for name in raw.get("stoppedRuntimes") or []
+                    if isinstance(name, str) and name in self._runtimes
+                }
                 self._auth = dict(raw.get("auth") or {})
                 self._drop_invalid_update_channel_locked()
             else:
                 self._config = _config_defaults()
                 self._components = {}
                 self._runtimes = {}
+                self._stopped = set()
                 self._auth = {}
                 self._write_locked()
 
@@ -619,6 +630,7 @@ class AgentState:
                 self._config = _config_defaults()
                 self._components = {}
                 self._runtimes = {}
+                self._stopped = set()
                 self._auth = {}
                 self._degraded_reason = reason
                 self._lost_passphrase = any(m.search(raw_text) for m in _AUTH_MARKERS)
@@ -851,6 +863,7 @@ class AgentState:
                 if spec.name in self._runtimes:
                     raise KeyError(f"runtime {spec.name!r} already exists")
                 del self._runtimes[name]
+                self._stopped.discard(name)
             resolved = self._resolve_ports_locked(spec)
             self._runtimes[resolved.name] = resolved
             self._write_locked()
@@ -861,8 +874,38 @@ class AgentState:
             if name not in self._runtimes:
                 return False
             del self._runtimes[name]
+            self._stopped.discard(name)
             self._write_locked()
             return True
+
+    def set_runtime_auto_start(self, name: str, auto_start: bool) -> RuntimeSpec | None:
+        """Change `autoStart` alone. No port is re-resolved: nothing else moved."""
+        with self._lock:
+            spec = self._runtimes.get(name)
+            if spec is None:
+                return None
+            updated = spec.model_copy(update={"autoStart": auto_start})
+            self._runtimes[name] = updated
+            self._write_locked()
+            return updated
+
+    # The supervisor's `StopMemory` (agent#11).
+
+    def remembered_stops(self) -> set[str]:
+        with self._lock:
+            return set(self._stopped)
+
+    def remember_stop(self, name: str) -> None:
+        with self._lock:
+            if name in self._runtimes and name not in self._stopped:
+                self._stopped.add(name)
+                self._write_locked()
+
+    def forget_stop(self, name: str) -> None:
+        with self._lock:
+            if name in self._stopped:
+                self._stopped.discard(name)
+                self._write_locked()
 
     def _component_ports_locked(self) -> set[int]:
         """Ports the components' URLs claim — companion drivers live in
@@ -1001,6 +1044,8 @@ class AgentState:
         out["runtimes"] = [
             spec.model_dump(exclude_none=True, mode="json") for spec in self._runtimes.values()
         ]
+        if self._stopped:
+            out["stoppedRuntimes"] = sorted(self._stopped)
         if self._auth:
             out["auth"] = dict(self._auth)
 

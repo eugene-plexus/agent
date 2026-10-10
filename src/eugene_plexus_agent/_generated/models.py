@@ -3084,9 +3084,24 @@ class RuntimeCapabilities(BaseModel):
     )
 
 
+class RuntimeAutoStart(BaseModel):
+    """
+    Body for `PUT /v1/runtimes/{name}/auto-start`.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    autoStart: bool = Field(
+        ..., description='Whether this runtime starts when the agent starts.'
+    )
+
+
 class StopReason(StrEnum):
     """
     * `operator` — an explicit stop, from the UI or the API.
+      Remembered across agent restarts: the runtime stays stopped,
+      whatever its `autoStart`, until something starts it.
     * `idle` — the gateway unloaded it after `idleUnloadSeconds`
       passed with no request for its model. It comes back on the
       next request if `startOnDemand` is set.
@@ -4083,7 +4098,7 @@ class RuntimeSpec(BaseModel):
     )
     autoStart: bool | None = Field(
         True,
-        description='Whether the agent spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM.\n',
+        description='Whether the agent spawns this runtime at startup and\nrespawns it on exit. False leaves it declared but\n`stopped`, which is how a rarely-used large model stays\nconfigured without holding VRAM. A runtime someone stopped\nstays stopped at startup whatever this says\n(`StopReason.operator`). `PUT /v1/runtimes/{name}/auto-start`\nchanges it without restarting the engine.\n',
     )
     autoDriver: bool | None = Field(
         True,
