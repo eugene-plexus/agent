@@ -29,9 +29,7 @@ update.
 **The channel** is `updateChannel` on this agent's config, and when it is
 not saved, the default: `releases`, or what the environment names
 (`EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL`, `edge` in the `:edge`
-container image). It used to be inferred afresh at every check; an install
-from before that saves, once, the channel it followed (`state.py`,
-"The update channel's one-time settling").
+container image).
 
 Everything reaches GitHub through `describe_fetch_failure`, so a failed
 check says what happened -- rate limit, certificate, timeout -- in the
@@ -455,35 +453,6 @@ def place(install: NodeInstall, target: Target, get: Fetch = fetch) -> Placement
 
 
 # --------------------------------------------------------------------------- #
-# The update channel's one-time settling (2026-09-30)
-# --------------------------------------------------------------------------- #
-#
-# Until 2026-09-30 an unset `updateChannel` was inferred afresh at every
-# check. It is a binary choice with a default now (Troy), and an install
-# that never saved one keeps the channel it followed: `state.py` settles a
-# container's at load, from its image, and a native install's is settled by
-# its first update check that can read the release list, with this. Nothing
-# else may call it -- it is the old rule, kept only to be applied once.
-
-
-def container_channel_before_default(image: str) -> UpdateChannel:
-    """What an unset channel followed in a container: its image tag."""
-    tag = image.rsplit(":", 1)[-1] if ":" in image else ""
-    return UpdateChannel.releases if _TAG.match(tag) else UpdateChannel.edge
-
-
-def channel_before_default(install: NodeInstall, releases: list[Target]) -> UpdateChannel:
-    """What an unset channel followed on this install before it had a default."""
-    if install.container is not None:
-        return container_channel_before_default(install.container.image)
-    have = installed_commits(install)
-    for release in releases:
-        if all(have.get(name) == pin for name, pin in release.components.items()):
-            return UpdateChannel.releases
-    return UpdateChannel.edge
-
-
-# --------------------------------------------------------------------------- #
 # The checker a node runs
 # --------------------------------------------------------------------------- #
 
@@ -494,9 +463,7 @@ RECHECK_SETTING_SECONDS = 60.0
 
 @dataclass
 class CheckResult:
-    #: None only while the channel is `pending` and the release list that
-    #: decides it could not be read.
-    channel: UpdateChannel | None
+    channel: UpdateChannel
     source: UpdateChannelSource
     checked_at: datetime | None = None
     newest: Target | None = None
@@ -520,14 +487,10 @@ class UpdateChecker:
         setting: Callable[[str], Any],
         get: Fetch = fetch,
         default_channel: Callable[[], UpdateChannel] = lambda: UpdateChannel.releases,
-        settling: Callable[[], bool] = lambda: False,
-        settle: Callable[[UpdateChannel], None] = lambda channel: None,
     ) -> None:
         self._setting = setting
         self._get = get
         self._default_channel = default_channel
-        self._settling = settling
-        self._settle = settle
         self._result: CheckResult | None = None
         self._lock = asyncio.Lock()
         self._last_attempt: float | None = None
@@ -545,52 +508,23 @@ class UpdateChecker:
         except ValueError:
             return None
 
-    def channel(self) -> tuple[UpdateChannel | None, UpdateChannelSource]:
+    def channel(self) -> tuple[UpdateChannel, UpdateChannelSource]:
         """The channel this machine follows now, and why. No network."""
         chosen = self.configured_channel()
         if chosen is not None:
             return chosen, UpdateChannelSource.setting
-        if self._settling():
-            return None, UpdateChannelSource.pending
         return self._default_channel(), UpdateChannelSource.default
 
     def _check_now(self, install: NodeInstall) -> CheckResult:
         now = datetime.now(UTC)
         channel, source = self.channel()
-        releases: list[Target] | None = None
-        if channel is None:
-            # An install from before the default that never saved a
-            # channel: the release list says which it followed, so read it
-            # first -- and never fall back to a guess when it cannot be
-            # read, which is how a release install used to be handed an
-            # edge build whenever that one request failed.
-            try:
-                releases = recent_releases(self._get)
-            except CheckFailed as exc:
-                return CheckResult(
-                    channel=None,
-                    source=source,
-                    checked_at=now,
-                    error=(
-                        "Which channel this machine follows is decided from the list of "
-                        f"releases, which could not be read: {exc}"
-                    ),
-                )
-            channel = channel_before_default(install, releases)
-            self._settle(channel)
-            source = UpdateChannelSource.setting
-            log.warning(
-                "updateChannel was never saved; this machine followed %s, and that is now "
-                "saved as its update channel so an update cannot move it to another one",
-                channel.value,
-            )
         commits = installed_commits(install)
         result = CheckResult(channel=channel, source=source, checked_at=now, commits=commits)
         try:
             if channel is UpdateChannel.edge:
                 newest = newest_edge(self._get)
             else:
-                newest = releases[0] if releases else newest_release(self._get)
+                newest = newest_release(self._get)
             placement = (
                 Placement(behind=[], ahead=[])
                 if install.development
@@ -611,7 +545,7 @@ class UpdateChecker:
         async with self._lock:
             self._last_attempt = time.perf_counter()
             result = await asyncio.to_thread(self._check_now, install)
-            label = result.channel.value if result.channel is not None else "channel not decided"
+            label = result.channel.value
             if result.error:
                 log.warning("update check (%s): %s", label, result.error)
             elif result.newest is not None and result.placement is not None:
@@ -646,7 +580,7 @@ class UpdateChecker:
         if result is None:
             return None
         channel, _ = self.channel()
-        if result.channel is not None and channel is not None and result.channel is not channel:
+        if result.channel is not channel:
             return None
         return result
 
@@ -689,8 +623,8 @@ class UpdateChecker:
         development = install.development
         return NodeUpdate(
             enabled=self.enabled,
-            channel=result.channel if result.channel is not None else channel,
-            channelSource=result.source if result.channel is not None else source,
+            channel=result.channel,
+            channelSource=result.source,
             checkedAt=result.checked_at,
             error=result.error,
             newest=result.newest.model() if result.newest is not None else None,

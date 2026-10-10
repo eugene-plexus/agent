@@ -1,5 +1,4 @@
-"""S0 of the hobbyist UX plan: the keyring entry is scoped per install, a
-legacy entry migrates once, the availability probe is measured, and the
+"""S0 of the hobbyist UX plan: the keyring entry is scoped per install, the availability probe is measured, and the
 status endpoint reports both.
 
 Why scoping: two installs share one machine more often than a single
@@ -64,45 +63,6 @@ def test_two_installs_on_one_machine_do_not_share_an_entry(fake_keyring: _FakeKe
 
 def test_the_install_id_is_stable_across_restarts() -> None:
     assert keyring_store.install_id_for(SALT_A) == keyring_store.install_id_for(SALT_A)
-
-
-def test_a_legacy_entry_is_read_once_and_moved(fake_keyring: _FakeKeyring) -> None:
-    """An install that predates scoping keeps auto-unlocking across the
-    upgrade: its single-slot entry is found, moved under its own name,
-    and the old slot is cleared."""
-    install = keyring_store.install_id_for(SALT_A)
-    key = secrets.token_bytes(32)
-    fake_keyring.store[(keyring_store.SERVICE, keyring_store.LEGACY_USERNAME)] = _b64(key)
-
-    assert keyring_store.get_master_key(install) == key
-    assert (keyring_store.SERVICE, keyring_store.LEGACY_USERNAME) not in fake_keyring.store
-    scoped = (keyring_store.SERVICE, keyring_store.username_for(install))
-    assert fake_keyring.store[scoped] == _b64(key)
-
-
-def test_migration_keeps_the_legacy_entry_when_the_scoped_write_fails(
-    fake_keyring: _FakeKeyring,
-) -> None:
-    """Written first, deleted second: a failure in between leaves a
-    duplicate, never nothing."""
-    install = keyring_store.install_id_for(SALT_A)
-    key = secrets.token_bytes(32)
-    fake_keyring.store[(keyring_store.SERVICE, keyring_store.LEGACY_USERNAME)] = _b64(key)
-    fake_keyring.raise_on.add("set")
-
-    assert keyring_store.get_master_key(install) == key
-    assert (keyring_store.SERVICE, keyring_store.LEGACY_USERNAME) in fake_keyring.store
-
-
-def test_delete_clears_a_never_migrated_legacy_entry(fake_keyring: _FakeKeyring) -> None:
-    """An install that leaves os_keyring before its first keyring start
-    must not leave a key behind under the old name."""
-    install = keyring_store.install_id_for(SALT_A)
-    fake_keyring.store[(keyring_store.SERVICE, keyring_store.LEGACY_USERNAME)] = _b64(
-        secrets.token_bytes(32)
-    )
-    assert keyring_store.delete_master_key(install) is True
-    assert fake_keyring.store == {}
 
 
 def test_the_probe_is_a_round_trip_and_leaves_nothing_behind(fake_keyring: _FakeKeyring) -> None:

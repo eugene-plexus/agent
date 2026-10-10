@@ -32,7 +32,6 @@ from fastapi.testclient import TestClient
 from eugene_plexus_agent._generated.common_models import ConfigUpdateRequest
 from eugene_plexus_agent.state import (
     DEFAULT_UPDATE_CHANNEL_VARIABLE,
-    UPDATE_CHANNEL_SETTLED_MARKER,
     AgentState,
 )
 
@@ -63,8 +62,6 @@ def test_a_new_install_follows_the_default_and_never_writes_it(tmp_path: Path) -
     state = _state(tmp_path, None)
     assert state.as_config_document().model_dump()["updateChannel"] == "releases"
     assert "updateChannel" not in _on_disk(tmp_path)
-    assert state.update_channel_settling() is False
-    assert (tmp_path / UPDATE_CHANNEL_SETTLED_MARKER).exists()
     field = _field(state, "updateChannel")
     assert field.default == "releases" and field.defaultSource is None
     assert field.unsetMeans is None
@@ -92,80 +89,28 @@ def test_the_environment_names_the_default_and_the_schema_says_so(
 def test_a_saved_channel_is_kept(tmp_path: Path) -> None:
     state = _state(tmp_path, {"updateChannel": "edge"})
     assert state.as_config_document().model_dump()["updateChannel"] == "edge"
-    assert state.update_channel_settling() is False
 
 
-def test_an_old_native_install_is_pending_and_shows_no_default(tmp_path: Path) -> None:
-    """The case Troy's worker was: a file with no channel, from before the
-    default. What it followed depends on the release list, which only the
-    network has -- so until the first check it says it is undecided."""
+def test_a_file_with_no_channel_follows_the_default(tmp_path: Path) -> None:
     state = _state(tmp_path, {"firstRunComplete": True})
-    assert state.update_channel_settling() is True
-    assert state.as_config_document().model_dump()["updateChannel"] is None
-    field = _field(state, "updateChannel")
-    assert field.unsetMeans and "first update check" in field.unsetMeans
-    # The check settles it once, and writes it.
-    state.settle_update_channel("edge")
-    assert _on_disk(tmp_path)["updateChannel"] == "edge"
-    assert state.update_channel_settling() is False
-    assert (tmp_path / UPDATE_CHANNEL_SETTLED_MARKER).exists()
+    assert state.as_config_document().model_dump()["updateChannel"] == "releases"
+    assert "updateChannel" not in _on_disk(tmp_path)
+    assert _field(state, "updateChannel").unsetMeans is None
 
 
-def test_a_reset_after_settling_stays_the_default(tmp_path: Path) -> None:
-    """The marker is why: without it the next boot would settle again and
-    undo the reset."""
-    _state(tmp_path, {"firstRunComplete": True}).settle_update_channel("edge")
-    state = AgentState(tmp_path / "agent.yaml")
-    state.load()
-    state.apply_config_patch(ConfigUpdateRequest.model_validate({"updateChannel": None}))
-    again = AgentState(tmp_path / "agent.yaml")
-    again.load()
-    assert again.update_channel_settling() is False
-    assert again.as_config_document().model_dump()["updateChannel"] == "releases"
-
-
-def test_choosing_a_channel_while_pending_settles_it(tmp_path: Path) -> None:
-    state = _state(tmp_path, {"firstRunComplete": True})
-    state.apply_config_patch(ConfigUpdateRequest.model_validate({"updateChannel": "releases"}))
-    assert state.update_channel_settling() is False
-    state.settle_update_channel("edge")  # a late check must not overwrite a choice
-    assert _on_disk(tmp_path)["updateChannel"] == "releases"
-
-
-@pytest.mark.parametrize(
-    ("image", "default", "saved"),
-    [
-        # An edge image whose default is edge: nothing to write.
-        ("ghcr.io/eugene-plexus/control-plane:edge", "edge", None),
-        # A release image whose default is releases: nothing to write.
-        ("ghcr.io/eugene-plexus/control-plane:v0.1.0-alpha.5", "releases", None),
-        # An edge image with no default in its environment (a local build):
-        # it followed edge, and the default would say releases -- so it is
-        # written.
-        ("eugene-plexus/control-plane:0.1", None, "edge"),
-    ],
-)
-def test_a_container_settles_from_its_image_at_load(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    image: str,
-    default: str | None,
-    saved: str | None,
+def test_a_container_follows_the_default_its_environment_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("EUGENE_PLEXUS_CONTAINER_IMAGE", image)
-    if default is not None:
-        monkeypatch.setenv(DEFAULT_UPDATE_CHANNEL_VARIABLE, default)
+    monkeypatch.setenv("EUGENE_PLEXUS_CONTAINER_IMAGE", "ghcr.io/eugene-plexus/control-plane:edge")
+    monkeypatch.setenv(DEFAULT_UPDATE_CHANNEL_VARIABLE, "edge")
     state = _state(tmp_path, {"firstRunComplete": True})
-    assert state.update_channel_settling() is False
-    assert _on_disk(tmp_path).get("updateChannel") == saved
-    expected = saved or default
-    assert state.as_config_document().model_dump()["updateChannel"] == expected
+    assert "updateChannel" not in _on_disk(tmp_path)
+    assert state.as_config_document().model_dump()["updateChannel"] == "edge"
 
 
-def test_a_channel_that_is_not_one_is_ignored_not_shown(tmp_path: Path) -> None:
+def test_a_channel_that_is_not_one_is_ignored_for_the_default(tmp_path: Path) -> None:
     state = _state(tmp_path, {"updateChannel": "beta"})
-    assert state.as_config_document().model_dump()["updateChannel"] is None
-    assert state.update_channel_settling() is True
+    assert state.as_config_document().model_dump()["updateChannel"] == "releases"
 
 
 # --------------------------------------------------------------------------- #

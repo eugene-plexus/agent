@@ -2035,23 +2035,10 @@ class UpdateChannelSource(StrEnum):
     install's environment names (`EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL`,
     which the `:edge` container image sets to `edge`).
 
-    `pending`: an install from before 2026-09-30 that never saved a
-    channel, whose first update check since has not yet read the
-    release list. That check saves the channel the machine followed
-    until then -- `releases` when its commits are exactly one of the
-    recent releases, `edge` otherwise -- so updating the agent never
-    moves a machine to another channel. `channel` is absent meanwhile.
-
-    `inferred`: sent only by agents before 2026-09-30, which worked an
-    unset channel out afresh at every check. Kept so a console can
-    still read one.
-
     """
 
     setting = 'setting'
     default = 'default'
-    pending = 'pending'
-    inferred = 'inferred'
 
 
 class UpdateOutcome(StrEnum):
@@ -2478,23 +2465,6 @@ class ClientKeyPolicy(BaseModel):
         description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
     )
     keys: list[ClientKeyPolicyEntry]
-
-
-class ClientKeyRevocations(BaseModel):
-    """
-    What the gateway polls. Ids only, and the revision at which the
-    set last changed.
-
-    """
-
-    ids: list[str] = Field(
-        ...,
-        description='`jti`s to refuse. Excludes keys whose `expiresAt` has passed:\nthose are refused by expiry, and keeping them here would\nmake this list grow forever.\n',
-    )
-    revision: int = Field(
-        ...,
-        description='Increments whenever the set changes. A reader logs on a\nchange rather than on every poll.\n',
-    )
 
 
 class AuthInitializeRequest(BaseModel):
@@ -5006,10 +4976,7 @@ class NodeUpdate(BaseModel):
     """
 
     enabled: bool
-    channel: UpdateChannel | None = Field(
-        None,
-        description='The channel this machine follows. Absent only while\n`channelSource` is `pending`: which one it follows has not been\ndecided yet, and a value here would be a guess.\n',
-    )
+    channel: UpdateChannel = Field(..., description='The channel this machine follows.')
     channelSource: UpdateChannelSource
     checkedAt: AwareDatetime | None = None
     error: str | None = Field(
@@ -5273,7 +5240,7 @@ class EngineDescriptor(BaseModel):
     )
     modelFormats: list[ModelFormat] = Field(
         ...,
-        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`strata` lists only `prepared`: it loads models it prepared,\nnever an arbitrary GGUF, so a console that knows no\n`prepared` model offers it for none.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n\n**Kept for consoles older than `accepts`;** it is the formats\nof the requirements in `accepts` that need no preparation, so\nan older console never offers Strata for every GGUF.\n",
+        description="On-disk model formats this adapter's engine can load. A\nproperty of the engine, not of this host — it does not\nchange with `available`.\n\nThis is the engine half of a join the UI performs: the\nlibrary reports what format each model *is*, and this\nreports what each engine can *load*. `llama_cpp` lists\n`gguf`; `vllm` lists `safetensors`. Between them the UI can\ngrey out a launch button and name the missing engine instead\nof offering one that fails.\n\n`strata` lists only `prepared`: it loads models it prepared,\nnever an arbitrary GGUF, so a console that knows no\n`prepared` model offers it for none.\n\n`vllm` does **not** list `gguf`, though upstream has a path\nfor it. That path is documented as highly experimental and\nunder-optimized, and it needs a second `--tokenizer` model\nbecause converting a GGUF tokenizer is unstable — so\nclaiming the format would light up a launch button across\nthe whole GGUF population llama.cpp already serves properly.\n\nA format match is a *first* filter and not a promise. It says\nthe engine can load this kind of file, not that it can load\nthis model: vLLM's model registry is the authority on\narchitectures and it answers only at spawn. The second\nfilter is therefore the engine's own failure, surfaced\nverbatim through `Runtime.lastError`. No architecture list is\ncopied in here, for the same reason the formats are not\ncopied into the library.\n\nIt lives here because engine knowledge lives here. Putting\nformat support on the library would give the library a copy\nof it, and the copy would be the one that went stale.\n\nIt is the formats of the requirements in `accepts` that need\nno preparation, a summary for a page that only says which\nformats run here (Home); what a model needs is judged from\n`accepts` (LS1).\n",
     )
     accepts: list[ModelRequirement] | None = Field(
         None,

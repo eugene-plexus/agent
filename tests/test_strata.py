@@ -63,8 +63,9 @@ def test_private_config_preserves_assets_and_assigns_distinct_aliases(prepared):
     original = config.read_bytes()
     adapter = strata.StrataAdapter()
     binary = DiscoveredBinary(server, Origin.configured)
+    provenance = _provenance(config.parent, entry=config.name)
     for name in ("small", "large"):
-        spec = RuntimeSpec(name=name, engine="strata", modelPath=str(config), modelAlias=name)
+        spec = RuntimeSpec(name=name, engine="strata", modelPath=str(provenance), modelAlias=name)
         argv = adapter.build_argv(spec, binary, 8123)
         saved = json.loads(Path(argv[argv.index("--config") + 1]).read_text())
         assert argv[argv.index("--engine") + 1] == "strata"
@@ -197,6 +198,14 @@ def test_a_provenance_file_that_cannot_launch_says_why(prepared, body, said):
         )
 
 
+def test_a_runtime_declared_on_a_bare_configuration_is_refused_with_the_reason(prepared):
+    _, server, config, _ = prepared
+    spec = RuntimeSpec(name="q", engine="strata", modelPath=str(config))
+    with pytest.raises(SpawnPlanError, match="runs prepared models from the Library") as refused:
+        strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
+    assert ".eugene-prepared.json" in str(refused.value)
+
+
 def test_strata_declares_the_prepared_models_it_loads():
     loads = [r for r in strata.StrataAdapter.accepts if r.format.value == "prepared"]
     assert len(loads) == 1 and loads[0].preparedFor is EngineKind.strata
@@ -319,13 +328,14 @@ def test_uninstall_requires_operator(client):
 
 def test_prepared_config_size_is_never_a_memory_estimate(authed_client, prepared):
     _, server, config, _ = prepared
+    provenance = _provenance(config.parent, entry=config.name)
     authed_client.patch("/v1/config", json={"strataServer": str(server)})
     response = authed_client.post(
         "/v1/runtimes/admission",
         json={
             "name": "a",
             "engine": "strata",
-            "modelPath": str(config),
+            "modelPath": str(provenance),
         },
     )
     assert response.status_code == 200
@@ -350,11 +360,16 @@ def test_admission_checks_prepared_assets_before_disrupting_a_running_model(
             "pathMappings": [{"from": "/remote/models", "to": str(config.parent)}],
         },
     )
+    _provenance(config.parent, entry=config.name)
     cfg["args"] += ["--mtp", "missing-mtp-pack"]
     config.write_text(json.dumps(cfg))
     response = authed_client.post(
         "/v1/runtimes/admission",
-        json={"name": "a", "engine": "strata", "modelPath": "/remote/models/qwen.json"},
+        json={
+            "name": "a",
+            "engine": "strata",
+            "modelPath": "/remote/models/qwen-flash.eugene-prepared.json",
+        },
     )
     assert response.status_code == 200
     body = response.json()
@@ -378,7 +393,9 @@ def test_uninstall_refuses_a_running_runtime_then_keeps_its_declaration(
     store.write_metadata(build, version="v1", variant="test", binary=binary)
     state = authed_client.app.state.agent_state
     state.add_runtime(
-        RuntimeSpec(name="a", engine="strata", modelPath="model.json", autoStart=False)
+        RuntimeSpec(
+            name="a", engine="strata", modelPath="model.eugene-prepared.json", autoStart=False
+        )
     )
     stub_runtime_supervisor.started.add("a")
     assert authed_client.post("/v1/engines/strata/uninstall").status_code == 409
@@ -480,7 +497,11 @@ def test_a_failed_start_names_the_engines_own_reason(prepared):
     configuration names a log; with one, its error carries the engine's lines."""
     _root, server, config, _ = prepared
     adapter = strata.StrataAdapter()
-    spec = RuntimeSpec(name="broken", engine="strata", modelPath=str(config))
+    spec = RuntimeSpec(
+        name="broken",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+    )
     argv = adapter.build_argv(spec, DiscoveredBinary(server, Origin.configured), 8123)
     launch = Path(argv[argv.index("--config") + 1])
     assert json.loads(launch.read_text())["log"] == str(launch.with_suffix(".log"))

@@ -107,16 +107,14 @@ def test_revoke_is_idempotent_and_keeps_the_first_timestamp(tmp_path: Path) -> N
 
 def test_revision_moves_on_every_policy_change(tmp_path: Path) -> None:
     store = ClientKeyStore(tmp_path / client_keys.KEYS_FILE)
-    _, before = store.revoked()
+    before = store.revision
     store.add(_record("one"))
-    _, after_mint = store.revoked()
-    assert after_mint == before + 1
+    assert store.revision == before + 1
     store.revoke("one")
-    _, after_revoke = store.revoked()
-    assert after_revoke == before + 2
+    assert store.revision == before + 2
 
 
-def test_an_expired_key_leaves_the_revoked_set_and_the_list(tmp_path: Path) -> None:
+def test_an_expired_key_leaves_the_list(tmp_path: Path) -> None:
     """A revocation list that only grows is a leak.
 
     An expired token is refused by its own `exp` with no list consulted,
@@ -126,8 +124,6 @@ def test_an_expired_key_leaves_the_revoked_set_and_the_list(tmp_path: Path) -> N
     store = ClientKeyStore(path)
     store.add(_record("old", expires=100.0, revoked=50.0))
     store.add(_record("new", expires=9_000_000_000.0, revoked=60.0))
-    ids, _ = store.revoked(now=200.0)
-    assert ids == ["new"]
     assert [r.id for r in store.records(now=200.0)] == ["new"]
 
 
@@ -193,7 +189,7 @@ def test_failed_atomic_replacement_does_not_acknowledge_revocation(tmp_path, mon
     with pytest.raises(OSError, match="disk full"):
         store.revoke("one")
     assert path.read_bytes() == before
-    assert store.revoked()[0] == []
+    assert [r.id for r in store.records() if r.revoked_at is not None] == []
 
 
 def test_unreadable_revocation_never_becomes_an_active_key(tmp_path) -> None:
@@ -204,7 +200,7 @@ def test_unreadable_revocation_never_becomes_an_active_key(tmp_path) -> None:
     store = ClientKeyStore(path)
     store.load()
     with pytest.raises(OSError):
-        store.revoked()
+        store.records()
 
 
 def test_policy_includes_registered_ids_and_refuses_corrupt_storage(authed_client) -> None:
@@ -339,15 +335,15 @@ def test_a_blank_name_is_refused_with_a_sentence(authed_client: TestClient) -> N
     assert "name" in resp.text.lower()
 
 
-def test_revoke_puts_the_id_in_the_set_and_bumps_the_revision(authed_client: TestClient) -> None:
+def test_revoke_marks_the_key_and_bumps_the_revision(authed_client: TestClient) -> None:
     made = _mint(authed_client)
     key_id = made["key"]["id"]
-    before = authed_client.get("/v1/auth/client-keys/revoked").json()
-    assert before["ids"] == []
+    before = authed_client.get("/v1/auth/client-keys/policy").json()
+    assert not [k for k in before["keys"] if k.get("revokedAt")]
 
     assert authed_client.delete(f"/v1/auth/client-keys/{key_id}").status_code == 204
-    after = authed_client.get("/v1/auth/client-keys/revoked").json()
-    assert after["ids"] == [key_id]
+    after = authed_client.get("/v1/auth/client-keys/policy").json()
+    assert [k["id"] for k in after["keys"] if k.get("revokedAt")] == [key_id]
     assert after["revision"] > before["revision"]
 
     listed = authed_client.get("/v1/auth/client-keys").json()["keys"]
@@ -400,7 +396,6 @@ def _client_token(app: FastAPI) -> str:
         ("get", "/v1/config"),
         ("get", "/v1/node"),
         ("get", "/v1/auth/client-keys"),
-        ("get", "/v1/auth/client-keys/revoked"),
         ("get", "/v1/directories"),
     ],
 )
@@ -429,12 +424,12 @@ def test_a_client_key_cannot_mint_another(app: FastAPI, authed_client: TestClien
     assert resp.status_code == 401
 
 
-def test_the_gateways_service_token_may_read_the_revoked_set(
+def test_the_gateways_service_token_may_read_the_policy(
     app: FastAPI, authed_client: TestClient
 ) -> None:
     gateway = local_service_token(app, "gateway")
     resp = authed_client.get(
-        "/v1/auth/client-keys/revoked", headers={"Authorization": f"Bearer {gateway}"}
+        "/v1/auth/client-keys/policy", headers={"Authorization": f"Bearer {gateway}"}
     )
     assert resp.status_code == 200
 
@@ -448,12 +443,6 @@ def test_another_components_service_token_may_not(
     keys an operator turned off."""
     other = local_service_token(app, kind)
     resp = authed_client.get(
-        "/v1/auth/client-keys/revoked", headers={"Authorization": f"Bearer {other}"}
+        "/v1/auth/client-keys/policy", headers={"Authorization": f"Bearer {other}"}
     )
-    assert resp.status_code == 401
-
-
-def test_a_service_token_may_not_list_the_keys(app: FastAPI, authed_client: TestClient) -> None:
-    gateway = local_service_token(app, "gateway")
-    resp = authed_client.get("/v1/auth/client-keys", headers={"Authorization": f"Bearer {gateway}"})
     assert resp.status_code == 401

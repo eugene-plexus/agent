@@ -100,7 +100,7 @@ MLX_MODEL = {**MODEL, "format": "safetensors", "safetensors": {"mlxQuantization"
 class _BothSafetensorsEngines(NodeActions):
     async def engines(self):
         return [
-            {"engine": e, "available": True, "modelFormats": ["safetensors"]}
+            {"engine": e, "available": True, "accepts": [{"format": "safetensors"}]}
             for e in ["vllm", "mlx"]
         ]
 
@@ -135,19 +135,18 @@ async def test_run_takes_the_engine_the_library_judges_best(app):
     assert result == {"step": "settings", "engine": "mlx"}
     method, path, body = library.asked[0]
     assert (method, path, body["models"]) == ("POST", "/v1/eligibility", ["m"])
-    # An engine reported without `accepts` is judged on its formats alone.
+    # The engine goes to the judge with the rules it reported.
     assert body["engines"][0]["accepts"] == [{"format": "safetensors"}]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", [404, 422])
-async def test_a_library_older_than_eligibility_keeps_the_mlx_rule(app, status):
-    # A container root updated after its workers answers 404 (2026-10-09);
-    # one older than LS3 refuses Strata's `prepared` requirement with 422.
+async def test_a_library_refusal_is_a_failure_not_a_guess(app, status):
+    # No fallback to a format rule: the library's refusal stands.
     worker = RunWorker(app, node_actions=_BothSafetensorsEngines(app))
     job = {"step": "checking", "engine": None, "model": MLX_MODEL}
-    result = await worker.advance(_Judge(status=status), "/unused", job, {})
-    assert result == {"step": "settings", "engine": "mlx"}
+    with pytest.raises(httpx.HTTPStatusError):
+        await worker.advance(_Judge(status=status), "/unused", job, {})
 
 
 @pytest.mark.asyncio

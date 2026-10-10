@@ -239,9 +239,10 @@ class EngineAdapter(abc.ABC):
 
     #: What this engine loads, as data the library judges
     #: (`POST /v1/eligibility`; library-sources-and-engines.md, LS1).
-    #: Finer than `model_formats`, which stays for older consoles and is
-    #: the formats of the requirements that need no preparation (a test
-    #: holds the two together).
+    #: Finer than `model_formats`, a summary of the formats this engine loads
+    #: as they are (Home reads it); judging uses `accepts`. It is the formats
+    #: of the requirements that need no preparation (a test holds the two
+    #: together).
     accepts: tuple[ModelRequirement, ...] = ()
 
     #: The models this adapter publishes as supported (LS4, design §4.4):

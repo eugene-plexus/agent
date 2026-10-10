@@ -457,10 +457,6 @@ CONFIG_FIELDS += [
 #: file. The `:edge` container image sets `edge`.
 DEFAULT_UPDATE_CHANNEL_VARIABLE = "EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL"
 UPDATE_CHANNELS = ("edge", "releases")
-#: Beside `agent.yaml`: the channel this install followed before the
-#: default existed has been settled, so an unsaved one means the default
-#: from now on -- including after someone resets it.
-UPDATE_CHANNEL_SETTLED_MARKER = ".update-channel-settled"
 
 
 def default_update_channel() -> str:
@@ -539,9 +535,6 @@ class AgentState:
         # Whether the file we could not read carried auth keys. Decides
         # whether first-run setup is offered or refused.
         self._lost_passphrase = False
-        # An install from before the channel had a default, that never saved
-        # one, whose first update check has not yet said which it followed.
-        self._channel_settling = False
 
     @property
     def path(self) -> Path:
@@ -578,16 +571,13 @@ class AgentState:
                     spec = RuntimeSpec.model_validate(entry)
                     self._runtimes[spec.name] = spec
                 self._auth = dict(raw.get("auth") or {})
-                self._channel_settling = self._settle_channel_at_load_locked()
+                self._drop_invalid_update_channel_locked()
             else:
                 self._config = _config_defaults()
                 self._components = {}
                 self._runtimes = {}
                 self._auth = {}
                 self._write_locked()
-                # A new install has nothing to keep: it follows the default.
-                self._channel_settling = False
-                self._mark_channel_settled_locked()
 
     def load_or_degrade(self) -> str | None:
         """Load, or come up on defaults and return why.
@@ -631,9 +621,6 @@ class AgentState:
                 self._runtimes = {}
                 self._auth = {}
                 self._degraded_reason = reason
-                # Nothing is known about the channel it followed, and nothing
-                # is written while degraded: decided by the first check.
-                self._channel_settling = not self._channel_marker().exists()
                 self._lost_passphrase = any(m.search(raw_text) for m in _AUTH_MARKERS)
             self._preserve_unreadable()
             log.error(
@@ -689,43 +676,12 @@ class AgentState:
         with self._lock:
             return self._lost_passphrase
 
-    # ----- the update channel's one-time settling (2026-09-30) ---------
-    #
-    # `updateChannel` became a binary choice with a default (`releases`, or
-    # what the environment names), where an unset one used to be inferred
-    # at every check. **No install may change channel because of that.** So
-    # an install whose file never saved one keeps the channel it followed:
-    #
-    # * a container's is its image tag, read here and saved only when it is
-    #   not what the image's default already says;
-    # * a native install's depends on whether its commits are one of the
-    #   recent releases, which only the network can say, so its first update
-    #   check that can read the release list saves it
-    #   (`updates.UpdateChecker`), and until then its channel is `pending`.
-    #
-    # A marker beside the file records that this has happened, so a channel
-    # reset to the default afterwards stays the default. The gateway's
-    # one-time `defaultMaxTokens` clean-up (9d3dcd7) is the same shape.
-
-    def _channel_marker(self) -> Path:
-        return self._path.parent / UPDATE_CHANNEL_SETTLED_MARKER
-
-    def _mark_channel_settled_locked(self) -> None:
-        try:
-            self._channel_marker().write_text(
-                "updateChannel: this install's channel was settled once; see state.py.\n",
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            log.warning("could not record that the update channel was settled: %s", exc)
-
-    def _settle_channel_at_load_locked(self) -> bool:
-        """What can be settled from this machine alone. True: still to do."""
+    def _drop_invalid_update_channel_locked(self) -> None:
+        """An unsaved channel is the default; a saved one that is not a
+        channel is ignored, so the default applies."""
         saved = self._config.get("updateChannel")
         if saved in UPDATE_CHANNELS:
-            if not self._channel_marker().exists():
-                self._mark_channel_settled_locked()
-            return False
+            return
         if saved is not None:
             log.warning(
                 "updateChannel %r in %s is not a channel (edge or releases); it is ignored",
@@ -733,40 +689,6 @@ class AgentState:
                 self._path,
             )
         self._config.pop("updateChannel", None)
-        if self._channel_marker().exists():
-            return False
-        from .updates import container_channel_before_default
-
-        image = os.environ.get("EUGENE_PLEXUS_CONTAINER_IMAGE", "").strip()
-        if image:
-            followed = container_channel_before_default(image).value
-            if followed != default_update_channel():
-                self._config["updateChannel"] = followed
-                self._write_locked()
-                log.warning(
-                    "updateChannel was never saved; this container followed %s, and that "
-                    "is now saved so an update cannot move it to another channel",
-                    followed,
-                )
-            self._mark_channel_settled_locked()
-            return False
-        return True
-
-    def update_channel_settling(self) -> bool:
-        """Whether this install's channel is still to be settled by a check."""
-        with self._lock:
-            return self._channel_settling
-
-    def settle_update_channel(self, channel: str) -> None:
-        """Save the channel an unsettled install followed, once."""
-        with self._lock:
-            if not self._channel_settling:
-                return
-            if self._config.get("updateChannel") not in UPDATE_CHANNELS:
-                self._config["updateChannel"] = channel
-                self._write_locked()
-            self._channel_settling = False
-            self._mark_channel_settled_locked()
 
     # ----- config trio ------------------------------------------------
 
@@ -774,10 +696,8 @@ class AgentState:
         with self._lock:
             doc = dict(self._config)
             if doc.get("updateChannel") not in UPDATE_CHANNELS:
-                # The value in effect: the default, or -- while an old install
-                # waits for its first check to settle it -- no value at all,
-                # which the schema explains rather than a default it may not use.
-                doc["updateChannel"] = None if self._channel_settling else default_update_channel()
+                # The value in effect: the default.
+                doc["updateChannel"] = default_update_channel()
             return ConfigDocument.model_validate(doc)
 
     def apply_config_patch(self, request: ConfigUpdateRequest) -> ConfigUpdateResult:
@@ -798,14 +718,11 @@ class AgentState:
                     continue
                 if key == "updateChannel":
                     # Saved, or back to the default -- which is never
-                    # written, so it follows the environment. Either way the
-                    # person has chosen: nothing is left to settle.
+                    # written, so it follows the environment.
                     if new_value is None:
                         self._config.pop(key, None)
                     else:
                         self._config[key] = new_value
-                    self._channel_settling = False
-                    self._mark_channel_settled_locked()
                 elif new_value is None and field.default is not None:
                     self._config[key] = field.default
                 else:
@@ -827,20 +744,12 @@ class AgentState:
         return ConfigSchema(component="agent", fields=fields, categories=CATEGORY_LABELS)
 
     def _channel_field(self) -> ConfigField:
-        """`updateChannel` with this install's default, and while it is still
-        to be settled, what an unsaved one means until then."""
+        """`updateChannel` with this install's default."""
         field = _CONFIG_FIELDS_BY_KEY["updateChannel"]
         update: dict[str, Any] = {"default": default_update_channel()}
         source = _update_channel_default_source()
         if source is not None:
             update["defaultSource"] = source
-        if self.update_channel_settling():
-            update["unsetMeans"] = (
-                "Not decided yet. This machine was installed before the channel had a "
-                "default, so at its first update check it saves the channel it was "
-                "installed from -- Releases for a release, Edge for anything else -- and "
-                "nothing is offered until then."
-            )
         return field.model_copy(update=update)
 
     def get_config(self, key: str) -> Any:

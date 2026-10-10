@@ -41,8 +41,6 @@ def checker_for(app: FastAPI) -> UpdateChecker:
         found = UpdateChecker(
             setting=state.get_config,
             default_channel=lambda: UpdateChannel(default_update_channel()),
-            settling=state.update_channel_settling,
-            settle=lambda channel: state.settle_update_channel(channel.value),
         )
         app.state.update_checker = found
     return found

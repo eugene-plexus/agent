@@ -236,8 +236,8 @@ def _read_members(source: str) -> tuple[str, ...] | None:
     if lowered.endswith(PREPARED_SUFFIX):
         return _prepared_members(source)
     if lowered.endswith(".json"):
-        # An engine configuration declared directly (before LS3): not a
-        # model this node can copy whole.
+        # An engine's own configuration is not a model a node copies; it is
+        # reached through the provenance file that names it.
         return None
     files = shards_of(source)
     if len(files) > 1 and not all(os.path.isfile(f) for f in files):

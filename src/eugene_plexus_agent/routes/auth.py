@@ -71,7 +71,6 @@ from .._generated.models import (
     ClientKeyLimits,
     ClientKeyList,
     ClientKeyPolicy,
-    ClientKeyRevocations,
     ClientKeyUpdateRequest,
     ServiceTokenRequest,
     ServiceTokenResponse,
@@ -769,35 +768,6 @@ async def client_key_policy(request: Request, response: Response) -> ClientKeyPo
         )
     except OSError as exc:
         raise owner.local_unavailable() from exc
-
-
-@router.get(
-    "/v1/auth/client-keys/revoked",
-    response_model=ClientKeyRevocations,
-    response_model_exclude_none=True,
-    dependencies=[Depends(require_operator_or_gateway)],
-)
-async def list_revoked_client_keys(request: Request) -> ClientKeyRevocations:
-    """What the gateway polls. Ids only, and the revision they are at.
-
-    `require_operator_or_gateway` and not "any service token": a leaked
-    driver or library token learns nothing from here. The same narrowing
-    M6 applied to starting and stopping a runtime, for the same reason
-    -- the set of components that legitimately need a surface is
-    usually one, and "any service" is what makes a leak useful.
-    """
-    owner = registry(request)
-    if owner.enrolled:
-        data = await owner.forward("GET", "/v1/auth/client-keys/policy")
-        return ClientKeyRevocations(
-            ids=[key["id"] for key in data["keys"] if key.get("revokedAt")],
-            revision=data["revision"],
-        )
-    try:
-        ids, revision = _keys(request).revoked()
-    except OSError as exc:
-        raise owner.local_unavailable() from exc
-    return ClientKeyRevocations(ids=ids, revision=revision)
 
 
 @router.delete(

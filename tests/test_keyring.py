@@ -135,7 +135,7 @@ def test_keyring_store_get_handles_garbage_b64(fake_keyring: _FakeKeyring) -> No
     """If something corrupts the keyring entry (or a different program
     writes there), `get_master_key` must return None — never raise,
     never return a half-decoded value."""
-    fake_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = (
+    fake_keyring.store[(keyring_store.SERVICE, keyring_store.username_for(INSTALL))] = (
         "this-is-not-base64-padding-or-anything"
     )
     assert keyring_store.get_master_key(INSTALL) is None
@@ -143,9 +143,9 @@ def test_keyring_store_get_handles_garbage_b64(fake_keyring: _FakeKeyring) -> No
 
 def test_keyring_store_get_handles_wrong_length(fake_keyring: _FakeKeyring) -> None:
     """An entry that base64-decodes but isn't 32 bytes — discard."""
-    fake_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
-        b"\x00" * 16
-    ).decode("ascii")
+    fake_keyring.store[(keyring_store.SERVICE, keyring_store.username_for(INSTALL))] = (
+        base64.b64encode(b"\x00" * 16).decode("ascii")
+    )
     assert keyring_store.get_master_key(INSTALL) is None
 
 
@@ -216,9 +216,11 @@ def test_lifespan_does_not_auto_unlock_when_mode_is_prompt(
     OS store before the operator finishes the wizard."""
     settings, _ = _seed_install(tmp_path, security_mode="prompt_on_startup")
     # Plant a key in the keyring as if it had been left over.
-    isolated_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
-        b"\x77" * 32
-    ).decode("ascii")
+    salt_b64 = yaml.safe_load((tmp_path / "agent.yaml").read_text())["auth"]["masterSalt"]
+    scoped = keyring_store.username_for(keyring_store.install_id_for(salt_b64))
+    isolated_keyring.store[(keyring_store.SERVICE, scoped)] = base64.b64encode(b"\x77" * 32).decode(
+        "ascii"
+    )
 
     fresh_app = create_app(settings=settings)
     fresh_app.state.supervisor = StubSupervisor()
@@ -236,9 +238,9 @@ def test_lifespan_no_auto_unlock_when_no_passphrase_set(
     settings = Settings(config_file=tmp_path / "agent.yaml")
     # Pre-seed a key as if from an earlier install (operator wiped
     # agent.yaml but forgot to clear the keyring).
-    isolated_keyring.store[(keyring_store.SERVICE, keyring_store.USERNAME)] = base64.b64encode(
-        b"\x33" * 32
-    ).decode("ascii")
+    isolated_keyring.store[(keyring_store.SERVICE, keyring_store.username_for(INSTALL))] = (
+        base64.b64encode(b"\x33" * 32).decode("ascii")
+    )
 
     fresh_app = create_app(settings=settings)
     fresh_app.state.supervisor = StubSupervisor()

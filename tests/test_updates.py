@@ -426,25 +426,6 @@ def test_a_commit_whose_date_cannot_be_read_fails_the_check() -> None:
         updates.place(_install(dict(NEW) | {"gateway": SHA["gateway"]}), target, web)
 
 
-def test_the_old_rule_is_kept_only_to_settle_a_channel_once() -> None:
-    releases = updates.recent_releases(_releases_web())
-    assert updates.channel_before_default(_install(SHA), releases) is UpdateChannel.releases
-    unknown = _install({n: "9" * 40 for n in SHA})
-    assert updates.channel_before_default(unknown, releases) is UpdateChannel.edge
-    # A container's own tag says it.
-    tagged = _install(
-        mechanism=InstallMechanism.container,
-        container=ContainerInstall(image="ghcr.io/eugene-plexus/control-plane:v0.1.0-alpha.3"),
-    )
-    assert updates.channel_before_default(tagged, []) is UpdateChannel.releases
-    edge = _install(
-        mechanism=InstallMechanism.container,
-        container=ContainerInstall(image="ghcr.io/eugene-plexus/control-plane:edge"),
-    )
-    assert updates.channel_before_default(edge, []) is UpdateChannel.edge
-    assert not hasattr(updates, "infer_channel")
-
-
 async def test_an_unsaved_channel_is_the_default() -> None:
     checker = updates.UpdateChecker(setting={}.get, get=_releases_web())
     assert checker.channel() == (UpdateChannel.releases, UpdateChannelSource.default)
@@ -452,40 +433,6 @@ async def test_an_unsaved_channel_is_the_default() -> None:
     assert result.channel is UpdateChannel.releases and result.error is None
     edge = updates.UpdateChecker(setting={}.get, default_channel=lambda: UpdateChannel.edge)
     assert edge.channel() == (UpdateChannel.edge, UpdateChannelSource.default)
-
-
-async def test_a_pending_install_saves_the_channel_it_followed_and_checks_it() -> None:
-    saved: list[UpdateChannel] = []
-    web = _releases_web()
-    checker = updates.UpdateChecker(
-        setting={}.get, get=web, settling=lambda: not saved, settle=saved.append
-    )
-    assert checker.channel() == (None, UpdateChannelSource.pending)
-    # On alpha.2 exactly: it followed releases, and that is what is saved.
-    result = await checker.check(_install(SHA))
-    assert saved == [UpdateChannel.releases]
-    assert result.channel is UpdateChannel.releases
-    assert result.source is UpdateChannelSource.setting
-    assert result.newest is not None and result.newest.release == "v0.1.0-alpha.3"
-
-
-async def test_a_pending_install_that_cannot_read_the_releases_follows_nothing() -> None:
-    """It used to fall back to edge -- which is how a release install could
-    be handed an edge build whenever that one request failed."""
-    saved: list[UpdateChannel] = []
-    web = Web({RELEASES_URL: OSError("down")} | _edge_web([_run("CI", SPECS_OK)]).pages)
-    checker = updates.UpdateChecker(
-        setting={}.get, get=web, settling=lambda: not saved, settle=saved.append
-    )
-    result = await checker.check(_install(SHA))
-    assert saved == [] and result.channel is None and result.newest is None
-    assert result.error and "list of releases" in result.error
-    view = checker.view(
-        _install(SHA), apply=update_apply.plan(_install(SHA), None, system_unit_ready=False)
-    )
-    assert view.channel is None and view.channelSource is UpdateChannelSource.pending
-    assert view.available is False
-    assert not any("actions/runs" in url for url in web.asked)
 
 
 async def test_a_result_for_another_channel_is_not_offered() -> None:
@@ -971,10 +918,6 @@ def test_an_install_with_the_tool_driver_is_ahead_of_a_target_from_before_it() -
     target = updates.Target(channel=UpdateChannel.releases, ref="v0", components=BEFORE_P8)
     placed = updates.place(_install(NEW), target, Web({}))
     assert placed.behind == [] and placed.ahead == ["tool-driver"] and not placed.newer
-    # And an install matching every pin the release has was on that release.
-    release = updates.Target(channel=UpdateChannel.releases, ref="v0", components=dict(SHA))
-    release.components.pop("tool-driver")
-    assert updates.channel_before_default(_install(SHA), [release]) is UpdateChannel.releases
 
 
 def test_an_install_without_the_tool_driver_is_behind_a_target_that_pins_it() -> None:

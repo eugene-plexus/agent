@@ -1093,18 +1093,6 @@
             ],
             "title": "Etaseconds"
           },
-          "runWhenReady": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Runwhenready",
-            "description": "The operator asked for this model to be run when it lands.\nRecorded, never acted on here — see `DownloadSpec`. Cleared\nby `POST /v1/downloads/{id}/claim`, so a finished download\nwhose flag is still set is one nobody has picked up yet.\n"
-          },
           "attempts": {
             "anyOf": [
               {
@@ -1370,19 +1358,6 @@
             "title": "Subdirectory",
             "description": "Relative destination under `root`, overriding the configured\nlayout. Path traversal is rejected; the result must stay\ninside the root.\n"
           },
-          "runWhenReady": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Runwhenready",
-            "description": "The operator asked for this model to be **run** when it\nlands, not merely fetched.\n\n**This component records it and never acts on it.** The\nlibrary does not launch anything — a launch is a profile, an\nengine and a runtime on some node's agent, and which node is\na question the library has no business answering. What this\nfield buys is that the *intent* outlives the browser tab\nthat expressed it: a 16 GB download takes long enough that\nthe person will close the laptop lid, and a console opening\nlater can see that a download was started in order to run\nsomething and carry on from there.\n\nExactly one console should carry on, which is what\n`POST /v1/downloads/{id}/claim` is for.\n",
-            "default": false
-          },
           "filename": {
             "anyOf": [
               {
@@ -1607,17 +1582,6 @@
                 "type": "null"
               }
             ]
-          },
-          "downloadId": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Downloadid"
           },
           "preparation": {
             "anyOf": [

@@ -5,8 +5,8 @@ weights/tokenizers/MTP packs stay in the operator's model folder.
 
 Since LS3 a prepared model is a Library model (library-sources-and-engines.md
 §4.5): its path is a provenance file, `<name>.eugene-prepared.json`, whose
-`entry` is Strata's JSON configuration. A runtime declared before LS3 names
-that configuration directly, and still launches.
+`entry` is Strata's JSON configuration. A runtime is declared on that
+provenance file, never on the configuration itself.
 """
 
 from __future__ import annotations
@@ -51,7 +51,6 @@ from .base import (
 from .devices import DeviceSnapshot, DevicesReader
 from .strata_models import (
     PREPARATION,
-    SETUP_CHOICES,
     STRATA_FILES,
     SUPPORTED_MODELS,
     SetupChoice,
@@ -112,11 +111,14 @@ PROVENANCE_VERSION = 1
 
 def prepared_entry(path: Path) -> Path:
     """Strata's configuration for a model path: the provenance file's
-    `entry`, or the path itself when it names a configuration directly
-    (a declaration from before LS3). Read at every launch, so a prepared
-    model re-adopted with a new entry starts from the new one."""
+    `entry`. Read at every launch, so a prepared model re-adopted with a new
+    entry starts from the new one."""
     if not path.name.lower().endswith(PREPARED_SUFFIX):
-        return path
+        raise SpawnPlanError(
+            f"{path} is not a prepared model. Strata runs prepared models from the Library, "
+            f"so declare the runtime on its {PREPARED_SUFFIX} file, not on Strata's "
+            "configuration"
+        )
     where = f"Prepared model {path}"
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -150,8 +152,7 @@ def prepared_entry(path: Path) -> Path:
 
 def choice_of_runtime(path: Path) -> SetupChoice | None:
     """Which of setup's choices a runtime's model is (LS6), for its fit: a
-    provenance file names the file it was made from (`source.file`), and a
-    configuration from before LS3 is setup's own `strata-<tag>.json`. None
+    provenance file names the file it was made from (`source.file`). None
     for a model made outside Eugene that names no source on the list, or a
     file that cannot be read: its fit is then not estimated."""
     name = path.name.lower()
@@ -164,9 +165,6 @@ def choice_of_runtime(path: Path) -> SetupChoice | None:
         file = source.get("file") if isinstance(source, dict) else None
         found = choice_for_file(file) if isinstance(file, str) and file else None
         return found[1] if found else None
-    if name.startswith("strata-") and name.endswith(".json"):
-        tag = name[len("strata-") : -len(".json")]
-        return next((c for c in SETUP_CHOICES.values() if c.tag == tag), None)
     return None
 
 

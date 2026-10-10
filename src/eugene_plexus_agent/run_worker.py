@@ -83,38 +83,14 @@ def could_have_here(engine: dict[str, Any]) -> bool:
 
 
 def eligibility_engine(engine: dict[str, Any]) -> dict[str, Any]:
-    """An engine as `POST /v1/eligibility` takes it. An agent older than
-    `accepts` reported only formats; those are whole rules of their own."""
-    accepts = engine.get("accepts")
-    if accepts is None:
-        accepts = [{"format": f} for f in engine.get("modelFormats") or []]
+    """An engine as `POST /v1/eligibility` takes it."""
     return {
         "engine": engine["engine"],
         "available": bool(engine.get("available")),
         "installable": not engine.get("available") and could_have_here(engine),
         "experimental": bool(engine.get("experimental")),
-        "accepts": accepts,
+        "accepts": engine.get("accepts") or [],
     }
-
-
-def _by_format(model: dict[str, Any], engines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Verdicts as a library older than `/v1/eligibility` allowed: the format,
-    and the one MLX rule. Only for a root whose library lags this agent."""
-    marked = (model.get("safetensors") or {}).get("mlxQuantization") is not None
-    out = []
-    for e in engines:
-        fits = model["format"] in (e.get("modelFormats") or []) and (
-            not marked or e["engine"] == "mlx"
-        )
-        out.append(
-            {
-                "engine": e["engine"],
-                "available": bool(e.get("available")),
-                "verdict": "runs" if fits else "no",
-                "reason": "runs it as it is" if fits else f"does not load {model['format']}",
-            }
-        )
-    return sorted(out, key=lambda v: (not v["available"], v["verdict"] != "runs"))
 
 
 async def judge(
@@ -122,18 +98,11 @@ async def judge(
 ) -> list[dict[str, Any]]:
     """Every engine's verdict on `model`, best first, from the library: the
     one judge (library-sources-and-engines.md, LS1)."""
-    try:
-        answer = await library.operation_request(
-            "POST",
-            "/v1/eligibility",
-            json={"models": [model["id"]], "engines": [eligibility_engine(e) for e in engines]},
-        )
-    except httpx.HTTPStatusError as exc:
-        # 404: a library older than the judge. 422: one older than a value
-        # this agent's engines declare (LS3's `prepared`), which it rejects.
-        if exc.response.status_code not in (404, 422):
-            raise
-        return _by_format(model, engines)
+    answer = await library.operation_request(
+        "POST",
+        "/v1/eligibility",
+        json={"models": [model["id"]], "engines": [eligibility_engine(e) for e in engines]},
+    )
     found = (answer or {}).get("models") or []
     if not found:
         raise ValueError(f"The library no longer knows {model.get('name') or model['id']}.")

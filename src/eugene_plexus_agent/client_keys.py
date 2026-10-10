@@ -178,12 +178,6 @@ class ClientKeyStore:
                 reverse=True,
             )
 
-    def revoked(self, *, now: float | None = None) -> tuple[list[str], int]:
-        with self._lock:
-            return sorted(
-                r.id for r in self.records(now=now) if r.revoked_at is not None
-            ), self._revision
-
     def add(self, record: ClientKeyRecord) -> ClientKeyRecord:
         with self._lock:
             self._check()
