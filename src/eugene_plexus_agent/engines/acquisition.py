@@ -553,17 +553,28 @@ class GitHubReleases:
 
     @staticmethod
     def _fetch(url: str) -> object:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "eugene-plexus-agent",
-            },
-        )
+        request = urllib.request.Request(url, headers=github_api_headers(url))
         with urllib.request.urlopen(
             request, timeout=_METADATA_TIMEOUT_SECONDS, context=egress_ssl_context()
         ) as response:
             return json.loads(response.read().decode("utf-8"))
+
+
+def github_api_headers(url: str) -> dict[str, str]:
+    """The headers for a GitHub API metadata request.
+
+    A `GITHUB_TOKEN` in the environment is sent to api.github.com, and only
+    there: GitHub Actions gives every job one, and without it a shared runner
+    address meets the anonymous limit of 60 requests an hour (specs#23, three
+    red CI runs in one day). A service install never inherits a person's
+    variables, so a person's machine asks as it always has. The token is never
+    logged, and never sent with a download (those go to other hosts).
+    """
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "eugene-plexus-agent"}
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token and urlparse(url).hostname == "api.github.com":
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def _parse_timestamp(value: object) -> datetime | None:
