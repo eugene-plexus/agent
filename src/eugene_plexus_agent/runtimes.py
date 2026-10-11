@@ -38,6 +38,7 @@ from ._generated.models import (
     Runtime,
     RuntimeCapabilities,
     RuntimeLocalPathSource,
+    RuntimeMode,
     RuntimeSpec,
     RuntimeStatus,
     StopReason,
@@ -802,13 +803,25 @@ class RuntimeSupervisor:
         status = self._status_for(sp, readiness, copying=job is not None)
         capabilities: RuntimeCapabilities | None = None
         engine_version: str | None = None
+        adapter = adapter_for(spec.engine)
+        argv = list(sp.last_argv) if sp is not None and sp.last_argv else []
+        # MR3: what this process was started as is in the argv it was launched
+        # with and nowhere else -- `/props` says nothing of it. Read for any
+        # process that has one, `loading` included, so a search model is never
+        # counted idle or evictable in the minutes before it answers.
+        started = adapter.search_flags(argv, spec.env) if adapter is not None and argv else None
+        searching = started is not None and any(started)
         if isinstance(readiness, Ready):
             capabilities = readiness.capabilities
+            if started is not None:
+                embeds, reranks = started
+                capabilities = (capabilities or RuntimeCapabilities()).model_copy(
+                    update={"embeddings": embeds, "reranking": reranks}
+                )
             # CB3: whether the slots share their context is in the argv
             # this process was launched with, not in anything it reports.
-            adapter = adapter_for(spec.engine)
-            if capabilities is not None and adapter is not None and sp is not None and sp.last_argv:
-                pool = adapter.context_pool(capabilities, list(sp.last_argv), spec.env)
+            if capabilities is not None and adapter is not None and argv:
+                pool = adapter.context_pool(capabilities, argv, spec.env)
                 if pool is not None:
                     capabilities = capabilities.model_copy(update={"contextPoolTokens": pool})
         if planner is not None and planner.binary is not None:
@@ -893,12 +906,16 @@ class RuntimeSupervisor:
                 else None
             ),
             modelAlias=spec.modelAlias or _default_alias(spec),
+            mode=spec.mode,
             host=spec.host,
             port=spec.port,
             autoStart=spec.autoStart,
             autoDriver=spec.autoDriver,
-            idleUnloadSeconds=spec.idleUnloadSeconds,
-            startOnDemand=spec.startOnDemand,
+            # What is in effect, which is what the gateway reads: a search model
+            # that is running is never unloaded for being idle or started on
+            # demand, whatever the declaration says (`RuntimeSpec.mode`).
+            idleUnloadSeconds=None if searching else spec.idleUnloadSeconds,
+            startOnDemand=None if searching else spec.startOnDemand,
             flags=spec.flags,
             extraArgs=spec.extraArgs,
             env=spec.env,
@@ -1385,6 +1402,12 @@ def validate_spec(spec: RuntimeSpec, get_config: ConfigGetter | None = None) -> 
         return (
             f"kev.serve binds 127.0.0.1 only (upstream has no --host flag), so host "
             f"{spec.host!r} cannot be honoured. Reach it through the gateway instead."
+        )
+    mode = RuntimeMode(spec.mode) if spec.mode else RuntimeMode.auto
+    if not adapter.accepts_mode(mode):
+        return (
+            f"{spec.engine.value} cannot start a model as {mode.value!r}: only llama.cpp starts "
+            f"a model as a search model (an embedding or reranking model). Use mode auto or chat."
         )
     if spec.flags:
         unknown = adapter.validate_flags(spec.flags)

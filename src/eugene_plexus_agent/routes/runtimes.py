@@ -65,6 +65,7 @@ from ..dependencies import (
     require_operator_or_service,
     require_operator_session,
 )
+from ..engines import run_mode
 from ..engines.acquisition import AcquisitionError, Unavailable, engine_root
 from ..engines.base import EngineUnavailableError
 from ..engines.devices import detect_devices
@@ -303,6 +304,53 @@ def require_library_folder(request: RuntimeContext, model_path: str) -> None:
         )
 
 
+def launch_view(request: RuntimeContext, spec: RuntimeSpec) -> RuntimeSpec:
+    """The spec as the engine will really be started (MR3), for admission to measure.
+
+    A search model with no `contextSize` is not started with the model's own
+    context: the agent gives it 4,096 shared by four requests, and a launch is
+    measured and reserved at what it will take. Left as declared, an embedder
+    would be sized at the model's full context (32,768 for Qwen3-Embedding, 3.5
+    GiB of cache) and, on a build whose fit is on, would have the whole card
+    promised to it while it loads. Every other spec comes back as it was.
+    """
+    if spec.engine is not EngineKind.llama_cpp:
+        return spec
+    if not run_mode.resolve(spec.mode, _opened_path(request, spec)).search:
+        return spec
+    return spec.model_copy(
+        update={"flags": run_mode.with_search_defaults(spec.flags, spec.env, spec.extraArgs)}
+    )
+
+
+def _opened_path(request: RuntimeContext, spec: RuntimeSpec) -> str:
+    """The file this host would open for `spec`: the Library folder's mounts, then this
+    node's own copy, exactly as the launch resolves it."""
+    supervisor = _supervisor(request)
+    settings = (
+        supervisor.copy_settings()
+        if supervisor is not None
+        else model_copies.CopySettings(enabled=False, directory=None, min_free_bytes=0)
+    )
+    return str(
+        model_copies.resolve_local_path(spec.modelPath, effective_rules_for(request), settings).path
+    )
+
+
+def started_as(request: RuntimeContext, spec: RuntimeSpec) -> tuple[bool, bool] | None:
+    """`(embeddings, reranking)` this declaration would start its engine as (MR3).
+
+    What a companion driver has to be asked about again when it changes: the
+    driver learns whether its engine embeds by trying it, and keeps the answer,
+    so a runtime started again as something else would be listed as what it was.
+    None for an engine that has no such notion.
+    """
+    if spec.engine is not EngineKind.llama_cpp:
+        return None
+    launch = run_mode.resolve(spec.mode, _opened_path(request, spec))
+    return run_mode.started_as([*launch.argv(), *(spec.extraArgs or [])], spec.env)
+
+
 def _ledger(request: RuntimeContext) -> ReservationLedger:
     """This node's record of memory promised to launches in flight.
 
@@ -342,6 +390,8 @@ def _reserve(
     """
     if admission is None or not admission.requiredBytes:
         return
+    # What admission measured, which for a search model is what it will take.
+    spec = launch_view(request, spec)
     size = reservation_bytes(spec, admission, engine_places=engine_places)
     _ledger(request).reserve(
         spec.name,
@@ -382,10 +432,19 @@ async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[A
     folders_unread = None if consulted or cache is None else cache.failure
     detector = getattr(request.app.state, "device_detector", None) or detect_devices
     snapshot = await asyncio.to_thread(detector)
-    observed = [(other, _compose(other, supervisor).status) for other in state.list_runtime_specs()]
+    # Measured at what the engine will be started with (MR3): a search model's
+    # flags, not the model's own context.
+    spec = await asyncio.to_thread(launch_view, request, spec)
+    views = [(other, _compose(other, supervisor)) for other in state.list_runtime_specs()]
+    observed = [(other, view.status) for other, view in views]
     running = [
-        RunningRuntime(spec=other, status=status)
-        for other, status in observed
+        # Evictable only if it can be unloaded: a running search model reports no
+        # idle timeout, so the gateway never stops it to make room.
+        RunningRuntime(
+            spec=other.model_copy(update={"idleUnloadSeconds": view.idleUnloadSeconds}),
+            status=view.status,
+        )
+        for other, view in views
         if other.name != spec.name
     ]
     # Read is where the ledger is reconciled: a reservation stands only
@@ -861,6 +920,9 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     previous = state.get_runtime_spec(name)
     if previous is None:
         raise _not_found(name)
+    # Read before the change is written, from the same file, so the two are
+    # comparable: what the engine was being started as, and what it will be.
+    was = await asyncio.to_thread(started_as, request, previous)
     try:
         updated = state.update_runtime(name, body)
     except KeyError as e:
@@ -887,6 +949,7 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     ):
         await remove_companion(state, components, previous.name)
     if updated.autoDriver is not False:
+        driver_before = state.get_topology_entry(companion_name(updated.name))
         try:
             await ensure_companion(state, components, updated)
         except CompanionConflict as e:
@@ -896,6 +959,19 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
                 title="Companion driver name already in use",
                 detail=str(e),
             ) from e
+        # A runtime that will start as something else gets a driver that asks
+        # again: the one it has learned, by trying, what the engine was
+        # (`started_as`) and would go on saying it.
+        if (
+            driver_before is not None
+            and components is not None
+            and was != await asyncio.to_thread(started_as, request, updated)
+        ):
+            log.info(
+                "runtime %s will start as something else; restarting its driver to ask again",
+                updated.name,
+            )
+            await components.restart(companion_name(updated.name))
 
     # Every field on a RuntimeSpec is baked into the argv at spawn time —
     # there is no way to re-flag a live llama-server — so any change

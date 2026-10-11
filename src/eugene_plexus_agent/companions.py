@@ -12,7 +12,12 @@ agent also declares a component named `<runtime>-driver`, kind
     modelId: <alias>
 
 and keeps the two together — the driver is removed with the runtime,
-renamed with it, and re-targeted when the alias changes.
+renamed with it, and re-targeted when the alias changes. It is also
+restarted when the runtime is edited to start as something else (MR3:
+an embedder that becomes chat, or the other way round): the driver learns
+by trying whether its engine embeds, and keeps the answer for its life,
+so one that was told "yes" would go on listing a chat model as an
+embedder (`routes/runtimes.py`, `update_runtime`).
 
 Decided over a declared pool (2026-09-10): one driver per backend is the
 rule the contract has stated since M0, a runtime is a backend, and a

@@ -30,11 +30,12 @@ from .._generated.models import (
     ModelRequirementAuthority,
     Os,
     RuntimeCapabilities,
+    RuntimeMode,
     RuntimeSpec,
     Secondary,
 )
 from ..child_env import child_environment
-from . import gpu_probe, llama_architectures
+from . import gpu_probe, llama_architectures, run_mode
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -60,6 +61,13 @@ log = logging.getLogger(__name__)
 # The alias helper moved to `base` when a second engine needed it; kept
 # importable from here so existing callers and tests do not have to move.
 __all__ = ["LlamaCppAdapter", "default_model_alias"]
+
+#: How the start-up line names what a model was started as.
+_TASK_WORDS = {
+    run_mode.Task.chat: "chat",
+    run_mode.Task.embedding: "an embedding model",
+    run_mode.Task.reranking: "a reranker",
+}
 
 # `llama-server --version` writes to stderr, and upstream changed the
 # format mid-2026:
@@ -451,6 +459,20 @@ class LlamaCppAdapter(EngineAdapter):
         argv += ["--alias", alias]
 
         flags = spec.flags or {}
+        # What the model is for (MR3). A chat model resolves to a task that adds
+        # nothing, so its command line is exactly what it was before this existed;
+        # an embedder or reranker is started the way llama-server needs, under the
+        # operator's own settings and above their `extraArgs`.
+        launch = run_mode.resolve(spec.mode, spec.modelPath)
+        if launch.search:
+            flags = run_mode.with_search_defaults(flags, spec.env, spec.extraArgs)
+            log.info("runtime %s starts as %s: %s", spec.name, _TASK_WORDS[launch.task], launch.why)
+            if spec.idleUnloadSeconds or spec.startOnDemand:
+                log.warning(
+                    "runtime %s is a search model, so its idleUnloadSeconds and startOnDemand "
+                    "are not acted on: the embeddings door never wakes a stopped runtime",
+                    spec.name,
+                )
         for field in self.flag_schema().fields:
             if field.key in _LOAD_MODE_KEYS:
                 # Not a presence-only switch any more; handled together
@@ -481,11 +503,21 @@ class LlamaCppAdapter(EngineAdapter):
 
         argv += _load_mode_argv(flags, binary.path)
 
+        argv += launch.argv()
+
         # Verbatim, last, so an operator can always override something the
         # curated surface generated above.
         if spec.extraArgs:
             argv += list(spec.extraArgs)
         return argv
+
+    def accepts_mode(self, mode: RuntimeMode) -> bool:
+        """llama.cpp is the one engine that starts a model as a search model."""
+        return True
+
+    def search_flags(self, argv: list[str], env: dict[str, str] | None) -> tuple[bool, bool] | None:
+        """`(embeddings, reranking)` for the command line this runtime was started with."""
+        return run_mode.started_as(argv, env)
 
     # --- observing --------------------------------------------------------
 
@@ -903,7 +935,9 @@ _FLAG_FIELDS: list[ConfigField] = [
             "clamps anything larger than the model or than available "
             "memory. A runtime reports back the window one slot gets, "
             "which is this value divided by the slot count — not a sign "
-            "it ran short of memory."
+            "it ran short of memory. A search model (an embedding or "
+            "reranking model) left unset starts with 4,096 instead, "
+            "shared by its 4 slots."
         ),
         category="memory",
         valueType=ConfigValueType.integer,
@@ -936,7 +970,10 @@ _FLAG_FIELDS: list[ConfigField] = [
             "as before. Left unset, llama.cpp runs 4 slots that share one "
             "pool of the whole context instead: a request alone can use "
             "all of it, and requests running at once share it. This is "
-            "also the unit of capacity the gateway divides work across."
+            "also the unit of capacity the gateway divides work across. A "
+            "search model (an embedding or reranking model) left unset "
+            "starts with 4 slots over 4,096 tokens, so one input may "
+            "hold 1,024."
         ),
         category="performance",
         valueType=ConfigValueType.integer,
@@ -956,7 +993,8 @@ _FLAG_FIELDS: list[ConfigField] = [
         label="Batch size",
         description=(
             "Logical batch size for prompt processing. Larger speeds up "
-            "long prompts at the cost of memory during the prefill."
+            "long prompts at the cost of memory during the prefill. A "
+            "search model left unset starts with 2,048."
         ),
         category="performance",
         valueType=ConfigValueType.integer,
@@ -968,7 +1006,9 @@ _FLAG_FIELDS: list[ConfigField] = [
         label="Micro-batch size",
         description=(
             "Physical batch size actually handed to the GPU at once. Only "
-            "worth touching if you are tuning prefill throughput."
+            "worth touching if you are tuning prefill throughput. A search "
+            "model left unset starts with 2,048: one that is not causal "
+            "cannot embed an input longer than this."
         ),
         category="performance",
         valueType=ConfigValueType.integer,

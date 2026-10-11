@@ -41,6 +41,7 @@ from .._generated.models import (
     Policy,
     PythonEngine,
     RuntimeCapabilities,
+    RuntimeMode,
     RuntimeSpec,
     SupportedModel,
 )
@@ -562,6 +563,27 @@ class EngineAdapter(abc.ABC):
         flight outgrow it together; the gateway budgets against this.
         None is the honest default: an engine that does not say, or one
         whose slots each have their own context.
+        """
+        return None
+
+    def accepts_mode(self, mode: RuntimeMode) -> bool:
+        """Whether this engine can start a model as `mode` (MR3).
+
+        Every engine starts a chat model, and `auto` is "whatever the file is":
+        for an engine that cannot start a search model that is chat. Only an
+        adapter that really adds the flags for an embedder or a reranker says yes
+        to the rest, so a declaration for another engine is refused rather than
+        started one way and reported another.
+        """
+        return mode in (RuntimeMode.auto, RuntimeMode.chat)
+
+    def search_flags(self, argv: list[str], env: dict[str, str] | None) -> tuple[bool, bool] | None:
+        """`(embeddings, reranking)` for the command line this runtime was started with.
+
+        None for an engine that has no such notion, which leaves
+        `RuntimeCapabilities.embeddings` as the engine reported it. The truth
+        comes off the argv because that is the only record: llama-server's
+        `/props` says nothing of its task (MR3).
         """
         return None
 

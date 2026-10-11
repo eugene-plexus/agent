@@ -58,6 +58,34 @@ async def test_a_name_collision_never_adopts_different_settings(authed_client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("chosen", ["chat", "embedding", "reranking"])
+async def test_a_changed_mode_is_never_adopted_by_a_run(authed_client, chosen):
+    """The console says "Runs as: ..." from the profile; a run that met a runtime
+    already declared under the other mode would start it as it was and say nothing
+    (MR3). It is refused the way a changed flag is."""
+    actions = NodeActions(authed_client.app)
+    await actions.launch(MODEL, PROFILE, start=False)
+    with pytest.raises(ValueError, match="different mode"):
+        await actions.launch(MODEL, {**PROFILE, "mode": chosen}, start=True)
+    # And it was not started.
+    [spec] = authed_client.app.state.agent_state.list_runtime_specs()
+    assert spec.mode is not None and spec.mode.value == "auto"
+
+
+@pytest.mark.asyncio
+async def test_a_runtime_declared_before_modes_existed_is_the_same_declaration_as_auto(
+    authed_client, stub_runtime_supervisor
+):
+    """Every runtime that exists says no mode, and a profile that says none is
+    run as `auto`: replaying one over the other is a replay, not a change."""
+    state = authed_client.app.state.agent_state
+    state.add_runtime(runtime_spec(MODEL, PROFILE, start=False).model_copy(update={"mode": None}))
+    for profile in (PROFILE, {**PROFILE, "mode": "auto"}):
+        await NodeActions(authed_client.app).launch(MODEL, profile, start=True)
+    assert stub_runtime_supervisor.is_running("example-8b")
+
+
+@pytest.mark.asyncio
 async def test_replay_repairs_a_declaration_missing_its_companion(authed_client):
     state = authed_client.app.state.agent_state
     state.add_runtime(runtime_spec(MODEL, PROFILE, start=False))

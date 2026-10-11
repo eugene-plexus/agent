@@ -22,7 +22,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException
 
-from ._generated.models import EngineKind, RuntimeSpec
+from ._generated.models import EngineKind, RuntimeMode, RuntimeSpec
 from .admission import LibraryFitClient
 from .engines import adapter_for
 from .engines.acquisition import engine_root
@@ -38,6 +38,17 @@ from .runtimes import _configured_binary, describe_engines, installer_for
 log = logging.getLogger(__name__)
 
 
+def _declared(spec: RuntimeSpec, key: str) -> Any:
+    """What a declaration says for `key`, for comparing two of them.
+
+    A `mode` nobody wrote is `auto`: every runtime declared before MR3 says
+    nothing, and a profile that says nothing is run as `auto`, so the two are
+    the same declaration and replaying one must not be refused as a change.
+    """
+    value = getattr(spec, key)
+    return (value or RuntimeMode.auto) if key == "mode" else value
+
+
 def runtime_spec(model: dict[str, Any], profile: dict[str, Any], *, start: bool) -> RuntimeSpec:
     base = re.sub("[^a-z0-9]+", "-", model["name"].lower()).strip("-") or "model"
     suffix = (
@@ -48,6 +59,9 @@ def runtime_spec(model: dict[str, Any], profile: dict[str, Any], *, start: bool)
             "name": (base + suffix)[:60].rstrip("-"),
             "engine": profile["engine"],
             "modelPath": model["path"],
+            # Copied like every other launch field (MR3): the profile's say about
+            # what the model is, or `auto`, which reads the file's header.
+            "mode": profile.get("mode") or "auto",
             "flags": profile.get("flags") or {},
             "extraArgs": profile.get("extraArgs") or [],
             "env": profile.get("env") or {},
@@ -309,6 +323,12 @@ class NodeActions:
             # carrying `contextSize` is refused at launch: it then takes the
             # model's own, which admission measures by its share (LS6).
             return None
+        capabilities = model.get("capabilities") or {}
+        if capabilities.get("embedding") or capabilities.get("rerank"):
+            # A search model is not sized to the card (MR3): it starts with its own
+            # 4,096-token window, and the largest context that fits would be a
+            # curated flag that beat it -- a gigabyte of cache nobody asked for.
+            return None
         spec = RuntimeSpec.model_validate(
             {
                 "name": "context-probe",
@@ -374,8 +394,8 @@ class NodeActions:
             if existing is None:
                 result = await actions.declare_runtime(context, spec)
             else:
-                for key in ("engine", "modelPath", "flags", "extraArgs", "env"):
-                    if getattr(existing, key) != getattr(spec, key):
+                for key in ("engine", "modelPath", "mode", "flags", "extraArgs", "env"):
+                    if _declared(existing, key) != _declared(spec, key):
                         raise ValueError(
                             f"Runtime {spec.name!r} already exists with different {key}; "
                             "rename or edit it on Inference"

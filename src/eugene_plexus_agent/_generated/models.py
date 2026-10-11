@@ -2812,6 +2812,50 @@ class RuntimeProfile(BaseModel):
     )
 
 
+class RuntimeMode(StrEnum):
+    """
+    What an engine is started to do with its model. A *search model*
+    is one that answers `POST /v1/embeddings` (`embedding`) or scores
+    passages against a question (`reranking`); everything else chats.
+    A runtime that does not say is `auto`.
+
+    * `auto` — the agent decides from the file's own header, read
+      when it launches the runtime. A pooling type of 4 (`rank`), or
+      classifier output labels, is `reranking`; any other pooling
+      type, or attention that is not causal, is `embedding`;
+      anything else is `chat`. A file whose header cannot be read is
+      `chat`, as it was before this field existed.
+    * `chat` — text generation, whatever the header says. The
+      command line is exactly the one a chat model had before this
+      field existed: nothing is added to it.
+    * `embedding` — llama.cpp gets `--embeddings`, and `--pooling`
+      only when the header names none (`mean` for a model that is not
+      causal, `last` for one that is). Unless the declaration's
+      `flags` set them, it also gets a 4,096-token context shared by
+      four requests (`contextSize`, `parallelSlots`), so one input may
+      hold 1,024 tokens, and 2,048-token batches (`batchSize`,
+      `ubatchSize`): a model that is not causal embeds no more tokens
+      at once than one physical batch holds, and llama-server
+      refuses a longer input. `extraArgs` still come last.
+    * `reranking` — llama.cpp gets `--reranking` (it sets the
+      pooling itself) and the same four defaults.
+
+    **Measured on b10948 and b11552 (2026-10-11):** a model started
+    without these flags answers neither `POST /v1/embeddings` (501)
+    nor, for an encoder, chat (500), and the gateway listed it as a
+    chat model. With `--embeddings` an encoder answers embeddings and
+    chat is a 500; a causal embedder such as Qwen3-Embedding still
+    produces chat text, which is meaningless. The gateway lists a
+    runtime by what its driver finds it answers, not by this field.
+
+    """
+
+    auto = 'auto'
+    chat = 'chat'
+    embedding = 'embedding'
+    reranking = 'reranking'
+
+
 class Source(StrEnum):
     """
     Which counter answered. On the wire so that "this host cannot
@@ -3074,7 +3118,12 @@ class RuntimeCapabilities(BaseModel):
         ge=1,
     )
     embeddings: bool | None = Field(
-        None, description='Whether this runtime was started in embedding mode.'
+        None,
+        description='Whether this runtime was started as an embedding model: it\nanswers `POST /v1/embeddings`. For llama.cpp it is set from\nthe command line the agent launched the engine with\n(`--embeddings`, or `LLAMA_ARG_EMBEDDINGS`), however the\nruntime came to carry it (`mode`, or `extraArgs`), so it is\n`false` for a chat model and for a reranker, and never a\nguess from the declaration. It is not read back from the\nengine because the engine has nothing to read: `/props` and\n`/v1/models` carry no pooling or embedding field (b11552).\nAbsent for an engine that does not report it.\n',
+    )
+    reranking: bool | None = Field(
+        None,
+        description='Whether this runtime was started to rerank: it answers\n`POST /rerank` (`--reranking`, or `LLAMA_ARG_RERANKING`),\non the same basis as `embeddings`. A reranking runtime also\nanswers `POST /v1/embeddings`, with zeros and gaps where\nnumbers should be (measured on b11552), so `embeddings` is\n`false` for it. Absent for an engine that does not report\nit.\n',
     )
     vision: bool | None = Field(
         None, description='Whether the loaded runtime explicitly reports image input.'
@@ -4086,6 +4135,10 @@ class RuntimeSpec(BaseModel):
         None,
         description="The model id this runtime serves under, and therefore what a\nclient asks the gateway for. Defaults to the model\nfilename with its extension stripped — plainly-named files\nmean the obvious name is already the right one, so this is\nan override, not a requirement.\n\n**The resolved value is always passed to the engine\nexplicitly, never left to the engine's own default.** vLLM's\ndefault served name is the `--model` argument verbatim, and\nwe launch models by absolute path because the user's files\nstay theirs — so leaving it unset would publish\n`/home/you/models/Qwen3-8B` as an OpenAI model id. That\nleaks the operator's directory layout to every API client\nand, worse, makes the routing key differ per host for the\nsame model, which breaks both multi-host placement and any\nfailover priority list that names a model. llama.cpp derives\nits default from the filename and would have been fine,\nwhich is exactly why this was invisible until a second\nengine existed.\n",
     )
+    mode: RuntimeMode | None = Field(
+        None,
+        description="What the engine is started to do with this model. Absent is\n`auto`: the agent reads the file's own header when it launches\nthe runtime and decides (see `RuntimeMode`).\n\n**A runtime has to say, because the engine will not guess.**\n`llama-server` embeds or reranks only when it is told to at\nlaunch, and a model started the other way does neither: an\nembedding GGUF started as chat answers `POST /v1/embeddings`\nwith a 501 and chat with a 500 (measured on b10948 and b11552,\n2026-10-11), and it was listed as a chat model.\n\n**A search model is meant to stay up.** For `embedding` and\n`reranking` the gateway never unloads the runtime for being\nidle and never starts it on demand (its embeddings door does\nnot wake a stopped runtime), so `idleUnloadSeconds` and\n`startOnDemand` are not acted on, and `Runtime` reports them\nabsent. It starts with the agent like any runtime: `autoStart`\nis true unless the declaration says not.\n\nOnly llama.cpp acts on `embedding` and `reranking`. Any other\nengine accepts `auto` and `chat` and refuses the rest with a\n400: starting vLLM, MLX or Strata one way and reporting\nanother is the lie this field exists to end.\n",
+    )
     host: str | None = Field(
         '127.0.0.1',
         description="Address the engine binds. Defaults to loopback: an engine\nhas no auth of its own, so it must not be exposed directly.\nReaching a model from another machine is the gateway's job,\nand the gateway has auth.\n",
@@ -4106,12 +4159,12 @@ class RuntimeSpec(BaseModel):
     )
     idleUnloadSeconds: int | None = Field(
         None,
-        description="Stop the engine after this many seconds with no request for\nits model through the gateway, releasing its GPU memory.\nAbsent or 0 means never, which is every existing\ndeclaration's behaviour unchanged.\n\n**The gateway decides; this agent executes.** Only the\ngateway sees demand, so it tracks the last request per\nruntime and calls `POST .../stop` with `reason: idle` when\nthis expires. A runtime with a request in flight is never\nstopped. Setting this also **opts the runtime into\neviction**: when a `startOnDemand` model will not fit, the\ngateway may stop the most-idle runtimes that carry a timeout\nto make room. A model that must stay resident sets none.\n",
+        description="Stop the engine after this many seconds with no request for\nits model through the gateway, releasing its GPU memory.\nAbsent or 0 means never, which is every existing\ndeclaration's behaviour unchanged.\n\n**The gateway decides; this agent executes.** Only the\ngateway sees demand, so it tracks the last request per\nruntime and calls `POST .../stop` with `reason: idle` when\nthis expires. A runtime with a request in flight is never\nstopped. Setting this also **opts the runtime into\neviction**: when a `startOnDemand` model will not fit, the\ngateway may stop the most-idle runtimes that carry a timeout\nto make room. A model that must stay resident sets none.\n\n**Never for a search model** (`mode`): the embeddings door\ndoes not wake a stopped runtime, so an unloaded embedder\nwould simply stop answering. The agent reports this field\nabsent on a running one, whatever was declared, so the\ngateway neither unloads it nor counts it evictable.\n",
         ge=0,
     )
     startOnDemand: bool | None = Field(
         False,
-        description="Start this runtime when a request arrives for its model and\nit is `stopped`. The gateway calls `POST .../start`, waits\nfor `ready` (bounded by its `swapWaitSeconds`), and serves\nthe request; the response says it did (`swapped_in`). With\n`autoStart: false` and `idleUnloadSeconds` set, this is\nllama-swap's model: declare five, load none, serve whichever\nis asked for, unload it when it goes quiet — several at\nonce when they fit.\n\nFalse by default so that a hand-pressed Stop stays stopped.\n",
+        description="Start this runtime when a request arrives for its model and\nit is `stopped`. The gateway calls `POST .../start`, waits\nfor `ready` (bounded by its `swapWaitSeconds`), and serves\nthe request; the response says it did (`swapped_in`). With\n`autoStart: false` and `idleUnloadSeconds` set, this is\nllama-swap's model: declare five, load none, serve whichever\nis asked for, unload it when it goes quiet — several at\nonce when they fit.\n\nFalse by default so that a hand-pressed Stop stays stopped.\nChat doors only: a search model (`mode`) is never started on\ndemand.\n",
     )
     flags: dict[str, Any] | None = Field(
         None,
@@ -4165,14 +4218,24 @@ class Runtime(BaseModel):
         None,
         description='Resolved alias — the declared value, or the derived filename.',
     )
+    mode: RuntimeMode | None = Field(
+        None,
+        description='As declared (`RuntimeSpec.mode`). `auto` is what was asked,\nnot what the file turned out to be: `capabilities.embeddings`\nand `capabilities.reranking` say what is running.\n',
+    )
     host: str | None = None
     port: int | None = Field(
         None, description='Resolved port, including one assigned by the agent.'
     )
     autoStart: bool | None = None
     autoDriver: bool | None = None
-    idleUnloadSeconds: int | None = None
-    startOnDemand: bool | None = None
+    idleUnloadSeconds: int | None = Field(
+        None,
+        description='What is in effect, which is what the gateway reads: the\ndeclared value, or absent for a running search model\n(`RuntimeSpec.mode`), which is never unloaded for being idle.\n',
+    )
+    startOnDemand: bool | None = Field(
+        None,
+        description='What is in effect: the declared value, or absent for a\nrunning search model, which is never started on demand.\n',
+    )
     flags: dict[str, Any] | None = None
     extraArgs: list[str] | None = None
     env: dict[str, str] | None = None
