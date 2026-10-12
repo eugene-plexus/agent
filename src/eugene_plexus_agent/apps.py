@@ -874,10 +874,14 @@ class _AppPlanner:
         app_url: Callable[[], str | None] = lambda: None,
         public_origin: str | None = None,
         oidc_backchannel: str | None = None,
+        gateway_detail: Callable[[], str | None] = lambda: None,
     ) -> None:
         self.record = record
         self._store = store
         self._gateway_url = gateway_url
+        #: Why there is no gateway address, when the agent knows: said when an app
+        #: that names `{gatewayUrl}` is not started for want of one.
+        self._gateway_detail = gateway_detail
         self._bind_host = bind_host
         self._oidc_issuer = oidc_issuer
         self._app_url = app_url
@@ -976,6 +980,10 @@ class _AppPlanner:
         }
 
     def _unfillable(self, exc: Exception) -> SpawnPlanError:
+        if isinstance(exc, app_launcher.GatewayUnknown):
+            # The launcher's own words, whichever way the app runs. They say "this
+            # app", and they are shown on the app's own card: no name before them.
+            return SpawnPlanError(str(exc))
         return SpawnPlanError(f"could not fill in how {self.record.id} starts: {exc}")
 
     def _planned(
@@ -994,7 +1002,9 @@ class _AppPlanner:
         launcher reads those from files, inside that account (C4). Nor does
         it carry `{embeddingModel}` or `{rerankModel}`: a model that runs
         when this is written may not when the app starts, so the launcher
-        asks the gateway at every start (MR6)."""
+        asks the gateway at every start (MR6). With no gateway address it
+        carries why there is none (`gatewayDetail`), for the words of the
+        refusal when the app names `{gatewayUrl}`."""
         manifest = self.record.manifest
         values: dict[str, str] = {
             "bindHost": self._bind_host() or "127.0.0.1",
@@ -1011,12 +1021,18 @@ class _AppPlanner:
         if manifest.signIn and client_id and issuer:
             values["oidcIssuer"] = issuer
             values["oidcClientId"] = client_id
-        return {
+        spec: dict[str, Any] = {
             "args": [a.root for a in manifest.args or []],
             "environment": dict(manifest.environment or {}),
             "values": values,
             "resetOnConnectionChange": manifest.resetOnConnectionChange,
         }
+        # No address, and the agent's own words for why: an app that names
+        # `{gatewayUrl}` is not started without one, and says so with them.
+        detail = None if gateway else self._gateway_detail()
+        if detail:
+            spec["gatewayDetail"] = detail
+        return spec
 
     def base_plan(self) -> SpawnPlan:
         """What every start of this app has, before its manifest's `args`
@@ -1506,6 +1522,7 @@ class AppManager:
             record,
             store=self.store,
             gateway_url=lambda: self._gateway.get(record.id),
+            gateway_detail=lambda: self._detail.get(record.id),
             bind_host=(lambda: "127.0.0.1") if record.id in SITE_HOST_IDS else self._bind_host,
             oidc_issuer=self._oidc_issuer,
             app_url=lambda: self.app_url(record.id),

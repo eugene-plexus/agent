@@ -550,6 +550,22 @@ def _unset_model(name: str, outside: list[str]) -> str:
     )
 
 
+class GatewayUnknown(ValueError):
+    """A manifest names `{gatewayUrl}` and this start has no gateway address to
+    give it. The message says why the app is not started: the agent's own words
+    for why there is none, when it has them, and what the app would do instead."""
+
+
+def _no_gateway(why: object) -> str:
+    cause = " ".join(str(why).split())[:300].rstrip(".") if why else ""
+    return (
+        f"{{gatewayUrl}} has no value at this start{f' ({cause})' if cause else ''}, and this "
+        "app names it, so it is not started: an app that is not given the gateway's address "
+        "uses its own default, and Open WebUI's is OpenAI's, so its documents and speech "
+        "would go there."
+    )
+
+
 def _stopped_model(name: str, model: str) -> str:
     """The note for a model that is the answer though it is not running now."""
     word = _MODEL_WORDS[name]
@@ -569,9 +585,16 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
     placeholder is filled in from `spec["values"]` (what the agent may
     write down), `spec["dataDir"]`, and the secrets read here from the
     files the spec names. A variable whose placeholder has no value this
-    start -- no gateway found, no sign-in client -- is left unset rather
+    start -- no sign-in client, no search model -- is left unset rather
     than set to half a value, and the returned lines say so; an argument
     gets an empty string, so the arguments after it keep their places.
+
+    **`{gatewayUrl}` is the one that is not left unset**: a manifest that
+    names it is not started without it (`GatewayUnknown`, raised before
+    anything is read or written). An app that is not given the gateway's
+    address uses its own default for each address it takes, and Open WebUI's
+    is OpenAI's: its documents and speech would go there. Both ways an app
+    runs meet it as a `ValueError` and refuse the start, naming why.
 
     `{embeddingModel}` and `{rerankModel}` are asked of the gateway, once,
     and only by a manifest that names one (`ask_gateway_for_models`). A
@@ -599,6 +622,8 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
     environment = {str(k): str(v) for k, v in (spec.get("environment") or {}).items()}
     reset = spec.get("resetOnConnectionChange")
     wanted = {n for text in [*args, *environment.values()] for n in placeholders(text)}
+    if "gatewayUrl" in wanted and not values.get("gatewayUrl"):
+        raise GatewayUnknown(_no_gateway(spec.get("gatewayDetail")))
     models = [name for name in MODEL_SURFACES if name in wanted]
 
     key = _secret(spec.get("keyFile")) if "clientKey" in wanted or reset or models else None

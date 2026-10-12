@@ -65,6 +65,12 @@ router = APIRouter(tags=["apps"], dependencies=[Depends(require_operator_session
 
 _APP_CALL_TIMEOUT = 10.0
 
+#: The limits an app's key is minted with, beside `writeLogs` (MR6, specs
+#: `agent.yaml`, `POST /v1/apps/{id}/install`): 8 requests at once and 600 a
+#: minute, where one person's client key has 2 and 60.
+APP_KEY_CONCURRENT = 8
+APP_KEY_PER_MINUTE = 600
+
 
 def _problem(code: int, title: str, detail: str) -> HTTPException:
     return HTTPException(
@@ -363,7 +369,20 @@ async def _ensure_key(request: Request, manager: AppManager, app_id: str) -> Non
         request,
         # writeLogs: the launcher that runs an app in its own account sends
         # what the app prints to POST /v1/logs with this key (C1).
-        ClientKeyCreateRequest(name=f"app:{app_id}@{node}", limits=ClientKeyLimits(writeLogs=True)),
+        # The limits are an app's, not one person's client's (MR6): everyone
+        # who uses the app shares its key, so the defaults of 2 at once and 60
+        # a minute were filled by two people chatting, and a document upload
+        # that sends its embeddings requests together was served 2 of 10. A key
+        # minted before this keeps the limits it has; the owner changes them on
+        # the keys page.
+        ClientKeyCreateRequest(
+            name=f"app:{app_id}@{node}",
+            limits=ClientKeyLimits(
+                writeLogs=True,
+                maxConcurrentRequests=APP_KEY_CONCURRENT,
+                requestsPerMinute=APP_KEY_PER_MINUTE,
+            ),
+        ),
         authorization=request.headers.get("authorization"),
     )
     key_file.parent.mkdir(parents=True, exist_ok=True)

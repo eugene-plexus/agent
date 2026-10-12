@@ -120,6 +120,17 @@
     RAG_EXTERNAL_RERANKER_URL: "{gatewayUrl}/v1/rerank"
     RAG_EXTERNAL_RERANKER_API_KEY: "{clientKey}"
     ENABLE_RAG_HYBRID_SEARCH: "true"
+    # Embeddings go out this many passages to a request, this many requests at
+    # a time. Open WebUI's defaults are one passage to a request (config.py,
+    # line 1019) and no limit on how many go together (line 1025; 0 is none),
+    # so every passage of a file is sent in the same moment (retrieval/utils.py,
+    # lines 1165-1181), and the first 429 fails the whole file: a request raises
+    # on any error status and nothing tries it again (lines 929-955). An app's
+    # key has limits (8 at once, 600 a minute), and a 10-passage file was served
+    # 2 of 10 (MR6's acceptance). 32 passages to a request, one request at a
+    # time, is about 32 times fewer requests and none together.
+    RAG_EMBEDDING_BATCH_SIZE: "32"
+    RAG_EMBEDDING_CONCURRENT_REQUESTS: "1"
     AUDIO_STT_ENGINE: openai
     OFFLINE_MODE: "true"
     ENABLE_VERSION_UPDATE_CHECK: "false"

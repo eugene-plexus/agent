@@ -217,6 +217,28 @@ def test_no_gateway_means_no_gateway_variable_rather_than_a_guess(tmp_path: Path
     assert "EUGENE_PLEXUS_APP_BIND_HOST" not in plan.env
 
 
+def test_the_manager_tells_the_planner_why_there_is_no_gateway(tmp_path: Path) -> None:
+    """An app that names `{gatewayUrl}` is not started without it, and says why in the
+    agent's own words: the manager resolved the address, found none, and kept its reason."""
+    manager = _manager(tmp_path)
+    why = "The gateway could not be found, so the app was given none: the root did not answer."
+
+    async def none() -> tuple[str | None, str | None]:
+        return None, why
+
+    manager._resolve_gateway = none
+    record = _record(_manifest(environment={"BASE": "{gatewayUrl}/v1"}))
+    _fake_python(manager.store, record)
+    asyncio.run(manager.start(record))
+    supervisor: Any = manager.supervisor
+    planner = supervisor.planners[record.id]
+    with pytest.raises(
+        apps.SpawnPlanError, match=r"^\{gatewayUrl\} has no value.*the root did not answer"
+    ):
+        planner.plan()
+    assert planner.launch()["gatewayDetail"] == why
+
+
 def test_a_missing_environment_is_refused_with_the_fix(tmp_path: Path) -> None:
     store = apps.AppStore(tmp_path / apps.APPS_FILE)
     planner = apps._AppPlanner(

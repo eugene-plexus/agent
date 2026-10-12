@@ -887,6 +887,25 @@ def test_open_webui_is_seeded_with_document_search_through_eugene() -> None:
     }
 
 
+def test_open_webui_sends_its_embeddings_in_batches_one_request_at_a_time(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    """Open WebUI's defaults are one passage to a request, every request of a file
+    together, and the first 429 fails the whole file (config.py lines 1019 and 1025;
+    retrieval/utils.py lines 1165-1181 and 929-955). An app's key has limits, and a
+    10-passage file was served 2 of 10 (MR6's acceptance). 32 passages to a request,
+    one request at a time, is about 32 times fewer requests and none together."""
+    (webui,) = [m for m in apps.load_catalogue() if m.id == "open-webui"]
+    env = webui.environment or {}
+    assert env.get("RAG_EMBEDDING_BATCH_SIZE") == "32"
+    assert env.get("RAG_EMBEDDING_CONCURRENT_REQUESTS") == "1"
+    # Rendered as it is started, and read by Open WebUI as integers: a batch of
+    # several, and a limit of one at a time (0, its default, is no limit).
+    rendered = _open_webui(tmp_path, gateway.url).plan().env
+    assert rendered["RAG_EMBEDDING_BATCH_SIZE"] == "32"
+    assert rendered["RAG_EMBEDDING_CONCURRENT_REQUESTS"] == "1"
+
+
 #: Every address Open WebUI 0.11.4's config.py defaults to OpenAI's after resetting
 #: `OPENAI_API_BASE_URL` to https://api.openai.com/v1 (lines 362-367): its own, and
 #: the five features that read it after (lines 1098, 1505, 1535, 1580, 1621).

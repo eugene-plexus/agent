@@ -45,7 +45,7 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_agent import app_accounts, app_launcher, apps
 from eugene_plexus_agent._generated.models import AppManifest, AppOrigin, ComponentStatus
-from eugene_plexus_agent.supervisor import ProcessState
+from eugene_plexus_agent.supervisor import ProcessState, SpawnPlanError, SupervisedProcess
 
 from .fake_gateway import FakeGateway
 from .test_app_accounts import FakeRunner, _free_port, _Ingress
@@ -104,8 +104,13 @@ def _record(manifest: AppManifest | None = None, *, port: int = 8190) -> apps.In
 
 
 def _planner(
-    store: apps.AppStore, record: apps.InstalledApp, *, gateway: str = "http://10.0.0.5:8079/gw"
+    store: apps.AppStore,
+    record: apps.InstalledApp,
+    *,
+    gateway: str | None = "http://10.0.0.5:8079/gw",
+    why: str | None = None,
 ) -> apps._AppPlanner:
+    """`gateway` None is an agent with no address to give; `why` is its own words for it."""
     python = apps.venv_python(store.version_dir(record.id, record.version) / "venv")
     python.parent.mkdir(parents=True, exist_ok=True)
     python.write_text("")
@@ -116,6 +121,7 @@ def _planner(
         bind_host=lambda: None,
         oidc_issuer=lambda: "http://10.0.0.5:8079/oidc",
         app_url=lambda: "http://10.0.0.5:8190",
+        gateway_detail=lambda: why,
     )
 
 
@@ -182,20 +188,20 @@ def test_every_placeholder_is_filled_in(tmp_path: Path) -> None:
 def test_a_placeholder_with_no_value_leaves_its_variable_unset_and_says_so(
     tmp_path: Path,
 ) -> None:
+    """Every placeholder but one: `{gatewayUrl}` is not left unset, the app is
+    not started without it (`test_an_app_that_names_the_gateway_...`)."""
     spec = _spec(
         tmp_path,
-        args=["--gateway", "{gatewayUrl}", "--port", "{port}"],
-        environment={"OPENAI_API_BASE_URL": "{gatewayUrl}/v1", "PLAIN": "x"},
+        args=["--app-url", "{appUrl}", "--port", "{port}"],
+        environment={"WEBUI_URL": "{appUrl}/x", "PLAIN": "x"},
         values={"port": "8190"},
     )
-    argv, env, notes = app_launcher.render_start(spec, {"OPENAI_API_BASE_URL": "inherited"})
-    # Not half a value ("/v1"), and not an inherited one either.
-    assert "OPENAI_API_BASE_URL" not in env and env["PLAIN"] == "x"
-    assert notes == [
-        "OPENAI_API_BASE_URL is not set at this start: there is no value for {gatewayUrl}."
-    ]
+    argv, env, notes = app_launcher.render_start(spec, {"WEBUI_URL": "inherited"})
+    # Not half a value ("/x"), and not an inherited one either.
+    assert "WEBUI_URL" not in env and env["PLAIN"] == "x"
+    assert notes == ["WEBUI_URL is not set at this start: there is no value for {appUrl}."]
     # An argument keeps its place, so the ones after it still mean what they say.
-    assert argv[-4:] == ["--gateway", "", "--port", "8190"]
+    assert argv[-4:] == ["--app-url", "", "--port", "8190"]
 
 
 def test_a_secret_carried_in_the_spec_is_never_used(tmp_path: Path) -> None:
@@ -231,6 +237,173 @@ def test_the_app_secret_is_made_once_and_kept(tmp_path: Path) -> None:
     other.mkdir()
     app_launcher.render_start(_spec(other, environment={"KEY": "{clientKey}"}), {})
     assert not (other / "data" / app_launcher.APP_SECRET_FILE).exists()
+
+
+# --------------------------------------------------------------------------- #
+# no start without the gateway's address
+# --------------------------------------------------------------------------- #
+
+#: The agent's own words for why it has no address (`resolve_gateway_for_apps`).
+GATEWAY_WHY = (
+    "This machine runs no gateway and is not part of an install yet, so there was no "
+    "gateway address to give the app."
+)
+
+
+@pytest.mark.parametrize(
+    ("args", "environment"),
+    [
+        pytest.param([], {"OPENAI_API_BASE_URL": "{gatewayUrl}/v1"}, id="in-the-environment"),
+        pytest.param(["--gateway", "{gatewayUrl}"], {}, id="in-an-argument"),
+        pytest.param(
+            ["--gateway", "{gatewayUrl}"],
+            {"BASE": "{gatewayUrl}/v1", "PLAIN": "x"},
+            id="in-both",
+        ),
+    ],
+)
+@pytest.mark.parametrize("given", [None, ""], ids=["no-address", "an-empty-address"])
+def test_an_app_that_names_the_gateway_is_not_started_without_its_address(
+    tmp_path: Path, args: list[str], environment: dict[str, str], given: str | None
+) -> None:
+    """Every other placeholder with no value leaves its variable unset. This one does
+    not: an app that is not given the gateway's address uses its own default for each
+    address it takes, and Open WebUI's is OpenAI's, so its documents and speech would
+    go there. The start is refused, and both ways an app runs meet that as a ValueError."""
+    values = {"port": "8190"} | ({} if given is None else {"gatewayUrl": given})
+    spec = _spec(tmp_path, args=args, environment=environment, values=values)
+    with pytest.raises(app_launcher.GatewayUnknown) as refused:
+        app_launcher.render_start(spec, {})
+    said = str(refused.value)
+    assert isinstance(refused.value, ValueError)
+    assert "{gatewayUrl} has no value at this start" in said and "so it is not started" in said
+    assert "OpenAI" in said and "documents and speech" in said
+
+
+def test_an_app_that_does_not_name_the_gateway_is_started_without_one(tmp_path: Path) -> None:
+    spec = _spec(
+        tmp_path, args=["--port", "{port}"], environment={"PLAIN": "x"}, values={"port": "8190"}
+    )
+    argv, env, notes = app_launcher.render_start(spec, {})
+    assert argv[-2:] == ["--port", "8190"] and env["PLAIN"] == "x" and notes == []
+
+
+def test_the_refusal_names_why_there_is_no_address(tmp_path: Path) -> None:
+    spec = _spec(
+        tmp_path,
+        environment={"BASE": "{gatewayUrl}/v1"},
+        values={"port": "8190"},
+        gatewayDetail=GATEWAY_WHY,
+    )
+    with pytest.raises(app_launcher.GatewayUnknown) as refused:
+        app_launcher.render_start(spec, {})
+    assert f"({GATEWAY_WHY.rstrip('.')})" in str(refused.value)
+    # Said once, in the agent's own words, and no more than it said.
+    assert str(refused.value).count("gateway address to give the app") == 1
+
+
+def test_a_refused_start_reads_nothing_and_keeps_nothing(tmp_path: Path) -> None:
+    """A start that never happened leaves no trace: no app secret made for it, and
+    no connection digest recorded, which the next start would be compared with."""
+    spec = _spec(
+        tmp_path,
+        environment={"BASE": "{gatewayUrl}/v1", "SECRET": "{appSecret}", "KEY": "{clientKey}"},
+        values={"port": "8190"},
+        resetOnConnectionChange="RESET_CONFIG_ON_START",
+    )
+    with pytest.raises(app_launcher.GatewayUnknown):
+        app_launcher.render_start(spec, {})
+    data = tmp_path / "data"
+    assert not (data / app_launcher.APP_SECRET_FILE).exists()
+    assert not (data / app_launcher.CONNECTION_FILE).exists()
+
+
+async def test_the_agents_own_supervisor_refuses_such_a_start_and_tries_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent's way of running an app: a `SpawnPlanError` naming why, which
+    `SupervisedProcess` counts as it counts any refused start -- a crash, a
+    back-off, another go -- and spawns nothing for."""
+    asked = 0
+
+    def gateway() -> None:
+        nonlocal asked
+        asked += 1
+
+    store = _store(tmp_path)
+    record = _record()  # the default entry names {gatewayUrl}
+    _planner(store, record)  # makes the interpreter file the planner looks for
+    planner = apps._AppPlanner(
+        record,
+        store=store,
+        gateway_url=gateway,
+        bind_host=lambda: None,
+        gateway_detail=lambda: GATEWAY_WHY,
+    )
+    with pytest.raises(SpawnPlanError, match=r"^\{gatewayUrl\} has no value at this start"):
+        planner.plan()
+    with pytest.raises(SpawnPlanError, match=r"^\{gatewayUrl\} has no value.*address to give"):
+        await planner.plan_async()
+
+    original_sleep = asyncio.sleep
+
+    async def quick(seconds: float) -> None:
+        await original_sleep(min(seconds, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", quick)
+    asked = 0
+    process = SupervisedProcess(planner, logging.getLogger("test"))
+    process.start()
+    try:
+        for _ in range(500):
+            if asked >= 3:
+                break
+            await original_sleep(0.01)
+    finally:
+        await process.stop()
+    assert asked >= 3, "a refused start was not tried again"
+    assert process.state == ProcessState.crashed
+    assert process.last_error is not None
+    assert process.last_error.startswith("{gatewayUrl} has no value at this start")
+    assert "(" + GATEWAY_WHY.rstrip(".") + ")" in process.last_error
+    assert process.last_argv is None, "an app that was refused was spawned"
+    assert process._consecutive_crashes >= 1
+
+
+def test_an_app_in_its_own_account_exits_with_the_words(tmp_path: Path) -> None:
+    """The launcher's way of running an app: it exits, and the words reach the
+    Logs page through its own forwarding, with the agent's reason in them."""
+    packages = _fake_package(tmp_path)
+    ingress = _Ingress()
+    store = _store(tmp_path)
+    launch = _planner(store, _record(), gateway=None, why=GATEWAY_WHY).launch()
+    assert launch["gatewayDetail"] == GATEWAY_WHY and "gatewayUrl" not in launch["values"]
+    # An address makes the reason beside it moot: it is not carried.
+    assert "gatewayDetail" not in _planner(store, _record(), why=GATEWAY_WHY).launch()
+    data = store.data_dir("fake")
+    spec: dict[str, Any] = {
+        **launch,
+        "app": "fake",
+        "argv": apps.entry_argv(Path(sys.executable), _manifest()),
+        "env": {"PYTHONPATH": str(packages)},
+        "dataDir": str(data),
+        "keyFile": str(store.key_file("fake")),
+        "ingress": ingress.url,
+    }
+    app_launcher._STOP.clear()
+    try:
+        assert app_launcher.run(spec) == 1
+        assert not (data / "record.json").exists(), "the app was started"
+        deadline = time.perf_counter() + 10
+        while not any("could not start the app" in line for line in ingress.lines):
+            assert time.perf_counter() < deadline, ingress.lines
+            time.sleep(0.1)
+        said = [line for line in ingress.lines if "could not start the app" in line]
+        assert said[0].startswith("[launcher] could not start the app: {gatewayUrl} has no value")
+        assert "(" + GATEWAY_WHY.rstrip(".") + ")" in said[0]
+        assert not any(KEY in line for line in ingress.lines)
+    finally:
+        ingress.server.shutdown()
 
 
 # --------------------------------------------------------------------------- #
@@ -666,10 +839,11 @@ def test_the_catalogue_offers_open_webui_as_designed() -> None:
     assert env["WEBUI_SECRET_KEY"] == "{appSecret}"
     assert env["OPENAI_API_BASE_URL"] == "{gatewayUrl}/v1"
     assert env["OPENID_PROVIDER_URL"] == "{oidcIssuer}/.well-known/openid-configuration"
-    # 33 until MR6 added the six that point its document search at Eugene and
-    # the ten that name the gateway for every address it would default to
-    # OpenAI's (`test_app_models.py` holds what each is and why).
-    assert len(env) == 49
+    # 33 until MR6 added the six that point its document search at Eugene, the
+    # ten that name the gateway for every address it would default to OpenAI's,
+    # and the two that batch its embeddings (`test_app_models.py` holds what
+    # each is and why).
+    assert len(env) == 51
 
     # Workbench needs none of it and did not change.
     workbench = catalogue["workbench"]

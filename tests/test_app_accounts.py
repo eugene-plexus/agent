@@ -29,7 +29,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import app_accounts, app_launcher, apps
+from eugene_plexus_agent import app_accounts, app_launcher, apps, client_admission
 from eugene_plexus_agent._generated.models import (
     AppManifest,
     AppOrigin,
@@ -157,6 +157,46 @@ def test_an_apps_key_may_send_logs(
     assert authed_client.post("/v1/apps/tiny/install").status_code == 202
     [body] = installing["bodies"]
     assert body.limits is not None and body.limits.writeLogs is True
+
+
+def test_an_apps_key_has_the_limits_of_an_app_not_of_one_persons_client(
+    app: FastAPI, authed_client: TestClient, installing: dict[str, Any]
+) -> None:
+    """Everyone who uses an app shares its key. The defaults of 2 at once and 60 a minute
+    are one person's client's: two people chatting filled them, and a document upload,
+    which sends its embeddings requests together and fails the file on the first 429,
+    was served 2 of 10 (MR6's acceptance)."""
+    app.state.apps.catalogue = {"tiny": _manifest(localActions=False)}
+    assert authed_client.post("/v1/apps/tiny/install").status_code == 202
+    [body] = installing["bodies"]
+    assert body.limits is not None
+    assert (body.limits.maxConcurrentRequests, body.limits.requestsPerMinute) == (8, 600)
+    assert body.limits.writeLogs is True
+    # What the key authority makes of them: they are inside the ranges it enforces,
+    # and are what the key is kept with.
+    assert client_admission.validate_limits(body.limits.model_dump(exclude_none=True)) == {
+        "allowedModels": None,
+        "maxConcurrentRequests": 8,
+        "requestsPerMinute": 600,
+        "writeLogs": True,
+    }
+
+
+def test_a_key_minted_before_keeps_its_limits(
+    app: FastAPI, authed_client: TestClient, installing: dict[str, Any]
+) -> None:
+    """The install mints a key once. An app that has one, and its file, is left as it is:
+    nothing is minted, so nothing is changed, and no limit is written onto it."""
+    manager: apps.AppManager = app.state.apps
+    manager.catalogue = {"tiny": _manifest(localActions=False)}
+    manager.store.put_key("tiny", apps.AppKey(key_id="k0", key_name="app:tiny@node-a"))
+    key_file = manager.store.key_file("tiny")
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.write_text("an-older-token", encoding="utf-8")
+    assert authed_client.post("/v1/apps/tiny/install").status_code == 202
+    assert installing["bodies"] == []
+    key = manager.store.key("tiny")
+    assert key is not None and key.key_id == "k0" and key_file.read_text() == "an-older-token"
 
 
 def test_the_catalogue_says_whether_this_node_makes_accounts(
