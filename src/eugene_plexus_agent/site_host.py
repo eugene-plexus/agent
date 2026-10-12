@@ -223,6 +223,7 @@ class SiteHostSupervisor:
         self._windows: WindowsStarter | None = None
         self._child: ChildStarter | None = None
         self._granted: tuple[Any, ...] | None = None
+        self._defects_said: set[str] = set()
 
     @property
     def manager(self) -> AppManager | None:
@@ -352,7 +353,12 @@ class SiteHostSupervisor:
         record = manager.store.get(RETIRED_ID)
         if record is not None and record.manifest.entry in SITE_HOST_ENTRIES:
             log.warning("removing %s: the operator-managed node folders retired", RETIRED_ID)
-            await manager.uninstall(RETIRED_ID)
+            # Its data stays, as any uninstall's does unless asked: removing
+            # an install is not removing what it held. Without `purge` this
+            # raised TypeError and stopped the supervisor at boot on every
+            # machine that still had the old helper (Amish_Station,
+            # 2026-10-11: a job site's join waited 15 minutes for nothing).
+            await manager.uninstall(RETIRED_ID, purge=False)
 
     async def reconcile(self, enabled: bool) -> None:
         manager = self.manager
@@ -568,6 +574,17 @@ class SiteHostSupervisor:
                     await self.step()
                 except (httpx.HTTPError, ValueError, KeyError, OSError, RuntimeError) as exc:
                     log.debug("site host supervision: %s", type(exc).__name__)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # Anything else is a defect, and must neither end
+                    # supervision (a job site's join would wait for ever) nor
+                    # pass unseen: said once per kind, with its trace.
+                    kind = sys.exc_info()[0]
+                    if kind is not None and kind.__name__ not in self._defects_said:
+                        self._defects_said.add(kind.__name__)
+                        log.exception("site host supervision stopped a step on a defect")
+                    self.error = "Eugene hit a fault preparing this job site. See its log."
                 self._wake.clear()
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._wake.wait(), 5)

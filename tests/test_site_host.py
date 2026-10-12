@@ -5,8 +5,12 @@ none of the site's identity. `site join` runs the site host's own join."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
+import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -26,6 +30,9 @@ from eugene_plexus_agent import app_accounts, site_cli, site_host
 from eugene_plexus_agent._generated.models import AppOrigin
 from eugene_plexus_agent.apps import InstalledApp, is_site_host
 from eugene_plexus_agent.site_host import HELPER_ID, RETIRED_ID, SiteHostSupervisor
+
+# The real loop, kept before conftest idles it for every test (its own reasons are there).
+_REAL_RUN = SiteHostSupervisor.run
 
 
 def test_the_host_is_told_what_only_the_agent_may_say(app: FastAPI) -> None:
@@ -136,11 +143,15 @@ async def test_turned_on_it_installs_and_slice_2s_host_is_removed(
     started: list[Any] = []
     monkeypatch.setattr(manager.installer, "start", lambda want, **_: started.append(want))
     monkeypatch.setattr(manager, "uv", lambda: Path(sys.executable))
-    removed: list[str] = []
+    removed: list[tuple[str, bool]] = []
 
-    async def uninstall(app_id: str, *, purge: bool = False) -> None:
-        removed.append(app_id)
+    # The real signature: `purge` has no default. A default here once hid that
+    # the call left it out, which stopped the supervisor at boot on every
+    # machine with the old helper (2026-10-11).
+    async def uninstall(app_id: str, *, purge: bool) -> None:
+        removed.append((app_id, purge))
 
+    assert inspect.signature(uninstall) == inspect.signature(manager.uninstall)
     monkeypatch.setattr(manager, "uninstall", uninstall)
     old = InstalledApp(
         manifest=site_host.manifest({}).model_copy(update={"id": RETIRED_ID}),
@@ -154,9 +165,40 @@ async def test_turned_on_it_installs_and_slice_2s_host_is_removed(
         await supervisor.reconcile(True)
     finally:
         await supervisor._host.aclose()
-    assert removed == [RETIRED_ID]
+    assert removed == [(RETIRED_ID, False)]
     assert [want.id for want in started] == [HELPER_ID]
     assert started[0].name == "Job site" and started[0].entry == site_host.ENTRY
+
+
+async def test_a_defect_in_one_step_neither_ends_supervision_nor_passes_unseen(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    supervisor = SiteHostSupervisor(app)
+    steps = 0
+    went_on = asyncio.Event()
+
+    async def step() -> None:
+        nonlocal steps
+        steps += 1
+        if steps <= 2:
+            raise TypeError("a defect")
+        went_on.set()
+
+    monkeypatch.setattr(supervisor, "step", step)
+    with caplog.at_level(logging.ERROR):
+        running = asyncio.create_task(_REAL_RUN(supervisor))
+        for _ in range(500):
+            if went_on.is_set():
+                break
+            supervisor._wake.set()
+            await asyncio.sleep(0.01)
+        running.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await running
+    assert went_on.is_set(), "supervision went on after the defect"
+    said = [r for r in caplog.records if "defect" in r.getMessage()]
+    assert len(said) == 1, "said once per kind, not every five seconds"
+    assert supervisor.error == "Eugene hit a fault preparing this job site. See its log."
 
 
 async def test_the_node_says_which_site_it_hosts(app: FastAPI) -> None:
