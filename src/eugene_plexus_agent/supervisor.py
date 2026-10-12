@@ -41,7 +41,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, NamedTuple, Protocol
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 from urllib.parse import urlparse
 
 import httpx
@@ -313,6 +313,24 @@ class SpawnPlanner(Protocol):
         than "exited with code 1", because the operator will believe it.
         """
         return None
+
+
+@runtime_checkable
+class AsyncSpawnPlanner(Protocol):
+    """A planner whose launch can wait on something -- an app that asks the
+    gateway which of the install's models run before it starts.
+
+    Optional, beside `SpawnPlanner.plan`: where a planner has `plan_async`
+    the loop awaits it in place of `plan()`, so the wait is that one task's
+    and not the event loop's -- a synchronous `plan()` that took four seconds
+    stopped every other task in the agent for the four. Components and
+    engines have none and are planned exactly as before. It answers as
+    `plan()` does: a `SpawnPlan`, `None` for nothing to launch, or
+    `SpawnPlanError`.
+    """
+
+    async def plan_async(self) -> SpawnPlan | None:
+        """`SpawnPlanner.plan`, awaited."""
 
 
 def _component_python() -> str:
@@ -858,7 +876,13 @@ class SupervisedProcess:
         self._was_ready = False
         self._ready_since = None
         try:
-            plan = self._planner.plan()
+            # A planner that can wait is awaited, so its wait is not the loop's.
+            planner = self._planner
+            plan = (
+                await planner.plan_async()
+                if isinstance(planner, AsyncSpawnPlanner)
+                else planner.plan()
+            )
         except SpawnPlanError as e:
             self._log.error("refusing to spawn %s: %s", self.name, e)
             self.state = ProcessState.crashed

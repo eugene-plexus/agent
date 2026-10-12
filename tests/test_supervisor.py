@@ -909,3 +909,56 @@ async def test_a_planner_that_raises_anything_is_a_crash_not_a_dead_task() -> No
         # The loop keeps backing off and retrying until the crash
         # threshold; end it here rather than leave a pending task.
         await sp.stop()
+
+
+async def test_a_planner_that_can_wait_is_awaited_and_one_that_cannot_is_planned_as_before() -> (
+    None
+):
+    """An app that asks the gateway which models run has `plan_async`, and the loop
+    awaits it in place of `plan()`: a `plan()` that took four seconds stopped every other
+    task in the agent for the four. Components and engines have none and are planned
+    exactly as they were."""
+
+    class _Waiting(_FakeEnginePlanner):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.calls: list[str] = []
+
+        def plan(self) -> SpawnPlan | None:
+            raise AssertionError("the loop called plan() on a planner that has plan_async")
+
+        async def plan_async(self) -> SpawnPlan | None:
+            await asyncio.sleep(0)  # a real wait: the loop is free while it lasts
+            self.calls.append("plan_async")
+            return None
+
+    class _Plain(_FakeEnginePlanner):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.calls: list[str] = []
+
+        def plan(self) -> SpawnPlan | None:
+            self.calls.append("plan")
+            return None
+
+    waiting = _Waiting()
+    await SupervisedProcess(waiting, logging.getLogger("test"))._spawn_once()
+    assert waiting.calls == ["plan_async"]
+
+    plain = _Plain()
+    await SupervisedProcess(plain, logging.getLogger("test"))._spawn_once()
+    assert plain.calls == ["plan"]
+
+
+async def test_a_planner_that_waits_and_cannot_build_is_a_crash_like_any_other() -> None:
+    """`plan_async` answers as `plan()` does: `SpawnPlanError` is a crash named in
+    `lastError`, not a task that dies."""
+
+    class _Refusing(_FakeEnginePlanner):
+        async def plan_async(self) -> SpawnPlan | None:
+            raise SpawnPlanError("could not fill in how the app starts: {nope}")
+
+    sp = SupervisedProcess(_Refusing([]), logging.getLogger("test"))
+    await sp._spawn_once()
+    assert sp.state == ProcessState.crashed
+    assert sp.last_error == "could not fill in how the app starts: {nope}"

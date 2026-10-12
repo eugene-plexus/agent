@@ -921,26 +921,67 @@ class _AppPlanner:
         placeholder one way. Secrets reach the child's environment and
         nothing else: never an argument (`validate_manifest`), never the log.
 
-        A manifest that names `{embeddingModel}` or `{rerankModel}` makes
-        this ask the gateway which models it lists, once, for up to
-        `app_launcher.MODELS_TIMEOUT_SECONDS`, and the event loop this runs
-        on waits with it. Open WebUI, the one shipped app that names them,
-        needs an account of its own, where the launcher waits instead; only
-        a custom app that names them on a host without accounts waits here.
+        This waits: a manifest that names `{embeddingModel}` or
+        `{rerankModel}` makes `render_start` ask the gateway which models it
+        lists, for up to `app_launcher.MODELS_TIMEOUT_SECONDS`. The
+        supervisor awaits `plan_async` instead, which does not stop the
+        event loop for it; this is the same plan for a caller that has no
+        loop to keep.
         """
         base = self.base_plan()
+        spec = self._render_spec(base)
+        try:
+            argv, env, notes = app_launcher.render_start(spec, base.env)
+        except (OSError, ValueError) as exc:
+            raise self._unfillable(exc) from exc
+        return self._planned(base, argv, env, notes)
+
+    async def plan_async(self) -> SpawnPlan:
+        """`plan`, with the part that can wait off the event loop.
+
+        `SupervisedProcess` awaits this in place of `plan()` (the
+        `AsyncSpawnPlanner` hook), so the up to `MODELS_TIMEOUT_SECONDS` that
+        `render_start` may spend asking the gateway is one task's wait and
+        not every task's in the agent.
+
+        **What runs in the thread is `render_start` and nothing else.** All
+        that reads the agent's own state -- `base_plan`, the callables behind
+        `launch()` (gateway, bind host, sign-in), the store -- runs here on
+        the loop, as it always did, and the thread is handed plain data: the
+        spec and a copy of the environment. What `render_start` itself
+        touches are the files in this app's data directory (the app secret,
+        the connection digest: written whole and swapped in, under
+        `app_launcher._DATA_FILES`), the key and secret files it reads, and
+        the network. A start that is stopped while it waits leaves its thread
+        to finish unread.
+        """
+        base = self.base_plan()
+        spec = self._render_spec(base)
+        try:
+            argv, env, notes = await asyncio.to_thread(app_launcher.render_start, spec, base.env)
+        except (OSError, ValueError) as exc:
+            raise self._unfillable(exc) from exc
+        return self._planned(base, argv, env, notes)
+
+    def _render_spec(self, base: SpawnPlan) -> dict[str, Any]:
+        """What `render_start` is given: the manifest's start as written, the
+        values that are not secret, and where this app's files are."""
         record = self.record
-        spec = {
+        return {
             "argv": base.argv,
             **self.launch(),
             "dataDir": str(self._store.data_dir(record.id)),
             "keyFile": str(self._store.key_file(record.id)),
             "oidcSecretFile": str(self._store.oidc_secret_file(record.id)),
         }
-        try:
-            argv, env, notes = app_launcher.render_start(spec, base.env)
-        except (OSError, ValueError) as exc:
-            raise SpawnPlanError(f"could not fill in how {record.id} starts: {exc}") from exc
+
+    def _unfillable(self, exc: Exception) -> SpawnPlanError:
+        return SpawnPlanError(f"could not fill in how {self.record.id} starts: {exc}")
+
+    def _planned(
+        self, base: SpawnPlan, argv: list[str], env: dict[str, str], notes: list[str]
+    ) -> SpawnPlan:
+        """The start, and what is worth saying about it in the agent's log."""
         for note in notes:
             log.warning("%s%s", self.log_prefix, note)
         return SpawnPlan(argv=argv, env=env, cwd=base.cwd, port=base.port)

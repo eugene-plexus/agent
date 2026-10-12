@@ -72,6 +72,28 @@
     CORS_ALLOW_ORIGIN: "{appUrl}"
     OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
     OPENAI_API_KEY: "{clientKey}"
+    # Every other place Open WebUI would send to OpenAI's API is the gateway's
+    # too. Its config.py (0.11.4) ends its OpenAI section by setting
+    # OPENAI_API_BASE_URL back to https://api.openai.com/v1 and OPENAI_API_KEY
+    # to the key of that address, which is empty here (lines 362-367), and each
+    # address after that which is not given defaults to the reset one: its
+    # documents' embeddings (RAG_, line 1098), images (IMAGES_, 1505), image
+    # edits (IMAGES_EDIT_, 1535), speech to text (AUDIO_STT_, 1580) and text to
+    # speech (AUDIO_TTS_, 1621), and their keys beside them. Without these an
+    # uploaded document's text went to https://api.openai.com/v1/embeddings
+    # (found in MR6's rehearsal; refused there for want of a key). A later
+    # release may add another: read its config.py for OPENAI_API_BASE_URL when
+    # the version above moves.
+    RAG_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
+    RAG_OPENAI_API_KEY: "{clientKey}"
+    IMAGES_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
+    IMAGES_OPENAI_API_KEY: "{clientKey}"
+    IMAGES_EDIT_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
+    IMAGES_EDIT_OPENAI_API_KEY: "{clientKey}"
+    AUDIO_STT_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
+    AUDIO_STT_OPENAI_API_KEY: "{clientKey}"
+    AUDIO_TTS_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
+    AUDIO_TTS_OPENAI_API_KEY: "{clientKey}"
     ENABLE_OLLAMA_API: "false"
     # Document search through Eugene's own door (MR6, specs
     # docs/design/workbench-memory-and-documents.md). Open WebUI copies these
@@ -80,11 +102,13 @@
     # its Admin Settings, Documents, which warns about re-reading documents.
     # {embeddingModel} and {rerankModel} are the first models the gateway lists
     # for this app's key that run on this install's own machines and embed, or
-    # sort results (read at every start; with none the variable is left unset
-    # and the start's notes say why). The sorter is used only when
-    # {rerankModel} has a value. A change of search model never resets the
-    # app's settings (resetOnConnectionChange is the gateway's address and the
-    # app's key alone): the vectors it stored belong to the model that made
+    # sort results, a running one before a stopped one (read at every start;
+    # with none the variable is left unset and the start's notes say why). The
+    # sorter is used only when {rerankModel} has a value. A change of search
+    # model never resets the app's settings: resetOnConnectionChange follows the
+    # gateway's address, the app's key and these variables as written here, with
+    # the models unfilled, so correcting one reaches an install that started
+    # before, once, and the vectors it stored stay with the model that made
     # them. Hybrid search is on because words plus meaning beat either alone in
     # Eugene's own measurement (MR5, 60 questions: recall@5 0.600 against 0.500
     # and 0.583, a small margin), and Open WebUI runs it with or without a

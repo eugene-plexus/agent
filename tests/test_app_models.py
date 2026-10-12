@@ -29,6 +29,7 @@ import hashlib
 import json
 import logging
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -245,27 +246,163 @@ def test_a_model_written_into_the_spec_is_not_taken_on_its_word(
 
 
 # --------------------------------------------------------------------------- #
+# a model that is listed and stopped
+# --------------------------------------------------------------------------- #
+
+
+def test_a_running_model_is_chosen_before_a_stopped_one(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    """The gateway keeps listing a model whose runtime was stopped, with no
+    backend ready: the one that is running is the better answer, wherever it is."""
+    gateway.models = [
+        listed("embed-stopped", "embeddings", ready=0),
+        listed("embed-running", "embeddings", ready=1),
+        listed("rerank-stopped", "rerank", ready=0),
+        listed("rerank-running", "rerank", ready=2),
+    ]
+    env, notes = _start(_spec_for(tmp_path, gateway.url))
+    assert (env["EMBED"], env["RERANK"]) == ("embed-running", "rerank-running")
+    assert notes == []
+
+
+def test_a_stopped_model_is_chosen_when_it_is_all_there_is_and_the_notes_say_so(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    """An app that keeps what its first start saw is better off with the install's
+    model than with its own default, so a model that is listed is the answer even
+    when nothing runs it now. The first listed, and the note says it is not running."""
+    gateway.models = [
+        listed("embed-a", "embeddings", ready=0),
+        listed("embed-b", "embeddings", ready=0),
+        listed("rerank-a", "rerank"),
+    ]
+    env, notes = _start(_spec_for(tmp_path, gateway.url))
+    assert env["EMBED"] == "embed-a" and env["RERANK"] == "rerank-a"
+    # One line, about the model that is not running, and nothing about the one that is.
+    (said,) = notes
+    assert said.startswith("{embeddingModel} is embed-a at this start, ")
+    assert "the gateway lists it but it is not running now" in said
+    assert "no other local search model is" in said
+    assert "rather than its own default" in said and "under Backends" in said
+
+
+def test_a_stopped_model_is_said_for_each_of_the_two_on_its_own(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    gateway.models = [listed("embed-a", "embeddings"), listed("rerank-a", "rerank", ready=0)]
+    env, notes = _start(_spec_for(tmp_path, gateway.url))
+    assert (env["EMBED"], env["RERANK"]) == ("embed-a", "rerank-a")
+    (said,) = notes
+    assert said.startswith("{rerankModel} is rerank-a at this start, ")
+    assert "no other local result sorter is" in said
+
+
+@pytest.mark.parametrize(
+    "ready",
+    [
+        pytest.param(None, id="a-gateway-older-than-the-field"),
+        pytest.param("lots", id="text"),
+        pytest.param(True, id="a-boolean"),
+    ],
+)
+def test_a_model_that_does_not_say_it_is_stopped_is_taken_as_running(
+    tmp_path: Path, gateway: FakeGateway, ready: Any
+) -> None:
+    gateway.models = [listed("embed-a", "embeddings", ready=ready)]
+    env, notes = _start(_spec_for(tmp_path, gateway.url))
+    assert env["EMBED"] == "embed-a"
+    assert not any("not running now" in n for n in notes)
+
+
+def test_an_outside_model_that_runs_does_not_displace_a_local_one_that_does_not(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    gateway.models = [
+        listed(OUTSIDE, "embeddings", locality="external", owned_by="openrouter", ready=3),
+        listed("embed-local", "embeddings", ready=0),
+    ]
+    env, notes = _start(_spec_for(tmp_path, gateway.url))
+    assert env["EMBED"] == "embed-local"
+    assert any("not running now" in n for n in notes)
+
+
+# --------------------------------------------------------------------------- #
 # when the gateway cannot say
 # --------------------------------------------------------------------------- #
 
 
-def test_a_gateway_that_is_down_is_named_as_it_was_seen(
+def test_a_gateway_that_never_comes_up_is_named_as_it_was_seen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Windows takes about two seconds to refuse a connection to a port nothing
-    # holds; a machine slower than that must still be told "refused", not "slow".
-    monkeypatch.setattr(app_launcher, "MODELS_TIMEOUT_SECONDS", 30.0)
+    # Windows takes about two seconds to say a connection to a port nothing holds
+    # is refused, so the time given has to be longer than that to see it.
+    monkeypatch.setattr(app_launcher, "MODELS_TIMEOUT_SECONDS", 2.5)
+    monkeypatch.setattr(app_launcher, "MODELS_RETRY_SECONDS", 0.1)
     url = f"http://127.0.0.1:{_free_port()}"  # nothing listens here
+    began = time.perf_counter()
     env, notes = _start(_spec_for(tmp_path, url), {"EMBED": "inherited"})
+    assert time.perf_counter() - began < 6
     assert "EMBED" not in env and "RERANK" not in env
     first = notes[0]
     assert first.startswith(
         "{embeddingModel} has no value at this start: the launcher could not ask which "
-        f"search model runs, because the gateway at {url} could not be reached ("
+        f"search model runs, because the gateway at {url} refused the connection ("
     )
-    assert "refused" in first
+    assert "refused" in first and first.endswith(
+        "; it had not come up after 2.5 seconds of trying."
+    )
     assert any(n.startswith("{rerankModel} has no value") for n in notes)
     assert "EMBED is not set at this start: there is no value for {embeddingModel}." in notes
+
+
+def test_a_gateway_that_is_not_up_yet_is_waited_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent has only just started and its gateway is a moment behind. An app
+    that keeps what its first start saw must not be given the less for it."""
+    monkeypatch.setattr(app_launcher, "MODELS_TIMEOUT_SECONDS", 10.0)
+    monkeypatch.setattr(app_launcher, "MODELS_RETRY_SECONDS", 0.2)
+    port = _free_port()
+    up: list[FakeGateway] = []
+
+    def come_up() -> None:
+        up.append(FakeGateway([listed("embed-a", "embeddings")], key=KEY, port=port))
+
+    # Windows retries a refused connection by itself for about two seconds and
+    # would reach a gateway that came up inside them without any help from
+    # here, so this one comes up after.
+    timer = threading.Timer(2.6, come_up)
+    timer.start()
+    began = time.perf_counter()
+    try:
+        env, notes = _start(_spec_for(tmp_path, f"http://127.0.0.1:{port}"))
+    finally:
+        timer.cancel()
+        waited = time.perf_counter() - began
+        for fake in up:
+            fake.close()
+    assert env.get("EMBED") == "embed-a", notes
+    assert 2.5 <= waited < 8
+    # Only the try that got through reached it: a refused one reaches nobody.
+    assert len(up) == 1 and len(up[0].requests) == 1
+
+
+@pytest.mark.parametrize("mode", ["problem", "garbage", "hangup", "wrong-key"])
+def test_only_a_refused_connection_is_tried_again(
+    tmp_path: Path, gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    """A gateway that is there and says no, or something else, has answered: asking
+    again would only be asking a thing that said no."""
+    monkeypatch.setattr(app_launcher, "MODELS_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(app_launcher, "MODELS_RETRY_SECONDS", 0.05)
+    gateway.models = [listed("embed-a", "embeddings")]
+    if mode == "wrong-key":
+        gateway.key = "some-other-key"
+    else:
+        gateway.mode, gateway.status = mode, 503
+    env, _notes = _start(_spec_for(tmp_path, gateway.url))
+    assert "EMBED" not in env and len(gateway.requests) == 1
 
 
 def test_a_gateway_that_does_not_answer_in_time_is_named(
@@ -555,39 +692,137 @@ def test_the_gateway_is_never_asked_through_the_users_proxy(
 def test_a_change_of_model_is_not_a_change_of_connection(
     tmp_path: Path, gateway: FakeGateway
 ) -> None:
-    spec = _spec_for(
-        tmp_path,
-        gateway.url,
-        environment={"EMBED": "{embeddingModel}"},
-        resetOnConnectionChange="RESET_CONFIG_ON_START",
-    )
-    reset = "RESET_CONFIG_ON_START"
+    spec = _reset_spec(tmp_path, gateway.url)
     gateway.models = [listed("embed-a", "embeddings")]
     env, notes = _start(spec)
-    assert env["EMBED"] == "embed-a" and reset not in env and notes == []
+    assert env["EMBED"] == "embed-a" and RESET not in env and notes == []
 
     # A different model comes first: the app is handed it, and nothing is reset.
     gateway.models = [listed("embed-b", "embeddings"), listed("embed-a", "embeddings")]
     env, notes = _start(spec)
-    assert env["EMBED"] == "embed-b" and reset not in env and notes == []
+    assert env["EMBED"] == "embed-b" and RESET not in env and notes == []
 
     # None runs: the variable is left unset, and still nothing is reset.
     gateway.models = []
     env, notes = _start(spec)
-    assert "EMBED" not in env and reset not in env
-    assert not any("changed since the last start" in n for n in notes)
+    assert "EMBED" not in env and RESET not in env
+    assert not any(CHANGED in n for n in notes)
 
-    # What was kept is the gateway's address and the app's key and nothing else.
+    # The key is not in what was kept.
     kept = (tmp_path / "data" / app_launcher.CONNECTION_FILE).read_text(encoding="utf-8")
-    assert kept.strip() == hashlib.sha256(f"{gateway.url}\n{KEY}".encode()).hexdigest()
+    assert KEY not in kept and gateway.url not in kept
 
-    # A rotated key is still a change of connection, and still resets.
+    # A rotated key is still a change, and still resets.
     (tmp_path / "client_key").write_text("a-new-key", encoding="utf-8")
     gateway.key = "a-new-key"
     gateway.models = [listed("embed-a", "embeddings")]
     env, notes = _start(spec)
-    assert env[reset] == "true" and env["EMBED"] == "embed-a"
-    assert any("changed since the last start" in n for n in notes)
+    assert env[RESET] == "true" and env["EMBED"] == "embed-a"
+    assert any(CHANGED in n for n in notes)
+
+
+RESET = "RESET_CONFIG_ON_START"
+#: Part of the line that says why a start reset.
+CHANGED = "changed since the last start"
+#: What Eugene gives the app, as a manifest writes it: unfilled.
+GIVEN = {"EMBED": "{embeddingModel}", "BASE": "{gatewayUrl}/v1", "SETTING": "one"}
+
+
+def _reset_spec(
+    tmp_path: Path, url: str, environment: dict[str, str] | None = None
+) -> dict[str, Any]:
+    return _spec_for(
+        tmp_path,
+        url,
+        environment=dict(GIVEN if environment is None else environment),
+        resetOnConnectionChange=RESET,
+    )
+
+
+def test_a_changed_setting_resets_once_and_says_what_changed(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    """Open WebUI keeps what its first start saw and ignores its environment after,
+    so a setting Eugene corrects reaches an install that already started only
+    through a reset, which clears what its admin set: once, and said."""
+    gateway.models = [listed("embed-a", "embeddings")]
+    env, notes = _start(_reset_spec(tmp_path, gateway.url))
+    assert RESET not in env and notes == []
+
+    corrected = dict(GIVEN, SETTING="two")
+    env, notes = _start(_reset_spec(tmp_path, gateway.url, corrected))
+    assert env[RESET] == "true"
+    (said,) = notes
+    assert CHANGED in said and f"{RESET}=true" in said
+    assert "the gateway's address, the app's key, or the settings Eugene gives it" in said
+
+    # Once: the same settings again are not a change.
+    env, notes = _start(_reset_spec(tmp_path, gateway.url, corrected))
+    assert RESET not in env and notes == []
+
+
+@pytest.mark.parametrize(
+    "corrected",
+    [
+        pytest.param({**GIVEN, "SETTING": "two"}, id="a-value-corrected"),
+        pytest.param({**GIVEN, "ADDED": "x"}, id="a-setting-added"),
+        pytest.param({k: v for k, v in GIVEN.items() if k != "SETTING"}, id="a-setting-removed"),
+        pytest.param({**GIVEN, "EMBED": "{rerankModel}"}, id="a-placeholder-changed"),
+    ],
+)
+def test_any_change_to_the_settings_as_written_is_a_change(
+    tmp_path: Path, gateway: FakeGateway, corrected: dict[str, str]
+) -> None:
+    _start(_reset_spec(tmp_path, gateway.url))
+    env, _notes = _start(_reset_spec(tmp_path, gateway.url, corrected))
+    assert env[RESET] == "true"
+
+
+def test_the_same_settings_in_another_order_are_not_a_change(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    """The digest holds them in a stable order: a manifest that lists the same
+    variables differently has changed nothing Eugene gives the app."""
+    gateway.models = [listed("embed-a", "embeddings")]
+    _start(_reset_spec(tmp_path, gateway.url))
+    shuffled = dict(reversed(list(GIVEN.items())))
+    assert list(shuffled) != list(GIVEN)
+    env, notes = _start(_reset_spec(tmp_path, gateway.url, shuffled))
+    assert RESET not in env and notes == []
+
+
+def test_the_same_settings_are_not_a_change(tmp_path: Path, gateway: FakeGateway) -> None:
+    gateway.models = [listed("embed-a", "embeddings")]
+    for _ in range(3):
+        env, notes = _start(_reset_spec(tmp_path, gateway.url))
+        assert RESET not in env and notes == []
+
+
+def test_a_digest_from_before_the_settings_joined_it_counts_as_a_change(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    """A release before this kept the gateway's address and the app's key alone. An
+    install that started under it has Open WebUI's old defaults in its database, and
+    the first start after is the one that must correct them."""
+    gateway.models = [listed("embed-a", "embeddings")]
+    (tmp_path / "data").mkdir()
+    old = hashlib.sha256(f"{gateway.url}\n{KEY}".encode()).hexdigest()
+    (tmp_path / "data" / app_launcher.CONNECTION_FILE).write_text(old, encoding="utf-8")
+    env, notes = _start(_reset_spec(tmp_path, gateway.url))
+    assert env[RESET] == "true" and any(CHANGED in n for n in notes)
+    # And once.
+    env, notes = _start(_reset_spec(tmp_path, gateway.url))
+    assert RESET not in env and notes == []
+
+
+def test_a_change_of_address_or_key_still_resets(tmp_path: Path, gateway: FakeGateway) -> None:
+    _start(_reset_spec(tmp_path, gateway.url))
+    other = FakeGateway(key=KEY)
+    try:
+        env, _notes = _start(_reset_spec(tmp_path, other.url))
+        assert env[RESET] == "true"
+    finally:
+        other.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -632,7 +867,16 @@ def _open_webui(tmp_path: Path, url: str) -> apps._AppPlanner:
 def test_open_webui_is_seeded_with_document_search_through_eugene() -> None:
     (webui,) = [m for m in apps.load_catalogue() if m.id == "open-webui"]
     env = webui.environment or {}
-    assert {k: v for k, v in env.items() if k.startswith(("RAG_", "ENABLE_RAG_"))} == {
+    search = (
+        "RAG_EMBEDDING_ENGINE",
+        "RAG_EMBEDDING_MODEL",
+        "RAG_RERANKING_ENGINE",
+        "RAG_RERANKING_MODEL",
+        "RAG_EXTERNAL_RERANKER_URL",
+        "RAG_EXTERNAL_RERANKER_API_KEY",
+        "ENABLE_RAG_HYBRID_SEARCH",
+    )
+    assert {k: env.get(k) for k in search} == {
         "RAG_EMBEDDING_ENGINE": "openai",
         "RAG_EMBEDDING_MODEL": "{embeddingModel}",
         "RAG_RERANKING_ENGINE": "external",
@@ -641,6 +885,65 @@ def test_open_webui_is_seeded_with_document_search_through_eugene() -> None:
         "RAG_EXTERNAL_RERANKER_API_KEY": "{clientKey}",
         "ENABLE_RAG_HYBRID_SEARCH": "true",
     }
+
+
+#: Every address Open WebUI 0.11.4's config.py defaults to OpenAI's after resetting
+#: `OPENAI_API_BASE_URL` to https://api.openai.com/v1 (lines 362-367): its own, and
+#: the five features that read it after (lines 1098, 1505, 1535, 1580, 1621).
+OPENAI_ADDRESSES = (
+    "OPENAI_API_BASE_URL",
+    "RAG_OPENAI_API_BASE_URL",
+    "IMAGES_OPENAI_API_BASE_URL",
+    "IMAGES_EDIT_OPENAI_API_BASE_URL",
+    "AUDIO_STT_OPENAI_API_BASE_URL",
+    "AUDIO_TTS_OPENAI_API_BASE_URL",
+)
+OPENAI_KEYS = tuple(a.replace("BASE_URL", "KEY") for a in OPENAI_ADDRESSES)
+
+
+def test_open_webui_names_the_gateway_for_every_address_it_would_default_to_openai() -> None:
+    (webui,) = [m for m in apps.load_catalogue() if m.id == "open-webui"]
+    env = webui.environment or {}
+    assert {name: env.get(name) for name in OPENAI_ADDRESSES} == dict.fromkeys(
+        OPENAI_ADDRESSES, "{gatewayUrl}/v1"
+    )
+    assert {name: env.get(name) for name in OPENAI_KEYS} == dict.fromkeys(
+        OPENAI_KEYS, "{clientKey}"
+    )
+
+
+def test_nothing_open_webui_is_started_with_is_openais_address(
+    tmp_path: Path, gateway: FakeGateway
+) -> None:
+    """Since C4 an uploaded document's text was sent to https://api.openai.com/v1/embeddings
+    (refused there, for want of a key): Open WebUI resets `OPENAI_API_BASE_URL` to that after
+    building its connections, and an address it is not given defaults to the reset one. Rendered
+    as it is started, no value of the entry may be OpenAI's, and every OpenAI address is the
+    gateway's, whichever models run."""
+    for run, models in enumerate(
+        ([], [listed("embed-a", "embeddings"), listed("rerank-a", "rerank")])
+    ):
+        gateway.models = models
+        (tmp_path / f"run{run}").mkdir()
+        plan = _open_webui(tmp_path / f"run{run}", gateway.url).plan()
+        (webui,) = [m for m in apps.load_catalogue() if m.id == "open-webui"]
+        rendered = {k: plan.env[k] for k in (webui.environment or {}) if k in plan.env}
+        assert rendered, "the entry rendered nothing"
+        assert not [k for k, v in rendered.items() if "api.openai.com" in v]
+        assert not any("api.openai.com" in a for a in plan.argv)
+        addresses = {
+            k: v
+            for k, v in rendered.items()
+            if k == "OPENAI_API_BASE_URL" or k.endswith("_OPENAI_API_BASE_URL")
+        }
+        assert set(addresses) == set(OPENAI_ADDRESSES)
+        assert set(addresses.values()) == {f"{gateway.url}/v1"}
+        keys = {
+            k: v
+            for k, v in rendered.items()
+            if k == "OPENAI_API_KEY" or k.endswith("_OPENAI_API_KEY")
+        }
+        assert set(keys) == set(OPENAI_KEYS) and set(keys.values()) == {KEY}
 
 
 def test_the_agent_writes_no_model_into_the_spec(tmp_path: Path, gateway: FakeGateway) -> None:

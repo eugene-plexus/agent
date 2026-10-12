@@ -171,18 +171,30 @@ MODEL_SURFACES = {"embeddingModel": "embeddings", "rerankModel": "rerank"}
 #: What a person calls each, in the notes.
 _MODEL_WORDS = {"embeddingModel": "search model", "rerankModel": "result sorter"}
 #: In all, how long a start waits for the gateway's list of models: the name
-#: lookup, the connection and the answer together. A start does not wait
-#: longer than this for a convenience.
+#: lookup, the connection, the tries and the answer together. A start does not
+#: wait longer than this for a convenience.
 MODELS_TIMEOUT_SECONDS = 4.0
+#: How long a refused connection waits before the next try, within that time.
+#: An agent that has only just started may be a few seconds ahead of its own
+#: gateway, and an app that keeps what its first start saw (Open WebUI's
+#: database wins after) must not be given the less for it.
+MODELS_RETRY_SECONDS = 0.5
 #: The longest list read. A big account lists hundreds of models.
 MODELS_MAX_BYTES = 16 * 1024 * 1024
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 #: `{appSecret}`: made at the app's first start, the same at every start after.
 APP_SECRET_FILE = "app_secret"
-#: A hash of the gateway's address and the app's key at the last start, for
-#: `resetOnConnectionChange`. A hash, so the file holds no key.
+#: A hash of the gateway's address, the app's key and the manifest's
+#: `environment` as written at the last start, for `resetOnConnectionChange`.
+#: A hash, so the file holds no key.
 CONNECTION_FILE = "connection.sha256"
+#: Held while the files `render_start` keeps in an app's data directory are
+#: read and written. The agent runs it in a thread (`_AppPlanner.plan_async`),
+#: and a start that was stopped while it waited leaves its thread to finish
+#: beside the next start's: two of them making `{appSecret}` at once would give
+#: the app a secret that is not the one kept.
+_DATA_FILES = threading.Lock()
 
 
 def placeholders(text: str) -> list[str]:
@@ -223,6 +235,12 @@ def app_secret(data_dir: str) -> str:
     """The app's own random secret (`{appSecret}`): made once, kept in its
     data directory, and the same at every start after -- an app that signs
     its sessions with it would sign everyone out at each restart otherwise."""
+    with _DATA_FILES:
+        return _kept_app_secret(data_dir)
+
+
+def _kept_app_secret(data_dir: str) -> str:
+    """`app_secret`, with `_DATA_FILES` held: read it, or make it and keep it."""
     path = os.path.join(data_dir, APP_SECRET_FILE)
     existing = _secret(path)
     if existing:
@@ -233,25 +251,38 @@ def app_secret(data_dir: str) -> str:
     return value
 
 
-def connection_changed(data_dir: str, gateway_url: str | None, client_key: str | None) -> bool:
-    """Whether the gateway's address or the app's key differs from the last
-    start's, recording this start's either way. A first start has nothing to
-    differ from, so it is not a change.
+def connection_changed(
+    data_dir: str,
+    gateway_url: str | None,
+    client_key: str | None,
+    environment: dict[str, str] | None = None,
+) -> bool:
+    """Whether what Eugene gives the app differs from the last start's:
+    the gateway's address, the app's key, or the manifest's `environment` as
+    written (its keys and values with the placeholders unfilled, in a stable
+    order). Recorded either way. A first start has nothing to differ from, so
+    it is not a change; a digest written before the environment was part of
+    it (the address and key alone) is not this one, so it is.
 
-    **Those two and nothing else.** A change of search model or sorter
-    (`{embeddingModel}`, `{rerankModel}`) is not a change of connection: a
-    reset would have the app take the new model while the vectors it stored
-    belong to the one that made them, and would clear what its admin set in
-    it. Neither is in the digest."""
-    digest = hashlib.sha256(f"{gateway_url or ''}\n{client_key or ''}".encode()).hexdigest()
+    **Unfilled, and so no more than that.** A change of search model or sorter
+    (`{embeddingModel}`, `{rerankModel}`) is a change of what a placeholder
+    is filled with, not of what Eugene gives: a reset would have the app take
+    the new model while the vectors it stored belong to the one that made
+    them, and would clear what its admin set in it. Only the templates are in
+    the digest."""
+    given = json.dumps(sorted((environment or {}).items()), separators=(",", ":"))
+    digest = hashlib.sha256(
+        f"{gateway_url or ''}\n{client_key or ''}\n{given}".encode()
+    ).hexdigest()
     path = os.path.join(data_dir, CONNECTION_FILE)
-    try:
-        previous = Path(path).read_text(encoding="utf-8").strip() or None
-    except OSError:
-        previous = None
-    if previous != digest:
-        os.makedirs(data_dir, exist_ok=True)
-        _write_own(path, digest)
+    with _DATA_FILES:
+        try:
+            previous = Path(path).read_text(encoding="utf-8").strip() or None
+        except OSError:
+            previous = None
+        if previous != digest:
+            os.makedirs(data_dir, exist_ok=True)
+            _write_own(path, digest)
     return previous is not None and previous != digest
 
 
@@ -281,6 +312,14 @@ class _CouldNotSay(Exception):
     as a clause that reads after "because"."""
 
 
+class _Refused(_CouldNotSay):
+    """Nothing is listening where the gateway should be: it may not be up yet."""
+
+
+class _Slow(_CouldNotSay):
+    """The gateway did not answer within the time left."""
+
+
 def _origin(url: str) -> str:
     """`url` as a person is told it: scheme and host, no path, no credentials."""
     parts = urllib.parse.urlsplit(url)
@@ -289,6 +328,14 @@ def _origin(url: str) -> str:
 
 def _slow(origin: str) -> str:
     return f"the gateway at {origin} did not answer within {MODELS_TIMEOUT_SECONDS:g} seconds"
+
+
+def _gave_up(refused: str | None, origin: str) -> str:
+    """Why the time ran out: a connection that was refused is the cause to name
+    (the gateway had not come up), not the try that was still waiting."""
+    if refused:
+        return f"{refused}; it had not come up after {MODELS_TIMEOUT_SECONDS:g} seconds of trying"
+    return _slow(origin)
 
 
 def _said(body: bytes) -> str:
@@ -333,9 +380,10 @@ def _refusal(origin: str, exc: urllib.error.HTTPError) -> str:
     return f"{answered}; it said: {said}" if said else answered
 
 
-def _read_models(gateway_url: str, key: str) -> list[dict[str, Any]]:
-    """`GET <gateway>/v1/models` with the app's key: the models it lists for
-    that key. Raises `_CouldNotSay`, naming what was observed."""
+def _read_models(gateway_url: str, key: str, timeout: float) -> list[dict[str, Any]]:
+    """`GET <gateway>/v1/models` with the app's key, given `timeout` seconds:
+    the models it lists for that key. Raises `_CouldNotSay`, naming what was
+    observed: `_Refused` when nothing listens, `_Slow` when `timeout` ran out."""
     if urllib.parse.urlsplit(gateway_url).scheme not in ("http", "https"):
         raise _CouldNotSay("the gateway's address does not start with http:// or https://")
     origin = _origin(gateway_url)
@@ -344,20 +392,25 @@ def _read_models(gateway_url: str, key: str) -> list[dict[str, Any]]:
         headers={"authorization": f"Bearer {key}", "accept": "application/json"},
     )
     # Never the user's proxy, which would be handed the app's key: the gateway
-    # is this install's own, as the log ingress is. One opener, for the one
-    # request a start makes.
+    # is this install's own, as the log ingress is. One opener for each try.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
-        with opener.open(request, timeout=MODELS_TIMEOUT_SECONDS) as response:
+        with opener.open(request, timeout=timeout) as response:
             body = response.read(MODELS_MAX_BYTES + 1)
     except urllib.error.HTTPError as exc:
         raise _CouldNotSay(_refusal(origin, exc)) from None
     except TimeoutError:
-        raise _CouldNotSay(_slow(origin)) from None
+        raise _Slow(_slow(origin)) from None
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, TimeoutError):
-            raise _CouldNotSay(_slow(origin)) from None
+            raise _Slow(_slow(origin)) from None
+        if isinstance(exc.reason, ConnectionRefusedError):
+            raise _Refused(
+                f"the gateway at {origin} refused the connection ({exc.reason})"
+            ) from None
         raise _CouldNotSay(f"the gateway at {origin} could not be reached ({exc.reason})") from None
+    except ConnectionRefusedError as exc:
+        raise _Refused(f"the gateway at {origin} refused the connection ({exc})") from None
     except (OSError, HTTPException) as exc:
         raise _CouldNotSay(f"the gateway at {origin} could not be read ({exc})") from None
     if len(body) > MODELS_MAX_BYTES:
@@ -382,11 +435,14 @@ def ask_gateway_for_models(
     """The models the gateway lists for the app's key, or why it could not say
     (a clause that reads after "because", never holding the key).
 
-    One request, made when a start asks and never again, so a change of model
-    is met at the next start; with the app's own key, never through the user's
-    proxy, and given `MODELS_TIMEOUT_SECONDS` in all. It runs in a thread of
-    its own so that the whole of it is bounded, a name that will not resolve
-    included: a socket's timeout does not cover that.
+    One request is made when a start asks and never again, so a change of
+    model is met at the next start: with the app's own key, never through the
+    user's proxy, given `MODELS_TIMEOUT_SECONDS` in all. A connection that is
+    refused is tried again every `MODELS_RETRY_SECONDS` inside that time (the
+    gateway may be coming up beside the agent); an answer of any other kind,
+    a refusal by the gateway itself included, is the answer. The tries run in
+    a thread of their own so that the whole of it is bounded, a name that will
+    not resolve included: a socket's timeout does not cover that.
     """
     if not gateway_url:
         return None, "this start was given no address for the gateway"
@@ -394,32 +450,59 @@ def ask_gateway_for_models(
         return None, (
             "this app has no key to ask the gateway with (its key file is missing or empty)"
         )
+    deadline = time.perf_counter() + MODELS_TIMEOUT_SECONDS
     outcome: dict[str, Any] = {}
 
     def ask() -> None:
-        try:
-            outcome["models"] = _read_models(gateway_url, key)
-        except _CouldNotSay as exc:
-            outcome["why"] = str(exc)
-        except Exception as exc:  # a thread's failure would otherwise vanish with it
-            outcome["why"] = f"asking it failed ({type(exc).__name__}: {exc})"
+        while True:
+            try:
+                left = max(deadline - time.perf_counter(), 0.05)
+                outcome["models"] = _read_models(gateway_url, key, left)
+                return
+            except _Refused as exc:
+                outcome["refused"] = str(exc)
+                if deadline - time.perf_counter() <= MODELS_RETRY_SECONDS:
+                    return
+                time.sleep(MODELS_RETRY_SECONDS)
+            except _Slow:
+                return
+            except _CouldNotSay as exc:
+                outcome["why"] = str(exc)
+                return
+            except Exception as exc:  # a thread's failure would otherwise vanish with it
+                outcome["why"] = f"asking it failed ({type(exc).__name__}: {exc})"
+                return
 
     worker = threading.Thread(target=ask, name="gateway-models", daemon=True)
     worker.start()
-    worker.join(MODELS_TIMEOUT_SECONDS)
-    if worker.is_alive():
-        return None, _slow(_origin(gateway_url))
+    worker.join(max(deadline - time.perf_counter(), 0.0))
     if "models" in outcome:
         models: list[dict[str, Any]] = outcome["models"]
         return models, None
-    why = str(outcome.get("why") or "the gateway did not say")
+    # No answer in the time, or an answer that was no: say which, from what was seen.
+    why = str(outcome.get("why") or _gave_up(outcome.get("refused"), _origin(gateway_url)))
     # A gateway that echoed the key back in an error would otherwise put it in the log.
     return None, why.replace(key, "[this app's key]")
 
 
-def local_model(models: list[dict[str, Any]], surface: str) -> tuple[str | None, list[str]]:
-    """The first listed model that lists `surface` and runs on the install's own
-    machines, and the ids of those that list it and are not known to.
+def _running(info: dict[str, Any]) -> bool:
+    """Whether a backend runs the listed model now: `ready_backends` above 0, or
+    the field absent (a gateway older than it), which is not the same as 0. The
+    gateway keeps listing a model whose runtime was stopped, with none ready."""
+    ready = info.get("ready_backends")
+    if isinstance(ready, int) and not isinstance(ready, bool):
+        return ready > 0
+    return True
+
+
+def local_model(models: list[dict[str, Any]], surface: str) -> tuple[str | None, bool, list[str]]:
+    """The model to use for `surface`, whether it is running, and the ids of those
+    that list the surface and are not known to run on the install's own machines.
+
+    The first local model that lists `surface` and is running; failing that,
+    the first local one that is listed, running or not, because an app that
+    keeps what its first start saw is better off with the install's model than
+    with its own default. None when no local model lists it.
 
     "Runs on the install's own machines" is the listing's own
     `x_eugene_plexus.locality`: `local` only when every backend serving the
@@ -432,6 +515,7 @@ def local_model(models: list[dict[str, Any]], surface: str) -> tuple[str | None,
     install unasked.
     """
     outside: list[str] = []
+    stopped: str | None = None
     for model in models:
         ident = model.get("id")
         # An id is put in an environment variable: nothing a process cannot take there.
@@ -443,10 +527,13 @@ def local_model(models: list[dict[str, Any]], surface: str) -> tuple[str | None,
         surfaces = info.get("surfaces")
         if not isinstance(surfaces, list) or surface not in surfaces:
             continue
-        if info.get("locality") == "local":
-            return ident, outside
-        outside.append(ident)
-    return None, outside
+        if info.get("locality") != "local":
+            outside.append(ident)
+        elif _running(info):
+            return ident, True, outside
+        elif stopped is None:
+            stopped = ident
+    return stopped, False, outside
 
 
 def _unset_model(name: str, outside: list[str]) -> str:
@@ -460,6 +547,17 @@ def _unset_model(name: str, outside: list[str]) -> str:
     return (
         f"{head}. The gateway lists {shown}, but {known} known to run on this install's own "
         "machines, and a model that does not is never used: the documents would leave the install."
+    )
+
+
+def _stopped_model(name: str, model: str) -> str:
+    """The note for a model that is the answer though it is not running now."""
+    word = _MODEL_WORDS[name]
+    return (
+        f"{{{name}}} is {model} at this start, though the gateway lists it but it is not running "
+        f"now, and no other local {word} is. The app keeps what its first start saw, so it is "
+        f"given the install's {word} rather than its own default: start {model} in Eugene's "
+        "console, under Backends, for it to work."
     )
 
 
@@ -479,11 +577,14 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
     and only by a manifest that names one (`ask_gateway_for_models`). A
     start does not wait on it for more than `MODELS_TIMEOUT_SECONDS`, and
     one that gets no answer, or no local model, says why in its own line
-    beside the variable's.
+    beside the variable's. A model that is listed but not running is still
+    the answer when it is all there is, and the line says so.
 
     With `resetOnConnectionChange`, that variable is `true` for a start
-    whose connection differs from the last one's and absent otherwise,
-    even when the environment it inherits has it.
+    whose connection differs from the last one's (the gateway's address,
+    the app's key, or the manifest's `environment` as written, unfilled:
+    `connection_changed`) and absent otherwise, even when the environment
+    it inherits has it.
     """
     data = str(spec.get("dataDir") or "")
     values = {
@@ -520,11 +621,13 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
                     f"{_MODEL_WORDS[name]} runs, because {why}."
                 )
                 continue
-            chosen, outside = local_model(listing, MODEL_SURFACES[name])
+            chosen, running, outside = local_model(listing, MODEL_SURFACES[name])
             if chosen is None:
                 notes.append(_unset_model(name, outside))
-            else:
-                values[name] = chosen
+                continue
+            values[name] = chosen
+            if not running:
+                notes.append(_stopped_model(name, chosen))
     argv = [str(a) for a in spec["argv"]]
     argv.extend(_fill(text, values)[0] for text in args)
     out = dict(env)
@@ -541,12 +644,13 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
             out[name] = filled
     if reset:
         out.pop(reset, None)
-        if data and connection_changed(data, values.get("gatewayUrl"), key):
+        if data and connection_changed(data, values.get("gatewayUrl"), key, environment):
             out[reset] = "true"
             notes.append(
-                "Eugene's connection details changed since the last start (the gateway's "
-                f"address or this app's key), so {reset}=true for this start: the app takes "
-                "the new ones, and settings changed inside it go back to their defaults."
+                "What Eugene gives this app changed since the last start (the gateway's "
+                "address, the app's key, or the settings Eugene gives it), so "
+                f"{reset}=true for this start: the app takes the new ones, and settings "
+                "changed inside it go back to their defaults."
             )
     return argv, out, notes
 

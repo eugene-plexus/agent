@@ -666,9 +666,10 @@ def test_the_catalogue_offers_open_webui_as_designed() -> None:
     assert env["WEBUI_SECRET_KEY"] == "{appSecret}"
     assert env["OPENAI_API_BASE_URL"] == "{gatewayUrl}/v1"
     assert env["OPENID_PROVIDER_URL"] == "{oidcIssuer}/.well-known/openid-configuration"
-    # 33 until MR6 added the six that point its document search at Eugene
-    # (`test_app_models.py` holds what each is and why).
-    assert len(env) == 39
+    # 33 until MR6 added the six that point its document search at Eugene and
+    # the ten that name the gateway for every address it would default to
+    # OpenAI's (`test_app_models.py` holds what each is and why).
+    assert len(env) == 49
 
     # Workbench needs none of it and did not change.
     workbench = catalogue["workbench"]

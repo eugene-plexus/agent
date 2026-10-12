@@ -21,6 +21,7 @@ def listed(
     *surfaces: str,
     locality: str | None = "local",
     owned_by: str = "openai_compat_custom",
+    ready: Any = 1,
 ) -> dict[str, Any]:
     """One entry of `GET /v1/models`, shaped as the real gateway's.
 
@@ -29,13 +30,18 @@ def listed(
     companion driver reports `openai_compat_custom`), never `local`, and
     where it runs is its `x_eugene_plexus.locality`. `owned_by` reads `local`
     only when no driver names a provider or two different ones do.
+
+    `ready` is `x_eugene_plexus.ready_backends`: how many backends run the
+    model now. The gateway keeps listing a model whose runtime was stopped,
+    with 0. `None` leaves the field out, as a gateway older than it does.
     """
     info: dict[str, Any] = {
         "drivers": [f"{model_id}-driver"],
         "backends": ["openai_compat_http"],
         "surfaces": list(surfaces),
-        "ready_backends": 1,
     }
+    if ready is not None:
+        info["ready_backends"] = ready
     if locality is not None:
         info["locality"] = locality
     return {
@@ -74,7 +80,10 @@ class FakeGateway:
         *,
         key: str | None = None,
         prefix: str = "",
+        port: int = 0,
     ) -> None:
+        """`port` 0 is one the system picks; a fake that comes up late is given
+        one that was free a moment ago."""
         self.models = list(models or [])
         #: The key it accepts; None accepts any.
         self.key = key
@@ -98,7 +107,7 @@ class FakeGateway:
             def log_message(self, *_a: object) -> None:
                 return None
 
-        self.server = _Server(("127.0.0.1", 0), Handler)
+        self.server = _Server(("127.0.0.1", port), Handler)
         # A short poll: `shutdown()` waits one, and a test per fake would wait half a second each.
         threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
