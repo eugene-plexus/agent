@@ -73,7 +73,29 @@
     OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
     OPENAI_API_KEY: "{clientKey}"
     ENABLE_OLLAMA_API: "false"
+    # Document search through Eugene's own door (MR6, specs
+    # docs/design/workbench-memory-and-documents.md). Open WebUI copies these
+    # into its database at its first start and its database wins after, so what
+    # is running at its first start is what it keeps; its admin changes them in
+    # its Admin Settings, Documents, which warns about re-reading documents.
+    # {embeddingModel} and {rerankModel} are the first models the gateway lists
+    # for this app's key that run on this install's own machines and embed, or
+    # sort results (read at every start; with none the variable is left unset
+    # and the start's notes say why). The sorter is used only when
+    # {rerankModel} has a value. A change of search model never resets the
+    # app's settings (resetOnConnectionChange is the gateway's address and the
+    # app's key alone): the vectors it stored belong to the model that made
+    # them. Hybrid search is on because words plus meaning beat either alone in
+    # Eugene's own measurement (MR5, 60 questions: recall@5 0.600 against 0.500
+    # and 0.583, a small margin), and Open WebUI runs it with or without a
+    # sorter.
     RAG_EMBEDDING_ENGINE: openai
+    RAG_EMBEDDING_MODEL: "{embeddingModel}"
+    RAG_RERANKING_ENGINE: external
+    RAG_RERANKING_MODEL: "{rerankModel}"
+    RAG_EXTERNAL_RERANKER_URL: "{gatewayUrl}/v1/rerank"
+    RAG_EXTERNAL_RERANKER_API_KEY: "{clientKey}"
+    ENABLE_RAG_HYBRID_SEARCH: "true"
     AUDIO_STT_ENGINE: openai
     OFFLINE_MODE: "true"
     ENABLE_VERSION_UPDATE_CHECK: "false"

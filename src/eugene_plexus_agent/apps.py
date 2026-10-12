@@ -920,6 +920,13 @@ class _AppPlanner:
         `render_start`, so this path and the app's own account fill a
         placeholder one way. Secrets reach the child's environment and
         nothing else: never an argument (`validate_manifest`), never the log.
+
+        A manifest that names `{embeddingModel}` or `{rerankModel}` makes
+        this ask the gateway which models it lists, once, for up to
+        `app_launcher.MODELS_TIMEOUT_SECONDS`, and the event loop this runs
+        on waits with it. Open WebUI, the one shipped app that names them,
+        needs an account of its own, where the launcher waits instead; only
+        a custom app that names them on a host without accounts waits here.
         """
         base = self.base_plan()
         record = self.record
@@ -943,7 +950,10 @@ class _AppPlanner:
         `environment` as written, the values that are not secret, and the
         variable a changed connection sets. What the spec the agent writes
         for an app's own account carries, so it holds no secret: the
-        launcher reads those from files, inside that account (C4)."""
+        launcher reads those from files, inside that account (C4). Nor does
+        it carry `{embeddingModel}` or `{rerankModel}`: a model that runs
+        when this is written may not when the app starts, so the launcher
+        asks the gateway at every start (MR6)."""
         manifest = self.record.manifest
         values: dict[str, str] = {
             "bindHost": self._bind_host() or "127.0.0.1",

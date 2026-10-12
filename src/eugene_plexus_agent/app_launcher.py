@@ -15,7 +15,10 @@ program. It:
   else**, from the files this account is given, so they never reach the
   spec, the agent's log or the service definition. `render_start` is the
   one implementation: the agent imports it for an app its own supervisor
-  runs, so the two ways an app runs cannot fill a placeholder two ways;
+  runs, so the two ways an app runs cannot fill a placeholder two ways.
+  Two of them, `{embeddingModel}` and `{rerankModel}` (MR6), are answered
+  by asking the gateway, with the app's own key, which of the install's
+  own models the app should use (`ask_gateway_for_models`);
 * forwards every line the app prints to the agent's log ingress
   (`POST /v1/logs`, OTLP JSON) with the app's own client key, so the Logs
   page shows the app as it shows a child the agent runs itself;
@@ -47,9 +50,12 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
+from http.client import HTTPException, HTTPMessage
 from pathlib import Path
+from typing import IO, Any
 
 WINDOWS = sys.platform == "win32"
 
@@ -149,11 +155,27 @@ PLACEHOLDERS = frozenset(
         "clientKey",
         "oidcClientSecret",
         "appSecret",
+        "embeddingModel",
+        "rerankModel",
     }
 )
 #: Read by `render_start` from files, never carried in a spec: a value for
 #: one of these in the spec's `values` is ignored.
 SECRET_PLACEHOLDERS = frozenset({"clientKey", "oidcClientSecret", "appSecret"})
+#: The placeholders answered by asking the gateway at every start (MR6), each
+#: with the surface a model must list to be the answer: the install's search
+#: model (it embeds) and its result sorter (it reranks). Never carried in a
+#: spec either: the model that was running when the agent wrote one may not
+#: be when the app starts.
+MODEL_SURFACES = {"embeddingModel": "embeddings", "rerankModel": "rerank"}
+#: What a person calls each, in the notes.
+_MODEL_WORDS = {"embeddingModel": "search model", "rerankModel": "result sorter"}
+#: In all, how long a start waits for the gateway's list of models: the name
+#: lookup, the connection and the answer together. A start does not wait
+#: longer than this for a convenience.
+MODELS_TIMEOUT_SECONDS = 4.0
+#: The longest list read. A big account lists hundreds of models.
+MODELS_MAX_BYTES = 16 * 1024 * 1024
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 #: `{appSecret}`: made at the app's first start, the same at every start after.
@@ -214,7 +236,13 @@ def app_secret(data_dir: str) -> str:
 def connection_changed(data_dir: str, gateway_url: str | None, client_key: str | None) -> bool:
     """Whether the gateway's address or the app's key differs from the last
     start's, recording this start's either way. A first start has nothing to
-    differ from, so it is not a change."""
+    differ from, so it is not a change.
+
+    **Those two and nothing else.** A change of search model or sorter
+    (`{embeddingModel}`, `{rerankModel}`) is not a change of connection: a
+    reset would have the app take the new model while the vectors it stored
+    belong to the one that made them, and would clear what its admin set in
+    it. Neither is in the digest."""
     digest = hashlib.sha256(f"{gateway_url or ''}\n{client_key or ''}".encode()).hexdigest()
     path = os.path.join(data_dir, CONNECTION_FILE)
     try:
@@ -225,6 +253,214 @@ def connection_changed(data_dir: str, gateway_url: str | None, client_key: str |
         os.makedirs(data_dir, exist_ok=True)
         _write_own(path, digest)
     return previous is not None and previous != digest
+
+
+# --------------------------------------------------------------------------- #
+# which of the install's own models the app is given (MR6)
+# --------------------------------------------------------------------------- #
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The app's key goes to the address it was given and to no other:
+    `urllib` would carry it on to wherever a redirect points."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
+class _CouldNotSay(Exception):
+    """The gateway could not say which models it lists. The message is why,
+    as a clause that reads after "because"."""
+
+
+def _origin(url: str) -> str:
+    """`url` as a person is told it: scheme and host, no path, no credentials."""
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}"
+
+
+def _slow(origin: str) -> str:
+    return f"the gateway at {origin} did not answer within {MODELS_TIMEOUT_SECONDS:g} seconds"
+
+
+def _said(body: bytes) -> str:
+    """What the gateway said with a refusal, in its own words and short: the
+    `detail` of its problem document, or an OpenAI-shaped `error.message`."""
+    try:
+        document = json.loads(body)
+    except ValueError:
+        return ""
+    layers = [document] if isinstance(document, dict) else []
+    for layer in list(layers):
+        layers.extend(
+            inner for inner in (layer.get("detail"), layer.get("error")) if isinstance(inner, dict)
+        )
+    for layer in layers:
+        for field in ("detail", "message", "title"):
+            text = layer.get(field)
+            if isinstance(text, str) and text.strip():
+                return " ".join(text.split())[:240]
+    return ""
+
+
+def _refusal(origin: str, exc: urllib.error.HTTPError) -> str:
+    code = exc.code
+    try:
+        said = _said(exc.read(4096))
+    except (OSError, HTTPException):
+        said = ""
+    finally:
+        exc.close()
+    answered = f"the gateway at {origin} answered HTTP {code}"
+    if 300 <= code < 400:
+        answered += " and sent the launcher elsewhere, which it does not follow with this app's key"
+    elif code == 401:
+        answered += " and did not accept this app's key"
+    elif code == 403:
+        answered += " and would not list its models for this app's key"
+    elif code == 404:
+        answered += " and has no list of models at that address (is it the gateway's?)"
+    elif code >= 500:
+        answered += ", which is a failure on its side"
+    return f"{answered}; it said: {said}" if said else answered
+
+
+def _read_models(gateway_url: str, key: str) -> list[dict[str, Any]]:
+    """`GET <gateway>/v1/models` with the app's key: the models it lists for
+    that key. Raises `_CouldNotSay`, naming what was observed."""
+    if urllib.parse.urlsplit(gateway_url).scheme not in ("http", "https"):
+        raise _CouldNotSay("the gateway's address does not start with http:// or https://")
+    origin = _origin(gateway_url)
+    request = urllib.request.Request(
+        gateway_url.rstrip("/") + "/v1/models",
+        headers={"authorization": f"Bearer {key}", "accept": "application/json"},
+    )
+    # Never the user's proxy, which would be handed the app's key: the gateway
+    # is this install's own, as the log ingress is. One opener, for the one
+    # request a start makes.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(request, timeout=MODELS_TIMEOUT_SECONDS) as response:
+            body = response.read(MODELS_MAX_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise _CouldNotSay(_refusal(origin, exc)) from None
+    except TimeoutError:
+        raise _CouldNotSay(_slow(origin)) from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise _CouldNotSay(_slow(origin)) from None
+        raise _CouldNotSay(f"the gateway at {origin} could not be reached ({exc.reason})") from None
+    except (OSError, HTTPException) as exc:
+        raise _CouldNotSay(f"the gateway at {origin} could not be read ({exc})") from None
+    if len(body) > MODELS_MAX_BYTES:
+        raise _CouldNotSay(
+            f"the gateway at {origin} answered with a list of models too long to read"
+        )
+    try:
+        document = json.loads(body)
+    except ValueError:
+        document = None
+    data = document.get("data") if isinstance(document, dict) else None
+    if not isinstance(data, list):
+        raise _CouldNotSay(
+            f"the gateway at {origin} answered with something that is not a list of models"
+        )
+    return [model for model in data if isinstance(model, dict)]
+
+
+def ask_gateway_for_models(
+    gateway_url: str | None, key: str | None
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """The models the gateway lists for the app's key, or why it could not say
+    (a clause that reads after "because", never holding the key).
+
+    One request, made when a start asks and never again, so a change of model
+    is met at the next start; with the app's own key, never through the user's
+    proxy, and given `MODELS_TIMEOUT_SECONDS` in all. It runs in a thread of
+    its own so that the whole of it is bounded, a name that will not resolve
+    included: a socket's timeout does not cover that.
+    """
+    if not gateway_url:
+        return None, "this start was given no address for the gateway"
+    if not key:
+        return None, (
+            "this app has no key to ask the gateway with (its key file is missing or empty)"
+        )
+    outcome: dict[str, Any] = {}
+
+    def ask() -> None:
+        try:
+            outcome["models"] = _read_models(gateway_url, key)
+        except _CouldNotSay as exc:
+            outcome["why"] = str(exc)
+        except Exception as exc:  # a thread's failure would otherwise vanish with it
+            outcome["why"] = f"asking it failed ({type(exc).__name__}: {exc})"
+
+    worker = threading.Thread(target=ask, name="gateway-models", daemon=True)
+    worker.start()
+    worker.join(MODELS_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        return None, _slow(_origin(gateway_url))
+    if "models" in outcome:
+        models: list[dict[str, Any]] = outcome["models"]
+        return models, None
+    why = str(outcome.get("why") or "the gateway did not say")
+    # A gateway that echoed the key back in an error would otherwise put it in the log.
+    return None, why.replace(key, "[this app's key]")
+
+
+def local_model(models: list[dict[str, Any]], surface: str) -> tuple[str | None, list[str]]:
+    """The first listed model that lists `surface` and runs on the install's own
+    machines, and the ids of those that list it and are not known to.
+
+    "Runs on the install's own machines" is the listing's own
+    `x_eugene_plexus.locality`: `local` only when every backend serving the
+    model says so, `external` when any is a cloud account or someone else's
+    server, `unknown` otherwise. **Not `owned_by`**: that is the driver's
+    provider key (`openai_compat_custom` for the driver of every runtime of
+    ours), and reads `local` only when no key is named or two different ones
+    are -- so it names no local model of ours, and calls a model served by two
+    outside accounts local. Never an outside model: documents would leave the
+    install unasked.
+    """
+    outside: list[str] = []
+    for model in models:
+        ident = model.get("id")
+        # An id is put in an environment variable: nothing a process cannot take there.
+        if not (isinstance(ident, str) and 0 < len(ident) <= 256 and ident.isprintable()):
+            continue
+        info = model.get("x_eugene_plexus")
+        if not isinstance(info, dict):
+            continue
+        surfaces = info.get("surfaces")
+        if not isinstance(surfaces, list) or surface not in surfaces:
+            continue
+        if info.get("locality") == "local":
+            return ident, outside
+        outside.append(ident)
+    return None, outside
+
+
+def _unset_model(name: str, outside: list[str]) -> str:
+    """Why a model placeholder has no value, when the gateway answered."""
+    word = _MODEL_WORDS[name]
+    head = f"{{{name}}} has no value at this start: no local {word} is running"
+    if not outside:
+        return f"{head} (the gateway lists none for this app's key)."
+    shown = ", ".join(outside[:3]) + (f" and {len(outside) - 3} more" if len(outside) > 3 else "")
+    known = "it is" if len(outside) == 1 else "none of them is"
+    return (
+        f"{head}. The gateway lists {shown}, but {known} known to run on this install's own "
+        "machines, and a model that does not is never used: the documents would leave the install."
+    )
 
 
 def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, str], list[str]]:
@@ -239,6 +475,12 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
     than set to half a value, and the returned lines say so; an argument
     gets an empty string, so the arguments after it keep their places.
 
+    `{embeddingModel}` and `{rerankModel}` are asked of the gateway, once,
+    and only by a manifest that names one (`ask_gateway_for_models`). A
+    start does not wait on it for more than `MODELS_TIMEOUT_SECONDS`, and
+    one that gets no answer, or no local model, says why in its own line
+    beside the variable's.
+
     With `resetOnConnectionChange`, that variable is `true` for a start
     whose connection differs from the last one's and absent otherwise,
     even when the environment it inherits has it.
@@ -248,6 +490,7 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
         str(k): str(v)
         for k, v in (spec.get("values") or {}).items()
         if v is not None and k in PLACEHOLDERS and k not in SECRET_PLACEHOLDERS
+        if k not in MODEL_SURFACES
     }
     if data:
         values["dataDir"] = data
@@ -255,8 +498,9 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
     environment = {str(k): str(v) for k, v in (spec.get("environment") or {}).items()}
     reset = spec.get("resetOnConnectionChange")
     wanted = {n for text in [*args, *environment.values()] for n in placeholders(text)}
+    models = [name for name in MODEL_SURFACES if name in wanted]
 
-    key = _secret(spec.get("keyFile")) if "clientKey" in wanted or reset else None
+    key = _secret(spec.get("keyFile")) if "clientKey" in wanted or reset or models else None
     if key:
         values["clientKey"] = key
     if "oidcClientSecret" in wanted:
@@ -267,6 +511,20 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
         values["appSecret"] = app_secret(data)
 
     notes: list[str] = []
+    if models:
+        listing, why = ask_gateway_for_models(values.get("gatewayUrl"), key)
+        for name in models:
+            if listing is None:
+                notes.append(
+                    f"{{{name}}} has no value at this start: the launcher could not ask which "
+                    f"{_MODEL_WORDS[name]} runs, because {why}."
+                )
+                continue
+            chosen, outside = local_model(listing, MODEL_SURFACES[name])
+            if chosen is None:
+                notes.append(_unset_model(name, outside))
+            else:
+                values[name] = chosen
     argv = [str(a) for a in spec["argv"]]
     argv.extend(_fill(text, values)[0] for text in args)
     out = dict(env)

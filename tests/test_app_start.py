@@ -15,7 +15,10 @@ plausible wrong implementation would get wrong:
   script calls it;
 * readiness is asked at `healthPath`;
 * a changed connection resets the app's settings for one start, and only
-  then.
+  then;
+* the two placeholders that name a model are asked of the gateway at every
+  start, and a change of model is not a change of connection
+  (`test_app_models.py`).
 
 Nothing here installs Open WebUI: a fake package in a temporary directory
 stands in for it.
@@ -44,6 +47,7 @@ from eugene_plexus_agent import app_accounts, app_launcher, apps
 from eugene_plexus_agent._generated.models import AppManifest, AppOrigin, ComponentStatus
 from eugene_plexus_agent.supervisor import ProcessState
 
+from .fake_gateway import FakeGateway
 from .test_app_accounts import FakeRunner, _free_port, _Ingress
 
 KEY = "the-client-key-value"
@@ -365,7 +369,7 @@ def _fake_package(tmp_path: Path) -> Path:
         "import json, os, sys\n"
         "NOT_CALLABLE = 3\n"
         "def main():\n"
-        "    names = ('DATA', 'KEY', 'SECRET', 'RESET_CONFIG_ON_START', 'GATEWAY')\n"
+        "    names = ('DATA', 'KEY', 'SECRET', 'RESET_CONFIG_ON_START', 'GATEWAY', 'EMBED', 'RERANK')\n"
         "    record = {'argv': sys.argv, 'env': {n: os.environ.get(n) for n in names},\n"
         "              'cwd_on_path': '' in sys.path}\n"
         "    with open(os.path.join(os.environ['DATA'], 'record.json'), 'w') as f:\n"
@@ -662,7 +666,9 @@ def test_the_catalogue_offers_open_webui_as_designed() -> None:
     assert env["WEBUI_SECRET_KEY"] == "{appSecret}"
     assert env["OPENAI_API_BASE_URL"] == "{gatewayUrl}/v1"
     assert env["OPENID_PROVIDER_URL"] == "{oidcIssuer}/.well-known/openid-configuration"
-    assert len(env) == 33
+    # 33 until MR6 added the six that point its document search at Eugene
+    # (`test_app_models.py` holds what each is and why).
+    assert len(env) == 39
 
     # Workbench needs none of it and did not change.
     workbench = catalogue["workbench"]
@@ -680,14 +686,21 @@ def test_open_webui_is_told_where_everything_is(tmp_path: Path) -> None:
     record = apps.InstalledApp(
         manifest=webui, origin=AppOrigin.catalogue, port=8191, installed_at=datetime.now(UTC)
     )
-    planner = _planner(store, record, gateway="http://127.0.0.1:8080")
-    plan = planner.plan()
+    # The entry names the install's search models, so a start asks a gateway
+    # which run: a fake one, on a port of its own. Never 8080, which a
+    # developer's live install holds and which would be dialled with a test key.
+    gateway = FakeGateway(key=KEY)
+    try:
+        planner = _planner(store, record, gateway=gateway.url)
+        plan = planner.plan()
+    finally:
+        gateway.close()
     data = str(store.data_dir("open-webui"))
     assert plan.argv[1:5] == ["-c", apps._CALL_SNIPPET, "open_webui:app", "open-webui"]
     assert plan.argv[5:] == ["serve", "--host", "127.0.0.1", "--port", "8191"]
     env = plan.env
     assert env["DATA_DIR"] == data and env["STATIC_DIR"] == data + "/static"
-    assert env["OPENAI_API_BASE_URL"] == "http://127.0.0.1:8080/v1"
+    assert env["OPENAI_API_BASE_URL"] == f"{gateway.url}/v1"
     assert env["OPENAI_API_KEY"] == KEY and env["OAUTH_CLIENT_SECRET"] == OIDC
     assert env["OAUTH_CLIENT_ID"] == "c-webui"
     assert env["OPENID_PROVIDER_URL"] == (
