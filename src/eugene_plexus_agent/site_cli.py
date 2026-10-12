@@ -543,7 +543,13 @@ def _prepared(config_dir: Path, args: argparse.Namespace) -> tuple[Path, Path]:
 def _password(args: argparse.Namespace) -> str:
     if args.password_stdin:
         return sys.stdin.readline().rstrip("\r\n")
-    return getpass.getpass(f"{args.owner}, your Eugene password (confirms this machine): ")
+    # Their own password, never Eugene's owner's: a job site belongs to the
+    # person who made the command, and "<name>'s password" read as the
+    # owner's to an owner who was also that person (2026-10-12).
+    return getpass.getpass(
+        f"{args.owner}, your own Eugene password, the one you sign in to Workbench with "
+        "(confirms this machine is yours): "
+    )
 
 
 def _give_to_owner_of(data: Path) -> None:
@@ -711,7 +717,10 @@ def link(config_dir: Path, args: argparse.Namespace) -> str:
     password = (
         sys.stdin.readline().rstrip("\r\n")
         if args.password_stdin
-        else getpass.getpass(f"{args.person}, your Eugene password (links you here): ")
+        else getpass.getpass(
+            f"{args.person}, your own Eugene password, the one you sign in to Workbench with "
+            "(links you here): "
+        )
     )
     done = subprocess.run(
         [
