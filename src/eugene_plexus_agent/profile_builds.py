@@ -373,7 +373,8 @@ def validate_request(body: ProfileBuildRequest) -> dict[str, Any]:
         )
     flags = {k: v for k, v in (spec.flags or {}).items() if v is not None}
     if flags.get(FLASH_ATTENTION_KEY) not in (None, *FLASH_ATTENTION_CHOICES):
-        raise BuildError("flashAttention must be on, off, or not set.")
+        found = flags[FLASH_ATTENTION_KEY]
+        raise BuildError(f"flashAttention must be on, off, or not set, not {found!r}.")
     parallel = flags.get("parallelSlots", 1)
     if type(parallel) is not int or parallel != 1:
         raise BuildError("A settings build measures one conversation at a time. Use one slot.")

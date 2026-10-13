@@ -698,6 +698,8 @@ def test_a_build_refuses_a_checkbox_where_flash_attention_is_a_choice():
 
     assert flags(flashAttention="on") == {"flashAttention": "on"}
     assert flags() == {}
-    for checkbox in (True, False):
-        with pytest.raises(BuildError, match="flashAttention must be on, off, or not set"):
-            flags(flashAttention=checkbox)
+    # The whole message, naming what was found as the launch path does: a string in its quotes.
+    for found in (True, False, "auto"):
+        with pytest.raises(BuildError) as refused:
+            flags(flashAttention=found)
+        assert str(refused.value) == f"flashAttention must be on, off, or not set, not {found!r}."
