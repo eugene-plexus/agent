@@ -627,12 +627,12 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="maxTokens",
         label="Default max tokens",
         description=(
-            "Upstream's default output length for a request that does not set one "
-            "(engine default 512). This is a *default*, not a context window: MLX "
-            "has no `--max-model-len` equivalent and never reports a context size, "
-            "so the runtime's declared context is the only number the library can "
-            "compute a fit against. The gateway sends max-tokens on every request "
-            "anyway, so this rarely decides anything."
+            "The default output length, in tokens, for a request that does not set "
+            "one.\n\n"
+            "The engine's own default is 512. It is not a context window: MLX never "
+            "reports a context size, so the runtime's declared context is what the "
+            "Library computes fit against. The gateway sends max tokens on every "
+            "request, so this rarely decides anything."
         ),
         category="memory",
         valueType=ConfigValueType.integer,

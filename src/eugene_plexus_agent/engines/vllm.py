@@ -797,13 +797,13 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="maxModelLen",
         label="Max model length",
         description=(
-            "The context window in tokens — prompt plus output — and the "
-            "number every fit verdict in the library is computed against. "
-            "The direct analogue of llama.cpp's context size. Leave unset to "
-            "take the model's own configured length; vLLM also accepts `auto` "
-            "(via extraArgs: `--max-model-len auto`) to pick the largest length "
-            "that fits in GPU memory. The value the engine actually resolved is "
-            "read back onto the runtime's capabilities."
+            "The context window in tokens, prompt plus output; the Library "
+            "computes every fit verdict against it.\n\n"
+            "The equivalent of llama.cpp's context size. Leave it unset to take the "
+            "model's own configured length. vLLM also accepts `auto`, through "
+            "extraArgs (`--max-model-len auto`), to pick the largest length that fits "
+            "in GPU memory. The value the engine resolved is read back onto the "
+            "runtime."
         ),
         category="memory",
         valueType=ConfigValueType.integer,
@@ -874,10 +874,10 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="maxNumSeqs",
         label="Max concurrent sequences",
         description=(
-            "How many sequences one scheduling step may hold — vLLM's name for "
-            "the unit of capacity the gateway divides work across (parallel "
-            "slots on llama.cpp). Raising it raises throughput and KV cache "
-            "pressure together."
+            "How many sequences one scheduling step may hold; the gateway divides "
+            "work by this capacity.\n\n"
+            "This is vLLM's name for what llama.cpp calls parallel slots. Raising it "
+            "raises throughput and KV cache pressure together."
         ),
         category="performance",
         valueType=ConfigValueType.integer,
@@ -931,12 +931,12 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="quantization",
         label="Quantization method",
         description=(
-            "Normally left unset: vLLM reads `quantization_config` from the "
-            "model's config.json and picks the method itself (AWQ, GPTQ, FP8, "
-            "compressed-tensors and the rest). Set it explicitly only for a "
-            "checkpoint that does not declare its own, or to force an "
-            "on-the-fly method such as `fp8`. The engine validates the name at "
-            "spawn."
+            "The quantization method; normally left unset, so vLLM picks it from "
+            "the model's config.\n\n"
+            "vLLM reads `quantization_config` from the model's `config.json` (AWQ, "
+            "GPTQ, FP8, compressed-tensors and the rest). Set it only for a checkpoint "
+            "that does not declare its own, or to force an on-the-fly method such as "
+            "`fp8`. The engine validates the name at spawn."
         ),
         category="model",
         valueType=ConfigValueType.string,

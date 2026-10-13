@@ -927,17 +927,13 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="contextSize",
         label="Context size",
         description=(
-            "Total tokens this runtime keeps in memory, shared by its "
-            "slots. The single biggest lever on memory use. With more "
-            "than one slot the engine divides this between them, so each "
-            "request sees a smaller window and the memory is unchanged. "
-            "Leave unset to take the model's trained context — the engine "
-            "clamps anything larger than the model or than available "
-            "memory. A runtime reports back the window one slot gets, "
-            "which is this value divided by the slot count — not a sign "
-            "it ran short of memory. A search model (an embedding or "
-            "reranking model) left unset starts with 4,096 instead, "
-            "shared by its 4 slots."
+            "Total tokens this runtime keeps in memory, shared by its slots; the "
+            "biggest lever on memory use.\n\n"
+            "With more than one slot the engine divides it between them, so each "
+            "request sees a smaller window and memory use is unchanged. Unset takes "
+            "the model's trained context; the engine clamps anything larger than the "
+            "model or than available memory. A search model (an embedding or reranking "
+            "model) left unset starts with 4,096 tokens, shared by its 4 slots."
         ),
         category="memory",
         valueType=ConfigValueType.integer,
@@ -962,18 +958,13 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="parallelSlots",
         label="Parallel slots",
         description=(
-            "Concurrent requests this runtime serves. A number set here "
-            "divides the context size between the slots rather than each "
-            "getting their own, so 4 slots at 32k gives every request 8k "
-            "and costs exactly what 1 slot at 32k costs — raise this and "
-            "raise context together if each request needs the same room "
-            "as before. Left unset, llama.cpp runs 4 slots that share one "
-            "pool of the whole context instead: a request alone can use "
-            "all of it, and requests running at once share it. This is "
-            "also the unit of capacity the gateway divides work across. A "
-            "search model (an embedding or reranking model) left unset "
-            "starts with 4 slots over 4,096 tokens, so one input may "
-            "hold 1,024."
+            "Concurrent requests this runtime serves, and the unit of capacity the "
+            "gateway divides work across.\n\n"
+            "A number set here divides the context size between the slots: 4 slots at "
+            "32k give each request 8k, for the same memory as 1 slot at 32k. Unset, "
+            "llama.cpp runs 4 slots that share one pool of the whole context, so a "
+            "lone request can use all of it. A search model left unset starts with 4 "
+            "slots over 4,096 tokens, so one input may hold 1,024."
         ),
         category="performance",
         valueType=ConfigValueType.integer,
@@ -1049,13 +1040,12 @@ _FLAG_FIELDS: list[ConfigField] = [
         key=CACHE_TYPE_KEY,
         label="Memory precision",
         description=(
-            "How precisely the model keeps what it has read so far (its KV "
-            "cache). Full is exact. 8-bit and 4-bit use about half and a "
-            "quarter of the memory, leaving room for more text or more of the "
-            "model on the graphics card, and change answers slightly: how much "
-            "depends on the model, by as much as ninefold between two measured "
-            "ones, so the profile builder measures it on yours. 8-bit and "
-            "4-bit need flash attention, which is switched on with them."
+            "How precisely the model keeps what it has read so far (its KV cache).\n\n"
+            "Full is exact. 8-bit and 4-bit use about half and a quarter of the "
+            "memory, leaving room for more text or more of the model on the graphics "
+            "card, but change answers slightly, by an amount that varies a lot between "
+            "models; the profile builder measures it on yours. 8-bit and 4-bit need "
+            "flash attention, which is switched on with them."
         ),
         category="memory",
         valueType=ConfigValueType.enum,
@@ -1068,9 +1058,9 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="memoryMargin",
         label="Leave this much graphics memory free (MiB)",
         description=(
-            "When llama.cpp decides how much of the model goes on each graphics "
-            "card, it leaves this much memory unused on every one. Raise it if "
-            "you game or render on the same card while a model is loaded."
+            "How much graphics memory llama.cpp keeps free on every card when it "
+            "places the model.\n\n"
+            "Raise it if you game or render on the same card while a model is loaded."
         ),
         category="memory",
         valueType=ConfigValueType.integer,
@@ -1095,16 +1085,14 @@ _FLAG_FIELDS: list[ConfigField] = [
         key=SLOT_PINNING_KEY,
         label="Keep each conversation in one slot",
         description=(
-            "Give each conversation its own slot and keep it there, instead "
-            "of llama.cpp's choice, which puts every conversation that starts "
-            "alike (two agent sessions in one project) in one slot so each "
-            "reads its history again. Only worth it when the context each "
-            "slot gets holds a whole conversation: measured, about 3 points "
-            "more of each prompt reused there, and up to 10 fewer where it "
-            "does not, because the slots keep their histories between turns. "
-            "Turns on the engine's --no-cache-idle-slots and the driver's "
-            "pinning together; a turn whose slot is busy waits for it, "
-            "because naming a busy slot can stall llama-server."
+            "Gives each conversation its own slot and keeps it there, instead of "
+            "llama.cpp's choice.\n\n"
+            "llama.cpp otherwise puts conversations that start alike in one slot, so "
+            "each reads its history again. Worth it only when each slot's context "
+            "holds a whole conversation: there about 3 points more of each prompt is "
+            "reused, and up to 10 fewer where it does not. It also turns on "
+            "`--no-cache-idle-slots` and the driver's pinning. A turn whose slot is "
+            "busy waits."
         ),
         category="performance",
         valueType=ConfigValueType.boolean,
@@ -1129,14 +1117,13 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="devices",
         label="GPUs to use",
         description=(
-            "Which devices to spread the model across, by llama.cpp's own "
-            "names, comma-separated: CUDA0, Vulkan1. Leave empty for every "
-            "discrete card, which is llama.cpp's default. Naming an "
-            "integrated GPU here (with a combined +vulkan build) is how to "
-            "test it as overflow beside a card. A Vulkan name cannot be "
-            "matched to a card Eugene measured, so such a launch is not "
-            "checked against memory. Run llama-server --list-devices to see "
-            "the names."
+            "Which devices to spread the model across, by llama.cpp's own names, "
+            "comma-separated, such as `CUDA0, Vulkan1`.\n\n"
+            "Leave it empty for every discrete card, llama.cpp's default. Naming an "
+            "integrated GPU here, with a combined `+vulkan` build, tests it as "
+            "overflow beside a card. A Vulkan name cannot be matched to a card Eugene "
+            "measured, so that launch is not checked against memory. Run `llama-server "
+            "--list-devices` to see the names."
         ),
         category="performance",
         valueType=ConfigValueType.string,
@@ -1147,13 +1134,13 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="splitMode",
         label="Split across GPUs",
         description=(
-            "How one model is spread across several GPUs. By layer is "
-            "llama.cpp's default: each card holds whole layers and the "
-            "memory adds up. By row splits each weight across the cards and "
-            "can be faster on cards joined by a fast link. Tensor is "
-            "upstream's experimental parallel split. One GPU only uses the "
-            "Main GPU and leaves the others free. Read off llama-server "
-            "b11211's own help."
+            "How one model is spread across several GPUs.\n\n"
+            "- **By layer** (llama.cpp's default): each card holds whole layers and "
+            "the memory adds up.\n"
+            "- **By row**: splits each weight across the cards; can be faster on "
+            "cards joined by a fast link.\n"
+            "- **Tensor**: upstream's experimental parallel split.\n"
+            "- **One GPU only**: uses the Main GPU and leaves the others free."
         ),
         category="performance",
         valueType=ConfigValueType.enum,
@@ -1191,14 +1178,12 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="noMmap",
         label="Disable mmap",
         description=(
-            "Read the model into memory instead of mapping it from disk. "
-            "Needs enough free RAM to hold the whole file. On a local "
-            "disk this is slower to start; **over a network share it is "
-            "usually much faster**, because a mapped read never gets the "
-            "read-ahead a plain sequential read does. Measured 2026-09-17 "
-            "on a 24.95 GB model over SMB on a 1 Gbps link: 10m01s "
-            "mapped against 4m16s read, where the same share delivers "
-            "113 MB/s to an ordinary sequential read."
+            "Reads the model into memory instead of mapping it from disk.\n\n"
+            "It needs enough free RAM to hold the whole file. On a local disk it "
+            "starts slower; **over a network share it is usually much faster**, "
+            "because a mapped read never gets the read-ahead a plain sequential read "
+            "does (a 25 GB model over SMB at 1 Gbps loaded in about 4 minutes instead "
+            "of 10)."
         ),
         category="memory",
         valueType=ConfigValueType.boolean,
@@ -1631,12 +1616,11 @@ def _cuda_variant(host: HostAccelerator, release: Release) -> str | Unavailable:
         return chosen[2]
     return Unavailable(
         reason=(
-            f"this machine's NVIDIA card (compute capability {cc}) has no finished code in "
-            f"release {release.version}'s CUDA {newer[0]}.{newer[1]} build, only PTX, and a "
-            f"driver that supports CUDA {driver} cannot compile PTX from a newer CUDA. No "
-            f"older CUDA build is published to fall back on. Update the NVIDIA driver to "
-            f"one that supports CUDA {newer[0]}.{newer[1]} or newer, or set `binary` on the "
-            f"runtime to a build compiled for this card."
+            f"this machine's NVIDIA card (compute capability {cc}) has only PTX in "
+            f"release {release.version}'s CUDA {newer[0]}.{newer[1]} build, which a driver "
+            f"that supports CUDA {driver} cannot compile, and no older build is published. "
+            f"Update the NVIDIA driver to one that supports CUDA {newer[0]}.{newer[1]} or "
+            f"newer, or set `binary` on the runtime to a build made for this card."
         ),
         # A release whose older-major asset is still uploading looks like
         # this too, and the one before it may carry it.

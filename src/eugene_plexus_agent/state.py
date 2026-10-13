@@ -118,19 +118,15 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="securityMode",
         label="Security mode",
         description=(
-            "How the agent handles its master encryption key "
-            "between restarts. Set during the wizard, editable later. "
-            "'Prompt on startup' keeps the master key in process "
-            "memory only (passphrase required every restart). "
-            "'OS keyring' stores it in your OS Credential Manager / "
-            "Keychain / Secret Service for auto-unlock; more "
-            "convenient, weaker boundary. 'Passphrase file' is for an "
-            "agent running under its own account, which has no keyring: "
-            "the passphrase is kept in a file only that account can read "
-            "(EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE, which the Linux system "
-            "install sets), written when you set it or sign in. Nothing restarts: "
-            "the keyring entry is stored or removed when you save, and the next "
-            "start unlocks accordingly."
+            "How this agent keeps its master encryption key between restarts.\n\n"
+            "- **Prompt on startup**: every restart asks for the passphrase.\n"
+            "- **OS keyring**: unlocks from your Credential Manager, Keychain or "
+            "Secret Service. More convenient, a weaker boundary.\n"
+            "- **Passphrase file**: for an agent running under its own account, "
+            "which has no keyring. The passphrase is kept in a file only that "
+            "account can read (`EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE`, which the "
+            "Linux system install sets), written when you set it or sign in.\n\n"
+            "A change applies at the next start."
         ),
         category="security",
         valueType=ConfigValueType.enum,
@@ -191,16 +187,13 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="vllmBinary",
         label="vLLM binary",
         description=(
-            "Install-wide path to the `vllm` console script inside the "
-            "virtual environment where you installed vLLM — for example "
-            "`/home/you/vllm/.venv/bin/vllm`. vLLM is an engine this agent "
-            "drives but does not install, so without this it is found only "
-            "if it is on PATH or a `binary` is set on every runtime. Point "
-            "at the console script, not at a Python interpreter or a venv "
-            "directory: the script's shebang binds its own interpreter, so "
-            "nothing needs activating. A `binary` set on an individual "
-            "runtime still wins over this. Read at the next spawn; no agent "
-            "restart needed."
+            "Path to the `vllm` console script, for every vLLM runtime on this "
+            "machine.\n\n"
+            "Use the script inside the virtual environment where you installed vLLM, "
+            "for example `/home/you/vllm/.venv/bin/vllm`, not a Python interpreter or "
+            "a venv folder; nothing needs activating. Without it, vLLM is found only "
+            "on PATH or through a `binary` set on each runtime, which wins over this. "
+            "Applies at the next spawn."
         ),
         category="engines",
         valueType=ConfigValueType.file_path,
@@ -220,10 +213,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="allowCustomApps",
         label="Allow apps not in the catalogue",
         description=(
-            "Expert override: allow adding an app by its source -- an archive URL or a folder "
-            "on this machine -- rather than only the apps this release ships. A custom app "
-            "runs its own code as this agent's OS user, holding the client key minted for it. "
-            "Hub credentials are still removed from its environment."
+            "Expert override: add an app from an archive URL or a folder, not only "
+            "the apps this release ships.\n\n"
+            "A custom app runs its own code as this agent's OS user, holding the "
+            "client key minted for it. Hub credentials are still removed from its "
+            "environment."
         ),
         category="apps",
         valueType=ConfigValueType.boolean,
@@ -233,19 +227,13 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="mlxBinary",
         label="MLX binary",
         description=(
-            "Install-wide path to the `mlx_lm.server` console script inside "
-            "the virtual environment where you installed mlx-lm — for example "
-            "`/Users/you/eugene-mlx/bin/mlx_lm.server`. The dot is part of "
-            "the script name, not a file extension. Like vLLM, mlx-lm is an "
-            "engine this agent drives but does not install, so without this "
-            "it is found only if it is on PATH or a `binary` is set on every "
-            "runtime. Point at the console script, not at a Python "
-            "interpreter or a venv directory. Apple silicon only: `pip "
-            "install mlx-lm` will succeed elsewhere and install nothing that "
-            "can run a model, because upstream marks its `mlx` dependency "
-            "`platform_system == 'Darwin'`. A `binary` set on an individual "
-            "runtime still wins over this. Read at the next spawn; no agent "
-            "restart needed."
+            "Path to the `mlx_lm.server` console script, for every MLX runtime on "
+            "this machine.\n\n"
+            "Use the script inside the virtual environment where you installed mlx-lm, "
+            "for example `/Users/you/eugene-mlx/bin/mlx_lm.server`, not a Python "
+            "interpreter or a venv folder. Apple silicon only. Without it, mlx-lm is "
+            "found only on PATH or through a `binary` set on each runtime, which wins "
+            "over this. Applies at the next spawn."
         ),
         category="engines",
         valueType=ConfigValueType.file_path,
@@ -266,16 +254,13 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="kevPython",
         label="Kev interpreter",
         description=(
-            "Install-wide path to the Python interpreter inside the Kev "
-            "checkout's own virtual environment — for example "
-            "`/home/you/eugene-kev/.venv/bin/python`. Kev has no console "
-            "script: the launch is `python -m kev.serve`, so the engine is "
-            "an interpreter that can import it, which `uv sync --extra "
-            "serve` in the checkout arranges. Deliberately never found on "
-            "PATH — a bare `python` is not evidence of a Kev environment — "
-            "so without this (or `binary` on the runtime) the engine reads "
-            "as not installed. GET /v1/engines carries the pinned checkout "
-            "recipe. Read at the next spawn; no agent restart needed."
+            "Path to the Python interpreter in the Kev checkout's own virtual "
+            "environment, for every Kev runtime on this machine.\n\n"
+            "For example `/home/you/eugene-kev/.venv/bin/python`. Kev runs as `python "
+            "-m kev.serve`, so the interpreter must be able to import it; `uv sync "
+            "--extra serve` in the checkout does that. A bare `python` on PATH is "
+            "never used: without this, or a `binary` on the runtime, Kev reads as not "
+            "installed. Applies at the next spawn."
         ),
         category="engines",
         valueType=ConfigValueType.file_path,
@@ -284,24 +269,14 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="advertiseUrl",
         label="Advertise address",
         description=(
-            "The address at which OTHER HOSTS reach this agent — for example "
-            "`http://100.64.0.7:8079` on a tailnet. Sent to the control root at "
-            "enrollment as this node's URL, and stamped onto every component this "
-            "agent spawns (same host, that component's port) so a gateway on "
-            "another host can reach a companion driver here. Leave empty on a "
-            "single-host install; when empty, enrollment derives it from the "
-            "interface this agent used to reach the control root and GET /v1/node "
-            "shows what it derived. Setting a host that is not loopback also makes "
-            "spawned components bind 0.0.0.0 instead of loopback, because a "
-            "component that must be reached from another host cannot bind only "
-            "to this one; engines are never widened. Announced to the control "
-            "root the moment you change it — no restart and no re-enrollment — "
-            "and read again at the next spawn. Set it on the node that runs the "
-            "gateway if other nodes' browsers cannot open it: a node whose "
-            "registry entry is a loopback address can be reached by nothing. "
-            "Give the full address including the port the OUTSIDE uses, which "
-            "is not necessarily the port this agent binds — a container "
-            "published on a different port is the common case."
+            "The address other machines use to reach this agent, for example "
+            "`http://100.64.0.7:8079` on a tailnet.\n\n"
+            "Include the port the outside uses, which in a container is often not the "
+            "port the agent binds. Leave it empty on a single machine; enrollment then "
+            "derives it from the interface used to reach the control root. A "
+            "non-loopback address makes the components this agent starts listen on all "
+            "interfaces; engines stay local. A change is announced to the control root "
+            "at once."
         ),
         category="node",
         valueType=ConfigValueType.url,
@@ -310,17 +285,16 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="allowedHosts",
         label="Allowed host names",
         description=(
-            "Extra names this machine may be opened by in a browser. Leave it empty unless you "
-            "reach Eugene through a reverse proxy or your own domain -- then add that name, for "
-            "example `llm.example.com`. Already allowed without listing: any IP address, "
-            "`localhost`, a plain machine name such as `tower`, names ending `.local`, `.lan`, "
-            "`.home.arpa`, `.internal` or `.ts.net`, this computer's own name, and the host of "
-            "the advertise address above. Separate several names with commas; `*` allows any "
-            "name, which turns this protection off. Why it exists: a web page you visit can "
-            "point a name it controls at this machine's address (DNS rebinding) and then use "
-            "Eugene as if it were Eugene's own page -- read its settings, or set up a fresh "
-            "install before you do. Answering only to names it has been given stops that. "
-            "Takes effect on the next request; no restart."
+            "Extra names a browser may use to open Eugene on this machine.\n\n"
+            "Leave it empty unless you reach Eugene through a reverse proxy or "
+            "your own domain; then add that name, for example `llm.example.com`. "
+            "Already allowed: any IP address, `localhost`, a plain machine name "
+            "such as `tower`, names ending `.local`, `.lan`, `.home.arpa`, "
+            "`.internal` or `.ts.net`, this computer's own name and the advertise "
+            "address's host. Separate names with commas.\n\n"
+            "Other names are refused to stop DNS rebinding, where a web page points "
+            "its own name at this machine. `*` allows any name and turns that "
+            "protection off."
         ),
         category="node",
         valueType=ConfigValueType.string,
@@ -330,20 +304,15 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="pathMappings",
         label="Library folder overrides",
         description=(
-            "Only where THIS machine mounts a Library folder somewhere other than "
-            "the folder's own mounts say. Leave this empty: a Library folder "
-            "carries the mounts its nodes reach it by (Library -> Folders), one "
-            "for Linux/macOS nodes and one for Windows nodes, and this machine "
-            "inherits the one of its kind. Add a row here only for the odd box "
-            "-- from `/models` (the folder, spelled exactly as the Library lists "
-            "it) to `Z:\\models` (where this machine mounted that share). The "
-            "rest of the path is carried over; the most specific rule wins; an "
-            "override beats the folder's mount. Applied at every launch, so a "
-            "change takes effect at the next start without re-declaring "
-            "anything; `Runtime.localPath` shows what was opened. This only says "
-            "where the share is; whether this machine also keeps its own copy of "
-            "the models it runs is the Model storage setting below. Test checks "
-            "the rule against the Library's real files before you save it."
+            "Overrides where this machine mounts a Library folder, when it differs "
+            "from the mounts the folder itself lists.\n\n"
+            "Leave it empty unless this machine is the odd one out: a Library folder "
+            "carries one mount for Linux and macOS and one for Windows, and this "
+            "machine uses the one for its kind. Add a row from the folder as the "
+            "Library spells it (`/models`) to where this machine mounted it "
+            "(`Z:\\models`); the rest of the path carries over, and the most specific "
+            "rule wins. Test checks a rule against the Library's files before you "
+            "save."
         ),
         category="storage",
         valueType=ConfigValueType.path_mappings,
@@ -353,17 +322,13 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="shareCredentials",
         label="Logins for file servers",
         description=(
-            "Only if a Library folder lives on a server that asks this machine "
-            "to log in. One row per server -- `192.168.16.252`, not a whole "
-            "path -- and it covers every folder on it, because Windows allows "
-            "one login per server. Leave it empty if models open fine today. "
-            "You will need a row once Eugene starts on its own at boot: before "
-            "you sign in there is no such thing as 'the password you saved in "
-            "File Explorer', and a server can refuse an anonymous visitor even "
-            "when the folder itself has no password on it. Where the folder is "
-            "mounted is the Library folder overrides setting above; this is who "
-            "this machine says it is when it gets there. Test tries the login "
-            "before you save it."
+            "The login this machine uses for a server that holds a Library folder "
+            "and asks for one.\n\n"
+            "One row per server, such as `192.168.16.252`, not a whole path; it covers "
+            "every folder on that server, because Windows allows one login per server. "
+            "Leave it empty if models open fine today. You will need a row once Eugene "
+            "starts at boot, before anyone signs in: a password saved in File Explorer "
+            "is not available then. Test tries the login before you save."
         ),
         category="storage",
         valueType=ConfigValueType.share_credentials,
@@ -373,16 +338,12 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="modelCopyEnabled",
         label="Keep a local copy of the models this machine runs",
         description=(
-            "Copy each model this machine runs onto its own disk the first time "
-            "it starts, and open the copy from then on. Reading a 25 GB model "
-            "over a gigabit share takes about four minutes every single start; "
-            "from a local SSD it takes seconds. The first start after you turn "
-            "this on is no faster -- that is when the copying happens -- and "
-            "every start after it is. Only the models this machine's own "
-            "runtimes point at are copied, nothing else, ever: delete a runtime "
-            "and its copy goes with it. The folder the models came from is "
-            "never written to. Where the share itself is mounted is the Library "
-            "folder overrides setting above."
+            "Copies each model this machine runs onto its own disk, and opens the "
+            "copy from then on.\n\n"
+            "Reading a 25 GB model over a gigabit share takes about four minutes every "
+            "start; from a local SSD, seconds. The copy is made at the model's first "
+            "start. Only models this machine's runtimes use are copied, and deleting a "
+            "runtime deletes its copy. The source folder is never written to."
         ),
         category="modelStorage",
         valueType=ConfigValueType.boolean,
@@ -392,11 +353,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="modelCopyDir",
         label="Where to keep them",
         description=(
-            "A folder on this machine's own disk, on the fastest drive with room "
-            "to spare. Copies are named exactly as the model is named, in the "
-            "same folder structure, so what is here stays readable and useful "
-            "with or without Eugene Plexus. Everything in this folder is ours to "
-            "delete; do not point it at a folder that holds anything else."
+            "The folder on this machine's own disk where model copies go; pick the "
+            "fastest drive with room to spare.\n\n"
+            "Copies keep the model's name and folder structure, so they stay readable "
+            "without Eugene. Eugene may delete anything in this folder, so do not "
+            "point it at a folder that holds anything else."
         ),
         category="modelStorage",
         valueType=ConfigValueType.file_path,
@@ -405,11 +366,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="modelCopyMinFreeGb",
         label="Always leave at least this much free (GB)",
         description=(
-            "A copy is skipped when making it would leave less than this much "
-            "free space on that drive, and the model is read over the network "
-            "as usual -- starting a model never fails because of this setting. "
-            "If free space drops below this for any other reason, copies are "
-            "deleted oldest first until it is back."
+            "The free space, in GB, to keep on the copy drive; a copy that would "
+            "leave less is skipped.\n\n"
+            "The model is then read over the network as usual, so this never stops a "
+            "model starting. If free space falls below it for any other reason, the "
+            "oldest copies are deleted until it is back."
         ),
         category="modelStorage",
         valueType=ConfigValueType.integer,
@@ -421,10 +382,10 @@ CONFIG_FIELDS += [
         key="updateChecks",
         label="Check for updates",
         description=(
-            "Look for a newer version of Eugene a minute after it starts and every six "
-            "hours, and say so when there is one. Nothing is installed without you "
-            "pressing Update. Turn it off and this machine asks GitHub only when you "
-            "press Check now."
+            "Checks for a newer version of Eugene a minute after it starts and "
+            "every six hours.\n\n"
+            "Nothing is installed until you press Update. Off, this machine asks "
+            "GitHub only when you press Check now."
         ),
         category="updates",
         valueType=ConfigValueType.boolean,
