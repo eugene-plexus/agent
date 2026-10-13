@@ -1,0 +1,71 @@
+allowCustomApps: false
+allowUnrestrictedEngineLaunch: false
+allowedHosts: ''
+auth:
+  masterSalt: AAAAAAAAAAAAAAAAAAAAAA==
+  passphraseHash: $argon2id$v=19$m=65536,t=3,p=4$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+components:
+- kind: gateway
+  name: gateway
+  safeMode: false
+  url: http://127.0.0.1:8080/
+- kind: library
+  name: library
+  safeMode: false
+  url: http://127.0.0.1:8082/
+engineBinaryRoots: []
+firstRunComplete: false
+modelCopyEnabled: false
+modelCopyMinFreeGb: 50
+pathMappings: []
+runtimes:
+- autoDriver: true
+  autoStart: true
+  engine: llama_cpp
+  flags:
+    contextSize: 8192
+    flashAttention: true
+    gpuLayers: 99
+  host: 127.0.0.1
+  modelPath: /models/qwen/qwen3-8b-q4_k_m.gguf
+  name: qwen3-8b
+  port: 8090
+  profile:
+    id: 0f71f3da4306
+    name: fast
+  startOnDemand: false
+- autoDriver: true
+  autoStart: false
+  engine: llama_cpp
+  flags:
+    flashAttention: false
+    gpuLayers: 0
+  host: 127.0.0.1
+  modelPath: /models/qwen/qwen3-8b-q4_k_m.gguf
+  name: qwen3-8b-cpu-only
+  port: 8091
+  startOnDemand: false
+- autoDriver: true
+  autoStart: true
+  engine: llama_cpp
+  flags:
+    contextSize: 16384
+    flashAttention: 'off'
+  host: 127.0.0.1
+  modelPath: /models/gemma/gemma-3-4b-q8_0.gguf
+  name: gemma
+  port: 8092
+  startOnDemand: false
+- autoDriver: true
+  autoStart: true
+  engine: llama_cpp
+  host: 127.0.0.1
+  modelPath: /models/bge/bge-m3.gguf
+  name: bge
+  port: 8093
+  startOnDemand: false
+securityMode: prompt_on_startup
+shareCredentials: []
+uiFontSize: medium
+uiTheme: auto
+updateChecks: true

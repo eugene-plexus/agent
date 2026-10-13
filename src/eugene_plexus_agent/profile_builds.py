@@ -59,9 +59,9 @@ from ._generated.models import (
 from ._http import shared_internal_client
 from .engines.llama_cpp import (
     CACHE_TYPE_KEY,
+    FLASH_ATTENTION_CHOICES,
     FLASH_ATTENTION_KEY,
     flash_attention_argv,
-    flash_attention_choice,
 )
 
 log = logging.getLogger(__name__)
@@ -372,6 +372,8 @@ def validate_request(body: ProfileBuildRequest) -> dict[str, Any]:
             "A settings build cannot reproduce raw extraArgs. Use a profile with supported fields."
         )
     flags = {k: v for k, v in (spec.flags or {}).items() if v is not None}
+    if flags.get(FLASH_ATTENTION_KEY) not in (None, *FLASH_ATTENTION_CHOICES):
+        raise BuildError("flashAttention must be on, off, or not set.")
     parallel = flags.get("parallelSlots", 1)
     if type(parallel) is not int or parallel != 1:
         raise BuildError("A settings build measures one conversation at a time. Use one slot.")
@@ -693,7 +695,7 @@ class ProfileBuilds:
                     str(plan.model),
                     "--ctx-size",
                     str(context),
-                    *cache_args(cache, flash_attention_choice(plan.flags)),
+                    *cache_args(cache, plan.flags.get(FLASH_ATTENTION_KEY)),
                     *(["--fit-target", str(plan.margin)] if plan.margin is not None else []),
                     *passthrough_args(plan.flags, bench=False),
                 ]
@@ -757,7 +759,7 @@ class ProfileBuilds:
                 str(REPETITIONS),
                 "--output",
                 "jsonl",
-                *cache_args(candidate.cacheType, flash_attention_choice(plan.flags)),
+                *cache_args(candidate.cacheType, plan.flags.get(FLASH_ATTENTION_KEY)),
                 *bench_placement(candidate.placement),
                 *passthrough_args(plan.flags, bench=True),
             ]
@@ -859,7 +861,7 @@ class ProfileBuilds:
             str(candidate.contextSize),
             "--parallel",
             "1",
-            *cache_args(candidate.cacheType, flash_attention_choice(plan.flags)),
+            *cache_args(candidate.cacheType, plan.flags.get(FLASH_ATTENTION_KEY)),
             *(["--fit-target", str(plan.margin)] if plan.margin is not None else []),
             *passthrough_args(plan.flags, bench=False),
         ]

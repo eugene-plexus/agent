@@ -6,8 +6,10 @@ firstRunComplete) and `TopologyStore` (the components list under
 `/v1/components`). Both share one lock and one on-disk file so concurrent
 PATCH operations from different routes can't corrupt each other.
 
-The on-disk shape:
+The on-disk shape (`stateVersion` is the format this release reads and writes; a
+file without it is one v0.1 wrote, converted once by `conversions.py`):
 
+    stateVersion: 2
     firstRunComplete: false
     uiTheme: auto
     uiFontSize: medium
@@ -45,7 +47,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from . import model_copies, model_paths, ports, share_credentials
+from . import conversions, model_copies, model_paths, ports, share_credentials
 from ._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -175,9 +177,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="allowUnrestrictedEngineLaunch",
         label="Allow unrestricted engine launch",
         description=(
+            "Lets a runtime use any binary and raw extra arguments, which can run code "
+            "as the agent's OS user.\n\n"
             "Expert override: allow arbitrary runtime binary paths and raw extraArgs. "
-            "These can execute code as the agent's OS user. Plexus credentials are still "
-            "removed from the child environment. Changes apply on the next launch."
+            "Plexus credentials are still removed from the child environment. Changes "
+            "apply on the next launch."
         ),
         category="engines",
         valueType=ConfigValueType.boolean,
@@ -213,11 +217,11 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="allowCustomApps",
         label="Allow apps not in the catalogue",
         description=(
-            "Expert override: add an app from an archive URL or a folder, not only "
-            "the apps this release ships.\n\n"
-            "A custom app runs its own code as this agent's OS user, holding the "
-            "client key minted for it. Hub credentials are still removed from its "
-            "environment."
+            "Expert override: apps from any archive or folder run their own code as the "
+            "agent's OS user.\n\n"
+            "Add an app from an archive URL or a folder, not only the apps this release "
+            "ships. A custom app holds the client key minted for it. Hub credentials "
+            "are still removed from its environment."
         ),
         category="apps",
         valueType=ConfigValueType.boolean,
@@ -276,7 +280,7 @@ CONFIG_FIELDS: list[ConfigField] = [
             "derives it from the interface used to reach the control root. A "
             "non-loopback address makes the components this agent starts listen on all "
             "interfaces; engines stay local. A change is announced to the control root "
-            "at once."
+            "at once. Components already running keep the old address until they restart."
         ),
         category="node",
         valueType=ConfigValueType.url,
@@ -285,7 +289,8 @@ CONFIG_FIELDS: list[ConfigField] = [
         key="allowedHosts",
         label="Allowed host names",
         description=(
-            "Extra names a browser may use to open Eugene on this machine.\n\n"
+            "Extra names a browser may use to reach Eugene; `*` allows every name and "
+            "switches off DNS-rebinding protection.\n\n"
             "Leave it empty unless you reach Eugene through a reverse proxy or "
             "your own domain; then add that name, for example `llm.example.com`. "
             "Already allowed: any IP address, `localhost`, a plain machine name "
@@ -312,7 +317,7 @@ CONFIG_FIELDS: list[ConfigField] = [
             "Library spells it (`/models`) to where this machine mounted it "
             "(`Z:\\models`); the rest of the path carries over, and the most specific "
             "rule wins. Test checks a rule against the Library's files before you "
-            "save."
+            "save. Applies at the next launch."
         ),
         category="storage",
         valueType=ConfigValueType.path_mappings,
@@ -513,9 +518,13 @@ class AgentState:
     def load(self) -> None:
         with self._lock:
             if self._path.exists():
-                raw = yaml.safe_load(self._path.read_text(encoding="utf-8")) or {}
+                original = self._path.read_bytes()
+                raw = yaml.safe_load(original.decode("utf-8")) or {}
                 if not isinstance(raw, dict):
                     raise ValueError(f"{self._path} must be a YAML mapping at the root")
+                # What v0.1 saved is converted once, kept as it was, and read in the
+                # current format only from here on (`conversions.py`).
+                raw = conversions.convert(self._path, original, raw)
                 merged = _config_defaults()
                 for k, v in raw.items():
                     field = _CONFIG_FIELDS_BY_KEY.get(k)
@@ -999,6 +1008,8 @@ class AgentState:
         + `os.replace`, with the mode given at creation.
         """
         out: dict[str, Any] = dict(self._config)
+        # The format this release reads and writes; a file without it is one v0.1 wrote.
+        out["stateVersion"] = conversions.STATE_VERSION
         out["components"] = [
             entry.model_dump(exclude_none=True, mode="json") for entry in self._components.values()
         ]

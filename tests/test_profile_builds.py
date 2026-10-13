@@ -684,3 +684,20 @@ def test_a_builds_trials_follow_the_profiles_flash_attention():
     assert flash(CacheType.f16, "on") == "on"
     assert flash(CacheType.q8_0, "off") == "on"
     assert flash(CacheType.q4_0, None) == "on"
+
+
+def test_a_build_refuses_a_checkbox_where_flash_attention_is_a_choice():
+    """What v0.1 saved as a checkbox was converted once (`conversions.py`); a profile
+    that still carries one is refused up front, naming the setting, not measured."""
+    from eugene_plexus_agent.profile_builds import validate_request
+
+    def flags(**extra):
+        request = _request()
+        request.runtime.flags = extra
+        return validate_request(request)
+
+    assert flags(flashAttention="on") == {"flashAttention": "on"}
+    assert flags() == {}
+    for checkbox in (True, False):
+        with pytest.raises(BuildError, match="flashAttention must be on, off, or not set"):
+            flags(flashAttention=checkbox)

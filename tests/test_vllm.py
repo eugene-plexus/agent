@@ -734,11 +734,12 @@ def test_dtype_and_kv_cache_dtype_enums_match_upstream_literals(adapter: VllmAda
 
 def test_trust_remote_code_says_what_it_is(adapter: VllmAdapter) -> None:
     """It executes code shipped inside the model folder. The UI presents
-    it as what it is."""
+    it as what it is, in the one line it shows before the details."""
     field = next(f for f in adapter.flag_schema().fields if f.key == "trustRemoteCode")
     assert field.valueType == ConfigValueType.boolean
     assert field.default is False
-    assert "executes code" in field.description.lower()
+    summary = field.description.split("\n\n")[0]
+    assert "code" in summary and "privileges" in summary
 
 
 def test_unknown_flags_are_reported_not_dropped(adapter: VllmAdapter) -> None:

@@ -79,3 +79,59 @@ def test_every_engine_flag_description_opens_with_one_short_sentence() -> None:
         checked += len(fields)
         assert [f"{kind.value}.{v}" for v in _violations(fields)] == []
     assert checked, "no engine flag was checked"
+
+
+# --- what the one line must carry, and what the details must say -------------------------
+
+#: A setting that can run code, or switch off a protection, says so in the line the console
+#: shows, not only in the details a click away: the line is all most people read.
+RISK_IN_THE_SUMMARY = {
+    "allowUnrestrictedEngineLaunch": ("run code", "OS user"),
+    "allowCustomApps": ("run their own code", "OS user"),
+    "allowedHosts": ("DNS-rebinding", "`*`"),
+}
+
+
+def _summary(field: dict[str, str]) -> str:
+    return _paragraphs(field["description"])[0]
+
+
+def _details(field: dict[str, str]) -> str:
+    return " ".join(_paragraphs(field["description"])[1:])
+
+
+def test_the_risk_check_can_fail() -> None:
+    quiet = {"description": "Allow arbitrary runtime binary paths.\n\nThese can run code."}
+    assert not all(phrase in _summary(quiet) for phrase in RISK_IN_THE_SUMMARY["allowCustomApps"])
+
+
+def test_a_setting_that_can_run_code_or_lower_a_protection_says_so_in_its_one_line(
+    authed_client: TestClient,
+) -> None:
+    fields = {f["key"]: f for f in authed_client.get("/v1/config/schema").json()["fields"]}
+    for key, phrases in RISK_IN_THE_SUMMARY.items():
+        summary = _summary(fields[key])
+        assert _words(summary) <= FIRST_SENTENCE_WORDS, key
+        for phrase in phrases:
+            assert phrase in summary, f"{key}: the one line does not say {phrase!r}: {summary}"
+
+
+def test_a_vllm_setting_that_runs_the_models_own_code_says_so_in_its_one_line() -> None:
+    adapter = ADAPTERS[next(k for k in ADAPTERS if k.value == "vllm")]
+    field = next(
+        f.model_dump(mode="json")
+        for f in adapter.flag_schema().fields
+        if f.key == "trustRemoteCode"
+    )
+    summary = _summary(field)
+    assert "code" in summary and "privileges" in summary and _words(summary) <= FIRST_SENTENCE_WORDS
+
+
+def test_two_settings_say_in_their_details_when_a_change_takes_effect(
+    authed_client: TestClient,
+) -> None:
+    fields = {f["key"]: f for f in authed_client.get("/v1/config/schema").json()["fields"]}
+    assert "Applies at the next launch." in _details(fields["pathMappings"])
+    assert "Components already running keep the old address until they restart." in _details(
+        fields["advertiseUrl"]
+    )

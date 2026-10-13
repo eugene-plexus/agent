@@ -946,11 +946,10 @@ _FLAG_FIELDS: list[ConfigField] = [
         key="trustRemoteCode",
         label="Trust remote code",
         description=(
-            "Allow the model directory's own Python modelling code to run. "
-            "Required by a real share of HuggingFace architectures. **This "
-            "executes code shipped inside the model folder with the engine's "
-            "privileges** — enable it only for a model you would run as a "
-            "script."
+            "Lets code shipped in the model folder run with the engine's privileges.\n\n"
+            "Allow the model directory's own Python modelling code to run. Required by "
+            "a real share of HuggingFace architectures. Enable it only for a model you "
+            "would run as a script."
         ),
         category="model",
         valueType=ConfigValueType.boolean,

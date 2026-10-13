@@ -27,7 +27,7 @@ HELP = "--n-depth --progress --output --n-gpu-layers --batch-size --ubatch-size 
 
 def test_depth_sweep_preserves_profile_and_leaves_generation_room():
     args, depths = benchmark_args(
-        request(gpuLayers=0, tensorSplit="0.6,0.4", flashAttention=False, noMmap=True),
+        request(gpuLayers=0, tensorSplit="0.6,0.4", noMmap=True),
         Path("bench"),
         "/models/a.gguf",
         HELP,
@@ -36,7 +36,7 @@ def test_depth_sweep_preserves_profile_and_leaves_generation_room():
     assert args[args.index("--n-depth") + 1] == "0,1984,3968"
     assert args[args.index("--n-gpu-layers") + 1] == "0"
     assert args[args.index("--tensor-split") + 1] == "0.6/0.4"
-    assert "--flash-attn" not in args  # false leaves the runtime's engine default alone
+    assert "--flash-attn" not in args  # unset leaves the runtime's engine default alone
     assert args[args.index("--load-mode") + 1] == "none"
     assert "--parallel" not in args and "--ctx-size" not in args
 
@@ -105,7 +105,10 @@ def test_a_benchmark_follows_the_three_flash_attention_states():
     assert flash(flashAttention="on") == "on"
     assert flash(flashAttention="off") == "off"
     assert flash() is None
-    assert flash(flashAttention=True) == "on" and flash(flashAttention=False) is None
     assert flash(flashAttention="off", cacheType="q8_0") == "on"
     with pytest.raises(ValueError, match="on, off, or not set"):
         flash(flashAttention="sometimes")
+    # A checkbox is what v0.1 saved and `conversions.py` rewrote: it is not read here.
+    for checkbox in (True, False):
+        with pytest.raises(ValueError, match="on, off, or not set"):
+            flash(flashAttention=checkbox)

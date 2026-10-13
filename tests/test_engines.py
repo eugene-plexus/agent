@@ -109,7 +109,7 @@ def test_cache_type_is_one_choice_for_k_and_v(
 
     # Flash attention already asked for: one switch, not two.
     both = adapter.build_argv(
-        _spec(flags={"cacheType": "q4_0", "flashAttention": True}), binary, port=8090
+        _spec(flags={"cacheType": "q4_0", "flashAttention": "on"}), binary, port=8090
     )
     assert both.count("--flash-attn") == 1
 
@@ -137,18 +137,18 @@ def test_flash_attention_takes_a_value(adapter: LlamaCppAdapter, binary: Discove
     llama-server read the next flag as the value and refused to start.
     Asserted with a flag after it, because that is the shape that broke."""
     on = adapter.build_argv(
-        _spec(flags={"flashAttention": True, "cacheType": "q8_0"}), binary, port=8090
+        _spec(flags={"flashAttention": "on", "cacheType": "q8_0"}), binary, port=8090
     )
     assert on[on.index("--flash-attn") + 1] == "on"
     assert on.count("--flash-attn") == 1
 
-    alone = adapter.build_argv(_spec(flags={"flashAttention": True}), binary, port=8090)
+    alone = adapter.build_argv(_spec(flags={"flashAttention": "on"}), binary, port=8090)
     assert alone[alone.index("--flash-attn") + 1] == "on"
 
-    # False leaves the engine's own default (auto) alone.
-    off = adapter.build_argv(_spec(flags={"flashAttention": False}), binary, port=8090)
-    assert "--flash-attn" not in off
-    assert "false" not in off
+    # Unset leaves the engine's own default (auto) alone.
+    unset = adapter.build_argv(_spec(flags={}), binary, port=8090)
+    assert "--flash-attn" not in unset
+    assert "false" not in unset
 
 
 def _flash(argv: list[str]) -> str | None:
@@ -158,7 +158,7 @@ def _flash(argv: list[str]) -> str | None:
 def test_flash_attention_is_on_off_or_the_engines_own_choice(
     adapter: LlamaCppAdapter, binary: DiscoveredBinary
 ) -> None:
-    """agent#6: three states, and an unticked box never meant off."""
+    """agent#6: three states."""
 
     def argv(**flags: object) -> list[str]:
         return adapter.build_argv(_spec(flags=flags), binary, port=8090)
@@ -166,15 +166,28 @@ def test_flash_attention_is_on_off_or_the_engines_own_choice(
     assert _flash(argv(flashAttention="on")) == "on"
     assert _flash(argv(flashAttention="off")) == "off"
     assert _flash(argv()) is None, "unset: llama.cpp decides (auto)"
-    # Profiles saved before three states: True sent on, False sent nothing.
-    assert _flash(argv(flashAttention=True)) == "on"
-    assert _flash(argv(flashAttention=False)) is None, "an old False is not off"
+
+
+def test_a_checkbox_is_not_read_as_a_setting(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary
+) -> None:
+    """A runtime saved with the checkbox was converted once when `agent.yaml` was
+    loaded (`test_conversions.py`). A boolean that reaches a launch anyway is not an
+    old save to be understood: the start is refused, naming what it found, so a
+    setting is never silently something other than what it says."""
+    for checkbox in (True, False):
+        with pytest.raises(ValueError, match="on, off, or not set, not"):
+            adapter.build_argv(_spec(flags={"flashAttention": checkbox}), binary, port=8090)
+        with pytest.raises(ValueError, match="on, off, or not set, not"):
+            adapter.build_argv(
+                _spec(flags={"flashAttention": checkbox, "cacheType": "q8_0"}), binary, port=8090
+            )
 
 
 def test_a_quantised_cache_turns_flash_attention_on_and_says_so(
     adapter: LlamaCppAdapter, binary: DiscoveredBinary, caplog: pytest.LogCaptureFixture
 ) -> None:
-    for choice in (None, "on", "off", False):
+    for choice in (None, "on", "off"):
         flags: dict[str, object] = {"cacheType": "q4_0"}
         if choice is not None:
             flags["flashAttention"] = choice

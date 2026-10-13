@@ -94,8 +94,6 @@ def benchmark_args(
     for key in ("continuousBatching", "noMmap", "mlock"):
         if key in flags and type(flags[key]) is not bool:
             raise ValueError(f"{key} must be a boolean.")
-    if flags.get("flashAttention") not in (None, True, False, "on", "off"):
-        raise ValueError("flashAttention must be on, off, or not set.")
     tokens = body.tokens or 128
     if tokens >= context:
         raise ValueError("Generated tokens must be fewer than the profile's context size.")

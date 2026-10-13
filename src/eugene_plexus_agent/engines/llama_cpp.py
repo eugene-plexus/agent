@@ -868,29 +868,22 @@ def cache_type_argv(value: object) -> list[str]:
 
 
 FLASH_ATTENTION_KEY = "flashAttention"
-
-
-def flash_attention_choice(flags: dict[str, object]) -> str | None:
-    """`on`, `off`, or None for "the engine decides" (agent#6).
-
-    A profile saved before the setting had three states holds a boolean.
-    True always sent `on`, so it is `on`. False always sent nothing, which
-    left llama.cpp's own `auto` (on wherever supported), so it is None --
-    never `off`: reading an old False as off would turn flash attention off
-    in every existing profile.
-    """
-    value = flags.get(FLASH_ATTENTION_KEY)
-    if value is True or value == "on":
-        return "on"
-    if value == "off":
-        return "off"
-    return None
+FLASH_ATTENTION_CHOICES = ("on", "off")
 
 
 def flash_attention_argv(flags: dict[str, object]) -> list[str]:
-    """What `--flash-attn` says, if anything. A quantised V cache needs it
-    on, whatever the profile says, so `off` there is overridden and logged."""
-    choice = flash_attention_choice(flags)
+    """What `--flash-attn` says, if anything (agent#6): `on`, `off`, or nothing,
+    which leaves llama.cpp's own `auto` (on wherever supported). A quantised V
+    cache needs it on, whatever the profile says, so `off` there is overridden
+    and logged.
+
+    Only those three are settings. A checkbox saved by v0.1 was converted once
+    when `agent.yaml` was loaded (`conversions.py`), so a boolean here is not an
+    old save to be understood; it is refused, naming what was found.
+    """
+    choice = flags.get(FLASH_ATTENTION_KEY)
+    if choice is not None and choice not in FLASH_ATTENTION_CHOICES:
+        raise ValueError(f"flashAttention must be on, off, or not set, not {choice!r}")
     quantised = flags.get(CACHE_TYPE_KEY) not in (None, "f16")
     if quantised:
         if choice == "off":
