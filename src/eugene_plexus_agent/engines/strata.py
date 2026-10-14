@@ -578,6 +578,8 @@ class StrataAdapter(EngineAdapter):
         if body.get("loaded") is not True:
             return Loading(detail="Strata is answering but its model is not loaded")
         context = body.get("max_context")
+        if type(context) is not int or context <= 0:
+            return Loading(detail="Strata has not reported a loaded model context yet")
         return Ready(
             capabilities=RuntimeCapabilities(
                 contextLength=context if type(context) is int and context > 0 else None,

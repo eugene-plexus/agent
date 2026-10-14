@@ -581,6 +581,7 @@ async def test_auto_safe_mode_after_crash_threshold(
         if len(captured_envs) >= 6:
             break
 
+    observed_state, observed_degraded = sp.state, sp.degraded
     await sp.stop()
 
     assert len(captured_envs) >= 6, (
@@ -599,8 +600,8 @@ async def test_auto_safe_mode_after_crash_threshold(
     # The loop is still cycling, not given up — and the plan it is now
     # running is the degraded one. `Supervisor.status_for` is what turns
     # that pair into ComponentStatus.safe_mode on the wire.
-    assert sp.state == ProcessState.starting
-    assert sp.degraded is True
+    assert observed_state == ProcessState.starting
+    assert observed_degraded is True
 
 
 async def test_manual_restart_clears_auto_safe_mode(

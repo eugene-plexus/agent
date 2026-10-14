@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -23,7 +25,7 @@ from eugene_plexus_agent.engines.acquisition import (
 )
 from eugene_plexus_agent.engines.base import DiscoveredBinary, Loading, NotAnswering, Ready
 from eugene_plexus_agent.engines.strata_install import plan
-from eugene_plexus_agent.runtimes import validate_spec
+from eugene_plexus_agent.runtimes import _RuntimePlanner, validate_spec
 from eugene_plexus_agent.supervisor import SpawnPlanError
 
 
@@ -112,6 +114,7 @@ def test_unsupported_or_missing_assets_refuse_before_spawn(prepared, change):
     "body,expected",
     [
         ({"service": "strata", "loaded": False}, Loading),
+        ({"service": "strata", "loaded": True, "max_context": 0}, Loading),
         ({"service": "strata", "loaded": True, "max_context": 4096}, Ready),
         ({"status": "ok"}, NotAnswering),
     ],
@@ -127,6 +130,25 @@ async def test_health_200_alone_is_not_ready(monkeypatch, body, expected):
     if isinstance(result, Ready):
         assert result.capabilities.parallelSlots == 1
         assert result.capabilities.contextPoolTokens is None
+
+
+def test_a_previous_strata_listener_cannot_supply_the_next_starts_readiness(prepared, monkeypatch):
+    _, server, config, _ = prepared
+    provenance = _provenance(config.parent, entry=config.name)
+    adapter = strata.StrataAdapter()
+    monkeypatch.setattr(
+        adapter, "resolve_binary", lambda *a, **kw: DiscoveredBinary(server, Origin.configured)
+    )
+    with socket.socket() as previous:
+        previous.bind(("127.0.0.1", 0))
+        previous.listen()
+        spec = RuntimeSpec(
+            name="new", engine="strata", modelPath=str(provenance), port=previous.getsockname()[1]
+        )
+        planner = _RuntimePlanner(spec, adapter, logging.getLogger("test"))
+        with pytest.raises(SpawnPlanError, match=r"already.*port|port.*already"):
+            planner.plan()
+    assert planner.plan().argv  # the same declaration can start once the old listener exits
 
 
 def test_recipe_is_pinned_and_platform_gated():

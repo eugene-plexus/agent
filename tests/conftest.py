@@ -435,6 +435,14 @@ def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_descendants_for_fake_launchers(monkeypatch: pytest.MonkeyPatch) -> None:
+    from eugene_plexus_agent import process_tree
+
+    # Unit fixtures use made-up PIDs. Real process-tree tests explicitly opt in.
+    monkeypatch.setattr(process_tree, "snapshot", lambda pid: [])
+
+
 # Process-wide HTTP clients (`_http.shared_internal_client`) outlive a
 # test by construction -- that is the point of them, since building one
 # parses certifi's PEM bundle at ~104 ms of synchronous CPU on the event

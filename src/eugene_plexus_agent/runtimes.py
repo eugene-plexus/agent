@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import model_copies
+from . import model_copies, ports
 from ._generated.models import (
     CopyProgress,
     EngineAcquisition,
@@ -206,6 +206,18 @@ class _RuntimePlanner:
             raise SpawnPlanError(
                 f"runtime {self.spec.name!r} has no port assigned; "
                 f"re-save it so the agent can allocate one"
+            )
+
+        # Strata's HTTPServer permits address reuse on Windows. An old server
+        # can otherwise answer the new process's health probe while its model
+        # is still loading. A known occupied port is not this launch's readiness.
+        if self.spec.engine is EngineKind.strata and not ports.is_free(
+            port, host=self.spec.host or "127.0.0.1"
+        ):
+            holder = ports.describe_holder(port) or "another listener"
+            raise SpawnPlanError(
+                f"Strata's port {port} is already held by {holder}; "
+                "stop that process or choose a free port before starting this runtime"
             )
 
         # The engine opens the model where THIS host has it (M11). The
@@ -450,7 +462,7 @@ class RuntimeSupervisor:
         configured without holding VRAM."""
         existing = self._processes.get(spec.name)
         if existing is not None:
-            if existing.supervising:
+            if existing.supervising or existing.stopping:
                 return
             # A loop that gave up -- a load that failed, or the crash limit
             # -- keeps its record so the error stays readable. Start means
@@ -725,15 +737,18 @@ class RuntimeSupervisor:
         forgets it.
         """
         await self._cancel_copy(name)
-        sp = self._processes.pop(name, None)
+        sp = self._processes.get(name)
+        if sp is not None:
+            await sp.stop()
+            if self._processes.get(name) is not sp:
+                return
+            self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
         self._proved_ready.pop(name, None)
         self._stop_reasons[name] = reason
         if self._stop_memory is not None and reason is StopReason.operator:
             self._stop_memory.remember_stop(name)
-        if sp is not None:
-            await sp.stop()
 
     async def stop_all(self) -> None:
         """Shut everything down. Best-effort — never raises."""

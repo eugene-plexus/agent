@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from . import orphan_kill, ports, process_signals, standby, tokens
+from . import orphan_kill, ports, process_signals, process_tree, standby, tokens
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
 from ._http import internal_client
 from .auth_state import AuthState
@@ -572,6 +572,8 @@ class SupervisedProcess:
         self._log = log
         self._proc: asyncio.subprocess.Process | None = None
         self._task: asyncio.Task[None] | None = None
+        self._tree_stop: asyncio.Task[None] | None = None
+        self._tree_children: list[Any] = []
         self._stop_requested = False
         self._consecutive_crashes = 0
         self._stop_on_startup_crash = stop_on_startup_crash
@@ -666,14 +668,19 @@ class SupervisedProcess:
         the threshold and drop a component into safe mode. POSIX never
         showed it, because SIGTERM gets uvicorn to exit 0.
         """
+        if self.stopping:
+            raise RuntimeError(self.last_error or f"{self.name} is still stopping its engine tree")
         self._consecutive_crashes = 0
         self._planner.reset()
         proc = self._proc
         if proc is not None and proc.returncode is None:
             self._expected_exit = True
+            self._begin_tree_stop(proc)
             sent = process_signals.request_stop(proc, name=self.name, logger=self._log)
             self._log.info("restart requested for %s; sent %s to pid %d", self.name, sent, proc.pid)
             await self._escalate_if_still_alive(proc)
+            if self._tree_stop is not None:
+                await asyncio.shield(self._tree_stop)
         elif self._task is None or self._task.done():
             self.start()
 
@@ -683,11 +690,13 @@ class SupervisedProcess:
         self._stop_requested = True
         self._expected_exit = True
         proc = self._proc
+        if proc is not None:
+            self._begin_tree_stop(proc)
         if proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process_signals.request_stop(proc, name=self.name, logger=self._log)
             try:
-                await asyncio.wait_for(proc.wait(), timeout=_TERM_TIMEOUT_SECONDS)
+                await asyncio.wait_for(self._parent_exit(proc), timeout=_TERM_TIMEOUT_SECONDS)
             except TimeoutError:
                 self._log.warning(
                     "%s did not exit within %.1fs of the stop request; killing",
@@ -697,11 +706,52 @@ class SupervisedProcess:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 with contextlib.suppress(BaseException):
-                    await proc.wait()
+                    await self._parent_exit(proc)
+        if self._tree_stop is not None:
+            await asyncio.shield(self._tree_stop)
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, BaseException):
                 await self._task
+
+    def _begin_tree_stop(self, proc: asyncio.subprocess.Process) -> None:
+        if self._tree_stop is not None:
+            if not self._tree_stop.done() or (
+                not self._tree_stop.cancelled() and self._tree_stop.exception() is None
+            ):
+                return
+        else:
+            self._tree_children = process_tree.snapshot(proc.pid)
+
+        async def drain() -> None:
+            try:
+                await self._parent_exit(proc)
+                await process_tree.finish(self._tree_children, name=self.name, logger=self._log)
+            except Exception as exc:
+                self.state = ProcessState.crashed
+                self.last_error = (
+                    f"Could not finish stopping {self.name}: {type(exc).__name__}: {exc}"
+                )
+                self._log.error(self.last_error)
+                raise
+
+        self._tree_stop = asyncio.create_task(drain(), name=f"stop-tree:{self.name}")
+
+    @staticmethod
+    async def _parent_exit(proc: Any) -> None:
+        # asyncio's pipe transport can keep wait() pending after process exit
+        # while a descendant still has stdout open. That descendant is exactly
+        # what the tree drain must be allowed to reap.
+        while proc.returncode is None:  # noqa: ASYNC110 - OS process observation
+            await asyncio.sleep(0.05)
+
+    @property
+    def stopping(self) -> bool:
+        return self._tree_stop is not None and (
+            not self._tree_stop.done()
+            or self._tree_stop.cancelled()
+            or self._tree_stop.exception() is not None
+        )
 
     async def _escalate_if_still_alive(self, proc: Any) -> None:
         """Hard-kill a child that ignored the stop request.
@@ -719,7 +769,7 @@ class SupervisedProcess:
         loop's untouched.
         """
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(proc.wait(), timeout=_TERM_TIMEOUT_SECONDS)
+            await asyncio.wait_for(self._parent_exit(proc), timeout=_TERM_TIMEOUT_SECONDS)
         if proc.returncode is None:
             self._log.warning(
                 "%s ignored the stop request for %.1fs; killing pid %s",
@@ -833,7 +883,12 @@ class SupervisedProcess:
         live here. Exits cleanly on `stop_requested`.
         """
         while not self._stop_requested:
-            await self._spawn_once()
+            try:
+                await self._spawn_once()
+            except Exception:
+                if self.stopping:
+                    return  # the observed stop error is retained; never overlap engines
+                raise
             if self._stop_requested:
                 return
             if self.state == ProcessState.not_spawnable:
@@ -873,6 +928,8 @@ class SupervisedProcess:
 
     async def _spawn_once(self) -> None:
         """One spawn / wait / mark-state iteration."""
+        self._tree_stop = None
+        self._tree_children = []
         self._was_ready = False
         self._ready_since = None
         try:
@@ -965,6 +1022,10 @@ class SupervisedProcess:
         try:
             return_code = await self._proc.wait()
             exited_at = time.perf_counter()
+            if self._tree_stop is not None:
+                # The loop cannot mark exited or launch a replacement while
+                # the old native engine still owns its memory or listen port.
+                await asyncio.shield(self._tree_stop)
         finally:
             # Give the reader a moment to drain any final lines the child
             # wrote on its way out, then cancel if it's still hung.
