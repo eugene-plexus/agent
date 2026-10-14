@@ -211,15 +211,27 @@ async def test_experts_context_uses_free_memory_on_the_target_node(app, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_a_run_suggests_vllm_no_context_it_would_refuse(app, monkeypatch):
-    """A profile carrying `contextSize` is refused for vLLM at launch (LS6,
-    library#9): Run measures nothing and suggests nothing for it."""
+async def test_a_run_suggests_vllm_context_in_its_own_flag(app, monkeypatch):
+    """Admission's fitting context survives settings and runtime composition."""
 
     async def admission(context, spec):
-        raise AssertionError("vLLM's context was measured for a flag it refuses")
+        assert spec.engine.value == "vllm"
+        return SimpleNamespace(maxContextLength=8192, fit="too_large")
 
     monkeypatch.setattr(runtimes, "_admission_for", admission)
-    assert await NodeActions(app).context_size(object(), MODEL, "vllm") is None
+    library = _Judge()
+    worker = RunWorker(app)
+    assert await worker.actions.context_size(library, MODEL, "vllm") == 8192
+    await worker.advance(
+        library,
+        "/operation",
+        {"step": "settings", "engine": "vllm", "model": MODEL, "lease": "lease"},
+        {},
+    )
+    body = library.asked[0][2]
+    assert body == {"lease": "lease", "engine": "vllm", "flags": {"maxModelLen": 8192}}
+    profile = {**PROFILE, "engine": "vllm", "flags": body["flags"]}
+    assert runtime_spec(MODEL, profile, start=True).flags == {"maxModelLen": 8192}
 
 
 def test_runtime_composition_keeps_profile_flags_env_and_arguments():

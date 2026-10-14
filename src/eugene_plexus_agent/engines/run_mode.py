@@ -80,8 +80,12 @@ def resolve(mode: RuntimeMode | str | None, model_path: str) -> Resolved:
         # Not "a chat model": the header did not read. It starts as it always has,
         # and if the file is what is wrong, the engine says so.
         return Resolved(Task.chat, "the file's header could not be read, so it starts as chat")
-    if facts.pooling_type == POOLING_RANK or facts.has_classifier_labels:
+    if facts.pooling_type == POOLING_RANK:
         return Resolved(Task.reranking, "its header names a reranker (pooling type 4)")
+    if facts.has_classifier_labels:
+        return Resolved(Task.reranking, "its header names classifier output labels")
+    if facts.causal is False and facts.has_classifier_tensors:
+        return Resolved(Task.reranking, "its non-causal attention has classifier tensors")
     if facts.pooling_type is not None:
         return Resolved(
             Task.embedding,

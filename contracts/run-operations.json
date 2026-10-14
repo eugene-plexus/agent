@@ -3602,6 +3602,19 @@
               }
             ],
             "title": "Contextsize"
+          },
+          "flags": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Flags",
+            "description": "Engine-owned launch flags chosen by the assigned agent. When supplied, these replace the legacy contextSize suggestion. Existing profiles are preserved."
           }
         },
         "additionalProperties": false,

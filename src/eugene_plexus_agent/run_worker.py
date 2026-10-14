@@ -74,18 +74,24 @@ def runtime_spec(model: dict[str, Any], profile: dict[str, Any], *, start: bool)
 _RUNNABLE = ("runs", "may_run")
 
 
-def takes_context_size(engine: str) -> bool:
-    """Whether the engine's launch flags have `contextSize`, the one a Run
-    writes into the profile it makes."""
+def context_flag(engine: str) -> str | None:
+    """The engine's own context flag, if its adapter declares one."""
     from .engines import ADAPTERS
 
     try:
         adapter = ADAPTERS.get(EngineKind(engine))
     except ValueError:
-        return False
+        return None
     if adapter is None:
-        return False
-    return any(field.key == "contextSize" for field in adapter.flag_schema().fields)
+        return None
+    return next(
+        (
+            field.key
+            for field in adapter.flag_schema().fields
+            if field.key in {"contextSize", "maxModelLen"}
+        ),
+        None,
+    )
 
 
 def could_have_here(engine: dict[str, Any]) -> bool:
@@ -318,10 +324,7 @@ class NodeActions:
     async def context_size(
         self, library: LibraryFitClient, model: dict[str, Any], engine: str
     ) -> int | None:
-        if not takes_context_size(engine):
-            # vLLM's context is its own flag (`maxModelLen`), and a profile
-            # carrying `contextSize` is refused at launch: it then takes the
-            # model's own, which admission measures by its share (LS6).
+        if context_flag(engine) is None:
             return None
         capabilities = model.get("capabilities") or {}
         if capabilities.get("embedding") or capabilities.get("rerank"):
@@ -523,11 +526,16 @@ class RunWorker:
             return await self._prepare(library, base, job, params)
         if step == "settings":
             context = await self.actions.context_size(library, model, engine)
+            flag = context_flag(engine)
             await library.operation_request(
                 "POST",
                 base + "/profile",
                 params=params,
-                json={"lease": job["lease"], "engine": engine, "contextSize": context},
+                json={
+                    "lease": job["lease"],
+                    "engine": engine,
+                    "flags": {flag: context} if flag and context else {},
+                },
             )
             # Skip still declares a stopped runtime; it never installs or starts.
             return {"step": "launching"}

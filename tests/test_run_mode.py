@@ -19,6 +19,7 @@ Four things have to hold, and each has its own tests:
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,29 @@ def test_auto_reads_the_header(tmp_path: Path, write: Any, task: Task) -> None:
     assert run_mode.resolve(None, str(write(tmp_path / "m.gguf"))).task is task
     assert run_mode.resolve("auto", str(write(tmp_path / "m.gguf"))).task is task
     assert run_mode.resolve(RuntimeMode.auto, str(write(tmp_path / "m.gguf"))).task is task
+
+
+@pytest.mark.parametrize(
+    "causal, name, expected",
+    [
+        (False, "cls.output.weight", True),
+        (False, "cls.weight", True),
+        (True, "cls.output.weight", False),
+        (False, "blk.0.attn_output.weight", False),
+    ],
+)
+def test_classifier_tensor_selects_reranking(tmp_path, adapter, binary, causal, name, expected):
+    path = g.write_gguf(tmp_path / "head.gguf", architecture="bert", causal=causal)
+    header = bytearray(path.read_bytes())
+    struct.pack_into("<Q", header, 8, 1)
+    encoded = name.encode()
+    header += struct.pack("<Q", len(encoded)) + encoded + struct.pack("<I Q I Q", 1, 8, 0, 0)
+    path.write_bytes(header)
+    argv = _argv(adapter, binary, path)
+    assert ("--reranking" in argv) is expected
+    if expected:
+        assert "--embeddings" not in argv and "--pooling" not in argv
+        assert "classifier" in run_mode.resolve("auto", str(path)).why
 
 
 def test_pooling_type_4_is_a_reranker_and_any_other_pooling_type_an_embedder(

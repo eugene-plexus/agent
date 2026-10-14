@@ -278,15 +278,14 @@ async def test_vllm_defaults_to_its_engines_own_share(tmp_path: Path) -> None:
     assert library.calls[0]["gpu_memory_utilization"] == 0.92
 
 
-def test_vllm_is_measured_at_its_own_flag_and_a_run_suggests_it_none() -> None:
-    from eugene_plexus_agent.run_worker import takes_context_size
+def test_vllm_is_measured_and_suggested_at_its_own_flag() -> None:
+    from eugene_plexus_agent.run_worker import context_flag
 
     assert model_length({"maxModelLen": 8192}) == 8192
     assert model_length({}) is None
-    # A profile carrying `contextSize` is refused for vLLM at launch, so Run
-    # suggests a context only to an engine whose flags have it.
-    assert takes_context_size("llama_cpp") is True
-    assert takes_context_size("vllm") is False
+    assert context_flag("llama_cpp") == "contextSize"
+    assert context_flag("vllm") == "maxModelLen"
+    assert context_flag("missing") is None
     spec = RuntimeSpec.model_validate(
         {"name": "v", "engine": "vllm", "modelPath": "/m", "flags": {"maxModelLen": 4096}}
     )

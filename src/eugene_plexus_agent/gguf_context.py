@@ -1,13 +1,14 @@
 """What a launch and a profile build need from a GGUF header.
 
-Two things, each read from the key-value block alone and never from tensor
-data. `trained_context` is the number a profile build needs: the library
+Two things, read from the header and never from tensor data.
+`trained_context` is the number a profile build needs: the library
 parses GGUF fully and is asked first, and this is the fallback for a node that
 cannot reach it, so a build never tries a context the model was not trained
 for. It stops at the answer. `run_facts` is what a launch needs (MR3): how the
 file is meant to be used, read from three keys, so the adapter can start an
 embedding or reranking model the way it has to be started. Those keys can sit
-anywhere in the block, so it reads the whole of it.
+anywhere in the block, so it reads the whole of it. Non-causal models also
+need the tensor table to identify a classifier head when metadata omits it.
 
 Duplicated rather than shared, by the polyrepo rule: the library's
 `formats/gguf.py` reads the same keys for the same words (`is_embedding`,
@@ -114,6 +115,8 @@ class RunFacts:
     """`<arch>.attention.causal`: absent for a decoder, False for an encoder."""
     has_classifier_labels: bool
     """`<arch>.classifier.output_labels` is there and not empty."""
+    has_classifier_tensors: bool = False
+    """A non-causal model's tensor table names a `cls.*` classification head."""
 
 
 #: Read once per file as it stands: a launch reads a header, and so do the
@@ -164,7 +167,7 @@ def _read_run_facts(path: Path) -> RunFacts | None:
             version = struct.unpack("<I", stream.read(4))[0]
             if version < 2:
                 return None
-            _u64(stream)  # tensor count
+            tensors = _u64(stream)
             keys = _u64(stream)
             if keys > _MAX_KEYS:
                 return None
@@ -185,6 +188,20 @@ def _read_run_facts(path: Path) -> RunFacts | None:
                     labels[name] = _skip_array(stream) > 0
                 else:
                     _skip(stream, kind)
+            classifier = False
+            if _pick(causal, architecture, _CAUSAL_SUFFIX) is False:
+                if tensors > 1 << 20:
+                    return None
+                for _ in range(tensors):
+                    size = _u64(stream)
+                    if size > _MAX_KEY_BYTES:
+                        return None
+                    name_bytes = stream.read(size)
+                    dims = struct.unpack("<I", stream.read(4))[0]
+                    if not 1 <= dims <= 8:
+                        return None
+                    classifier |= name_bytes.startswith(b"cls.")
+                    stream.seek(dims * 8 + 4 + 8, 1)  # dimensions, type, offset; no weights
             # A seek past the end of the file is not an error, so a download cut
             # off inside the last array of fixed-size numbers would read as whole.
             if stream.tell() > path.stat().st_size:
@@ -195,6 +212,7 @@ def _read_run_facts(path: Path) -> RunFacts | None:
         pooling_type=_pick(pooling, architecture, _POOLING_SUFFIX),
         causal=_pick(causal, architecture, _CAUSAL_SUFFIX),
         has_classifier_labels=_pick(labels, architecture, _LABELS_SUFFIX) is True,
+        has_classifier_tensors=classifier,
     )
 
 
