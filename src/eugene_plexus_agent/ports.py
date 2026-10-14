@@ -53,7 +53,7 @@ def looks_like_address_in_use(output: str) -> bool:
     return bool(output) and bool(_IN_USE.search(output))
 
 
-def is_free(port: int, *, host: str = "127.0.0.1") -> bool:
+def is_free(port: int, *, host: str = "127.0.0.1", reuse_address: bool = False) -> bool:
     """Could something bind `port` on `host` right now?
 
     **Asking the socket, not the topology** (review §6.1 #7). The wizard
@@ -63,17 +63,11 @@ def is_free(port: int, *, host: str = "127.0.0.1") -> bool:
     most development boxes. This is the same walk keyed on the only
     thing that decides a bind.
 
-    `SO_EXCLUSIVEADDRUSE` on Windows, nothing on POSIX. **And no check
-    covers it, which was measured rather than assumed.** Against an
-    actively listening socket on this box every variant refuses -- no
-    option 10048, `SO_REUSEADDR` 13, `SO_EXCLUSIVEADDRUSE` 10048 -- so
-    the option changes no answer this function can be asked about in a
-    test, and neither can `SO_REUSEADDR`, which was expected to break it
-    outright and does not. What the exclusive flag buys is the
-    `TIME_WAIT` case, which no check here can arrange deterministically.
-    It is kept as correct hygiene for a probe whose whole job is to
-    answer the question uvicorn will ask a second later, and the
-    sabotage pass records it as uncovered rather than dressing it up.
+    Windows always uses `SO_EXCLUSIVEADDRUSE`. On POSIX, `reuse_address`
+    matches a server that uses `SO_REUSEADDR`: a recently closed connection
+    in `TIME_WAIT` does not prevent its next bind. A live listener still
+    refuses the bind. Port allocation keeps the conservative default;
+    Strata's launch preflight opts in to match its HTTPServer.
 
     Never raises: a probe that cannot be performed answers "free", so a
     platform quirk degrades to today's behaviour rather than refusing to
@@ -85,6 +79,8 @@ def is_free(port: int, *, host: str = "127.0.0.1") -> bool:
         if exclusive is not None:
             with contextlib.suppress(OSError):
                 sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
+        elif reuse_address:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, port))
     except OSError:
         return False

@@ -132,7 +132,10 @@ async def test_health_200_alone_is_not_ready(monkeypatch, body, expected):
         assert result.capabilities.contextPoolTokens is None
 
 
-def test_a_previous_strata_listener_cannot_supply_the_next_starts_readiness(prepared, monkeypatch):
+@pytest.mark.parametrize("reuse", [False, True])
+def test_a_previous_strata_listener_cannot_supply_the_next_starts_readiness(
+    prepared, monkeypatch, reuse
+):
     _, server, config, _ = prepared
     provenance = _provenance(config.parent, entry=config.name)
     adapter = strata.StrataAdapter()
@@ -140,6 +143,8 @@ def test_a_previous_strata_listener_cannot_supply_the_next_starts_readiness(prep
         adapter, "resolve_binary", lambda *a, **kw: DiscoveredBinary(server, Origin.configured)
     )
     with socket.socket() as previous:
+        if reuse:
+            previous.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         previous.bind(("127.0.0.1", 0))
         previous.listen()
         spec = RuntimeSpec(
@@ -149,6 +154,40 @@ def test_a_previous_strata_listener_cannot_supply_the_next_starts_readiness(prep
         with pytest.raises(SpawnPlanError, match=r"already.*port|port.*already"):
             planner.plan()
     assert planner.plan().argv  # the same declaration can start once the old listener exits
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX HTTPServer address reuse after TIME_WAIT")
+def test_strata_can_restart_while_an_old_connection_is_in_time_wait(prepared, monkeypatch):
+    from eugene_plexus_agent import ports
+
+    _, server, config, _ = prepared
+    adapter = strata.StrataAdapter()
+    monkeypatch.setattr(
+        adapter, "resolve_binary", lambda *a, **kw: DiscoveredBinary(server, Origin.configured)
+    )
+    with socket.socket() as previous:
+        previous.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        previous.bind(("127.0.0.1", 0))
+        port = previous.getsockname()[1]
+        previous.listen()
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            connection, _ = previous.accept()
+            with connection:
+                connection.shutdown(socket.SHUT_WR)
+                assert client.recv(1) == b""
+    # A conservative bind refuses TIME_WAIT, while HTTPServer's own reuse bind
+    # succeeds. No listener remains to supply another process's health answer.
+    assert not ports.is_free(port)
+    with socket.socket() as restarted:
+        restarted.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        restarted.bind(("127.0.0.1", port))
+    spec = RuntimeSpec(
+        name="restart",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+        port=port,
+    )
+    assert _RuntimePlanner(spec, adapter, logging.getLogger("test")).plan().argv
 
 
 def test_recipe_is_pinned_and_platform_gated():

@@ -212,7 +212,7 @@ class _RuntimePlanner:
         # can otherwise answer the new process's health probe while its model
         # is still loading. A known occupied port is not this launch's readiness.
         if self.spec.engine is EngineKind.strata and not ports.is_free(
-            port, host=self.spec.host or "127.0.0.1"
+            port, host=self.spec.host or "127.0.0.1", reuse_address=True
         ):
             holder = ports.describe_holder(port) or "another listener"
             raise SpawnPlanError(
