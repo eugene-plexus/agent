@@ -14,11 +14,13 @@ import logging
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
 
-from .. import install_info, update_apply
+from .. import install_info, update_all, update_apply
 from .._generated.common_models import Problem
 from .._generated.models import (
     NodeInstall,
     NodeUpdate,
+    UpdateAllRun,
+    UpdateAllStatus,
     UpdateChannel,
     UpdateRequest,
     UpdateRun,
@@ -108,6 +110,15 @@ async def check_now(request: Request) -> NodeUpdate:
     dependencies=_write_auth,
 )
 async def update_now(request: Request, body: UpdateRequest) -> UpdateRun:
+    lock = getattr(request.app.state, "update_apply_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state.update_apply_lock = lock
+    async with lock:
+        return await _update_now(request, body)
+
+
+async def _update_now(request: Request, body: UpdateRequest) -> UpdateRun:
     install = await asyncio.to_thread(install_info.describe)
     view = await asyncio.to_thread(_view, request, install)
     if not view.apply.possible:
@@ -203,3 +214,38 @@ async def update_now(request: Request, body: UpdateRequest) -> UpdateRun:
         raise _problem(
             409, "update-not-started", "The update could not be started", str(exc)
         ) from exc
+
+
+@router.get(
+    "/v1/updates/all",
+    response_model=UpdateAllStatus,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def get_update_all(request: Request) -> UpdateAllStatus:
+    manager = update_all.manager(request.app)
+    if manager._load_error:
+        raise _problem(
+            409,
+            "update-all-unreadable",
+            "Saved update progress is unreadable",
+            "Check this agent's log before starting another update.",
+        )
+    return UpdateAllStatus(run=manager.run)
+
+
+@router.post(
+    "/v1/updates/all",
+    response_model=UpdateAllRun,
+    status_code=202,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def start_update_all(request: Request) -> UpdateAllRun:
+    if request.app.state.settings.safe_mode:
+        raise _problem(409, "update-safe-mode", "Safe mode", "Leave safe mode before updating.")
+    token = request.headers["authorization"].partition(" ")[2].strip()
+    try:
+        return await update_all.manager(request.app).start(token)
+    except update_all.UpdateAllError as exc:
+        raise _problem(exc.status, "update-all", "Update all could not start", str(exc)) from exc

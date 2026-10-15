@@ -47,6 +47,7 @@ from . import (
     share_credentials,
     standby,
     ui_assets,
+    update_all,
 )
 from ._http import aclose_shared
 from .auth_state import AuthState
@@ -502,8 +503,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
     )
     try:
+        if not settings.safe_mode:
+            update_all.manager(app).resume()
         yield
     finally:
+        all_updates = getattr(app.state, "update_all", None)
+        if all_updates is not None:
+            await all_updates.close()
         for task in (approval_task, sign_in_task, firewall_task):
             if task is not None:
                 task.cancel()

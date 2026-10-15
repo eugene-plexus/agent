@@ -2076,6 +2076,87 @@ class LogPage(BaseModel):
     )
 
 
+class UpdateAllRunState(StrEnum):
+    """
+    Complete means every item updated or was current; attention includes manual or failed items.
+    """
+
+    running = 'running'
+    complete = 'complete'
+    attention = 'attention'
+
+
+class UpdateAllItemState(StrEnum):
+    """
+    Per-machine or per-app progress, retained through restarts.
+    """
+
+    pending = 'pending'
+    checking = 'checking'
+    updating = 'updating'
+    updated = 'updated'
+    current = 'current'
+    manual = 'manual'
+    failed = 'failed'
+    skipped = 'skipped'
+
+
+class UpdateAllItemKind(StrEnum):
+    """
+    A machine's Eugene installation or an installed catalogue app.
+    """
+
+    node = 'node'
+    app = 'app'
+
+
+class UpdateAllItem(BaseModel):
+    """
+    One machine or installed app in the update job.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str = Field(..., description='Enrolled machine name.')
+    kind: UpdateAllItemKind
+    app: str | None = Field(None, description='Catalogue app id for an app item.')
+    state: UpdateAllItemState
+    detail: str = Field(..., description='What happened or what to do next.')
+    target: str | None = Field(
+        None, description='Verified node ref or app version being installed.'
+    )
+    startedAt: AwareDatetime | None = Field(
+        None, description='When this item began applying.'
+    )
+    components: dict[str, str] | None = Field(
+        None,
+        description="Expected installed component stamps used to verify a node's return.",
+    )
+
+
+class UpdateAllRun(BaseModel):
+    """
+    Durable progress of one operator-requested Update all job.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., description='Unique job identifier.')
+    root: str = Field(..., description='Control root machine updated first.')
+    startedAt: AwareDatetime = Field(..., description='When the job was accepted.')
+    expiresAt: AwareDatetime = Field(
+        ..., description='Latest time further work may start.'
+    )
+    finishedAt: AwareDatetime | None = Field(None, description='When all work stopped.')
+    state: UpdateAllRunState
+    items: list[UpdateAllItem] = Field(
+        ...,
+        description='Root first, then workers, with installed apps added after each node returns.',
+    )
+
+
 class UpdateRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -3993,6 +4074,14 @@ class UpdateRun(BaseModel):
     log: str | None = Field(
         None, description='Where the whole installer output is, on this machine.'
     )
+
+
+class UpdateAllStatus(BaseModel):
+    """
+    The latest install-wide update started from this console.
+    """
+
+    run: UpdateAllRun | None = None
 
 
 class HostFirewall(BaseModel):
