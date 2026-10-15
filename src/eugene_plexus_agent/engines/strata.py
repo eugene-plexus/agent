@@ -1,6 +1,6 @@
 """Experimental, prepared-config Strata integration (upstream v0.1.39).
 
-The HTTP server owns the native child. Only text, one request at a time;
+The HTTP server owns the native child. Text chat, with optional parallel requests;
 weights/tokenizers/MTP packs stay in the operator's model folder.
 
 Since LS3 a prepared model is a Library model (library-sources-and-engines.md
@@ -304,8 +304,9 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
         )
         if unsupported:
             raise ValueError("unsupported config features: " + ", ".join(unsupported))
-        if cfg.get("parallel", 1) != 1:
-            raise ValueError("this integration supports parallel: 1 only")
+        parallel = cfg.get("parallel", 1)
+        if type(parallel) is not int or not 1 <= parallel <= 8:
+            raise ValueError("parallel must be a whole number from 1 to 8")
         if cfg.get("cuda", 13) != 13 or cfg.get("backend", "cuda") != "cuda":
             raise ValueError("this recipe supports the CUDA 13 engine only")
         cwd = Path(cfg.get("cwd") or path.parent)
@@ -358,7 +359,7 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
             "args": normalized,
             "tokenizer": str(tokenizer),
             "model_name": alias,
-            "parallel": 1,
+            "parallel": parallel,
             "lazy_load": False,
             "idle_unload_s": 0,
             "open_browser": False,
@@ -580,10 +581,30 @@ class StrataAdapter(EngineAdapter):
         context = body.get("max_context")
         if type(context) is not int or context <= 0:
             return Loading(detail="Strata has not reported a loaded model context yet")
+        parallel = 1
+        # /slots is a llama.cpp compatibility stub with one entry. Only the
+        # native status endpoint reports the slots the engine actually obtained.
+        try:
+            status_response = await probe_client().get(
+                f"{base_url}/v1/status", headers=headers, timeout=3
+            )
+            status = status_response.json()
+            if (
+                status_response.status_code == 200
+                and isinstance(status, dict)
+                and status.get("service") == "strata"
+                and status.get("loaded") is True
+            ):
+                concurrency = status.get("concurrency")
+                serving = concurrency.get("serving") if isinstance(concurrency, dict) else None
+                if type(serving) is int and 1 <= serving <= 8:
+                    parallel = serving
+        except (httpx.HTTPError, ValueError):
+            pass  # health is still ready; unknown capacity stays conservatively at one
         return Ready(
             capabilities=RuntimeCapabilities(
                 contextLength=context if type(context) is int and context > 0 else None,
-                parallelSlots=1,
+                parallelSlots=parallel,
                 embeddings=False,
                 vision=False,
                 multimodal=False,

@@ -96,7 +96,9 @@ def test_prepared_setup_tuning_and_metadata_are_accepted(prepared):
     [
         {"before_load": "whoami"},
         {"mcp_servers": {"x": {"command": "whoami"}}},
-        {"parallel": 4},
+        {"parallel": 9},
+        {"parallel": True},
+        {"parallel": 0},
         {"vision": {"exe": "x"}},
         {"args": ["--batch", "8"]},
         {"tokenizer": "missing"},
@@ -108,6 +110,38 @@ def test_unsupported_or_missing_assets_refuse_before_spawn(prepared, change):
     config.write_text(json.dumps({**cfg, **change}))
     with pytest.raises(SpawnPlanError):
         strata.prepared_config(config, alias="a", root=root)
+
+
+@pytest.mark.parametrize("parallel", [1, 2, 4, 8])
+def test_prepared_parallel_requests_are_preserved(prepared, parallel):
+    root, _, config, cfg = prepared
+    cfg["parallel"] = parallel
+    config.write_text(json.dumps(cfg))
+    saved = strata.prepared_config(config, alias="a", root=root)
+    assert saved["parallel"] == parallel
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "serving,expected", [(2, 2), (4, 4), (8, 8), (0, 1), (True, 1), (None, 1), (99, 1)]
+)
+async def test_readiness_reports_effective_parallel_capacity(monkeypatch, serving, expected):
+    def answer(request):
+        assert request.headers["authorization"] == "Bearer test"
+        body = {"service": "strata", "loaded": True, "max_context": 4096}
+        if request.url.path == "/v1/status":
+            body["concurrency"] = {"serving": serving, "requested": 8}
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        monkeypatch.setattr(strata, "probe_client", lambda: client)
+        result = await strata.StrataAdapter().probe_readiness(
+            "http://strata", headers={"Authorization": "Bearer test"}
+        )
+    assert isinstance(result, Ready)
+    assert result.capabilities.parallelSlots == expected
+    assert result.capabilities.contextLength == 4096
+    assert result.capabilities.contextPoolTokens is None
 
 
 @pytest.mark.parametrize(
