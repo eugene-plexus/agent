@@ -170,6 +170,7 @@ def decide(
     request_id: str,
     model: str | None,
     now: float,
+    principal: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """No mutation until the caller persists the returned candidate atomically."""
     limits = validate_limits(key.get("limits")) if key else None
@@ -190,7 +191,8 @@ def decide(
             raise AdmissionRefusal(401, "This client key is unregistered, expired or revoked.")
     if action == "check":
         return result, None
-    digest = hashlib.sha256(json.dumps(limits, sort_keys=True).encode()).hexdigest()
+    policy = {"limits": limits, "principal": principal} if principal else limits
+    digest = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
     if action == "release":
         if existing is not None:
             existing["active"] = False

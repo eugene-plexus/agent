@@ -2227,7 +2227,7 @@
               }
             ],
             "title": "Rerank",
-            "description": "The model is a reranker: it scores how well a passage answers\na question instead of turning text into a vector (a pooling\ntype of 4, `rank`, or classifier output labels in its\nmetadata). The console says \"sort results\". It needs\n`--reranking` the way an embedder needs `--embeddings`, and\nthe agent starts one that way by itself (`RuntimeMode`).\n\n**The metadata can miss one.** A cross-encoder converted\nwithout either key (the gpustack bge-reranker-v2-m3 file is\none: a non-causal `bert` with a classifier head and neither\nkey) reads as `embedding`, and `ModelProfileSpec.mode` is\nhow a person says otherwise.\n"
+            "description": "The model is a reranker: it scores how well a passage answers\na question instead of turning text into a vector (a pooling\ntype of 4, `rank`, classifier output labels in its metadata,\nor a non-causal attention model with `cls.*` classifier\ntensors). The console says \"sort results\". It needs\n`--reranking` the way an embedder needs `--embeddings`, and\nthe agent starts one that way by itself (`RuntimeMode`).\n\nA classifier head identifies cross-encoders such as\nbge-reranker-v2-m3 even when neither pooling nor output-label\nmetadata is present. A conversion with none of these markers\ncan still require a `ModelProfileSpec.mode` override.\n"
           },
           "vision": {
             "anyOf": [
