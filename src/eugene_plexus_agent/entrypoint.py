@@ -158,6 +158,18 @@ def _address(host: str) -> bool:
     return not (address.is_unspecified or address.is_multicast or address.is_loopback)
 
 
+class InferencePath(BaseModel):
+    """An opt-in API path on the console name, with its own network policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    networks: list[str] = Field(min_length=1)
+
+    @field_validator("networks")
+    @classmethod
+    def valid_networks(cls, values: list[str]) -> list[str]:
+        return Service.valid_networks(values)
+
+
 class AutomaticCertificates(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     email: str
@@ -198,6 +210,7 @@ class EntryConfig(BaseModel):
     console: Service
     workbench: Service
     inference: Service | None = None
+    inference_on_console: InferencePath | None = None
     nodes: Service | None = None
     certificate: Path | None = None
     private_key: Path | None = None
@@ -319,7 +332,9 @@ class EntryConfig(BaseModel):
             "consoleUrl": self.console.origin,
             "workbenchUrl": self.workbench.origin,
         }
-        if self.inference:
+        if self.inference_on_console:
+            result["inferenceUrl"] = self.console.origin + "/inference"
+        elif self.inference:
             result["inferenceUrl"] = self.inference.origin
         if self.nodes:
             result["nodesUrl"] = self.nodes.origin
@@ -575,7 +590,13 @@ def caddy_config(
         ):
             routes.append({"match": [refused], "handle": [_refusal(403, body)], "terminal": True})
 
-    def route(service: Service, target: str, paths: list[str] | None = None) -> None:
+    def route(
+        service: Service,
+        target: str,
+        paths: list[str] | None = None,
+        *,
+        strip_prefix: str | None = None,
+    ) -> None:
         match: dict[str, Any] = {
             "host": [service.host],
             "client_ip" if config.proxy else "remote_ip": {"ranges": service.networks},
@@ -614,11 +635,81 @@ def caddy_config(
                     "flush_interval": -1,
                 },
             ]
+        if strip_prefix:
+            # API bytes share the console origin, so they must never execute as
+            # a browser document, even if an upstream returns HTML or SVG.
+            handlers = [
+                {
+                    "handler": "headers",
+                    "response": {
+                        "set": {
+                            "Content-Security-Policy": [
+                                "default-src 'none'; frame-ancestors 'none'; sandbox"
+                            ],
+                            "X-Content-Type-Options": ["nosniff"],
+                        }
+                    },
+                },
+                {"handler": "rewrite", "strip_path_prefix": strip_prefix},
+                *handlers,
+            ]
         routes.append({"match": [match], "handle": handlers, "terminal": True})
 
     # Public sign-in does not grant access to the adjacent console/API routes.
     sign_in = config.console.model_copy(update={"networks": config.workbench.networks})
     route(sign_in, "agent", ["/oidc/*"])
+    if config.inference_on_console:
+        inference = config.console.model_copy(
+            update={"networks": config.inference_on_console.networks}
+        )
+        route(
+            inference,
+            "gateway",
+            ["/inference" + path for path in _INFERENCE_PATHS],
+            strip_prefix="/inference",
+        )
+        routes.append(
+            {
+                "match": [
+                    {
+                        "host": [config.console.host],
+                        "path": ["/inference/v1", "/inference/v1/*"],
+                        "not": [
+                            {
+                                "client_ip" if config.proxy else "remote_ip": {
+                                    "ranges": config.inference_on_console.networks,
+                                }
+                            }
+                        ],
+                    }
+                ],
+                "handle": [
+                    _refusal(403, f"The model API does not allow requests from {visitor}.\n")
+                ],
+                "terminal": True,
+            }
+        )
+    # Reserve the API namespace, even when disabled. The /inference/ page
+    # belongs to the existing console and must retain its own access policy. A refused API request
+    # cannot fall through to the console's less restrictive network policy.
+    routes.append(
+        {
+            "match": [
+                {"host": [config.console.host], "path": ["/inference/v1", "/inference/v1/*"]}
+            ],
+            "handle": [
+                _refusal(
+                    403,
+                    (
+                        "This path is not a model API endpoint.\n"
+                        if config.inference_on_console
+                        else "The model API is disabled in Container access setup.\n"
+                    ),
+                )
+            ],
+            "terminal": True,
+        }
+    )
     if config.console_direct:
         # The console is on its own port; its name signs people in to
         # Workbench and says where the console is, and nothing else.

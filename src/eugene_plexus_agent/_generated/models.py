@@ -2532,7 +2532,7 @@ class ClientAdmissionResult(BaseModel):
     keyId: str
     keyName: str
     personId: str | None = Field(
-        None, description='Stable subject verified by the root'
+        None, description='Stable subject verified by the root, never caller supplied.'
     )
     appClientId: str | None = None
     limits: ClientKeyLimits | None = None
@@ -3464,7 +3464,10 @@ class PublicEntryPoint(BaseModel):
 
     consoleUrl: AnyUrl
     workbenchUrl: AnyUrl
-    inferenceUrl: AnyUrl | None = None
+    inferenceUrl: AnyUrl | None = Field(
+        None,
+        description='Model API root, before /v1. May include /inference on the console origin; otherwise the separate inference origin.',
+    )
     nodesUrl: AnyUrl | None = None
     publicSites: bool | None = Field(
         None,

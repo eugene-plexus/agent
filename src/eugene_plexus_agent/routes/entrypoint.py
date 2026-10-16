@@ -72,7 +72,19 @@ def _steps(config: EntryConfig) -> list[str]:
         "Update Workbench in Apps first. Keep the existing /data volume, model mounts "
         "and container settings.",
         "Point these names at " + ("your reverse proxy: " if config.proxy else "Eugene: ") + hosts,
+        f"Eugene's sign-in address is {config.console.origin}/oidc. External sign-in uses it "
+        "automatically unless you have explicitly saved another address.",
     ]
+    if config.inference_on_console:
+        steps.append(
+            f"Use {config.console.origin}/inference/v1 as the model API base URL. "
+            "It shares Eugene's proxy host and port, with its own network rules and API keys."
+        )
+        if config.inference:
+            steps.append(
+                f"The existing model API at {config.inference.origin}/v1 remains available. "
+                "Move clients to the new address before removing its proxy host."
+            )
     if config.proxy:
         steps += [
             "Create one proxy host per name, preserving Host. Forward them all to Eugene "

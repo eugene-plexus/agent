@@ -433,7 +433,10 @@ def _bodies(document: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, An
 
 
 def test_each_proxy_refusal_names_its_check_and_what_eugene_saw(tmp_path):
-    refusals = _bodies(caddy_config(proxy_config(), tmp_path, "secret", {"agent": 8079}))
+    all_refusals = _bodies(caddy_config(proxy_config(), tmp_path, "secret", {"agent": 8079}))
+    api_refusal = next(h for _, h in all_refusals if "model API" in h["body"])
+    assert "disabled" in api_refusal["body"]
+    refusals = [(r, h) for r, h in all_refusals if h is not api_refusal]
     texts = [handler["body"] for _, handler in refusals]
     assert len(texts) == len(set(texts)) == 6
     assert "came from {http.request.remote.host}, which is not a proxy Eugene trusts" in texts[0]
@@ -460,8 +463,8 @@ def test_direct_refusals_name_the_connecting_address(tmp_path):
         }
     )
     texts = [h["body"] for _, h in _bodies(caddy_config(direct, tmp_path, "s", {"agent": 8079}))]
-    assert len(texts) == 3
-    assert "does not answer {http.request.remote.host}" in texts[1]
+    assert len(texts) == 4
+    assert any("does not answer {http.request.remote.host}" in text for text in texts)
 
 
 # --------------------------------------------------------------------------- #
@@ -539,7 +542,8 @@ def test_its_name_serves_only_workbench_sign_in(tmp_path):
     on_console = [
         r for r in routes if r.get("match", [{}])[0].get("host") == ["eugene.example.org"]
     ]
-    sign_in, refusal = on_console
+    sign_in, api_refusal, refusal = on_console
+    assert "disabled" in api_refusal["handle"][0]["body"]
     assert sign_in["match"][0]["path"] == ["/oidc/*"]
     assert sign_in["match"][0]["client_ip"]["ranges"] == ["0.0.0.0/0"]  # Workbench's networks
     assert sign_in["handle"][-1]["upstreams"] == [{"dial": "127.0.0.1:8079"}]

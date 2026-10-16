@@ -69,6 +69,65 @@ def test_invalid_or_missing_policy_cannot_enable_public_admin():
             config(**changes)
 
 
+def test_shared_inference_requires_its_own_explicit_networks():
+    for value in ({}, {"networks": []}, {"networks": ["192.168.1.5/24"]}):
+        with pytest.raises(ValidationError):
+            config(inference_on_console=value)
+    entry = config(inference_on_console={"networks": ["0.0.0.0/0"]})
+    assert len(entry.services()) == 2
+    assert entry.public_urls()["inferenceUrl"] == "https://eugene.home.arpa:8443/inference"
+    assert entry.console.networks == ["192.168.1.0/24"]
+
+
+@pytest.mark.parametrize("console_direct", [False, True])
+def test_shared_inference_precedes_console_and_reserves_rejected_paths(tmp_path, console_direct):
+    entry = config(
+        console_direct=console_direct,
+        inference_on_console={"networks": ["10.0.0.0/8"]},
+        inference={"origin": "https://old-api.home.arpa:8443", "networks": ["192.168.1.0/24"]},
+    )
+    routes = caddy_config(entry, tmp_path, "secret", {"agent": 8079, "gateway": 8080})["apps"][
+        "http"
+    ]["servers"]["entry"]["routes"]
+    api = next(
+        r for r in routes if "/inference/v1/models" in r.get("match", [{}])[0].get("path", [])
+    )
+    assert api["match"][0]["remote_ip"]["ranges"] == ["10.0.0.0/8"]
+    assert {"handler": "rewrite", "strip_path_prefix": "/inference"} in api["handle"]
+    assert api["handle"][-1]["upstreams"] == [{"dial": "127.0.0.1:8080"}]
+    assert "sandbox" in api["handle"][0]["response"]["set"]["Content-Security-Policy"][0]
+    guard = next(
+        r
+        for r in routes
+        if r.get("match", [{}])[0].get("path") == ["/inference/v1", "/inference/v1/*"]
+    )
+    assert routes.index(api) < routes.index(guard)
+    assert guard["handle"][0]["status_code"] == 403 and guard["terminal"]
+    legacy = next(r for r in routes if r.get("match", [{}])[0].get("host") == ["old-api.home.arpa"])
+    assert "/v1/models" in legacy["match"][0]["path"]
+    assert all(h["handler"] != "rewrite" for h in legacy["handle"])
+
+
+def test_disabled_shared_inference_still_cannot_reach_console(tmp_path):
+    routes = caddy_config(config(), tmp_path, "secret", {"agent": 8079})["apps"]["http"]["servers"][
+        "entry"
+    ]["routes"]
+    guard = next(
+        r
+        for r in routes
+        if r.get("match", [{}])[0].get("path") == ["/inference/v1", "/inference/v1/*"]
+    )
+    console = next(
+        r
+        for r in routes
+        if r.get("match", [{}])[0].get("host") == ["eugene.home.arpa"]
+        and "path" not in r["match"][0]
+    )
+    assert routes.index(guard) < routes.index(console)
+    assert "/inference/" not in guard["match"][0]["path"]
+    assert "/inference/*" not in guard["match"][0]["path"]
+
+
 @pytest.mark.parametrize(
     "peer,secret,expected",
     [
