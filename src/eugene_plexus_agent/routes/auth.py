@@ -857,6 +857,8 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
                 body=body.model_dump(mode="json", exclude_none=True),
             )
         )
+    if body.personToken is not None:
+        raise _problem(503, "Person authority unavailable", "Person access needs the control root.")
     try:
         return ClientAdmissionResult.model_validate(
             _keys(request).admit(

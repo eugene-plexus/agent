@@ -318,6 +318,33 @@ def test_a_session_for_this_console_is_exchanged_for_the_far_node(
     assert claims.aud == ("node:root",)
 
 
+def test_administration_token_reaches_only_control_without_exchange(
+    app: FastAPI, client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    app.state.control_transport = control_transport(
+        exchanges.requests,
+        components=[
+            {"node": "root", "name": "control", "kind": "control"},
+            {"node": "root", "name": "gateway", "kind": "gateway"},
+        ],
+        nodes=[{"name": "root", "url": "http://root.invalid:8279/"}],
+    )
+    token, _ = exchanges.root.token.mint(
+        typ=tokens.TYP_ADMINISTRATION,
+        sub="person-1",
+        aud=["control"],
+        ttl_seconds=3600,
+        extra={"administration_version": 1},
+    )
+    auth = {"Authorization": "Bearer " + token}
+    assert client.get("/api/proxy/control/v1/people", headers=auth).status_code == 200
+    assert upstream.last.headers["authorization"] == auth["Authorization"]
+    assert client.get("/api/proxy/gateway/v1/models", headers=auth).status_code == 200
+    assert "authorization" not in upstream.last.headers
+    assert not any(r.url.path == "/v1/auth/token" for r in exchanges.requests)
+    assert client.get("/v1/config", headers=auth).status_code == 401
+
+
 def test_one_session_is_exchanged_once_per_far_machine(
     app: FastAPI, client: TestClient, upstream: Upstream, exchanges: Exchanges
 ) -> None:

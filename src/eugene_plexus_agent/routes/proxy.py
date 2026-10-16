@@ -490,7 +490,7 @@ def _refuse_signed_out(request: Request) -> None:
 # Credential translation (D7)
 # --------------------------------------------------------------------- #
 
-_ANY_CLASS = (tokens.TYP_SESSION, tokens.TYP_SERVICE, tokens.TYP_CLIENT)
+_ANY_CLASS = (tokens.TYP_SESSION, tokens.TYP_SERVICE, tokens.TYP_CLIENT, tokens.TYP_ADMINISTRATION)
 
 # How long before an exchanged token's expiry it is replaced rather than
 # reused: enough that a request started now finishes before it lapses.

@@ -65,7 +65,12 @@ async def _standing(request: Request, key_id: str) -> _Standing:
     cached = cache.get(key_id)
     if cached is not None and cached.until > now:
         return cached
-    body = {"action": "check", "keyId": key_id, "requestId": secrets.token_hex(8)}
+    body = {
+        "action": "check",
+        "keyId": key_id,
+        "requestId": secrets.token_hex(8),
+        "purpose": "logs",
+    }
     owner = registry(request)
     try:
         if owner.enrolled:

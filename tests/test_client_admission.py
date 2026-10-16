@@ -84,6 +84,8 @@ def test_standalone_http_limits_and_operator_edit(authed_client):
         c.post("/v1/auth/client-keys/admission", json=payload, headers=headers).status_code == 401
     )
     assert c.put(path, json={"limits": {}}, headers=headers).status_code == 401
+    proof = {**payload, "personToken": "a-person-proof"}
+    assert c.post("/v1/auth/client-keys/admission", json=proof).status_code == 503
     assert (
         c.post(
             "/v1/auth/client-keys", json={"name": "bad", "limits": {"allowedModels": [" "]}}
