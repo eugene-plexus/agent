@@ -55,7 +55,7 @@ _PASSED_BACK = (
 )
 #: What the caller sends that the root needs: the client's secret or the
 #: bearer, and what the body is.
-_PASSED_ON = ("authorization", "content-type", "accept")
+_PASSED_ON = ("authorization", "content-type", "accept", "user-agent")
 
 
 def _root_url(request: Request) -> str | None:
@@ -86,6 +86,17 @@ async def forward(request: Request, path: str) -> Response:
             status_code=503,
         )
     headers = {k: v for k, v in request.headers.items() if k.lower() in _PASSED_ON}
+    # The shared HTTP pool must never replay one visitor's cookies for another.
+    # Only Eugene's dedicated sign-in cookies cross this path; app cookies do not.
+    allowed_cookies = {
+        "ep-signin",
+        "ep-signin-flow",
+        "__Secure-ep-signin",
+        "__Secure-ep-signin-flow",
+    }
+    headers["cookie"] = "; ".join(
+        f"{key}={value}" for key, value in request.cookies.items() if key in allowed_cookies
+    )
     headers[FORWARDED_HOST_HEADER] = request.headers.get("host") or request.url.netloc
     headers[FORWARDED_PROTO_HEADER] = request.url.scheme
     entry = getattr(request.app.state, "entrypoint_config", None)
@@ -120,4 +131,8 @@ async def forward(request: Request, path: str) -> Response:
             status_code=503,
         )
     back = {k: v for k, v in answer.headers.items() if k.lower() in _PASSED_BACK}
-    return Response(content=answer.content, status_code=answer.status_code, headers=back)
+    response = Response(content=answer.content, status_code=answer.status_code, headers=back)
+    for value in answer.headers.get_list("set-cookie"):
+        if value.partition("=")[0] in allowed_cookies:
+            response.headers.append("set-cookie", value)
+    return response
