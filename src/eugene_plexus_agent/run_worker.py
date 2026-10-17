@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -22,11 +23,13 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException
 
+from . import model_copies
 from ._generated.models import EngineKind, RuntimeMode, RuntimeSpec
 from .admission import LibraryFitClient
 from .engines import adapter_for
 from .engines.acquisition import engine_root
 from .engines.devices import detect_devices
+from .engines.strata import StrataAdapter
 from .model_paths import join_local, resolve_model_path
 from .node_work import launch_guard
 from .preparation import PreparationError, PreparationJobs, PreparationResult, Progress, Recipe
@@ -251,6 +254,7 @@ class NodeActions:
                 model=Path(local),
                 source_path=model["path"],
                 context=wanted.get("contextSize"),
+                vision=wanted.get("vision", "off"),
             )
 
         try:
@@ -410,6 +414,40 @@ class NodeActions:
                         state, actions._component_supervisor(context), existing
                     )
                 if start:
+                    supervisor = actions._supervisor(context)
+                    if (
+                        existing.engine is EngineKind.strata
+                        and supervisor is not None
+                        and supervisor.is_running(existing.name)
+                    ):
+                        launched = supervisor.compose(existing).argv or []
+                        if "--config" in launched:
+                            await actions.refresh_library_folders(context)
+                            rules = actions.effective_rules_for(context)
+
+                            def changed() -> bool:
+                                adapter = StrataAdapter()
+                                binary = adapter.resolve_binary(
+                                    existing,
+                                    configured=_configured_binary(adapter, state.get_config),
+                                )
+                                local = model_copies.resolve_local_path(
+                                    existing.modelPath, rules, supervisor.copy_settings()
+                                )
+                                current = adapter.prepare_config(
+                                    existing.model_copy(update={"modelPath": local.path}), binary
+                                )
+                                snapshot = Path(launched[launched.index("--config") + 1])
+                                saved = json.loads(snapshot.read_text(encoding="utf-8"))
+                                if not isinstance(saved, dict):
+                                    raise ValueError(
+                                        f"Strata launch config is not an object: {snapshot}"
+                                    )
+                                saved.pop("log", None)
+                                return saved != current
+
+                            if await asyncio.to_thread(changed):
+                                await supervisor.stop_one(existing.name)
                     await actions.start_declared_runtime(context, existing.name)
                 result = actions._compose(existing, actions._supervisor(context))
         return result.model_dump(mode="json")

@@ -2748,6 +2748,11 @@
             ],
             "title": "Contextsize",
             "description": "The context the engine prepares for. Absent: the engine's own recommendation for the node."
+          },
+          "vision": {
+            "$ref": "#/components/schemas/PreparationVisionMode",
+            "description": "Image encoder placement. Off preserves text-only preparation.",
+            "default": "off"
           }
         },
         "additionalProperties": false,
@@ -2836,6 +2841,16 @@
         ],
         "title": "PreparationStatus",
         "description": "Where a preparation is, as the engine's node reports it (LS5)."
+      },
+      "PreparationVisionMode": {
+        "type": "string",
+        "enum": [
+          "off",
+          "cpu",
+          "gpu"
+        ],
+        "title": "PreparationVisionMode",
+        "description": "Where to encode images during inference; off prepares text only."
       },
       "PreparedDetail": {
         "properties": {

@@ -121,6 +121,50 @@ def test_prepared_parallel_requests_are_preserved(prepared, parallel):
     assert saved["parallel"] == parallel
 
 
+@pytest.mark.parametrize("gpu", [False, True])
+def test_vision_config_uses_owned_executable_and_portable_assets(prepared, gpu):
+    root, _, config, cfg = prepared
+    encoder = root / "engine" / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
+    encoder.touch()
+    (config.parent / "mmproj.gguf").touch()
+    cfg["args"].append("--vision")
+    cfg["vision"] = {
+        "exe": "do-not-execute.exe",
+        "mmproj": "mmproj.gguf",
+        "model": "shard.gguf",
+        "gpu": gpu,
+        "max_tokens": 300,
+    }
+    config.write_text(json.dumps(cfg))
+    saved = strata.prepared_config(config, alias="a", root=root)
+    assert saved["vision"] == {
+        **cfg["vision"],
+        "exe": str(encoder),
+        "mmproj": str(config.parent / "mmproj.gguf"),
+        "model": str(config.parent / "shard.gguf"),
+    }
+    assert config.parent / "mmproj.gguf" in strata.StrataAdapter().prepared_files(
+        _provenance(config.parent, entry=config.name)
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("enabled", [False, True, "true", None])
+async def test_readiness_reports_current_vision_capability(monkeypatch, enabled):
+    def answer(request):
+        body = {"service": "strata", "loaded": True, "max_context": 4096}
+        if request.url.path == "/v1/status":
+            body["vision"] = {"enabled": enabled, "available": True, "error": None}
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+        monkeypatch.setattr(strata, "probe_client", lambda: client)
+        result = await strata.StrataAdapter().probe_readiness("http://strata")
+    assert isinstance(result, Ready)
+    assert result.capabilities.vision is (enabled is True)
+    assert result.capabilities.multimodal is (enabled is True)
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize(
     "serving,expected", [(2, 2), (4, 4), (8, 8), (0, 1), (True, 1), (None, 1), (99, 1)]

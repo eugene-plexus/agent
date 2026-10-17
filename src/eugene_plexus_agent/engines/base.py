@@ -39,6 +39,7 @@ from .._generated.models import (
     ModelRequirement,
     Origin,
     Policy,
+    PreparationVisionMode,
     PythonEngine,
     RuntimeCapabilities,
     RuntimeMode,
@@ -300,6 +301,7 @@ class EngineAdapter(abc.ABC):
         model: Path,
         source_path: str,
         context: int | None,
+        vision: PreparationVisionMode = PreparationVisionMode.off,
     ) -> Recipe:
         """Plan preparing `model`, in the Library folder `folder` (both as
         this node reaches them), with the engine's own tools (LS5); or say,

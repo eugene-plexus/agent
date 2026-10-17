@@ -11,11 +11,12 @@ import hashlib
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
-from eugene_plexus_agent import preparation_send
+from eugene_plexus_agent import preparation_send, run_worker
 from eugene_plexus_agent.model_paths import PathRule
 from eugene_plexus_agent.preparation import PreparationJobs, PreparationResult, Progress
 from eugene_plexus_agent.routes import runtimes as actions
@@ -29,6 +30,39 @@ GGUF = {
     "format": "gguf",
 }
 PREPARE = {"modelId": "g", "preparation": {"engine": "strata"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vision", [None, "off", "cpu", "gpu"])
+async def test_worker_passes_the_requested_image_mode(authed_client, monkeypatch, tmp_path, vision):
+    app = authed_client.app
+
+    async def refreshed(_context):
+        return False
+
+    planned = []
+    recipe = object()
+
+    def plan(**kwargs):
+        planned.append(kwargs)
+        return recipe
+
+    adapter = SimpleNamespace(discover=lambda **kwargs: object(), plan_preparation=plan)
+    monkeypatch.setattr(run_worker, "adapter_for", lambda _kind: adapter)
+    monkeypatch.setattr(run_worker, "_configured_binary", lambda *args: None)
+    monkeypatch.setattr(actions, "refresh_library_folders", refreshed)
+    monkeypatch.setattr(
+        actions,
+        "effective_rules_for",
+        lambda _c: [PathRule(source="/models", target=str(tmp_path))],
+    )
+    node = NodeActions(app)
+    progress = Progress(state="running")
+    monkeypatch.setattr(node.preparations, "start", lambda *args, **kwargs: progress)
+    preparation = {"engine": "strata", **({"vision": vision} if vision else {})}
+    job = _job("preparing", intent={"modelId": "g", "preparation": preparation})
+    assert await node.prepare(job) is progress
+    assert planned[0]["vision"] == (vision or "off")
 
 
 def _verdict(engine, verdict, *, available=True, reason="runs it after preparing it"):

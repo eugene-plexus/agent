@@ -38,7 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .._generated.models import SupportedModel
+from .._generated.models import PreparationVisionMode, SupportedModel
 from ..child_env import child_environment
 from ..preparation import (
     PreparationError,
@@ -228,6 +228,7 @@ def plan(
     context: int | None,
     ram_bytes: int | None,
     gpu: int | None = None,
+    vision: PreparationVisionMode = PreparationVisionMode.off,
 ) -> StrataPreparation:
     """Check what can be checked before anything starts (B51), or say why not.
 
@@ -242,6 +243,10 @@ def plan(
             "them (its setup refuses any other GGUF)."
         )
     supported, choice = found
+    vision = PreparationVisionMode(vision)
+    modes = supported.preparation.visionModes if supported.preparation is not None else None
+    if vision is not PreparationVisionMode.off and vision not in (modes or []):
+        raise PreparationError(f"Strata does not support images with {supported.title}.")
     if context is not None and context not in CONTEXTS:
         raise PreparationError(
             f"Strata's setup prepares a context of {', '.join(str(c) for c in CONTEXTS)} "
@@ -265,7 +270,7 @@ def plan(
         inside = Path("..")
     if inside.parts[:1] == ("..",) or inside.is_absolute():
         raise PreparationError(f"{gguf} is not inside the Library folder {folder}.")
-    need = disk_needed(choice, ram_bytes)
+    need = disk_needed(choice, ram_bytes) + (1_000_000_000 if vision != "off" else 0)
     free = free_bytes(work)
     if free is not None and free < need:
         raise PreparationError(
@@ -284,6 +289,7 @@ def plan(
         gpu=gpu,
         source_path=source_path,
         bytes_needed=need,
+        vision=PreparationVisionMode(vision),
     )
 
 
@@ -319,6 +325,7 @@ class StrataPreparation:
     gpu: int | None
     source_path: str
     bytes_needed: int | None
+    vision: PreparationVisionMode = PreparationVisionMode.off
     _failure: list[str] = field(default_factory=list)
     _pending: str = ""
     #: The folder setup is given as the GGUF's (B102).
@@ -362,7 +369,7 @@ class StrataPreparation:
             "--data-dir",
             str(self.data_dir),
             "--vision",
-            "no",
+            "no" if self.vision is PreparationVisionMode.off else self.vision.value,
             "--experimental-speed-projection",
             "off",
             "--no-browser",
@@ -613,6 +620,24 @@ class StrataPreparation:
         cfg["args"] = args
         if isinstance(cfg.get("tokenizer"), str):
             cfg["tokenizer"] = self._relative(cfg["tokenizer"])
+        vision = cfg.get("vision")
+        if self.vision is not PreparationVisionMode.off and not isinstance(vision, dict):
+            raise PreparationError("Strata's setup did not enable the requested image encoder.")
+        if isinstance(vision, dict):
+            expected_gpu = self.vision is PreparationVisionMode.gpu
+            if self.vision is PreparationVisionMode.off:
+                raise PreparationError("Strata's setup enabled images although images were off.")
+            if vision.get("gpu") is not expected_gpu:
+                effective = "GPU" if vision.get("gpu") is True else "CPU or unavailable"
+                raise PreparationError(
+                    f"Strata's setup selected {effective} image encoding instead of the requested "
+                    f"{self.vision.value.upper()} encoder. Check the setup log and prepare again "
+                    "with a supported image mode."
+                )
+            vision.pop("exe", None)
+            for key in ("mmproj", "model"):
+                if isinstance(vision.get(key), str):
+                    vision[key] = self._relative(vision[key])
         # Node-neutral (Troy, LS7): this file lives in the Library and any
         # node may launch it, so nothing of the node that prepared it stays.
         # A launch writes its own exe, log, libraries, port and name.

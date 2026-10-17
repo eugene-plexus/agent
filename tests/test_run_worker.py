@@ -1,11 +1,13 @@
 """The durable worker uses the same launch guard and admission as HTTP routes."""
 
+import json
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from eugene_plexus_agent.companions import companion_name
+from eugene_plexus_agent.engines.strata import StrataAdapter
 from eugene_plexus_agent.routes import runtimes
 from eugene_plexus_agent.run_worker import NodeActions, RunWorker, runtime_spec
 from eugene_plexus_agent.runtime_context import NodeContext
@@ -26,6 +28,46 @@ PROFILE = {
     "extraArgs": [],
     "env": {},
 }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before,after", [(None, {"gpu": False}), ({"gpu": False}, None)])
+async def test_changed_prepared_images_restart_once(
+    authed_client, stub_runtime_supervisor, tmp_path, monkeypatch, before, after
+):
+    from eugene_plexus_agent._generated.models import AdmissionDecision
+
+    model = {**MODEL, "path": str(tmp_path / "strata.json"), "format": "prepared"}
+    profile = {**PROFILE, "engine": "strata", "flags": {}}
+    state = authed_client.app.state.agent_state
+    spec = runtime_spec(model, profile, start=True)
+    state.add_runtime(spec)
+    stub_runtime_supervisor.started.add(spec.name)
+    snapshot = tmp_path / "launched.json"
+    snapshot.write_text(json.dumps({"vision": before, "log": "owned.log"}))
+    compose = stub_runtime_supervisor.compose
+    monkeypatch.setattr(
+        stub_runtime_supervisor,
+        "compose",
+        lambda entry: compose(entry).model_copy(
+            update={"argv": ["python", "--config", str(snapshot)]}
+        ),
+    )
+    monkeypatch.setattr(StrataAdapter, "resolve_binary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(StrataAdapter, "prepare_config", lambda *args: {"vision": after})
+
+    async def admission(*args, **kwargs):
+        return SimpleNamespace(decision=AdmissionDecision.admit, requiredBytes=None), False
+
+    monkeypatch.setattr(runtimes, "_measure_launch", admission)
+    actions = NodeActions(authed_client.app)
+    await actions.launch(model, profile, start=False)
+    assert ("stop_one", spec.name) not in stub_runtime_supervisor.calls
+    await actions.launch(model, profile, start=True)
+    assert stub_runtime_supervisor.calls.count(("stop_one", spec.name)) == 1
+    snapshot.write_text(json.dumps({"vision": after, "log": "owned.log"}))
+    await actions.launch(model, profile, start=True)
+    assert stub_runtime_supervisor.calls.count(("stop_one", spec.name)) == 1
 
 
 @pytest.mark.asyncio

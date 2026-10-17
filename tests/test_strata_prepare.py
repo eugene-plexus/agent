@@ -95,6 +95,16 @@ cfg = {"exe": str(ROOT / "engine" / "strata.exe"), "args": args, "cwd": str(ROOT
        "log": str(ROOT / f"strata-{tag}.log"), "lib_dirs": [], "port": 8080}
 if os.environ.get("FAKE_SETUP_VISION"):
     cfg["vision"] = {"exe": "strata-vision.exe"}
+elif a.vision in ("cpu", "gpu"):
+    encoder = data / "models" / "mmproj.gguf"
+    encoder.parent.mkdir(parents=True, exist_ok=True)
+    encoder.write_bytes(b"GGUF encoder")
+    args.append("--vision")
+    cfg["vision"] = {"exe": str(ROOT / "engine" / "strata-vision.exe"),
+                     "mmproj": str(encoder), "model": str(shards[0]),
+                     "gpu": a.vision == "gpu", "max_tokens": 1024 if a.vision == "gpu" else 300}
+    if os.environ.get("FAKE_SETUP_VISION_CPU"):
+        cfg["vision"]["gpu"] = False
 (ROOT / f"strata-{tag}.json").write_text(json.dumps(cfg))
 (ROOT / f"run-{tag}.bat").write_text("@echo off")
 print("All set.", flush=True)
@@ -111,6 +121,7 @@ def build(tmp_path, monkeypatch):
     native = root / "engine" / ("strata.exe" if os.name == "nt" else "strata")
     native.parent.mkdir()
     native.write_text("")
+    native.with_name("strata-vision.exe" if os.name == "nt" else "strata-vision").touch()
     (root / "data").mkdir()
     (root / "data" / "expert-profile.bin").write_bytes(b"\1" * 64)
     (root / "setup.py").write_text(FAKE_SETUP, encoding="utf-8")
@@ -221,6 +232,44 @@ def test_a_missing_shard_is_named(build):
 def test_a_context_setup_does_not_offer_is_refused(build):
     with pytest.raises(PreparationError, match="not 50000"):
         _plan(build, context=50000)
+
+
+@pytest.mark.parametrize("vision", ["off", "cpu", "gpu"])
+def test_image_encoder_choice_is_kept_by_the_preparation_plan(build, vision):
+    recipe = _plan(build, vision=vision)
+    assert recipe.vision == vision
+    argv = recipe.argv()
+    assert argv[argv.index("--vision") + 1] == ("no" if vision == "off" else vision)
+    assert recipe.bytes_needed == 8_000_000_000 + (0 if vision == "off" else 1_000_000_000)
+
+
+@pytest.mark.parametrize("vision", ["cpu", "gpu"])
+def test_image_encoder_fallback_is_not_silently_accepted(build, monkeypatch, vision):
+    monkeypatch.setenv("FAKE_SETUP_VISION_CPU", "1")
+    recipe = _plan(build, vision=vision)
+    if vision == "gpu":
+        with pytest.raises(PreparationError, match=r"CPU or unavailable.*requested GPU"):
+            recipe.run(Progress())
+    else:
+        assert recipe.run(Progress()).entry.is_file()
+
+
+@pytest.mark.parametrize("vision", ["cpu", "gpu"])
+def test_image_preparation_keeps_portable_encoder_assets(build, vision):
+    recipe = _plan(build, vision=vision)
+    result = recipe.run(Progress())
+    config = json.loads(result.entry.read_text())
+    assert config["vision"]["mmproj"] == "models/mmproj.gguf"
+    assert "exe" not in config["vision"]
+    assert config["vision"]["gpu"] is (vision == "gpu")
+    assert recipe.data_dir / "models" / "mmproj.gguf" in result.files
+    facts = {item["path"]: item for item in result.facts["files"]}
+    assert facts["models/mmproj.gguf"]["shared"] is True
+
+
+def test_models_without_upstream_image_support_offer_no_image_modes():
+    for model in SUPPORTED_MODELS:
+        assert bool(model.preparation.visionModes) is (model.id != "unsloth-UD-Q4_K_XL")
 
 
 def test_too_little_disk_names_both_numbers(build, monkeypatch):
@@ -346,7 +395,7 @@ def test_setups_failure_is_the_cause(build, monkeypatch):
 
 def test_a_configuration_eugene_cannot_launch_is_not_listed(build, monkeypatch):
     monkeypatch.setenv("FAKE_SETUP_VISION", "1")
-    with pytest.raises(PreparationError, match=r"cannot launch: .*vision"):
+    with pytest.raises(PreparationError, match="enabled images although images were off"):
         _plan(build).run(Progress())
 
 

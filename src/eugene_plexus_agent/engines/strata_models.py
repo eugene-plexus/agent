@@ -33,6 +33,7 @@ from .._generated.models import (
     FitVerdict,
     ModelFormat,
     ModelPreparation,
+    PreparationVisionMode,
     PreparedSource,
     SupportedModel,
 )
@@ -47,6 +48,7 @@ PREPARATION = ModelPreparation(
     recipe="strata-prepare",
     note="an expert pack, a lookup table and an MTP helper",
     contexts=[Context(c) for c in SETUP_CONTEXTS],
+    visionModes=list(PreparationVisionMode),
 )
 
 _QWEN = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
@@ -92,6 +94,8 @@ def _entry(
     preparation = PREPARATION
     if min_engine is not None:
         preparation = preparation.model_copy(update={"minEngineVersion": min_engine})
+    if id == "unsloth-UD-Q4_K_XL":
+        preparation = preparation.model_copy(update={"visionModes": None})
     return SupportedModel(
         id=id,
         title=title,

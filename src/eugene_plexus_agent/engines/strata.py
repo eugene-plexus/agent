@@ -28,6 +28,7 @@ from .._generated.models import (
     EngineKind,
     ModelFormat,
     ModelRequirement,
+    PreparationVisionMode,
     PreparedProvenance,
     RuntimeCapabilities,
     RuntimeSpec,
@@ -81,13 +82,13 @@ VALUE_ARGS = {
     "--pool-workers",
     "--pcie-frac",
 }
-BOOL_ARGS = {"--resident-experts", "--mmap-experts"}
+BOOL_ARGS = {"--resident-experts", "--mmap-experts", "--vision"}
 #: The arguments naming the source model's own files, its GGUF shards: a
 #: node copies them as that model's, and a provenance file does not list them.
-SOURCE_ARGS = frozenset({"--native", "--ple-gguf"})
+SOURCE_ARGS = frozenset({"--native", "--ple-gguf", "vision.model"})
 #: Files every model setup prepared in one data folder uses (setup fetches
 #: the MTP helper once per data folder): kept while any of them is (LS7).
-SHARED_ARGS = frozenset({"--mtp"})
+SHARED_ARGS = frozenset({"--mtp", "vision.mmproj"})
 PASS_KEYS = {
     "sampling",
     "reasoning_budget_tokens",
@@ -196,6 +197,12 @@ def named_paths(entry: Path, cfg: dict[str, object]) -> list[tuple[str, Path]]:
     tokenizer = cfg.get("tokenizer")
     if isinstance(tokenizer, str):
         named.append(("tokenizer", tokenizer))
+    vision = cfg.get("vision")
+    if isinstance(vision, dict):
+        for key in ("mmproj", "model"):
+            value = vision.get(key)
+            if isinstance(value, str):
+                named.append((f"vision.{key}", value))
     out = []
     for flag, value in named:
         path = Path(os.path.expanduser(value))
@@ -297,7 +304,7 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
             PASS_KEYS
             | OWNED_KEYS
             | SETUP_KEYS
-            | {"args", "tokenizer", "parallel", "cuda", "backend"}
+            | {"args", "tokenizer", "parallel", "cuda", "backend", "vision"}
         )
         unsupported = sorted(
             k for k, v in cfg.items() if k not in allowed and v not in (None, False, [], {})
@@ -352,8 +359,42 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
         native = root / "engine" / ("strata.exe" if os.name == "nt" else "strata")
         if not native.is_file():
             raise ValueError(f"native engine is missing: {native}")
+        vision = cfg.get("vision")
+        normalized_vision: dict[str, object] = {}
+        if vision is not None and vision is not False:
+            if not isinstance(vision, dict):
+                raise ValueError("vision must be an image encoder object")
+            if not {"mmproj", "model"} <= vision.keys():
+                raise ValueError("vision requires mmproj and model paths")
+            unknown = set(vision) - {"exe", "mmproj", "model", "gpu", "max_tokens", "threads"}
+            if unknown:
+                raise ValueError("unsupported vision settings: " + ", ".join(sorted(unknown)))
+            encoder = (
+                root / "engine" / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
+            )
+            if not encoder.is_file():
+                raise ValueError(f"vision encoder is missing: {encoder}; reinstall Strata")
+            normalized_vision = {
+                "exe": str(encoder),
+                "mmproj": existing(vision.get("mmproj")),
+                "model": existing(vision.get("model")),
+                "gpu": vision.get("gpu", False),
+            }
+            if type(normalized_vision["gpu"]) is not bool:
+                raise ValueError("vision.gpu must be true or false")
+            for key in ("max_tokens", "threads"):
+                if key in vision:
+                    value = vision[key]
+                    if type(value) is not int or value < 1:
+                        raise ValueError(f"vision.{key} must be a positive whole number")
+                    normalized_vision[key] = value
+        if bool(normalized_vision) != ("--vision" in seen):
+            raise ValueError(
+                "vision settings and the native --vision flag must be supplied together"
+            )
         return {
             **{k: v for k, v in cfg.items() if k in PASS_KEYS},
+            **({"vision": normalized_vision} if normalized_vision else {}),
             "exe": str(native),
             "cwd": str(root),
             "args": normalized,
@@ -471,6 +512,7 @@ class StrataAdapter(EngineAdapter):
         model: Path,
         source_path: str,
         context: int | None,
+        vision: PreparationVisionMode = PreparationVisionMode.off,
     ) -> Recipe:
         """Upstream's setup, into `Strata-data` in this node's folder for the
         Library folder (B43, B45, B101); see `strata_prepare`."""
@@ -487,6 +529,7 @@ class StrataAdapter(EngineAdapter):
             context=context,
             ram_bytes=total,
             gpu=main_gpu(),
+            vision=vision,
         )
 
     answers_while_loading = False
@@ -582,6 +625,7 @@ class StrataAdapter(EngineAdapter):
         if type(context) is not int or context <= 0:
             return Loading(detail="Strata has not reported a loaded model context yet")
         parallel = 1
+        vision = False
         # /slots is a llama.cpp compatibility stub with one entry. Only the
         # native status endpoint reports the slots the engine actually obtained.
         try:
@@ -599,6 +643,13 @@ class StrataAdapter(EngineAdapter):
                 serving = concurrency.get("serving") if isinstance(concurrency, dict) else None
                 if type(serving) is int and 1 <= serving <= 8:
                     parallel = serving
+                images = status.get("vision")
+                vision = (
+                    isinstance(images, dict)
+                    and images.get("enabled") is True
+                    and images.get("available") is True
+                    and not images.get("error")
+                )
         except (httpx.HTTPError, ValueError):
             pass  # health is still ready; unknown capacity stays conservatively at one
         return Ready(
@@ -606,8 +657,8 @@ class StrataAdapter(EngineAdapter):
                 contextLength=context if type(context) is int and context > 0 else None,
                 parallelSlots=parallel,
                 embeddings=False,
-                vision=False,
-                multimodal=False,
+                vision=vision,
+                multimodal=vision,
             )
         )
 
