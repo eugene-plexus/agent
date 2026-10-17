@@ -55,7 +55,10 @@ def test_the_forward_sets_what_only_it_knows_and_drops_the_callers_copies(
             },
         )
 
-    app.state.oidc_forward_client = httpx.AsyncClient(transport=httpx.MockTransport(root))
+    app.state.oidc_forward_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(root),
+        cookies={"ep-signin": "another-visitors-session", "root": "root-client-cookie"},
+    )
     answer = client.post(
         "/oidc/authorize?x=1",
         content=b"request=r&password=p",
@@ -78,7 +81,7 @@ def test_the_forward_sets_what_only_it_knows_and_drops_the_callers_copies(
     assert str(sent.url) == "http://control.invalid:8083/oidc/authorize?x=1"
     assert sent.content == b"request=r&password=p"
     assert sent.headers["authorization"] == "Basic Y2xpZW50OnNlY3JldA=="
-    assert "cookie" not in sent.headers
+    assert sent.headers["cookie"] == ""
     assert sent.headers[oidc_forward.FORWARDED_HOST_HEADER] == "testserver"
     assert sent.headers[oidc_forward.FORWARDED_FOR_HEADER] == "testclient"
     token = sent.headers[oidc_forward.NODE_TOKEN_HEADER]
