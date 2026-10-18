@@ -1585,7 +1585,7 @@
             "type": "array",
             "minItems": 1,
             "title": "Files",
-            "description": "Repo-relative paths. Every shard of a split candidate, the\nprojector if the operator wants vision, and for safetensors\nthe sidecars as well as the weights. Take these from\n`CatalogueCandidate.files` and `CatalogueModel.projectors`.\n"
+            "description": "Repo-relative paths. Every shard of a split candidate, the\nprojector if the operator wants vision, and for safetensors\nthe sidecars as well as the weights. Take these from\n`CatalogueCandidate.files`, `CatalogueModel.projectors` and\n`CatalogueModel.draftFiles`.\n"
           },
           "root": {
             "anyOf": [
