@@ -9,9 +9,8 @@ What is pinned here:
 - **The version comes from the code**, stamped by `git archive`: a stamped
   commit, a development checkout, a package installed before commits were
   recorded, and a missing one are four different answers.
-- **`edge` is gated**: the newest `main` commit on which every workflow
-  that ran succeeded, CI among them. A commit whose container build
-  failed, or whose CI is still running, is skipped.
+- **`edge` follows the published marker**: the specs publisher controls
+    the named CI and image gates; the agent reads its immutable commit.
 - **`releases`** reads each release's own manifest and carries the
   installer checksums it publishes.
 - **The only thing an update can install is what this agent found.**
@@ -54,8 +53,6 @@ SHA = {name: f"{i}" * 40 for i, name in enumerate(updates.COMPONENT_NAMES, start
 # seventh (`g`), which is how the tool-driver's pin first read as missing.
 NEW = {name: f"{0xA0 + i:02x}" * 20 for i, name in enumerate(updates.COMPONENT_NAMES)}
 SPECS_OK = "c" * 40
-SPECS_RED = "d" * 40
-SPECS_RUNNING = "e" * 40
 
 
 def _install(
@@ -96,33 +93,6 @@ def _install_sh(pins: dict[str, str]) -> str:
     lines = [f"PIN_{names[n]}={pins[n]}" for n in updates.COMPONENT_NAMES if n in pins]
     lines[-1] += "   # branch `dist`, not `main`"
     return "#!/bin/sh\n" + "\n".join(lines) + "\n"
-
-
-def _run(
-    name: str,
-    sha: str,
-    status: str = "completed",
-    conclusion: str | None = "success",
-    *,
-    branch: str = "main",
-    event: str = "push",
-    created: str = "2026-09-27T15:54:00Z",
-):
-    return {
-        "name": name,
-        "head_sha": sha,
-        "head_branch": branch,
-        "event": event,
-        "status": status,
-        "conclusion": conclusion,
-        "created_at": created,
-        "head_commit": {"timestamp": "2026-09-27T15:53:54Z"},
-    }
-
-
-def _head(sha: str, made: str = "2026-09-27T15:53:54Z") -> dict[str, Any]:
-    """GitHub's answer for main's newest commit."""
-    return {"sha": sha, "commit": {"committer": {"date": made}}}
 
 
 #: When the commits in `SHA` and `NEW` were made: `NEW` is the later build.
@@ -176,16 +146,13 @@ class Web:
         )
 
 
-def _edge_web(
-    runs: list[dict[str, Any]], pins: dict[str, str] = NEW, head: dict[str, Any] | None = None
-) -> Web:
-    pages: dict[str, Any] = {
-        updates.EDGE_RUNS: {"workflow_runs": runs},
-        updates.MAIN_HEAD: head or _head(runs[0]["head_sha"] if runs else "0" * 40),
-    }
-    for run in runs:
-        pages[f"{updates.RAW}/{run['head_sha']}/scripts/install.sh"] = _install_sh(pins)
-    return Web(pages)
+def _edge_web(pins: dict[str, str] = NEW, *, ref: str = SPECS_OK) -> Web:
+    return Web(
+        {
+            updates.EDGE_MARKER: {"sha": ref, "commit": {"committer": {"date": NEW_DATE}}},
+            f"{updates.RAW}/{ref}/scripts/install.sh": _install_sh(pins),
+        }
+    )
 
 
 RELEASES_URL = f"{updates.API}/releases?per_page=20"
@@ -284,81 +251,70 @@ def test_a_container_says_so_and_names_its_image(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_edge_is_the_newest_commit_every_check_passed_on() -> None:
-    web = _edge_web(
-        [
-            # Newest: CI still running.
-            _run("CI", SPECS_RUNNING, status="in_progress", conclusion=None),
-            # Next: CI passed, the container build failed -- the edge image
-            # was not given this one, so a native install is not either.
-            _run("CI", SPECS_RED),
-            _run("Container image", SPECS_RED, conclusion="failure"),
-            # Next: everything passed.
-            _run("CI", SPECS_OK),
-            _run("Container image", SPECS_OK),
-        ]
-    )
+def test_edge_is_the_published_marker_commit() -> None:
+    web = _edge_web()
     target = updates.newest_edge(web)
     assert target.ref == SPECS_OK and target.channel is UpdateChannel.edge
+    assert target.specs_commit == SPECS_OK
     assert target.components == NEW
-    assert target.installers["install.ps1"].url.endswith(f"/{SPECS_OK}/scripts/install.ps1")
-    # The pins came from the installer at that commit, not at main.
-    assert f"{updates.RAW}/{SPECS_OK}/scripts/install.sh" in web.asked
+    assert target.published_at == datetime.fromisoformat(NEW_DATE.replace("Z", "+00:00"))
+    assert target.installers == {
+        "install.sh": updates.Installer(f"{updates.RAW}/{SPECS_OK}/scripts/install.sh"),
+        "install.ps1": updates.Installer(f"{updates.RAW}/{SPECS_OK}/scripts/install.ps1"),
+    }
+    assert web.asked == [
+        updates.EDGE_MARKER,
+        f"{updates.RAW}/{SPECS_OK}/scripts/install.sh",
+    ]
 
 
-def test_a_commit_the_container_did_not_run_for_still_counts() -> None:
-    # The container workflow runs only when the image's inputs change, so a
-    # docs commit has only CI -- and changed nothing in the image.
-    target = updates.newest_edge(_edge_web([_run("CI", SPECS_OK)]))
-    assert target.ref == SPECS_OK
-
-
-def test_a_commit_with_no_ci_is_not_offered() -> None:
-    with pytest.raises(updates.CheckFailed, match="none of the last 1 commits"):
-        updates.newest_edge(_edge_web([_run("Container image", SPECS_OK)]))
-
-
-def test_runs_on_other_branches_and_events_are_not_edge() -> None:
-    """The run list is read unfiltered (GitHub's own filters have been seen
-    days behind) and narrowed here."""
-    web = _edge_web(
-        [
-            _run("CI", SPECS_RED, branch="j14a2-per-user"),
-            _run("CI", SPECS_RUNNING, event="dynamic"),
-            _run("CI", SPECS_OK),
-        ],
-        head=_head(SPECS_OK),
-    )
-    assert updates.newest_edge(web).ref == SPECS_OK
-
-
-def test_a_run_list_behind_main_names_no_edge() -> None:
-    """2026-10-07: GitHub's list ended nine days before main's newest commit,
-    so an old commit was named edge and every install read itself as newer.
-    A list that has not reached main says so instead."""
-    stale = _edge_web(
-        [_run("CI", SPECS_OK, created="2026-09-29T00:09:13Z")],
-        head=_head("d" * 40, made="2026-10-07T11:49:00Z"),
-    )
-    with pytest.raises(updates.CheckFailed, match="has not reached main's newest commit"):
-        updates.newest_edge(stale)
-
-
-def test_a_newest_commit_no_workflow_ran_for_is_not_behind() -> None:
-    """A commit that started no run is not a list that is behind: the newest
-    run is from just before it."""
-    web = _edge_web(
-        [_run("CI", SPECS_OK, created="2026-10-07T11:00:00Z")],
-        head=_head("d" * 40, made="2026-10-07T11:30:00Z"),
-    )
-    assert updates.newest_edge(web).ref == SPECS_OK
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"commit": {"committer": {"date": NEW_DATE}}},
+        {"sha": None, "commit": {"committer": {"date": NEW_DATE}}},
+        {"sha": 123, "commit": {"committer": {"date": NEW_DATE}}},
+        {"sha": "not-a-commit", "commit": {"committer": {"date": NEW_DATE}}},
+        {"sha": SPECS_OK + "\n", "commit": {"committer": {"date": NEW_DATE}}},
+        {"sha": SPECS_OK.upper(), "commit": {"committer": {"date": NEW_DATE}}},
+        {"sha": SPECS_OK},
+        {"sha": SPECS_OK, "commit": {}},
+        {"sha": SPECS_OK, "commit": {"committer": {}}},
+        {"sha": SPECS_OK, "commit": {"committer": {"date": None}}},
+        {"sha": SPECS_OK, "commit": {"committer": {"date": 123}}},
+        {"sha": SPECS_OK, "commit": {"committer": {"date": "not-a-date"}}},
+        {"sha": SPECS_OK, "commit": None},
+        {"sha": SPECS_OK, "commit": []},
+        {"sha": SPECS_OK, "commit": {"committer": None}},
+        {"sha": SPECS_OK, "commit": {"committer": []}},
+        [],
+    ],
+)
+def test_an_invalid_edge_marker_is_refused_without_fetching_an_installer(marker: Any) -> None:
+    web = _edge_web()
+    web.pages[updates.EDGE_MARKER] = marker
+    with pytest.raises(
+        updates.CheckFailed,
+        match=re.escape(f"{updates.EDGE_MARKER} did not name a valid published edge commit"),
+    ):
+        updates.newest_edge(web)
+    assert web.asked == [updates.EDGE_MARKER]
 
 
 def test_an_installer_that_pins_too_little_is_not_compared() -> None:
-    web = _edge_web([_run("CI", SPECS_OK)])
+    web = _edge_web()
     web.pages[f"{updates.RAW}/{SPECS_OK}/scripts/install.sh"] = "PIN_AGENT=" + "a" * 40 + "\n"
     with pytest.raises(updates.CheckFailed, match="no commit for control"):
         updates.newest_edge(web)
+
+
+def test_a_failed_edge_installer_fetch_is_refused() -> None:
+    web = _edge_web()
+    installer_url = f"{updates.RAW}/{SPECS_OK}/scripts/install.sh"
+    web.pages[installer_url] = OSError("installer unavailable")
+    with pytest.raises(updates.CheckFailed, match="installer unavailable"):
+        updates.newest_edge(web)
+    assert web.asked == [updates.EDGE_MARKER, installer_url]
 
 
 def test_releases_are_read_from_their_own_manifests_newest_first() -> None:
@@ -371,14 +327,23 @@ def test_releases_are_read_from_their_own_manifests_newest_first() -> None:
     assert newest.installers["install.ps1"].url.endswith("/v0.1.0-alpha.3/install.ps1")
 
 
-def test_a_failed_check_says_what_happened() -> None:
-    import urllib.error
-
-    web = Web({updates.EDGE_RUNS: urllib.error.URLError(TimeoutError("timed out"))})
+@pytest.mark.parametrize(
+    ("error", "observed"),
+    [
+        (OSError("published marker missing"), "published marker missing"),
+        (TimeoutError("timed out"), "did not answer within"),
+    ],
+)
+def test_a_failed_check_says_what_happened_without_fallback(error: OSError, observed: str) -> None:
+    web = Web({updates.EDGE_MARKER: error})
     with pytest.raises(updates.CheckFailed) as failed:
         updates.newest_edge(web)
-    # describe_fetch_failure's words, not "check network access".
+    assert str(failed.value).startswith("the published edge marker could not be read: ")
     assert "api.github.com" in str(failed.value)
+    assert observed in str(failed.value)
+    assert isinstance(failed.value.__cause__, updates.CheckFailed)
+    assert failed.value.__cause__.__cause__ is error
+    assert web.asked == [updates.EDGE_MARKER]
 
 
 # --------------------------------------------------------------------------- #
@@ -437,7 +402,7 @@ async def test_an_unsaved_channel_is_the_default() -> None:
 
 async def test_a_result_for_another_channel_is_not_offered() -> None:
     settings: dict[str, Any] = {"updateChannel": "edge"}
-    checker = updates.UpdateChecker(setting=settings.get, get=_edge_web([_run("CI", SPECS_OK)]))
+    checker = updates.UpdateChecker(setting=settings.get, get=_edge_web())
     await checker.check(_install(SHA))
     install = _install(SHA)
     plan = update_apply.plan(install, None, system_unit_ready=False)
@@ -450,19 +415,17 @@ async def test_a_result_for_another_channel_is_not_offered() -> None:
 
 async def test_a_check_that_fails_keeps_what_the_last_one_found() -> None:
     settings: dict[str, Any] = {"updateChannel": "edge"}
-    web = _edge_web([_run("CI", SPECS_OK)])
+    web = _edge_web()
     checker = updates.UpdateChecker(setting=settings.get, get=web)
     first = await checker.check(_install(SHA))
     assert first.newest is not None and first.error is None
-    web.pages[updates.EDGE_RUNS] = OSError("down")
+    web.pages[updates.EDGE_MARKER] = OSError("down")
     second = await checker.check(_install(SHA))
     assert second.error and second.newest is not None and second.newest.ref == SPECS_OK
 
 
 async def test_a_development_checkout_is_never_offered_an_update() -> None:
-    checker = updates.UpdateChecker(
-        setting={"updateChannel": "edge"}.get, get=_edge_web([_run("CI", SPECS_OK)])
-    )
+    checker = updates.UpdateChecker(setting={"updateChannel": "edge"}.get, get=_edge_web())
     install = _install(development=True)
     await checker.check(install)
     view = checker.view(install, apply=update_apply.plan(install, None, system_unit_ready=False))
@@ -761,7 +724,7 @@ def _checked(client: TestClient, install: NodeInstall, web: Web, monkeypatch) ->
 def test_get_node_says_what_is_installed_and_what_is_newer(
     authed_client: TestClient, monkeypatch
 ) -> None:
-    _checked(authed_client, _install(SHA), _edge_web([_run("CI", SPECS_OK)]), monkeypatch)
+    _checked(authed_client, _install(SHA), _edge_web(), monkeypatch)
     assert authed_client.post("/v1/node/update/check").status_code == 200
     body = authed_client.get("/v1/node").json()
     assert body["install"]["mechanism"] == "windows_service"
@@ -771,7 +734,7 @@ def test_get_node_says_what_is_installed_and_what_is_newer(
 
 
 def test_update_installs_only_what_this_agent_found(authed_client: TestClient, monkeypatch) -> None:
-    _checked(authed_client, _install(SHA), _edge_web([_run("CI", SPECS_OK)]), monkeypatch)
+    _checked(authed_client, _install(SHA), _edge_web(), monkeypatch)
     authed_client.post("/v1/node/update/check")
     started: list[str] = []
     monkeypatch.setattr(
@@ -792,17 +755,17 @@ def test_update_installs_only_what_this_agent_found(authed_client: TestClient, m
 def test_update_before_any_check_is_refused_with_a_reason(
     authed_client: TestClient, monkeypatch
 ) -> None:
-    _checked(authed_client, _install(SHA), _edge_web([]), monkeypatch)
+    _checked(authed_client, _install(SHA), _edge_web(), monkeypatch)
     r = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
     assert r.status_code == 409 and "Check for updates" in r.json()["detail"]["detail"]
 
 
 def test_update_rechecks_and_never_starts_the_cached_edge_target(authed_client, monkeypatch):
-    web = _edge_web([_run("CI", SPECS_OK)])
+    web = _edge_web()
     _checked(authed_client, _install(SHA), web, monkeypatch)
     authed_client.post("/v1/node/update/check")
     latest = "f" * 40
-    web.pages.update(_edge_web([_run("CI", latest)]).pages)
+    web.pages.update(_edge_web(ref=latest).pages)
     started = []
     monkeypatch.setattr(
         update_apply, "start", lambda **kwargs: started.append(kwargs["target"].ref)
@@ -815,10 +778,10 @@ def test_update_rechecks_and_never_starts_the_cached_edge_target(authed_client, 
 
 
 def test_update_does_not_use_last_good_target_when_final_check_fails(authed_client, monkeypatch):
-    web = _edge_web([_run("CI", SPECS_OK)])
+    web = _edge_web()
     _checked(authed_client, _install(SHA), web, monkeypatch)
     authed_client.post("/v1/node/update/check")
-    web.pages[updates.EDGE_RUNS] = OSError("offline")
+    web.pages[updates.EDGE_MARKER] = OSError("offline")
     started = []
     monkeypatch.setattr(update_apply, "start", lambda **kwargs: started.append(True))
     response = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
@@ -828,14 +791,14 @@ def test_update_does_not_use_last_good_target_when_final_check_fails(authed_clie
 
 
 def test_a_container_is_refused_with_its_steps(authed_client: TestClient, monkeypatch) -> None:
-    _checked(authed_client, _container("unraid"), _edge_web([_run("CI", SPECS_OK)]), monkeypatch)
+    _checked(authed_client, _container("unraid"), _edge_web(), monkeypatch)
     authed_client.post("/v1/node/update/check")
     r = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
     assert r.status_code == 409 and "Force Update" in r.json()["detail"]["detail"]
 
 
 def test_up_to_date_is_not_updated_again(authed_client: TestClient, monkeypatch) -> None:
-    _checked(authed_client, _install(NEW), _edge_web([_run("CI", SPECS_OK)]), monkeypatch)
+    _checked(authed_client, _install(NEW), _edge_web(), monkeypatch)
     authed_client.post("/v1/node/update/check")
     r = authed_client.post("/v1/node/update", json={"target": SPECS_OK})
     assert r.status_code == 409 and r.json()["detail"]["title"] == "Already up to date"
@@ -845,7 +808,7 @@ def test_an_older_newest_is_refused_and_never_called_newer(
     authed_client: TestClient, monkeypatch
 ) -> None:
     """The route refuses a downgrade, and GET /v1/node never calls it available."""
-    _checked(authed_client, _install(NEW), _edge_web([_run("CI", SPECS_OK)], SHA), monkeypatch)
+    _checked(authed_client, _install(NEW), _edge_web(SHA), monkeypatch)
     authed_client.post("/v1/node/update/check")
     update = authed_client.get("/v1/node").json()["update"]
     assert update["available"] is False

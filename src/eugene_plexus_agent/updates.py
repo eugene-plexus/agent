@@ -2,12 +2,8 @@
 
 **Two channels** (Troy, 2026-09-27):
 
-- `edge`: the head of `main`, **gated**. The newest `main` commit on which
-  every workflow that ran for it succeeded, CI among them. The container
-  workflow runs only when the image's inputs change, so a commit it did
-  not run for changed nothing in the image. This is also the commit the
-  `:edge` container was built from, so a native install is never offered
-  an update the container was not given.
+- `edge`: the explicit published `edge` marker, advanced by the specs
+    publisher after its named CI and image gates pass.
 - `releases`: the newest published release (prereleases included, since
   nothing here is released as stable yet), read from its own
   `manifest.json`, whose installer checksums the download is checked
@@ -208,86 +204,33 @@ def _timestamp(value: object) -> datetime | None:
 # --------------------------------------------------------------------------- #
 
 
-#: Every repository run, newest first. Not GitHub's own `branch`/`event`
-#: filters: on 2026-10-07 the filtered listing ended at 2026-09-29 while the
-#: unfiltered one was current, and every node read edge as a nine-day-old
-#: commit and itself as newer, so nothing was offered.
-EDGE_RUNS = f"{API}/actions/runs?per_page=100"
-MAIN_HEAD = f"{API}/commits/main"
-#: How far the newest run may trail `main`'s newest commit before the list
-#: is taken to be behind (a commit no workflow ran for is not behind).
-_RUNS_BEHIND = 6 * 3600
+EDGE_MARKER = f"{API}/commits/edge"
 
 
 def newest_edge(get: Fetch = fetch) -> Target:
-    """The newest `main` commit every workflow that ran for succeeded on."""
-    url = EDGE_RUNS
-    body = _get_json(get, url)
-    runs = body.get("workflow_runs") if isinstance(body, dict) else None
-    if not isinstance(runs, list):
-        raise CheckFailed(f"{url} did not list any workflow runs")
-    runs = [
-        r
-        for r in runs
-        if isinstance(r, dict) and r.get("head_branch") == "main" and r.get("event") == "push"
-    ]
-    _not_behind_main(get, runs)
-    order: list[str] = []
-    by_commit: dict[str, list[dict[str, Any]]] = {}
-    for run in runs:
-        sha = run.get("head_sha")
-        if not isinstance(sha, str) or not _FULL_COMMIT.match(sha):
-            continue
-        if sha not in by_commit:
-            order.append(sha)
-            by_commit[sha] = []
-        by_commit[sha].append(run)
-    for sha in order:
-        commit_runs = by_commit[sha]
-        # A run concludes `success` only once it has completed, so a run
-        # still going is not a pass either.
-        passed = all(r.get("conclusion") == "success" for r in commit_runs)
-        has_ci = any(r.get("name") == "CI" for r in commit_runs)
-        if not (passed and has_ci):
-            continue
-        published = _timestamp((commit_runs[0].get("head_commit") or {}).get("timestamp"))
-        pins = parse_pins(_get_text(get, f"{RAW}/{sha}/scripts/install.sh"))
-        return Target(
-            channel=UpdateChannel.edge,
-            ref=sha,
-            specs_commit=sha,
-            published_at=published,
-            components=pins,
-            installers={
-                "install.sh": Installer(f"{RAW}/{sha}/scripts/install.sh"),
-                "install.ps1": Installer(f"{RAW}/{sha}/scripts/install.ps1"),
-            },
-        )
-    raise CheckFailed(
-        f"none of the last {len(order)} commits on main has passed every check yet, "
-        "so nothing is offered until one has"
+    """The commit explicitly named by the published `edge` marker."""
+    try:
+        body = _get_json(get, EDGE_MARKER)
+    except CheckFailed as exc:
+        raise CheckFailed("the published edge marker could not be read: " + str(exc)) from exc
+    sha = body.get("sha") if isinstance(body, dict) else None
+    commit = body.get("commit") if isinstance(body, dict) else None
+    committer = commit.get("committer") if isinstance(commit, dict) else None
+    published = _timestamp(committer.get("date") if isinstance(committer, dict) else None)
+    if not isinstance(sha, str) or not _FULL_COMMIT.fullmatch(sha) or published is None:
+        raise CheckFailed(f"{EDGE_MARKER} did not name a valid published edge commit")
+    pins = parse_pins(_get_text(get, f"{RAW}/{sha}/scripts/install.sh"))
+    return Target(
+        channel=UpdateChannel.edge,
+        ref=sha,
+        specs_commit=sha,
+        published_at=published,
+        components=pins,
+        installers={
+            "install.sh": Installer(f"{RAW}/{sha}/scripts/install.sh"),
+            "install.ps1": Installer(f"{RAW}/{sha}/scripts/install.ps1"),
+        },
     )
-
-
-def _not_behind_main(get: Fetch, runs: list[dict[str, Any]]) -> None:
-    """Refuse a run list that has not reached `main`'s newest commit: an old
-    commit named as edge would read this install as newer and offer nothing,
-    which is a wrong answer, not an empty one."""
-    head = _get_json(get, MAIN_HEAD)
-    sha = head.get("sha") if isinstance(head, dict) else None
-    commit = (head.get("commit") or {}) if isinstance(head, dict) else {}
-    made = _timestamp((commit.get("committer") or {}).get("date"))
-    if not isinstance(sha, str) or made is None:
-        raise CheckFailed(f"{MAIN_HEAD} did not say what main's newest commit is")
-    if any(r.get("head_sha") == sha for r in runs):
-        return
-    times = [t for r in runs if (t := _timestamp(r.get("created_at"))) is not None]
-    newest = max(times, default=None)
-    if newest is None or (made - newest).total_seconds() > _RUNS_BEHIND:
-        raise CheckFailed(
-            f"GitHub's list of checks has not reached main's newest commit ({sha[:7]}) yet, "
-            "so which commit is edge cannot be told; it is checked again later"
-        )
 
 
 def recent_releases(get: Fetch = fetch, *, limit: int = 5) -> list[Target]:
