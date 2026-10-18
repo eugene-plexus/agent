@@ -991,8 +991,9 @@ _FLAG_FIELDS: list[ConfigField] = [
         key=speculation.REUSE_TEXT_KEY,
         label="Reuse repeated text",
         description=(
-            "Speculative decoding from text already in the conversation (llama.cpp's "
-            "`ngram-mod`). When the answer starts repeating something it has seen, such "
+            "Speculative decoding from text already in the conversation.\n\n"
+            "This is llama.cpp's `ngram-mod`. When the answer starts repeating "
+            "something it has seen, such "
             "as code it is editing, the repeat is proposed several tokens at a time and "
             "checked in one step instead of written one token at a time.\n\n"
             "It needs no extra file and about 16 MB of system memory, and proposes "
@@ -1009,10 +1010,9 @@ _FLAG_FIELDS: list[ConfigField] = [
         key=speculation.DRAFT_WITH_KEY,
         label="Draft with",
         description=(
-            "Speculative decoding with a small predictor: it drafts a few tokens ahead "
-            "and the model checks them all in one step, keeping those it agrees with, "
-            "so the answer is the model's own and comes faster when most drafts are "
-            "kept.\n\n"
+            "Speculative decoding with a small predictor that drafts a few tokens ahead.\n\n"
+            "The model checks the drafts in one step and keeps those it agrees with, so "
+            "the answer is still the model's own and comes faster when most are kept.\n\n"
             "- **Model's own prediction head** uses the multi-token prediction (MTP) "
             "head some models carry in their file. It runs on the model's own weights "
             "and needs little extra memory.\n"

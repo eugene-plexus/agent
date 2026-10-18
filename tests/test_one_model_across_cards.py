@@ -83,7 +83,10 @@ def _spec(size_gib: float, **overrides: object) -> RuntimeSpec:
         "engine": "llama_cpp",
         "modelPath": f"/models/big-{size_gib}.gguf",
     }
-    body.update(overrides)
+    # Speculation off: these tests are about reservations, and its allowance
+    # (SD1) would move every number they compare.
+    flags = {"reuseRepeatedText": False, **dict(overrides.pop("flags", None) or {})}  # type: ignore[call-overload]
+    body.update(overrides, flags=flags)
     return RuntimeSpec.model_validate(body)
 
 

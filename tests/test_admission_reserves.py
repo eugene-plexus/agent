@@ -76,7 +76,10 @@ def _model(tmp_path: Path, size: int, tag: str = "") -> str:
 
 def _spec(name: str, path: str, **overrides: object) -> RuntimeSpec:
     body: dict[str, object] = {"name": name, "engine": "llama_cpp", "modelPath": path}
-    body.update(overrides)
+    # Speculation off: these tests are about reservations, and its allowance
+    # (SD1) would move every number they compare.
+    flags = {"reuseRepeatedText": False, **dict(overrides.pop("flags", None) or {})}  # type: ignore[call-overload]
+    body.update(overrides, flags=flags)
     return RuntimeSpec.model_validate(body)
 
 
@@ -339,7 +342,10 @@ def test_reserving_the_same_runtime_twice_replaces_rather_than_adds() -> None:
 
 def _body(name: str, path: str, **overrides: object) -> dict[str, object]:
     body: dict[str, object] = {"name": name, "engine": "llama_cpp", "modelPath": path}
-    body.update(overrides)
+    # Speculation off: these tests are about reservations, and its allowance
+    # (SD1) would move every number they compare.
+    flags = {"reuseRepeatedText": False, **dict(overrides.pop("flags", None) or {})}  # type: ignore[call-overload]
+    body.update(overrides, flags=flags)
     return body
 
 
