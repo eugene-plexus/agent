@@ -1647,6 +1647,45 @@
         "title": "DownloadState",
         "description": "Named phases rather than a percentage, following M1's engine\ninstall for the same reason: the phases fail differently and the\noperator needs to know which one they are in. A stall in\n`downloading` is the network, a stall in `verifying` is the\ndisk, and `verifying` *failing* is the one that means the bytes\nare wrong.\n\n* `queued` — accepted, waiting on `maxConcurrentDownloads`.\n* `resolving` — asking upstream for the commit, sizes and\n  digests. Where a gated repo's 401 surfaces.\n* `paused` — operator-stopped; the `.part` is kept and shows up\n  in the next scan as `incomplete_download`.\n* `cancelled` — operator-abandoned; the `.part` is removed.\n* `failed` — the retry budget is spent. `resume` runs the same\n  loop again."
       },
+      "DraftFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path",
+            "description": "Absolute path, in the same folder as the model."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/DraftKind"
+          },
+          "sizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sizebytes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "kind"
+        ],
+        "title": "DraftFile"
+      },
+      "DraftKind": {
+        "type": "string",
+        "enum": [
+          "mtp",
+          "simple"
+        ],
+        "title": "DraftKind",
+        "description": "How llama.cpp drafts with a companion file, read from the file\nitself:\n\n* `mtp` — a separate MTP head: the `nextn` tensors of the last\n  block and no first block (`--spec-type draft-mtp`).\n* `simple` — a whole small model named as a draft (`draft-*.gguf`)\n  (`--spec-type draft-simple`)."
+      },
       "EngineKind": {
         "type": "string",
         "enum": [
@@ -1760,6 +1799,16 @@
             "title": "Projectorpath",
             "description": "Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause \"this model can see\" is a fact the browser should\nshow and a profile should be able to override.\n"
           },
+          "speculation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GgufSpeculation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "recommendedSampling": {
             "anyOf": [
               {
@@ -1787,6 +1836,30 @@
         "type": "object",
         "title": "GgufDetail",
         "description": "GGUF-specific metadata, read from the file's KV block. Present\niff `format` is `gguf`."
+      },
+      "GgufSpeculation": {
+        "properties": {
+          "mtpHead": {
+            "type": "boolean",
+            "title": "Mtphead",
+            "description": "The model carries its own multi-token prediction head in this\nfile, beside every other block. Its profile can then draft\nwith \"Model's own prediction head\" (`--spec-type draft-mtp`\nwith no draft file), which runs on the main weights and costs\nonly a small context.\n\n`<arch>.nextn_predict_layers` is not enough on its own: a\nseparate MTP file (ggml-org's `mtp-*.gguf`) declares it too,\nand holds only the last block.\n"
+          },
+          "draftFiles": {
+            "items": {
+              "$ref": "#/components/schemas/DraftFile"
+            },
+            "type": "array",
+            "title": "Draftfiles",
+            "description": "Companion files in this model's folder that it can draft\nwith (`--spec-draft-model`). Also listed in `files` with the\nrole `draft`, and skipped as models with the reason `draft`.\nEmpty when there are none.\n"
+          }
+        },
+        "type": "object",
+        "required": [
+          "mtpHead",
+          "draftFiles"
+        ],
+        "title": "GgufSpeculation",
+        "description": "What this model can draft with when it runs with speculative\ndecoding (docs/design/speculative-decoding.md, SD1). Read from\nthe tensor table, by llama.cpp's own rule (b11719,\n`common_speculative_types_from_gguf`): a file carries an MTP head\nwhen it has `blk.<block_count-1>.nextn.eh_proj.weight`.\n\nAbsent on an entry scanned before SD1, which a rescan fills in."
       },
       "HTTPValidationError": {
         "properties": {
@@ -2307,13 +2380,14 @@
           "weights",
           "shard",
           "projector",
+          "draft",
           "config",
           "tokenizer",
           "index",
           "other"
         ],
         "title": "ModelFileRole",
-        "description": "* `weights` — the file named on the launch line. Exactly one per\n  model: the single `.gguf`, the first shard of a split one, or\n  the primary safetensors file.\n* `shard` — the second through Nth part of a split model.\n* `projector` — a vision projector (`general.type: mmproj`),\n  which is why it is a role here and not a model of its own.\n* `config` / `tokenizer` / `index` — safetensors sidecars.\n* `other` — present in the model's directory, counted in\n  `sizeBytes`, not classified."
+        "description": "* `weights` — the file named on the launch line. Exactly one per\n  model: the single `.gguf`, the first shard of a split one, or\n  the primary safetensors file.\n* `shard` — the second through Nth part of a split model.\n* `projector` — a vision projector (`general.type: mmproj`),\n  which is why it is a role here and not a model of its own.\n* `draft` — a speculative-decoding companion beside a GGUF model\n  (`GgufSpeculation.draftFiles`): a separate MTP head or a small\n  draft model. Like a projector, it belongs to the model beside\n  it, and several quants of one model can share it.\n* `config` / `tokenizer` / `index` — safetensors sidecars.\n* `other` — present in the model's directory, counted in\n  `sizeBytes`, not classified."
       },
       "ModelFormat": {
         "type": "string",

@@ -21,6 +21,8 @@ from eugene_plexus_agent._generated.models import (
     RuntimeStatus,
 )
 from eugene_plexus_agent.admission import (
+    DRAFT_CONTEXT_BYTES,
+    REPEATED_TEXT_BYTES,
     LibraryFit,
     RunningRuntime,
     check_admission,
@@ -150,8 +152,9 @@ async def test_a_small_model_is_admitted_by_file_size(tmp_path: Path) -> None:
     # when the spec names none, and the overhead allowance. It was a flat
     # `size * 1.1` until 2026-09-19, which made the number the same at 4k
     # and at 128k (R3.2, review §6.2 #19) -- this assertion was one of
-    # the two locking that in.
-    assert result.requiredBytes == int(2 * GIB * 1.15) + GIB
+    # the two locking that in. Plus what reusing repeated text holds, which
+    # every llama.cpp launch does unless its profile turns it off (SD1, S3).
+    assert result.requiredBytes == int(2 * GIB * 1.15) + GIB + REPEATED_TEXT_BYTES
     assert result.freeBytes == 24 * GIB
     assert result.device is not None and result.device.index == 0
     assert result.reason.startswith("admit:")
@@ -171,8 +174,9 @@ async def test_a_model_larger_than_free_memory_is_refused_with_the_numbers(
     assert result.fit is AdmissionFit.split
     # 30 GiB of weights, its estimated cache at the assumed context, and
     # the overhead allowance. Was "33.0 GiB" while the allowance was a
-    # flat tenth whatever context was asked for.
-    assert "35.5 GiB" in result.reason
+    # flat tenth whatever context was asked for. Then 35.5 GiB, before
+    # reusing repeated text was counted (SD1).
+    assert "35.8 GiB" in result.reason
     assert "24.0 GiB free of 32.0 GiB" in result.reason
     assert "?force=true" in result.reason
 
@@ -214,11 +218,12 @@ async def test_the_library_answer_wins_and_is_labelled_metadata(tmp_path: Path) 
         running=[],
     )
     assert result.basis is AdmissionBasis.metadata
-    assert result.requiredBytes == 27 * GIB
+    assert result.requiredBytes == 27 * GIB + REPEATED_TEXT_BYTES
     assert result.contextLength == 131072
     assert result.decision is AdmissionDecision.refuse
-    # The budget the agent measured is what the library scored against.
-    assert library.calls[0]["vram_bytes"] == 24 * GIB
+    # The budget the agent measured is what the library scored against,
+    # less what reusing repeated text holds beside the model (SD1).
+    assert library.calls[0]["vram_bytes"] == 24 * GIB - REPEATED_TEXT_BYTES
     assert library.calls[0]["context_length"] == 131072
 
 
@@ -467,3 +472,41 @@ async def test_run_work_sends_its_own_headers_beside_the_credential():
     assert seen[0].headers["content-type"] == "application/octet-stream"
     assert seen[0].headers["authorization"] == "Bearer tok"
     assert seen[0].content == b"abc"
+
+
+@pytest.mark.anyio
+async def test_drafting_is_counted_as_measured(tmp_path: Path) -> None:
+    """SD1, S4: the model's own head adds its draft context; a companion adds
+    its weights too; neither is counted when speculation is set by hand."""
+    model = _model(tmp_path, 2 * GIB)
+    companion = str(tmp_path / "mtp-model.gguf")
+    _SIZES[companion] = 3 * GIB // 2
+
+    async def required(**spec: object) -> int:
+        result = await check_admission(
+            _spec(model, **spec),
+            snapshot=fake_devices(free=24 * GIB, total=32 * GIB),
+            library=None,
+            running=[],
+        )
+        return result.requiredBytes or 0
+
+    base = await required(flags={"reuseRepeatedText": False})
+    assert await required() == base + REPEATED_TEXT_BYTES
+    assert await required(flags={"draftWith": "mtpHead"}) == (
+        base + REPEATED_TEXT_BYTES + DRAFT_CONTEXT_BYTES
+    )
+    assert (
+        await required(
+            flags={
+                "draftWith": "companion",
+                "draftModelPath": companion,
+                "reuseRepeatedText": False,
+            }
+        )
+        == base + DRAFT_CONTEXT_BYTES + 3 * GIB // 2
+    )
+    assert (
+        await required(flags={"draftWith": "mtpHead"}, extraArgs=["--spec-type", "ngram-simple"])
+        == base
+    )

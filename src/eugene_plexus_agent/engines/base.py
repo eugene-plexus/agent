@@ -44,6 +44,7 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimeMode,
     RuntimeSpec,
+    RuntimeSpeculation,
     SupportedModel,
 )
 from .._http import shared_internal_client
@@ -670,6 +671,25 @@ class EngineAdapter(abc.ABC):
         what lets the generic config editor render engine flags with no
         engine-specific UI code.
         """
+
+    def declaration_problem(self, spec: RuntimeSpec) -> str | None:
+        """What is wrong with this declaration for this engine, beyond unknown
+        flag keys, or None. Checked before anything runs."""
+        return None
+
+    def companion_files(self, spec: RuntimeSpec) -> tuple[str, ...]:
+        """Files beside the model that this declaration also loads, as
+        declared (SD1: a drafting companion). A node's own copy of the model
+        carries them in their places."""
+        return ()
+
+    def speculation_view(self, spec: RuntimeSpec, argv: list[str]) -> RuntimeSpeculation | None:
+        """Speculative decoding as this runtime was started with it (SD1)."""
+        return None
+
+    async def read_speculation(self, base_url: str) -> tuple[int | None, int | None] | None:
+        """`(drafted, accepted)` token counters from the running engine."""
+        return None
 
     def validate_flags(self, flags: dict[str, object]) -> list[str]:
         """Return the flag keys this adapter does not recognise.

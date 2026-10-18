@@ -233,3 +233,115 @@ def _skip_array(stream: BinaryIO) -> int:
         for _ in range(count):
             _skip(stream, inner)
     return count
+
+
+# --- what a file can draft with (SD1) -----------------------------------------
+
+_BLOCK_COUNT_SUFFIX = ".block_count"
+_NEXTN_SUFFIX = b".nextn.eh_proj.weight"
+
+
+@dataclass(frozen=True)
+class DraftingFacts:
+    """Where a file's MTP head is, by llama.cpp's own rule (b11719,
+    `common_speculative_types_from_gguf`): `blk.<block_count-1>.nextn.eh_proj.weight`.
+
+    The library reads the same tensors for the same words
+    (`GgufMetadata.mtp_head`, `draft_kind`), and the two must agree.
+    """
+
+    mtp_tensors: bool
+    """The last block carries an MTP head."""
+    has_first_block: bool
+    """The table names a `blk.0.` tensor: a whole model, not a separate head."""
+
+    @property
+    def mtp_head(self) -> bool:
+        """A whole model with its own head: drafts as `draft-mtp` with no file."""
+        return self.mtp_tensors and self.has_first_block
+
+    @property
+    def companion_type(self) -> str | None:
+        """llama.cpp's `--spec-type` for drafting with this file as
+        `--spec-draft-model`, as llama.cpp would infer it: `draft-mtp` for a
+        file with an MTP head, `draft-simple` for a whole model without one,
+        None for something llama.cpp cannot draft with."""
+        if self.mtp_tensors:
+            return "draft-mtp"
+        if self.has_first_block:
+            return "draft-simple"
+        return None
+
+
+_DRAFTING: dict[tuple[str, int, int], DraftingFacts | None] = {}
+
+
+def drafting_facts(path: Path | str) -> DraftingFacts | None:
+    """What the file at `path` can draft with, or None when it cannot be read.
+
+    Reads the key block (stepping over the vocabulary) and the tensor table,
+    never a weight. Cached per file as it stands, like `run_facts`.
+    """
+    target = Path(path)
+    try:
+        stat = target.stat()
+    except OSError:
+        return None
+    key = (str(target), stat.st_mtime_ns, stat.st_size)
+    if key in _DRAFTING:
+        return _DRAFTING[key]
+    facts = _read_drafting_facts(target)
+    if len(_DRAFTING) >= _FACTS_KEPT:
+        _DRAFTING.pop(next(iter(_DRAFTING)))
+    _DRAFTING[key] = facts
+    return facts
+
+
+def _read_drafting_facts(path: Path) -> DraftingFacts | None:
+    blocks: dict[str, int] = {}
+    architecture: str | None = None
+    nextn: set[bytes] = set()
+    first_block = False
+    try:
+        with path.open("rb", buffering=1 << 20) as stream:
+            if stream.read(4) != MAGIC:
+                return None
+            version = struct.unpack("<I", stream.read(4))[0]
+            if version < 2:
+                return None
+            tensors = _u64(stream)
+            keys = _u64(stream)
+            if keys > _MAX_KEYS or tensors > 1 << 20:
+                return None
+            for _ in range(keys):
+                size = _u64(stream)
+                if size > _MAX_KEY_BYTES:
+                    return None
+                name = stream.read(size).decode("utf-8", errors="replace")
+                kind = struct.unpack("<I", stream.read(4))[0]
+                if name == _ARCHITECTURE and kind == _STRING:
+                    architecture = _string(stream).decode("utf-8", errors="replace")
+                elif name.endswith(_BLOCK_COUNT_SUFFIX) and kind in _INT_FORMATS:
+                    fmt = _INT_FORMATS[kind]
+                    blocks[name] = int(struct.unpack(fmt, stream.read(struct.calcsize(fmt)))[0])
+                else:
+                    _skip(stream, kind)
+            for _ in range(tensors):
+                size = _u64(stream)
+                if size > _MAX_KEY_BYTES:
+                    return None
+                name_bytes = stream.read(size)
+                dims = struct.unpack("<I", stream.read(4))[0]
+                if not 1 <= dims <= 8:
+                    return None
+                first_block |= name_bytes.startswith(b"blk.0.")
+                if name_bytes.endswith(_NEXTN_SUFFIX):
+                    nextn.add(name_bytes)
+                stream.seek(dims * 8 + 4 + 8, 1)  # dimensions, type, offset; no weights
+            if stream.tell() > path.stat().st_size:
+                return None
+    except (OSError, ValueError, struct.error, OverflowError, MemoryError):
+        return None
+    count = _pick(blocks, architecture, _BLOCK_COUNT_SUFFIX)
+    last = f"blk.{count - 1}".encode() + _NEXTN_SUFFIX if count else None
+    return DraftingFacts(mtp_tensors=last in nextn, has_first_block=first_block)

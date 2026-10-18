@@ -40,6 +40,7 @@ from ._generated.models import (
     RuntimeLocalPathSource,
     RuntimeMode,
     RuntimeSpec,
+    RuntimeSpeculation,
     RuntimeStatus,
     StopReason,
 )
@@ -54,6 +55,7 @@ from .engines import (
     adapter_for,
     default_model_alias,
     interpret_readiness,
+    speculation,
 )
 from .engines.acquisition import (
     AcquisitionError,
@@ -85,6 +87,15 @@ log = logging.getLogger(__name__)
 # nothing to learn from probing it four times a second, and `/props` is a
 # heavier answer than `/healthz`.
 _READINESS_POLL_SECONDS = 2.0
+#: How often a speculating engine's `/metrics` is read (SD1).
+_SPECULATION_READ_SECONDS = 10.0
+
+
+def _companions(spec: RuntimeSpec) -> tuple[str, ...]:
+    """Files beside the model this declaration also loads, as declared."""
+    adapter = adapter_for(spec.engine)
+    return adapter.companion_files(spec) if adapter is not None else ()
+
 
 # The statuses in which a process holds the file its plan opened.
 _PROCESS_RUNNING = frozenset({RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.ready})
@@ -226,7 +237,12 @@ class _RuntimePlanner:
         # only place the two differ.
         launch_spec = self._launch_spec()
         self.opened_path = launch_spec.modelPath
-        argv = self._adapter.build_argv(launch_spec, binary, port)
+        try:
+            argv = self._adapter.build_argv(launch_spec, binary, port)
+        except ValueError as e:
+            # A setting this model or build cannot honour (a cache precision,
+            # a head the model lacks), in the adapter's own words.
+            raise SpawnPlanError(str(e)) from e
 
         # Engines inherit the ambient environment, then the adapter's own
         # defaults for values the engine cannot start without on this
@@ -288,17 +304,28 @@ class _RuntimePlanner:
         for four minutes. Copying belongs to the runtime's own task, in
         `RuntimeSupervisor`, which finishes before this is ever called.
         """
-        resolved = resolve_local_path(self.spec.modelPath, self._rules(), self._copy_settings())
-        if resolved.path == self.spec.modelPath:
-            return self.spec
-        self._log.info(
-            "%s: opening %s as %s (%s)",
-            self.spec.name,
-            self.spec.modelPath,
-            resolved.path,
-            resolved.source,
-        )
-        return self.spec.model_copy(update={"modelPath": resolved.path})
+        rules, settings = self._rules(), self._copy_settings()
+        resolved = resolve_local_path(self.spec.modelPath, rules, settings)
+        spec = self.spec
+        if resolved.path != spec.modelPath:
+            self._log.info(
+                "%s: opening %s as %s (%s)",
+                spec.name,
+                spec.modelPath,
+                resolved.path,
+                resolved.source,
+            )
+            spec = spec.model_copy(update={"modelPath": resolved.path})
+        # A drafting companion (SD1) is opened by the same rule, so it is
+        # read from the node's copy beside the model when there is one.
+        draft = speculation.companion(spec.flags)
+        if draft is not None:
+            local = resolve_local_path(draft, rules, settings).path
+            if local != draft:
+                self._log.info("%s: drafting with %s as %s", spec.name, draft, local)
+                flags = {**(spec.flags or {}), speculation.DRAFT_MODEL_KEY: local}
+                spec = spec.model_copy(update={"flags": flags})
+        return spec
 
     def _copy_settings(self) -> model_copies.CopySettings:
         if self._get_config is None:
@@ -428,6 +455,12 @@ class RuntimeSupervisor:
         # minutes nobody can account for.
         self._copy_jobs: dict[str, _CopyJob] = {}
         self._copy_notes: dict[str, str] = {}
+        # SD1: (drafted, accepted) from each speculating engine's `/metrics`,
+        # and when they were read, so the counters are read every few
+        # seconds rather than on every readiness poll.
+        # Keyed on the process too (`last_restart`): counters count from the
+        # engine's start, so a restart's are new ones.
+        self._speculation: dict[str, tuple[datetime | None, float, int | None, int | None]] = {}
         # The declared model paths this loop last reconciled against.
         # None until the first pass, so a fresh agent reconciles once.
         self._last_declared: set[str] | None = None
@@ -533,7 +566,9 @@ class RuntimeSupervisor:
         the screen can say why this start is reading over the network.
         """
         settings = self.copy_settings()
-        plan = model_copies.plan_for(spec.modelPath, self._rules(), settings)
+        plan = model_copies.plan_for(
+            spec.modelPath, self._rules(), settings, companions=_companions(spec)
+        )
         if plan is None:
             self._copy_notes.pop(spec.name, None)
             return None
@@ -593,7 +628,9 @@ class RuntimeSupervisor:
             planner = self._planners.get(name)
             if planner is None:
                 continue
-            plan = model_copies.plan_for(planner.spec.modelPath, rules, settings)
+            plan = model_copies.plan_for(
+                planner.spec.modelPath, rules, settings, companions=_companions(planner.spec)
+            )
             if plan is not None:
                 for destination in plan.destinations:
                     in_use[destination] = name
@@ -664,7 +701,7 @@ class RuntimeSupervisor:
         keep = [
             destination
             for plan in model_copies.wanted(
-                [s.modelPath for s in specs], self._rules(), settings
+                [(s.modelPath, _companions(s)) for s in specs], self._rules(), settings
             ).values()
             for destination in plan.destinations
         ]
@@ -691,6 +728,7 @@ class RuntimeSupervisor:
         self._readiness.pop(name, None)
         self._proved_ready.pop(name, None)
         self._stop_reasons.pop(name, None)
+        self._speculation.pop(name, None)
         self._forget_stop(name)
         self._copy_notes.pop(name, None)
         self._load_progress.forget(name)
@@ -720,7 +758,9 @@ class RuntimeSupervisor:
 
     def _copy_wanted(self, spec: RuntimeSpec) -> bool:
         """Whether this runtime would copy its model if started now."""
-        plan = model_copies.plan_for(spec.modelPath, self._rules(), self.copy_settings())
+        plan = model_copies.plan_for(
+            spec.modelPath, self._rules(), self.copy_settings(), companions=_companions(spec)
+        )
         return plan is not None and not model_copies.copy_is_current(plan)
 
     async def stop_one(self, name: str, *, reason: StopReason = StopReason.operator) -> None:
@@ -952,7 +992,26 @@ class RuntimeSupervisor:
             lastRestart=last_restart,
             lastError=last_error,
             loadProgress=load_progress,
+            speculation=self._speculation_for(spec, adapter, argv, status),
         )
+
+    def _speculation_for(
+        self,
+        spec: RuntimeSpec,
+        adapter: EngineAdapter | None,
+        argv: list[str],
+        status: RuntimeStatus,
+    ) -> RuntimeSpeculation | None:
+        if adapter is None:
+            return None
+        view = adapter.speculation_view(spec, argv)
+        if view is None:
+            return None
+        sp = self._processes.get(spec.name)
+        counters = self._speculation.get(spec.name) if status in _PROCESS_RUNNING else None
+        if counters is not None and sp is not None and counters[0] == sp.last_restart:
+            view.draftedTokens, view.acceptedTokens = counters[2], counters[3]
+        return view
 
     def _status_for(
         self,
@@ -1019,7 +1078,7 @@ class RuntimeSupervisor:
         the copy directory every two seconds -- which on a spinning disk
         holding 200 GB of models is not free.
         """
-        declared = {s.modelPath for s in specs}
+        declared = {path for s in specs for path in (s.modelPath, *_companions(s))}
         if declared == self._last_declared:
             return
         self._last_declared = declared
@@ -1075,6 +1134,27 @@ class RuntimeSupervisor:
             self._readiness[spec.name] = outcome
         else:
             self._readiness[spec.name] = None
+        if isinstance(outcome, Ready) and speculation.in_argv(sp.last_argv or []):
+            await self._read_speculation(spec, adapter, base, started_at)
+
+    async def _read_speculation(
+        self, spec: RuntimeSpec, adapter: EngineAdapter, base: str, started_at: datetime | None
+    ) -> None:
+        """The engine's drafted and accepted token counts, for the run's
+        acceptance rate (SD1). A fact on the screen, never a decision."""
+        last = self._speculation.get(spec.name)
+        if last is not None and last[0] != started_at:
+            last = None
+        now = time.perf_counter()
+        if last is not None and now - last[1] < _SPECULATION_READ_SECONDS:
+            return
+        counters = await adapter.read_speculation(base)
+        if counters is None:
+            # Kept as it was: a slow `/metrics` under load is not a reset.
+            if last is None:
+                self._speculation[spec.name] = (started_at, now, None, None)
+            return
+        self._speculation[spec.name] = (started_at, now, *counters)
 
 
 # One installer per engine, created on demand and kept for the life of the
@@ -1434,6 +1514,9 @@ def validate_spec(spec: RuntimeSpec, get_config: ConfigGetter | None = None) -> 
                 f"surface goes in extraArgs, which requires allowUnrestrictedEngineLaunch "
                 f"in this agent's Config."
             )
+    problem = adapter.declaration_problem(spec)
+    if problem is not None:
+        return problem
     return _launch_policy(spec, adapter, get_config)
 
 

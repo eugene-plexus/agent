@@ -32,10 +32,11 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimeMode,
     RuntimeSpec,
+    RuntimeSpeculation,
     Secondary,
 )
 from ..child_env import child_environment
-from . import gpu_probe, llama_architectures, run_mode
+from . import gpu_probe, llama_architectures, run_mode, speculation
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -485,7 +486,7 @@ class LlamaCppAdapter(EngineAdapter):
                 # the cache and the setting: flash_attention_argv (agent#6).
                 argv += flash_attention_argv(flags)
                 continue
-            if field.key == FLASH_ATTENTION_KEY:
+            if field.key == FLASH_ATTENTION_KEY or field.key in speculation.KEYS:
                 continue
             if field.key not in flags:
                 continue
@@ -505,11 +506,79 @@ class LlamaCppAdapter(EngineAdapter):
 
         argv += launch.argv()
 
+        # Speculative decoding (SD1): "Reuse repeated text" on unless the
+        # profile turns it off, and "Draft with" as chosen, both only as far
+        # as this build offers them. Nothing when `extraArgs` sets it by hand.
+        argv += list(
+            speculation.plan(
+                flags,
+                spec.modelPath,
+                extra_args=spec.extraArgs,
+                env=spec.env,
+                search=launch.search,
+                offered=speculation.offered_types(_help_text(binary.path)),
+            ).argv
+        )
+        # The counters the run's acceptance rate is read from.
+        argv += speculation.metrics_argv([*argv, *(spec.extraArgs or [])])
+
         # Verbatim, last, so an operator can always override something the
         # curated surface generated above.
         if spec.extraArgs:
             argv += list(spec.extraArgs)
         return argv
+
+    def declaration_problem(self, spec: RuntimeSpec) -> str | None:
+        return speculation.declaration_problem(spec.modelPath, spec.flags)
+
+    def companion_files(self, spec: RuntimeSpec) -> tuple[str, ...]:
+        found = speculation.companion(spec.flags)
+        return (found,) if found else ()
+
+    def speculation_view(self, spec: RuntimeSpec, argv: list[str]) -> RuntimeSpeculation | None:
+        """What the running command line speculates with, and why anything
+        the profile asks for is not in effect. The counters are the
+        supervisor's to add, from `read_speculation`."""
+        ran = speculation.in_argv(argv)
+        if ran is not None:
+            types, draft = ran
+            note = None
+            if not speculation.by_hand(spec.extraArgs, spec.env):
+                note = self._speculation_plan(spec, argv).note
+            return RuntimeSpeculation(types=types, draftModelPath=draft, note=note)
+        if not argv:
+            return None
+        planned = self._speculation_plan(spec, argv)
+        if planned.note is None:
+            return None
+        return RuntimeSpeculation(types=[], note=planned.note)
+
+    def _speculation_plan(self, spec: RuntimeSpec, argv: list[str]) -> speculation.Plan:
+        embeddings, reranking = run_mode.started_as(argv, spec.env)
+        try:
+            return speculation.plan(
+                spec.flags or {},
+                spec.modelPath,
+                extra_args=spec.extraArgs,
+                env=spec.env,
+                search=embeddings or reranking,
+                offered=speculation.offered_types(_help_text(Path(argv[0]))),
+            )
+        except ValueError as exc:
+            return speculation.Plan(note=str(exc))
+
+    async def read_speculation(self, base_url: str) -> tuple[int | None, int | None] | None:
+        """`(drafted, accepted)` from llama-server's `/metrics`, or None."""
+        try:
+            response = await _probe_client().get(
+                f"{base_url.rstrip('/')}/metrics", timeout=_PROBE_TIMEOUT_SECONDS
+            )
+        except httpx.HTTPError as e:
+            log.debug("speculation counters from %s: %s", base_url, e)
+            return None
+        if not response.is_success:
+            return None
+        return speculation.parse_metrics(response.text)
 
     def accepts_mode(self, mode: RuntimeMode) -> bool:
         """llama.cpp is the one engine that starts a model as a search model."""
@@ -722,6 +791,37 @@ _LONG_FLAG_RE = re.compile(r"--[a-z0-9][a-z0-9-]*")
 # path is a different binary, and the engine store writes each build to
 # its own directory anyway.
 _help_flags_cache: dict[tuple[str, float, int], frozenset[str]] = {}
+_help_text_cache: dict[tuple[str, float, int], str] = {}
+
+
+def _help_text(binary: Path) -> str | None:
+    """This binary's own `--help`, once per binary per process, or None
+    when it could not be asked."""
+    try:
+        stat = binary.stat()
+        key = (str(binary), stat.st_mtime, stat.st_size)
+    except OSError:
+        return None
+    cached = _help_text_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            [str(binary), "--help"],
+            capture_output=True,
+            env=child_environment(),
+            text=True,
+            timeout=_HELP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("help probe for %s failed: %s", binary, e)
+        return None
+    text = (proc.stdout or "") + (proc.stderr or "")
+    if not _LONG_FLAG_RE.search(text):
+        return None
+    _help_text_cache[key] = text
+    return text
 
 
 def _supported_long_flags(binary: Path) -> frozenset[str] | None:
@@ -740,21 +840,10 @@ def _supported_long_flags(binary: Path) -> frozenset[str] | None:
     cached = _help_flags_cache.get(key)
     if cached is not None:
         return cached
-    try:
-        proc = subprocess.run(
-            [str(binary), "--help"],
-            capture_output=True,
-            env=child_environment(),
-            text=True,
-            timeout=_HELP_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        log.debug("help probe for %s failed: %s", binary, e)
+    text = _help_text(binary)
+    if text is None:
         return None
-    found = frozenset(_LONG_FLAG_RE.findall((proc.stdout or "") + (proc.stderr or "")))
-    if not found:
-        return None
+    found = frozenset(_LONG_FLAG_RE.findall(text))
     _help_flags_cache[key] = found
     return found
 
@@ -820,6 +909,7 @@ _CATEGORIES = {
     "memory": "Memory and context",
     "performance": "Performance",
     "sampling": "Serving",
+    "speculation": "Speculative decoding",
 }
 
 #: CB4: keep each conversation in one engine slot (the driver pins it).
@@ -896,6 +986,72 @@ def flash_attention_argv(flags: dict[str, object]) -> list[str]:
 
 
 _FLAG_FIELDS: list[ConfigField] = [
+    # Speculative decoding (SD1, docs/design/speculative-decoding.md).
+    ConfigField(
+        key=speculation.REUSE_TEXT_KEY,
+        label="Reuse repeated text",
+        description=(
+            "Speculative decoding from text already in the conversation (llama.cpp's "
+            "`ngram-mod`). When the answer starts repeating something it has seen, such "
+            "as code it is editing, the repeat is proposed several tokens at a time and "
+            "checked in one step instead of written one token at a time.\n\n"
+            "It needs no extra file and about 16 MB of system memory, and proposes "
+            "nothing when nothing repeats. The running model shows how much of what it "
+            "proposed was kept."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.boolean,
+        default=True,
+        unsetMeans="On: Eugene passes `--spec-type ngram-mod` to llama.cpp builds that offer it.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=speculation.DRAFT_WITH_KEY,
+        label="Draft with",
+        description=(
+            "Speculative decoding with a small predictor: it drafts a few tokens ahead "
+            "and the model checks them all in one step, keeping those it agrees with, "
+            "so the answer is the model's own and comes faster when most drafts are "
+            "kept.\n\n"
+            "- **Model's own prediction head** uses the multi-token prediction (MTP) "
+            "head some models carry in their file. It runs on the model's own weights "
+            "and needs little extra memory.\n"
+            "- **Companion file** uses a separate MTP head or a small draft model from "
+            "the model's folder, which needs memory for its weights and cache.\n\n"
+            "The settings builder times each one on this machine and keeps the faster."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.enum,
+        enumValues=list(speculation.DRAFT_WITH_CHOICES),
+        enumLabels=["Off", "Model's own prediction head (MTP)", "Companion file"],
+        unsetMeans="Off: nothing drafts, until a settings build finds a way that is faster here.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=speculation.DRAFT_MODEL_KEY,
+        label="Companion file",
+        description=(
+            "The MTP head or draft model to draft with, from the same Library folder as "
+            "the model. Used when Draft with is Companion file."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.string,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=speculation.DRAFT_TOKENS_KEY,
+        label="Tokens drafted per step",
+        description=(
+            "How many tokens the predictor drafts before the model checks them "
+            "(`--spec-draft-n-max`). More pays off only when most drafts are kept."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.integer,
+        minimum=1,
+        maximum=16,
+        unsetMeans="3, llama.cpp's own default.",
+        requiresRestart=True,
+    ),
     ConfigField(
         key="projectorPath",
         label="Vision projector",

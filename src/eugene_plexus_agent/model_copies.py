@@ -285,9 +285,16 @@ def plan_for(
     settings: CopySettings,
     *,
     expand: Callable[[str], str] = os.path.expanduser,
+    companions: Sequence[str] = (),
 ) -> CopyPlan | None:
     """Where this node would keep its copy of `declared`, or None when
     it would not keep one at all.
+
+    `companions` are files beside the model that the declaration also
+    loads (SD1: a drafting companion), declared as the model is. They join
+    the copy in their own places, so the engine opens them beside the
+    model's copy. One that is not there is left out, to fail the launch
+    with its own reason rather than block the model's copy.
 
     None also covers the case that matters more than it looks: a source
     that is **already inside the copy directory**. Without it, a restart
@@ -306,6 +313,10 @@ def plan_for(
     files = members_of(source)
     if files is None:
         return None
+    for extra in companions:
+        local = resolve_model_path(extra, rules, expand=expand).local_path
+        if os.path.isfile(local) and local not in files:
+            files = (*files, local)
     if len(files) <= 1:
         return CopyPlan(declared=declared, source=source, destination=destination)
     # The Library folder as this node reaches it: the source less the part
@@ -331,7 +342,7 @@ def plan_for(
 
 
 def wanted(
-    declared_paths: Iterable[str],
+    declared_paths: Iterable[str | tuple[str, Sequence[str]]],
     rules: Sequence[PathRule],
     settings: CopySettings,
 ) -> dict[str, CopyPlan]:
@@ -344,9 +355,24 @@ def wanted(
     """
     out: dict[str, CopyPlan] = {}
     for declared in declared_paths:
-        plan = plan_for(declared, rules, settings)
-        if plan is not None:
-            out.setdefault(plan.destination, plan)
+        path, companions = (declared, ()) if isinstance(declared, str) else declared
+        plan = plan_for(path, rules, settings, companions=companions)
+        if plan is None:
+            continue
+        held = out.get(plan.destination)
+        if held is None:
+            out[plan.destination] = plan
+            continue
+        # One model, two runtimes, one drafting with a companion: the copy
+        # keeps the companion for the runtime that wants it.
+        members = {m.destination: m for m in (*held.files, *plan.files)}
+        if len(members) > len(held.files):
+            out[plan.destination] = CopyPlan(
+                declared=held.declared,
+                source=held.source,
+                destination=held.destination,
+                members=tuple(members.values()),
+            )
     return out
 
 

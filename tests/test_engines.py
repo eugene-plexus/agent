@@ -441,12 +441,14 @@ def test_every_schema_flag_reaches_the_command_line_somehow(
     """A flag in the schema that nothing translates would render in the UI
     and then KeyError at spawn.
 
-    Three routes now: most keys are a one-to-one CLI name, `noMmap` /
+    Four routes now: most keys are a one-to-one CLI name, `noMmap` /
     `mlock` collapse into a single `--load-mode` value whose spelling
-    depends on the binary, and `cacheType` expands into the K/V pair of
-    flags. A key in no set is the defect this guards; a key in two would
-    be built twice.
+    depends on the binary, `cacheType` expands into the K/V pair of
+    flags, and the speculative-decoding keys (SD1) become `--spec-*`
+    together. A key in no set is the defect this guards; a key in two
+    would be built twice.
     """
+    from eugene_plexus_agent.engines import speculation
     from eugene_plexus_agent.engines.llama_cpp import (
         _FLAG_CLI_NAMES,
         _LOAD_MODE_KEYS,
@@ -456,9 +458,12 @@ def test_every_schema_flag_reaches_the_command_line_somehow(
     direct = set(_FLAG_CLI_NAMES)
     collapsed = set(_LOAD_MODE_KEYS)
     expanded = {CACHE_TYPE_KEY}
+    drafting = set(speculation.KEYS)
     assert not (direct & collapsed), "a key translated twice would be passed twice"
     assert not (direct & expanded) and not (collapsed & expanded)
-    assert {f.key for f in adapter.flag_schema().fields} == direct | collapsed | expanded
+    assert not drafting & (direct | collapsed | expanded)
+    keys = {f.key for f in adapter.flag_schema().fields}
+    assert keys == direct | collapsed | expanded | drafting
 
 
 def test_unknown_flags_are_reported_not_dropped(adapter: LlamaCppAdapter) -> None:

@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -26,6 +27,7 @@ from .._generated.models import (
 )
 from ..child_env import child_environment
 from ..dependencies import require_operator_session
+from ..engines import speculation
 from ..engines.base import EngineUnavailableError
 from ..engines.devices import detect_devices
 from ..engines.llama_cpp import LlamaCppAdapter
@@ -191,8 +193,33 @@ async def _prepare(body: ProfileBuildRequest, request: Request) -> tuple[BuildPl
         margin=body.memoryMarginMiB,
         env=env,
         detect=detector,
+        drafts=await _drafts(body, request, state.get_config),
     )
     return plan, tools
+
+
+async def _drafts(
+    body: ProfileBuildRequest, request: Request, get_config: Any
+) -> list[tuple[str, Path]]:
+    """The companions to time (SD1): each in the model's own folder, as
+    this node opens it. One that is elsewhere is refused, as a launch
+    refuses it; one this node cannot open is left out."""
+    out: list[tuple[str, Path]] = []
+    for entry in body.draftFiles or []:
+        declared = entry.root
+        flags = {speculation.DRAFT_WITH_KEY: "companion", speculation.DRAFT_MODEL_KEY: declared}
+        if problem := speculation.declaration_problem(body.runtime.modelPath, flags):
+            raise BuildError(problem[0].upper() + problem[1:] + ".")
+        local = await asyncio.to_thread(
+            resolve_local_path,
+            declared,
+            effective_rules_for(request),
+            settings_from_config(get_config),
+        )
+        path = Path(local.path)
+        if await asyncio.to_thread(path.is_file):
+            out.append((declared, path))
+    return out
 
 
 def _estimate(body: ProfileBuildRequest, plan: BuildPlan) -> tuple[int, str]:

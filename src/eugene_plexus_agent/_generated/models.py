@@ -137,6 +137,9 @@ class ProfileBuildPhase(StrEnum):
       placement passed explicitly.
     * `confirming` — loading the recommended candidate once in
       llama-server and checking it serves.
+    * `drafting` — timing decode in llama-server on the confirmed
+      candidate with each way this model can draft (SD1). Skipped
+      for a model that has nothing to draft with.
     * `finished` — the job has ended; `state` says how.
 
     """
@@ -145,6 +148,7 @@ class ProfileBuildPhase(StrEnum):
     candidates = 'candidates'
     measuring = 'measuring'
     confirming = 'confirming'
+    drafting = 'drafting'
     finished = 'finished'
 
 
@@ -161,6 +165,10 @@ class ProfileBuildEvaluation(BaseModel):
     source: EvaluationTextSource
     sha256: str | None = None
     tokens: int | None = Field(None, ge=0)
+
+
+class DraftFile(RootModel[str]):
+    root: str = Field(..., max_length=4096)
 
 
 class CacheQuality(BaseModel):
@@ -221,6 +229,50 @@ class BuildCandidate(BaseModel):
     graphicsMemoryBytes: int | None = Field(
         None,
         description='Graphics memory used while confirming, where the node can measure it.',
+        ge=0,
+    )
+    detail: str | None = None
+
+
+class DraftWith(StrEnum):
+    """
+    What a llama.cpp runtime drafts with (the profile flag
+    `draftWith`, SD1):
+
+    * `off` — nothing; the default until a settings build has timed
+      the others on the node (S1).
+    * `mtpHead` — the model's own MTP head (`--spec-type draft-mtp`).
+    * `companion` — a companion file (`draftModelPath`) with
+      `--spec-draft-model`, as `draft-mtp` or `draft-simple` by the
+      file's own tensors.
+
+    """
+
+    off = 'off'
+    mtpHead = 'mtpHead'
+    companion = 'companion'
+
+
+class DraftTrial(BaseModel):
+    """
+    One way of drafting, timed in llama-server on the confirmed candidate, with "Reuse repeated text" off so the model's own drafting is what is timed.
+    """
+
+    draftWith: DraftWith
+    draftModelPath: str | None = Field(
+        None,
+        description='The companion file, as the Library names it. Null unless `draftWith` is `companion`.',
+    )
+    decodeTokensPerSecond: float | None = Field(
+        None,
+        description="llama-server's own decode speed for one fixed generation (`timings.predicted_per_second`). Null when it did not serve.",
+        gt=0.0,
+    )
+    draftedTokens: int | None = Field(None, ge=0)
+    acceptedTokens: int | None = Field(None, ge=0)
+    graphicsMemoryBytes: int | None = Field(
+        None,
+        description='Graphics memory used while this trial was loaded, where the node can measure it.',
         ge=0,
     )
     detail: str | None = None
@@ -2980,6 +3032,46 @@ class RuntimeMode(StrEnum):
     reranking = 'reranking'
 
 
+class RuntimeSpeculation(BaseModel):
+    """
+    Speculative decoding as this runtime was started with it, and how
+    much of what it drafted the model kept (SD1,
+    docs/design/speculative-decoding.md). Read from the command line
+    and from llama-server's own counters
+    (`llamacpp:spec_decode_num_draft_tokens_total` and
+    `llamacpp:spec_decode_num_accepted_tokens_total` on `/metrics`),
+    which count from the engine's last start. A fact, not advice:
+    Eugene recommends nothing from the rate (S3).
+
+    Absent when the runtime speculates with nothing, or when its
+    engine does not.
+
+    """
+
+    types: list[str] = Field(
+        ...,
+        description="llama.cpp's own names, in the order it tries them for each\nsequence, for example `[ngram-mod, draft-mtp]`.\n",
+    )
+    draftModelPath: str | None = Field(
+        None,
+        description="The companion file it drafts with (`--spec-draft-model`), as this host opens it. Null when it drafts with the model's own head or with no model.",
+    )
+    draftedTokens: int | None = Field(
+        None,
+        description='Tokens drafted since the engine started. Null until it has been read.',
+        ge=0,
+    )
+    acceptedTokens: int | None = Field(
+        None,
+        description='Drafted tokens the model kept. The acceptance rate is this over `draftedTokens`.',
+        ge=0,
+    )
+    note: str | None = Field(
+        None,
+        description='Why speculation the profile asks for is not in effect, for\nexample an engine build that does not offer it. Null when it\nis in effect as asked.\n',
+    )
+
+
 class Source(StrEnum):
     """
     Which counter answered. On the wire so that "this host cannot
@@ -4411,6 +4503,7 @@ class Runtime(BaseModel):
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
     )
     loadProgress: LoadProgress | None = None
+    speculation: RuntimeSpeculation | None = None
 
 
 class ModelCopyClearResult(BaseModel):
@@ -4862,6 +4955,12 @@ class ProfileBuildRequest(BaseModel):
     restartAfter: bool | None = Field(
         True, description='Same rule as `BenchmarkRequest.restartAfter`.'
     )
+    draftFiles: list[DraftFile] | None = Field(
+        [],
+        description="Companion files the Library found beside the model\n(`GgufSpeculation.draftFiles` paths), to time in the\n`drafting` phase. Each must sit in the model's own folder;\nthe agent reads each file's kind itself. The model's own MTP\nhead, if it has one, is read from the model file and needs\nnothing here.\n",
+        max_length=8,
+        validate_default=True,
+    )
 
 
 class ProfileBuild(BaseModel):
@@ -4892,6 +4991,15 @@ class ProfileBuild(BaseModel):
     modelSizeBytes: int | None = Field(None, ge=0)
     hardware: dict[str, str] | None = None
     restarts: list[MeasurementRestart]
+    draftTrials: list[DraftTrial] | None = Field(
+        None,
+        description="The `drafting` phase's trials, `off` first. Empty when the model had nothing to draft with, or for a build from before SD1.",
+    )
+    recommendedDraft: int | None = Field(
+        None,
+        description="Index into `draftTrials` of the fastest, which the saved\nprofile's `draftWith` takes (S1). A way of drafting must beat\n`off` by more than 3%, the same tolerance as `recommended`, or\n`off` is kept. Null when nothing was timed.\n",
+        ge=0,
+    )
 
 
 class ProfileBuildList(BaseModel):

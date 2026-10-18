@@ -78,6 +78,7 @@ from ._generated.models import (
     RuntimeStatus,
 )
 from ._http import internal_client, shared_internal_client
+from .engines import speculation
 from .engines.devices import DeviceSnapshot
 from .enrollment import problem_detail
 from .model_paths import PathRule, resolve_model_path
@@ -105,6 +106,23 @@ log = logging.getLogger(__name__)
 ESTIMATED_KV_FRACTION = 0.15
 ESTIMATED_KV_BASELINE_CONTEXT = 8192
 OVERHEAD_BYTES = 1024**3
+
+# Speculative decoding (SD1), measured on the 5090 before it was trusted (S4,
+# 2026-10-18, llama.cpp b11719, 32,768 tokens of context; Qwen3.5-9B with its
+# own head, Qwen3.6-27B with ggml-org's MTP file). Over the same launch with
+# nothing drafting, the GPU held at its peak:
+#
+# * reusing repeated text (`ngram-mod`): 163-183 MiB more on both models;
+# * the model's own MTP head: 996 MiB more on the 9B, its draft context, on
+#   the shared weights rather than a second copy;
+# * a companion MTP file: its 1,602 MiB of weights plus 1,446 MiB of draft
+#   context on the 27B.
+#
+# Counted as flat allowances above the largest of those, plus a companion's
+# file. Only two models were measured: a much larger one may need more, and
+# `docs/acceptance/sd1-speculative-decoding.md` has the numbers.
+REPEATED_TEXT_BYTES = 256 * 1024**2
+DRAFT_CONTEXT_BYTES = 1792 * 1024**2
 
 # What the estimate assumes when the spec leaves `contextSize` to the
 # engine, which is what every profile that has not been edited does. Not
@@ -878,6 +896,38 @@ def model_size_bytes(model_path: str) -> int | None:
     return None
 
 
+def drafting_bytes(
+    spec: RuntimeSpec,
+    mappings: Sequence[PathRule],
+    sizer: Callable[[str], int | None],
+    copy_settings: model_copies.CopySettings | None = None,
+) -> int:
+    """What speculative decoding adds to a llama.cpp launch (SD1, S4).
+
+    Read from the profile's flags, as the launch reads them: "Reuse repeated
+    text" unless it is turned off, and "Draft with". A companion is sized
+    where this node opens it. Hand-written speculation in `extraArgs` is not
+    counted: the operator is setting the engine by hand there, as with any
+    other raw argument.
+    """
+    if spec.engine is not EngineKind.llama_cpp or speculation.by_hand(spec.extraArgs, spec.env):
+        return 0
+    flags = spec.flags or {}
+    total = REPEATED_TEXT_BYTES if flags.get(speculation.REUSE_TEXT_KEY) is not False else 0
+    choice = flags.get(speculation.DRAFT_WITH_KEY)
+    if choice == "mtpHead":
+        total += DRAFT_CONTEXT_BYTES
+    elif choice == "companion":
+        total += DRAFT_CONTEXT_BYTES
+        draft = speculation.companion(flags)
+        if draft is not None:
+            local = resolve_model_path(draft, mappings).local_path
+            if copy_settings is not None:
+                local = model_copies.resolve_local_path(draft, mappings, copy_settings).path
+            total += sizer(local) or 0
+    return total
+
+
 def file_size_requirement(size_bytes: int, context_length: int) -> int:
     """What a launch needs, when the file's size is all we know.
 
@@ -1302,6 +1352,16 @@ async def check_admission(
             warning="; ".join(warnings) or f"{engine_name(spec.engine)}'s fit is not estimated",
         )
 
+    # What drafting adds (SD1): the library's fit and the file's size both
+    # cover the model alone, so its room is taken off the budget the fit is
+    # asked about and added to what the launch requires.
+    drafting = (
+        await asyncio.to_thread(drafting_bytes, spec, mappings, sizer, copy_settings)
+        if not shares
+        else 0
+    )
+    fit_budget = max(budget - drafting, 0) if budget is not None else None
+
     # Required bytes: the library when it answers, the file otherwise.
     required: int | None = None
     basis = AdmissionBasis.file_size
@@ -1311,7 +1371,7 @@ async def check_admission(
         answer = await library.fit(
             spec.modelPath,
             context_length=context_length,
-            vram_bytes=budget,
+            vram_bytes=fit_budget,
             ram_bytes=ram_available if spillover_device else None,
             unified_memory=unified,
             gpu_count=cards,
@@ -1320,7 +1380,7 @@ async def check_admission(
             vram_total_bytes=total if shares else None,
         )
         if answer is not None:
-            required = answer.required_bytes
+            required = answer.required_bytes + drafting
             basis = AdmissionBasis.metadata
             fit = _library_verdict(answer.verdict) if budget is not None else AdmissionFit.unknown
             if answer.context_length is not None:
@@ -1340,6 +1400,7 @@ async def check_admission(
             context_length = context_length or ASSUMED_CONTEXT_LENGTH
             # One allowance per card: each holds its own compute buffers.
             required = file_size_requirement(size, context_length) + OVERHEAD_BYTES * (cards - 1)
+            required += drafting
             fit = local_verdict(required, free=budget, total=total, ram_available=ram_available)
         else:
             warnings.append(f"{spec.modelPath} could not be sized on disk")

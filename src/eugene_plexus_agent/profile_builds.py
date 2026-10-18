@@ -49,6 +49,8 @@ from ._generated.models import (
     BuildCandidate,
     CacheQuality,
     CacheType,
+    DraftTrial,
+    DraftWith,
     MeasurementRestart,
     MeasurementRestartState,
     ProfileBuild,
@@ -57,12 +59,14 @@ from ._generated.models import (
     ProfileBuildRequest,
 )
 from ._http import shared_internal_client
+from .engines import speculation
 from .engines.llama_cpp import (
     CACHE_TYPE_KEY,
     FLASH_ATTENTION_CHOICES,
     FLASH_ATTENTION_KEY,
     flash_attention_argv,
 )
+from .gguf_context import drafting_facts
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +116,25 @@ BALANCE = 0.8
 # Two speeds this close are the same speed: llama-bench's own spread on
 # decode was 0.2-1% in §0, and without a tolerance noise picks the winner.
 SPEED_TOLERANCE = 0.03
+
+# The drafting phase (SD1): one fixed generation per way of drafting, long
+# enough for llama-server's decode speed to settle. A request without a
+# temperature takes the model's own sampling defaults, which is what most
+# clients get, so a way that only pays off greedily is not favoured.
+DRAFT_REQUEST: dict[str, Any] = {
+    "messages": [
+        {
+            "role": "user",
+            "content": (
+                "Explain how a hash table handles collisions, then write a short "
+                "Python class that implements one with separate chaining."
+            ),
+        }
+    ],
+    "max_tokens": 384,
+    "seed": 7,
+}
+DRAFT_TIMEOUT = 600
 
 # The quality baseline stores every scored token's distribution as 16-bit
 # values. Bounded by the largest vocabulary in common use rather than read
@@ -407,6 +430,9 @@ class BuildPlan:
     env: dict[str, str]
     detect: Callable[[], Any] | None = None
     stopped: list[str] = field(default_factory=list)
+    #: Companion files to time in the drafting phase (SD1): each as the
+    #: Library names it and as this node opens it.
+    drafts: list[tuple[str, Path]] = field(default_factory=list)
 
 
 AfterJob = Callable[[], Awaitable[list[MeasurementRestart]]]
@@ -845,9 +871,62 @@ class ProfileBuilds:
             "each candidate's reason is kept with it."
         )
 
+    async def _draft(self, job: ProfileBuild, plan: BuildPlan) -> None:
+        """Time decode with each way this model can draft, on the confirmed
+        candidate, and keep the fastest (SD1, S1). Skipped when there is
+        nothing to draft with.
+
+        "Reuse repeated text" is off in every trial: what it saves depends on
+        how much of a person's own work repeats, which one prompt cannot
+        stand for, so it is not a choice the build makes.
+        """
+        if job.recommended is None:
+            return
+        ways = await asyncio.to_thread(drafting_ways, plan)
+        if not ways:
+            return
+        job.phase = ProfileBuildPhase.drafting
+        candidate = job.candidates[job.recommended]
+        job.draftTrials = [
+            DraftTrial(draftWith=DraftWith.off),
+            *(DraftTrial(draftWith=w, draftModelPath=d) for w, d, _ in ways),
+        ]
+        arguments = [[], *(a for _, _, a in ways)]
+        total = len(job.draftTrials)
+        for n, (trial, extra) in enumerate(zip(job.draftTrials, arguments, strict=True), 1):
+            job.detail = f"Timing decode {_trial_words(trial)} ({n} of {total})…"
+            self._save()
+            ok, detail, used, timings = await self._serve(candidate, plan, extra=extra, timed=True)
+            trial.graphicsMemoryBytes = used
+            trial.detail = detail
+            if ok and timings is not None:
+                speed = timings.get("predicted_per_second")
+                trial.decodeTokensPerSecond = (
+                    float(speed) if isinstance(speed, int | float) and speed > 0 else None
+                )
+                trial.draftedTokens = _count(timings.get("draft_n"))
+                trial.acceptedTokens = _count(timings.get("draft_n_accepted"))
+            self._save()
+        job.recommendedDraft = recommend_draft(job.draftTrials)
+        self._save()
+
     async def _serve_once(
         self, candidate: BuildCandidate, plan: BuildPlan
     ) -> tuple[bool, str, int | None]:
+        ok, detail, used, _ = await self._serve(candidate, plan)
+        return ok, detail, used
+
+    async def _serve(
+        self,
+        candidate: BuildCandidate,
+        plan: BuildPlan,
+        *,
+        extra: Sequence[str] = (),
+        timed: bool = False,
+    ) -> tuple[bool, str, int | None, dict[str, Any] | None]:
+        """Load `candidate` in llama-server with `extra` arguments, answer a
+        short request, and with `timed` one fixed generation whose
+        `timings` are returned."""
         before = await asyncio.to_thread(_accelerator_free, plan.detect)
         port = free_port()
         argv = [
@@ -865,6 +944,7 @@ class ProfileBuilds:
             *cache_args(candidate.cacheType, plan.flags.get(FLASH_ATTENTION_KEY)),
             *(["--fit-target", str(plan.margin)] if plan.margin is not None else []),
             *passthrough_args(plan.flags, bench=False),
+            *extra,
         ]
         self.process = await asyncio.create_subprocess_exec(
             *argv,
@@ -896,7 +976,8 @@ class ProfileBuilds:
                 if self.stopping:
                     raise asyncio.CancelledError
                 if self.process.returncode is not None:
-                    return False, f"llama-server exited while loading. {_tail(''.join(tail))}", None
+                    exited = f"llama-server exited while loading. {_tail(''.join(tail))}"
+                    return False, exited, None, None
                 try:
                     health = await client.get(f"{base}/health")
                     if health.status_code == 200:
@@ -904,15 +985,30 @@ class ProfileBuilds:
                 except httpx.HTTPError:
                     pass
                 if time.perf_counter() > deadline:
-                    return False, "llama-server did not finish loading within 10 minutes.", None
+                    return (
+                        False,
+                        "llama-server did not finish loading within 10 minutes.",
+                        None,
+                        None,
+                    )
                 await asyncio.sleep(1)
             used = _used_since(before, await asyncio.to_thread(_accelerator_free, plan.detect))
             reply = await client.post(
                 f"{base}/completion", json={"prompt": "Hello", "n_predict": 8}, timeout=120
             )
             if reply.status_code != 200:
-                return False, f"llama-server answered {reply.status_code} to a short request.", used
-            return True, "Loaded and answered in llama-server.", used
+                short = f"llama-server answered {reply.status_code} to a short request."
+                return False, short, used, None
+            if not timed:
+                return True, "Loaded and answered in llama-server.", used, None
+            reply = await client.post(
+                f"{base}/v1/chat/completions", json=DRAFT_REQUEST, timeout=DRAFT_TIMEOUT
+            )
+            timings = reply.json().get("timings") if reply.status_code == 200 else None
+            if not isinstance(timings, dict):
+                late = f"llama-server answered {reply.status_code} to the timed request."
+                return False, late, used, None
+            return True, "Timed in llama-server.", used, timings
         finally:
             await self._terminate()
             reader.cancel()
@@ -931,13 +1027,16 @@ class ProfileBuilds:
                 await self._candidates(job, plan)
                 await self._measure(job, plan)
                 await self._confirm(job, plan)
+                await self._draft(job, plan)
             job.state = BenchmarkState.completed
             job.progress = 1
             chosen = job.candidates[job.recommended] if job.recommended is not None else None
             job.detail = (
                 f"Measured {sum(1 for c in job.candidates if c.decodeTokensPerSecond)} settings. "
                 + (
-                    f"Suggested: {chosen.contextSize:,} tokens, {chosen.cacheType.value} cache."
+                    f"Suggested: {chosen.contextSize:,} tokens, {chosen.cacheType.value} cache"
+                    + _draft_words(job)
+                    + "."
                     if chosen
                     else ""
                 )
@@ -994,6 +1093,68 @@ class ProfileBuilds:
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
+
+
+def drafting_ways(plan: BuildPlan) -> list[tuple[DraftWith, str | None, list[str]]]:
+    """Each way this model can draft on this node, with the arguments that
+    turn it on: its own MTP head, then each companion llama.cpp can draft
+    with. Read from the files themselves, as a launch reads them."""
+    ways: list[tuple[DraftWith, str | None, list[str]]] = []
+    facts = drafting_facts(plan.model)
+    if facts is not None and facts.mtp_head:
+        ways.append((DraftWith.mtpHead, None, ["--spec-type", speculation.DRAFT_MTP]))
+    for declared, local in plan.drafts:
+        found = drafting_facts(local)
+        kind = found.companion_type if found is not None else None
+        if kind is not None:
+            ways.append(
+                (
+                    DraftWith.companion,
+                    declared,
+                    ["--spec-type", kind, "--spec-draft-model", str(local)],
+                )
+            )
+    return ways
+
+
+def recommend_draft(trials: Sequence[DraftTrial]) -> int | None:
+    """The fastest trial's index, when it beats drafting with nothing by more
+    than `SPEED_TOLERANCE`; else 0, drafting with nothing. None when nothing
+    drafting with nothing could be timed."""
+    if not trials or trials[0].decodeTokensPerSecond is None:
+        return None
+    baseline = trials[0].decodeTokensPerSecond
+    best = max(
+        range(len(trials)),
+        key=lambda i: trials[i].decodeTokensPerSecond or 0.0,
+    )
+    fastest = trials[best].decodeTokensPerSecond or 0.0
+    return best if fastest > baseline * (1 + SPEED_TOLERANCE) else 0
+
+
+def _count(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+_TRIAL_WORDS = {
+    DraftWith.off: "with nothing drafting",
+    DraftWith.mtpHead: "drafting with the model's own prediction head",
+    DraftWith.companion: "drafting with a companion file",
+}
+
+
+def _trial_words(trial: DraftTrial) -> str:
+    return _TRIAL_WORDS[trial.draftWith]
+
+
+def _draft_words(job: ProfileBuild) -> str:
+    """`, drafting with …` for the summary, when a way of drafting won."""
+    if job.recommendedDraft is None or not job.draftTrials:
+        return ""
+    trial = job.draftTrials[job.recommendedDraft]
+    if trial.draftWith is DraftWith.off:
+        return ", nothing drafting (no way of drafting was faster here)"
+    return ", " + _trial_words(trial)
 
 
 def _distinct_placements(placements: dict[CacheType, list[str]]) -> list[CacheType]:
