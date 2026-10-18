@@ -114,7 +114,18 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         "mode": state.get_config("securityMode"),
         "copy_enabled": state.get_config("modelCopyEnabled") is True,
         "copy_dir": state.get_config("modelCopyDir"),
+        "history_bytes": _history_bytes(request),
     }
+
+
+def _history_bytes(request: Request) -> int | None:
+    from ..host_history import HostHistoryStore
+
+    store = getattr(request.app.state, "host_history", None)
+    return store.size_bytes() if isinstance(store, HostHistoryStore) else None
+
+
+_HISTORY_RETENTION_KEYS = ("hostHistoryRawHours", "hostHistoryMinuteDays", "hostHistoryHourDays")
 
 
 def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
@@ -182,6 +193,16 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
             if found is not None:
                 level, text = found
                 update["status"] = ConfigFieldStatus(level=ConfigFieldStatusLevel(level), text=text)
+    elif key in _HISTORY_RETENTION_KEYS:
+        size = live["history_bytes"]
+        update["status"] = ConfigFieldStatus(
+            level=ConfigFieldStatusLevel.info,
+            text=(
+                f"This machine's history takes {size / 1024**2:.1f} MB on disk now."
+                if size is not None
+                else "Nothing is recorded on this machine yet."
+            ),
+        )
     elif key == "securityMode":
         status = _security_mode_status(live)
         if status is not None:

@@ -829,6 +829,27 @@ class RuntimeSupervisor:
         sp = self._processes.get(name)
         return (sp is not None and sp.supervising) or name in self._copy_jobs
 
+    def host_counts(self) -> tuple[int, int, tuple[int, ...]]:
+        """`(ready, on their way, engine pids)` for host history.
+
+        On their way is copying, starting or loading. The pids are the
+        launched processes only; the sampler adds their descendants.
+        """
+        ready = loading = 0
+        pids: list[int] = []
+        for name in set(self._processes) | set(self._copy_jobs):
+            sp = self._processes.get(name)
+            status = self._status_for(
+                sp, self._readiness.get(name), copying=name in self._copy_jobs
+            )
+            if status is RuntimeStatus.ready:
+                ready += 1
+            elif status in (RuntimeStatus.copying, RuntimeStatus.starting, RuntimeStatus.loading):
+                loading += 1
+            if sp is not None and sp.pid is not None and sp.supervising:
+                pids.append(sp.pid)
+        return ready, loading, tuple(pids)
+
     async def _cancel_copy(self, name: str) -> None:
         """Stop a copy in flight and wait for its thread to notice."""
         job = self._copy_jobs.pop(name, None)

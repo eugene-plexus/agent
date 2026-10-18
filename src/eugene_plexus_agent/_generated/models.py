@@ -2012,6 +2012,171 @@ class LocalStandby(BaseModel):
     )
 
 
+class HostHistoryStep(StrEnum):
+    """
+    A resolution of host history: single samples, or minute or hour
+    rollups. Each is kept for its own retention
+    (`hostHistoryRawHours`, `hostHistoryMinuteDays`,
+    `hostHistoryHourDays`).
+
+    """
+
+    raw = 'raw'
+    minute = 'minute'
+    hour = 'hour'
+
+
+class HostHistoryStepChoice(StrEnum):
+    """
+    A resolution to ask for, or `auto` to let the agent choose.
+    """
+
+    auto = 'auto'
+    raw = 'raw'
+    minute = 'minute'
+    hour = 'hour'
+
+
+class HostMetric(StrEnum):
+    """
+    What a host-history series measures.
+
+    * `gpuMemoryUsed` is every process's use of the card, system-wide.
+      `gpuMemoryEugene` is the part of it held by this agent's own
+      runtimes (their process trees), measured per process, not
+      estimated from a reservation; the rest is everything else on
+      the machine.
+    * `gpuUtilization` is the busiest engine's percentage, the figure
+      Task Manager shows. `gpuTemperature` is the core temperature,
+      `gpuPower` the board's draw.
+    * `diskFree` and `diskTotal` are per volume, for each volume that
+      holds a model folder, the model-copy folder or the engine folder.
+    * `runtimesRunning` counts this agent's runtimes that are ready;
+      `runtimesLoading` those copying, starting or loading.
+
+    """
+
+    gpuMemoryUsed = 'gpuMemoryUsed'
+    gpuMemoryTotal = 'gpuMemoryTotal'
+    gpuMemoryEugene = 'gpuMemoryEugene'
+    gpuUtilization = 'gpuUtilization'
+    gpuTemperature = 'gpuTemperature'
+    gpuPower = 'gpuPower'
+    cpuUtilization = 'cpuUtilization'
+    ramUsed = 'ramUsed'
+    ramTotal = 'ramTotal'
+    swapUsed = 'swapUsed'
+    swapTotal = 'swapTotal'
+    diskFree = 'diskFree'
+    diskTotal = 'diskTotal'
+    runtimesRunning = 'runtimesRunning'
+    runtimesLoading = 'runtimesLoading'
+
+
+class HostUnit(StrEnum):
+    bytes = 'bytes'
+    percent = 'percent'
+    celsius = 'celsius'
+    watts = 'watts'
+    count = 'count'
+
+
+class HostBucket(BaseModel):
+    """
+    One bucket on the window's timeline.
+    """
+
+    start: AwareDatetime
+    samples: int = Field(
+        ...,
+        description='Samples recorded in this bucket. 0 is a gap: nothing was\nrecording.\n',
+        ge=0,
+    )
+    expectedSamples: int = Field(
+        ...,
+        description='How many the sample interval in force would have produced.\nFewer than this is a partial bucket: a missed sample, or the\nstart or end of a gap.\n',
+        ge=1,
+    )
+
+
+class HostSeries(BaseModel):
+    """
+    One measured quantity over the window. `min`, `mean` and `max`
+    have one entry per `HostHistory.buckets` entry, `null` where that
+    bucket holds no reading of this series. For `raw` buckets the three
+    are the same reading.
+
+    """
+
+    key: str = Field(
+        ...,
+        description='Stable across the window and across requests: `gpu:<kind>:<index>`\nplus the metric for a GPU series, `disk:<volume>` plus the metric\nfor a disk series, the metric alone for the rest.\n',
+    )
+    metric: HostMetric
+    unit: HostUnit
+    label: str = Field(
+        ...,
+        description='What to call it on a screen, e.g. `NVIDIA GeForce RTX 5090 memory used`.',
+    )
+    deviceKind: ComputeDeviceKind | None = None
+    deviceIndex: int | None = Field(
+        None,
+        description="The device's `ComputeDevice.index` in `GET /v1/node`, for a GPU series.",
+    )
+    deviceName: str | None = None
+    volume: str | None = Field(
+        None, description="The volume's mount point or drive, for a disk series."
+    )
+    holds: list[str] | None = Field(
+        None,
+        description='For a disk series, the folders on that volume it is measured\nfor: model folders, the model-copy folder, the engine folder.\n',
+    )
+    unavailable: str | None = Field(
+        None,
+        description='Why this host does not report this series, when it does not;\nevery value is then `null`. Absent when it reports.\n',
+    )
+    latest: float | None = Field(
+        None,
+        description='The newest reading, whatever the window. Absent when there is none.',
+    )
+    min: list[float | None]
+    mean: list[float | None]
+    max: list[float | None]
+
+
+class HostHistory(BaseModel):
+    """
+    What this host's hardware did over a window (`GET /v1/node/history`).
+    """
+
+    enabled: bool = Field(
+        ..., description='Whether this agent is recording now (`hostHistoryEnabled`).'
+    )
+    sampleSeconds: int = Field(
+        ..., description='The sample interval in force (`hostHistorySampleSeconds`).'
+    )
+    step: HostHistoryStep
+    stepSeconds: int
+    from_: AwareDatetime = Field(
+        ..., alias='from', description="The window's start, aligned down to the step."
+    )
+    to: AwareDatetime = Field(..., description="The window's end, exclusive.")
+    recordingSince: AwareDatetime | None = Field(
+        None,
+        description='The oldest bucket kept at this resolution. Absent when nothing\nis recorded.\n',
+    )
+    truncated: bool = Field(
+        ...,
+        description="True when `from` is older than this resolution's retention, so\nthe start of the window is gone rather than empty.\n",
+    )
+    latestAt: AwareDatetime | None = Field(
+        None, description='When the newest sample was taken. Absent when there is none.'
+    )
+    storeBytes: int | None = Field(None, description="The store's size on disk.")
+    buckets: list[HostBucket]
+    series: list[HostSeries]
+
+
 class Os(StrEnum):
     windows = 'windows'
     linux = 'linux'

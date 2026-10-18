@@ -28,19 +28,23 @@ import asyncio
 import logging
 import platform
 import sys
+import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import __version__, default_topology, reach, standby, tokens
+from .. import __version__, default_topology, host_history, reach, standby, tokens
 from .._generated.common_models import ConfigUpdateRequest, Problem, SignedTrustBundle
 from .._generated.models import (
     Arch,
     ComponentStatus,
     EnrollRequest,
+    HostHistory,
+    HostHistoryStepChoice,
+    HostMetric,
     LocalStandby,
     NodeIdentity,
     NodeReach,
@@ -797,3 +801,74 @@ def _from_enrollment_error(exc: EnrollmentError) -> HTTPException:
         status.HTTP_409_CONFLICT if exc.slug == "already-enrolled" else status.HTTP_502_BAD_GATEWAY
     )
     return _problem(code, exc.slug, exc.title, exc.detail)
+
+
+# --- host history (specs docs/design/host-history.md) -------------------------
+
+
+def _history_store(request: Request) -> host_history.HostHistoryStore:
+    store = getattr(request.app.state, "host_history", None)
+    if not isinstance(store, host_history.HostHistoryStore):
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "host-history-unavailable",
+            "Host history is not available",
+            "This agent has no history store (it is running in safe mode).",
+        )
+    return store
+
+
+@router.get(
+    "/v1/node/history",
+    response_model=HostHistory,
+    response_model_exclude_none=True,
+    dependencies=_read_auth,
+)
+async def get_node_history(
+    request: Request,
+    from_: Annotated[datetime | None, Query(alias="from")] = None,
+    to: datetime | None = None,
+    step: HostHistoryStepChoice = HostHistoryStepChoice.auto,
+    metric: Annotated[list[HostMetric] | None, Query()] = None,
+) -> HostHistory:
+    """What this host's hardware did over a window. See `agent.yaml`."""
+    store = _history_store(request)
+    if not await asyncio.to_thread(store.open):
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "host-history-unavailable",
+            "Host history could not be read",
+            store.error or "the history store could not be opened",
+        )
+    state: AgentState = request.app.state.agent_state
+    settings = host_history.read_settings(state.get_config)
+    try:
+        return await asyncio.to_thread(
+            store.query,
+            now=time.time(),
+            settings=settings,
+            start=from_.timestamp() if from_ is not None else None,
+            end=to.timestamp() if to is not None else None,
+            step=step,
+            metrics=metric,
+        )
+    except host_history.HistoryWindowError as exc:
+        raise _problem(
+            status.HTTP_400_BAD_REQUEST, "host-history-window", "Window refused", str(exc)
+        ) from exc
+
+
+@router.delete("/v1/node/history", status_code=204, dependencies=_write_auth)
+async def delete_node_history(request: Request) -> Response:
+    """Delete everything recorded. Recording, if on, starts again from empty."""
+    store = _history_store(request)
+    if not await asyncio.to_thread(store.open):
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "host-history-unavailable",
+            "Host history could not be deleted",
+            store.error or "the history store could not be opened",
+        )
+    await asyncio.to_thread(store.clear)
+    log.info("host history deleted at an operator's request")
+    return Response(status_code=204)

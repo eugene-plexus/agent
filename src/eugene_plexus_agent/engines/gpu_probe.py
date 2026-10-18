@@ -91,6 +91,10 @@ class Adapter:
     dedicated_used_bytes: int | None = None
     """System-wide, every process included. None when unreadable."""
     shared_used_bytes: int | None = None
+    key: str | None = None
+    """Where the platform's live counters find this adapter: the PDH
+    instance prefix on Windows (`luid_0x00000000_0x0000d550`), the sysfs
+    device directory on Linux. The agent's host history reads by it."""
 
     def budget(self, ram_available: int | None) -> tuple[int | None, int | None]:
         """`(total, free)` as an engine on this adapter would have them.
@@ -434,7 +438,10 @@ def windows_adapters() -> list[Adapter]:
         dedicated_used, shared_used = usage.get(luid, (None, None))
         out.append(
             dataclasses.replace(
-                described, dedicated_used_bytes=dedicated_used, shared_used_bytes=shared_used
+                described,
+                dedicated_used_bytes=dedicated_used,
+                shared_used_bytes=shared_used,
+                key=luid,
             )
         )
     return out
@@ -738,6 +745,7 @@ def linux_adapters(root: Path | str = "/sys/class/drm") -> list[Adapter]:
                     shared_bytes=gtt if apu else None,
                     dedicated_used_bytes=vram_used,
                     shared_used_bytes=gtt_used if apu else None,
+                    key=str(device),
                 )
             )
             continue
@@ -748,6 +756,7 @@ def linux_adapters(root: Path | str = "/sys/class/drm") -> list[Adapter]:
                 integrated=vendor == INTEL and slot == _INTEL_INTEGRATED_SLOT,
                 dedicated_bytes=None,
                 shared_bytes=None,
+                key=str(device),
             )
         )
     return out

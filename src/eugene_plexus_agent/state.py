@@ -418,6 +418,66 @@ CONFIG_FIELDS += [
     ),
 ]
 
+CONFIG_FIELDS += [
+    ConfigField(
+        key="hostHistoryEnabled",
+        label="Record this machine's hardware",
+        description=(
+            "Keeps a history of this machine's hardware for the Hosts page.\n\n"
+            "GPU memory, utilization, temperature and power; CPU, RAM and swap; free "
+            "space where models and engines live. History only helps when it was already "
+            "recording before something went wrong. Off, nothing new is recorded and "
+            "nothing recorded is deleted."
+        ),
+        category="hostHistory",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
+        key="hostHistorySampleSeconds",
+        label="Read the hardware every (seconds)",
+        description=(
+            "How often a reading is taken. Each one costs about 2 ms of CPU on a machine "
+            "with one NVIDIA card."
+        ),
+        category="hostHistory",
+        valueType=ConfigValueType.integer,
+        default=10,
+        minimum=2,
+        maximum=3600,
+    ),
+    ConfigField(
+        key="hostHistoryRawHours",
+        label="Keep every reading for (hours)",
+        description="Every single reading, for the 1-hour view.",
+        category="hostHistory",
+        valueType=ConfigValueType.integer,
+        default=6,
+        minimum=1,
+        maximum=720,
+    ),
+    ConfigField(
+        key="hostHistoryMinuteDays",
+        label="Keep minute averages for (days)",
+        description="The lowest, average and highest of each minute, for views up to a week.",
+        category="hostHistory",
+        valueType=ConfigValueType.integer,
+        default=7,
+        minimum=1,
+        maximum=365,
+    ),
+    ConfigField(
+        key="hostHistoryHourDays",
+        label="Keep hour averages for (days)",
+        description="The lowest, average and highest of each hour, for the 30-day view.",
+        category="hostHistory",
+        valueType=ConfigValueType.integer,
+        default=90,
+        minimum=1,
+        maximum=3650,
+    ),
+]
+
 #: The update channel's default comes from here when it is set and valid,
 #: the way the library's roots do: shown in the UI, never written to the
 #: file. The `:edge` container image sets `edge`.
@@ -450,6 +510,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "storage": "Library",
     "modelStorage": "Model storage",
     "apps": "Apps",
+    "hostHistory": "Host history",
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}
@@ -1083,6 +1144,10 @@ def _validate(field: ConfigField, value: Any) -> str | None:
             return f"expected a whole number, got {type(value).__name__}"
         if value < 0:
             return "must not be negative"
+        if field.minimum is not None and value < field.minimum:
+            return f"must be at least {int(field.minimum)}"
+        if field.maximum is not None and value > field.maximum:
+            return f"must be at most {int(field.maximum)}"
         return None
     if vt == ConfigValueType.path_mappings:
         # Shape only. Existence is checked by `POST /v1/config/test`, for

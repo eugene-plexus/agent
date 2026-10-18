@@ -413,6 +413,37 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             runtime_supervisor.start_at_boot(spec)
         await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
 
+    # Host history (specs docs/design/host-history.md): each agent records
+    # its own host. The store is opened by the first sample, so a file that
+    # cannot be opened costs only this, with the cause on the endpoint.
+    from . import host_history, host_probes
+    from .engines.devices import detect_devices
+
+    history_store = host_history.HostHistoryStore(
+        settings.config_file.resolve().parent / host_history.FILE_NAME
+    )
+    app.state.host_history = history_store
+
+    def _history_probe() -> host_probes.HostProbe:
+        def counts() -> host_probes.RuntimeCounts:
+            ready, loading, pids = runtime_supervisor.host_counts()
+            return host_probes.RuntimeCounts(running=ready, loading=loading, pids=pids)
+
+        return host_probes.HostProbe(
+            devices=getattr(app.state, "device_detector", None) or detect_devices,
+            runtimes=counts,
+            folders=lambda: host_history.folders_of(app.state),
+        )
+
+    history_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(
+            host_history.HostSampler(history_store, _history_probe, state.get_config).run_forever(),
+            name="host-history",
+        )
+    )
+
     # Apps last, and in the background: each start resolves the gateway,
     # which on a worker is a read from the control root, and a root that
     # is down must not hold up supervision of the hub itself.
@@ -510,7 +541,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         all_updates = getattr(app.state, "update_all", None)
         if all_updates is not None:
             await all_updates.close()
-        for task in (approval_task, sign_in_task, firewall_task):
+        for task in (approval_task, sign_in_task, firewall_task, history_task):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)

@@ -490,3 +490,17 @@ def _idle_site_host_loop(monkeypatch: pytest.MonkeyPatch) -> None:
         await asyncio.Event().wait()
 
     monkeypatch.setattr(site_host.SiteHostSupervisor, "run", idle)
+
+
+@pytest.fixture(autouse=True)
+def _idle_host_history_sampler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No real hardware reads from a test app; `test_host_history` ticks
+    the sampler by hand."""
+    import asyncio
+
+    from eugene_plexus_agent import host_history
+
+    async def idle(self: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(host_history.HostSampler, "run_forever", idle)
