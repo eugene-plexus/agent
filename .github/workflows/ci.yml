@@ -42,6 +42,16 @@ jobs:
           python-version: '3.12'
           cache: pip
 
+      # Every Windows install runs the agent from a venv, and the service
+      # code looks for its venv's Scripts\python.exe; the runner's own Python
+      # has none.
+      - name: Use a venv on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP\\venv"
+          echo "$RUNNER_TEMP\\venv\\Scripts" >> "$GITHUB_PATH"
+
       - name: Install package + dev deps
         shell: bash
         run: |

@@ -24,6 +24,7 @@ The three behaviors unique to this adapter, each with its own section:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -479,7 +480,8 @@ def test_manual_install_pins_the_verified_release() -> None:
     install = adapter.manual_install(HostAccelerator(os=Os.macos, arch=Arch.arm64))
     assert install.command is not None
     assert f"mlx-lm=={UPSTREAM_VERSION_PINNED}" in install.command
-    assert "uv venv" in install.command
+    # uv may be named by its full path, quoted, as uv.EXE on Windows.
+    assert re.search(r"uv(\.exe)?['\"]? venv\b", install.command, re.IGNORECASE)
     assert "eugene-mlx" in install.command
     # The Rosetta trap: the notes tell the tester how to verify the
     # environment is native ARM before trusting it.
