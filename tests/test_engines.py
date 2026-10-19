@@ -171,14 +171,19 @@ def test_flash_attention_is_on_off_or_the_engines_own_choice(
 def test_a_checkbox_is_not_read_as_a_setting(
     adapter: LlamaCppAdapter, binary: DiscoveredBinary
 ) -> None:
-    """A runtime saved with the checkbox was converted once when `agent.yaml` was
-    loaded (`test_conversions.py`). A boolean that reaches a launch anyway is not an
-    old save to be understood: the start is refused, naming what it found, so a
-    setting is never silently something other than what it says."""
+    """A runtime saved with the checkbox was converted by v0.3.0 and is no longer. A
+    boolean that reaches a launch is not an old save to be understood: the start is
+    refused, naming what it found, v0.1 and the way out, so a setting is never
+    silently something other than what it says."""
     for checkbox in (True, False):
-        with pytest.raises(ValueError, match="on, off, or not set, not"):
+        with pytest.raises(ValueError) as refused:
             adapter.build_argv(_spec(flags={"flashAttention": checkbox}), binary, port=8090)
-        with pytest.raises(ValueError, match="on, off, or not set, not"):
+        assert str(refused.value) == (
+            f"A saved runtime holds flashAttention as a checkbox ({checkbox}), which v0.1 wrote "
+            "and v0.3.0 converted. This version no longer converts it: start Eugene v0.3.0 once "
+            "to convert it, then update."
+        )
+        with pytest.raises(ValueError, match=r"which v0\.1 wrote"):
             adapter.build_argv(
                 _spec(flags={"flashAttention": checkbox, "cacheType": "q8_0"}), binary, port=8090
             )

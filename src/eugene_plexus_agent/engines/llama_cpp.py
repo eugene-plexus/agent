@@ -967,11 +967,17 @@ def flash_attention_argv(flags: dict[str, object]) -> list[str]:
     cache needs it on, whatever the profile says, so `off` there is overridden
     and logged.
 
-    Only those three are settings. A checkbox saved by v0.1 was converted once
-    when `agent.yaml` was loaded (`conversions.py`), so a boolean here is not an
-    old save to be understood; it is refused, naming what was found.
+    Only those three are settings. A checkbox saved by v0.1 was converted by v0.3.0
+    when it loaded `agent.yaml` and this version does not, so a boolean here is not
+    an old save to be understood; it is refused, naming what was found and the way out.
     """
     choice = flags.get(FLASH_ATTENTION_KEY)
+    if isinstance(choice, bool):
+        raise ValueError(
+            f"A saved runtime holds flashAttention as a checkbox ({choice}), which v0.1 wrote "
+            "and v0.3.0 converted. This version no longer converts it: start Eugene v0.3.0 once "
+            "to convert it, then update."
+        )
     if choice is not None and choice not in FLASH_ATTENTION_CHOICES:
         raise ValueError(f"flashAttention must be on, off, or not set, not {choice!r}")
     quantised = flags.get(CACHE_TYPE_KEY) not in (None, "f16")

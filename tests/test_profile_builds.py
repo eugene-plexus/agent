@@ -687,7 +687,7 @@ def test_a_builds_trials_follow_the_profiles_flash_attention():
 
 
 def test_a_build_refuses_a_checkbox_where_flash_attention_is_a_choice():
-    """What v0.1 saved as a checkbox was converted once (`conversions.py`); a profile
+    """What v0.1 saved as a checkbox was converted by v0.3.0; a profile
     that still carries one is refused up front, naming the setting, not measured."""
     from eugene_plexus_agent.profile_builds import validate_request
 

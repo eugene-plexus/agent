@@ -108,7 +108,7 @@ def test_a_benchmark_follows_the_three_flash_attention_states():
     assert flash(flashAttention="off", cacheType="q8_0") == "on"
     with pytest.raises(ValueError, match="on, off, or not set"):
         flash(flashAttention="sometimes")
-    # A checkbox is what v0.1 saved and `conversions.py` rewrote: it is not read here.
+    # A checkbox is what v0.1 saved and v0.3.0 converted: it is not read here.
     for checkbox in (True, False):
-        with pytest.raises(ValueError, match="on, off, or not set"):
+        with pytest.raises(ValueError, match=r"which v0\.1 wrote"):
             flash(flashAttention=checkbox)

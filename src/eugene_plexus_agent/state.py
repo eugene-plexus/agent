@@ -6,8 +6,10 @@ firstRunComplete) and `TopologyStore` (the components list under
 `/v1/components`). Both share one lock and one on-disk file so concurrent
 PATCH operations from different routes can't corrupt each other.
 
-The on-disk shape (`stateVersion` is the format this release reads and writes; a
-file without it is one v0.1 wrote, converted once by `conversions.py`):
+The on-disk shape (`stateVersion` is the format this release writes on every write;
+a file without it is read as it is, since a v0.2 file that was never rewritten may
+lack it. What v0.1 wrote and v0.3.0 converted is no longer converted: a checkbox
+flash attention in a saved runtime is refused when the runtime starts, naming v0.1):
 
     stateVersion: 2
     firstRunComplete: false
@@ -47,7 +49,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from . import conversions, model_copies, model_paths, ports, share_credentials
+from . import model_copies, model_paths, ports, share_credentials
 from ._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -65,6 +67,9 @@ from ._generated.models import (
     RuntimeSpec,
 )
 from ._private_files import write_private
+
+#: Written to `agent.yaml` by every write: the format this release writes.
+STATE_VERSION = 2
 
 # Port range the agent assigns engine runtimes from when the operator
 # doesn't pick one. Above the component ports (8079-8083) and clear of the
@@ -579,13 +584,9 @@ class AgentState:
     def load(self) -> None:
         with self._lock:
             if self._path.exists():
-                original = self._path.read_bytes()
-                raw = yaml.safe_load(original.decode("utf-8")) or {}
+                raw = yaml.safe_load(self._path.read_bytes().decode("utf-8")) or {}
                 if not isinstance(raw, dict):
                     raise ValueError(f"{self._path} must be a YAML mapping at the root")
-                # What v0.1 saved is converted once, kept as it was, and read in the
-                # current format only from here on (`conversions.py`).
-                raw = conversions.convert(self._path, original, raw)
                 merged = _config_defaults()
                 for k, v in raw.items():
                     field = _CONFIG_FIELDS_BY_KEY.get(k)
@@ -1069,8 +1070,7 @@ class AgentState:
         + `os.replace`, with the mode given at creation.
         """
         out: dict[str, Any] = dict(self._config)
-        # The format this release reads and writes; a file without it is one v0.1 wrote.
-        out["stateVersion"] = conversions.STATE_VERSION
+        out["stateVersion"] = STATE_VERSION
         out["components"] = [
             entry.model_dump(exclude_none=True, mode="json") for entry in self._components.values()
         ]
