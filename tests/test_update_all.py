@@ -105,7 +105,8 @@ def manager(tmp_path, monkeypatch, fleet):
 
 
 async def done(instance):
-    await asyncio.wait_for(asyncio.shield(instance._task), timeout=2)
+    # A hang guard, not a speed check: the Windows runner is slow at the state writes.
+    await asyncio.wait_for(asyncio.shield(instance._task), timeout=10)
     return instance.run
 
 

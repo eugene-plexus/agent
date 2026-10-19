@@ -559,7 +559,7 @@ async def test_late_ready_probe_cannot_belong_to_a_replacement(
     monkeypatch.setattr(harness.adapter, "probe_readiness", delayed)
     probe = asyncio.create_task(harness.supervisor._probe_one(harness.spec))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), 10)
         process._finish(1)
         replacement = await harness.next_process()
         release.set()
