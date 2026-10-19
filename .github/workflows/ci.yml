@@ -24,8 +24,16 @@ jobs:
           ./gitleaks dir . --no-banner --redact
 
   lint-typecheck-test:
-    name: Lint, type-check, test
-    runs-on: ubuntu-latest
+    # Windows too: the service, tray and job-site code is Windows-only, and
+    # until v0.3.0's qualification no CI ran these tests with pywin32
+    # (2026-10-19). Windows installs carry the service and tray extras.
+    name: Lint, type-check, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
 
@@ -35,7 +43,13 @@ jobs:
           cache: pip
 
       - name: Install package + dev deps
-        run: pip install -e ".[dev]"
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            pip install -e ".[dev,service,tray]"
+          else
+            pip install -e ".[dev]"
+          fi
 
       - name: Verify vendored platform integrity
         run: python scripts/check-vendored.py
