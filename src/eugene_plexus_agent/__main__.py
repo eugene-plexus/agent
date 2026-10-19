@@ -91,6 +91,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Name for this node in the install. Defaults to the hostname.",
     )
     join.add_argument(
+        "--label",
+        metavar="LABEL",
+        help=(
+            'The name people see for this machine, spaces allowed ("Studio PC"). '
+            "Changeable later from Nodes; the name above stays its identity."
+        ),
+    )
+    join.add_argument(
         "--advertise",
         metavar="URL",
         help=(
@@ -123,6 +131,7 @@ def main(argv: list[str] | None = None) -> None:
                     name=args.name,
                     advertise_url=args.advertise,
                     force=args.force,
+                    label=args.label,
                 ),
                 settings,
             )

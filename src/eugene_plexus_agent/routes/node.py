@@ -305,6 +305,7 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
             control_url=control_url,
             token=body.token,
             name=body.name,
+            label=body.label,
             advertise_url=advertise,
             devices=[d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
             transport=getattr(request.app.state, "control_transport", None),

@@ -178,6 +178,7 @@ async def perform_enrollment(
     name: str | None,
     advertise_url: str | None,
     devices: list[dict[str, Any]] | None = None,
+    label: str | None = None,
     transport: Any = None,
 ) -> EnrollmentOutcome:
     """Exchange a join token for membership, and persist the result.
@@ -216,6 +217,10 @@ async def perform_enrollment(
     }
     if advertise_url is not None:
         payload["url"] = advertise_url
+    # The name people see (node-labels.md). The root checks it, before the
+    # token is spent; omitted, a machine enrolling again keeps its label.
+    if label is not None and label.strip():
+        payload["label"] = label.strip()
 
     try:
         async with internal_client(timeout=ENROLL_TIMEOUT_SECONDS, transport=transport) as client:
@@ -228,6 +233,15 @@ async def perform_enrollment(
             f"this agent is still unenrolled.",
         ) from exc
 
+    if response.status_code == 409 and _problem_title(response) == LABEL_TAKEN_TITLE:
+        # The name people see is another machine's (node-labels.md). Not a
+        # token problem: the root refused before spending it.
+        raise EnrollmentError(
+            "label-taken",
+            LABEL_TAKEN_TITLE,
+            f"{problem_detail(response)} Choose another name for this machine; the join "
+            "token was not used and nothing was recorded.",
+        )
     if response.status_code in (401, 409):
         # The root answers 401 for a token it does not know or that has
         # expired, and 409 for one already used. Neither changes by trying
@@ -418,6 +432,22 @@ async def keep_address_announced(
                     delay = min(delay * 2, ANNOUNCE_RETRY_MAX_SECONDS)
                     continue
         await sleep(ADDRESS_RECHECK_SECONDS)
+
+
+#: The control root's title for a label another machine has (`labelNode`).
+LABEL_TAKEN_TITLE = "Name already in use"
+
+
+def _problem_title(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("detail")
+    title = inner.get("title") if isinstance(inner, dict) else payload.get("title")
+    return title if isinstance(title, str) else None
 
 
 def problem_detail(response: httpx.Response) -> str:

@@ -1011,6 +1011,40 @@ def test_enrollment_sends_the_nodes_signing_public_key(
     assert store.record.signing_public_key != store.record.public_key
 
 
+def test_enrollment_carries_the_label_only_when_one_is_given(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The first-run wizard names the control host (node-labels.md). With
+    no label the field is absent, so a machine enrolling again keeps the
+    label the root holds for it."""
+    _enroll(authed_client, control, label="  Studio PC  ")
+    assert control.enroll_requests[-1]["label"] == "Studio PC"
+    assert control.enroll_requests[-1]["name"] == "gpu-box", "the name does not move"
+
+
+def test_a_taken_label_is_named_as_such_not_as_a_refused_token(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The root answers 409 for a used token and for a taken label; only the
+    first is a token problem, and the person fixes the second by typing."""
+    control.refuse = (
+        409,
+        {"title": "Name already in use", "detail": "Another machine is already called 'NAS'."},
+    )
+    answer = _enroll(authed_client, control, label="NAS")
+    assert answer.status_code == 502, answer.text
+    assert "label-taken" in answer.text and "already called 'NAS'" in answer.text
+    assert "join token was not used" in answer.text
+    assert "Join token refused" not in answer.text
+
+
+def test_enrollment_without_a_label_sends_none(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    _enroll(authed_client, control)
+    assert "label" not in control.enroll_requests[-1]
+
+
 @pytest.mark.asyncio
 async def test_a_node_that_moved_announces_its_new_address(
     authed_client: TestClient, control: FakeControl

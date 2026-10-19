@@ -2570,6 +2570,12 @@ class EnrollRequest(BaseModel):
         None,
         description="Requested node name. Defaults to the host's own name, which\nis the answer an operator would have typed anyway.\n",
     )
+    label: str | None = Field(
+        None,
+        description="The name people see for this machine, passed to the control\nroot's enrollment as `EnrollmentRequest.label` and checked there\n(`NodeLabel` in `control.yaml`). The first-run wizard sends what\nthe person typed for this machine; omitted, the machine is shown\nby its name.\n",
+        max_length=64,
+        min_length=1,
+    )
 
 
 class ServiceTokenRequest(BaseModel):

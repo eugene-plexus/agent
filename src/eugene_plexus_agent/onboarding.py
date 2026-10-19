@@ -76,6 +76,7 @@ class JoinRequest:
     name: str | None = None
     advertise_url: str | None = None
     force: bool = False
+    label: str | None = None
 
 
 def has_tty() -> bool:
@@ -342,6 +343,7 @@ async def _join(
         control_url=request.control_url,
         token=request.token,
         name=request.name,
+        label=request.label,
         advertise_url=advertise,
         devices=[d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
     )
