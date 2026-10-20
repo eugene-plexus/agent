@@ -617,6 +617,10 @@ class SupervisedProcess:
         # a diagnostic aid, not a log: the log already has everything.
         self._output_tail: deque[str] = deque(maxlen=_OUTPUT_TAIL_LINES)
         self.last_restart: datetime | None = None
+        #: How many times this process was spawned: what tells one run from the next.
+        #: `last_restart` cannot -- on Windows under Python 3.12 the clock ticks every
+        #: 15.6 ms, so a respawn can carry the same time as the run it replaced.
+        self.spawns = 0
 
     @classmethod
     def for_component(
@@ -1008,6 +1012,7 @@ class SupervisedProcess:
             (v for k, v in (plan.env or {}).items() if k.endswith("_BIND_HOST")), None
         )
         self.last_restart = datetime.now(UTC)
+        self.spawns += 1
         self.last_error = None
 
         # Background reader: drains the child's stdout pipe and re-emits

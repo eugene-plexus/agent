@@ -427,14 +427,14 @@ class RuntimeSupervisor:
         # process because it is an *observation*, not loop state — the
         # same reason component safe-mode observations live on Supervisor.
         self._readiness: dict[str, Loading | Ready | None] = {}
-        #: Which PROCESS proved residency: runtime name -> the
-        #: `last_restart` marker of the process that returned Ready.
+        #: Which PROCESS proved residency: runtime name -> the run
+        #: (`_run_of`) of the process that returned Ready.
         #: Feeds `probe_readiness(established=...)`, so an expensive
         #: first proof (MLX generates a token) is paid once per process
         #: rather than once per poll. Keyed on the restart marker, not
         #: the name, because a crash-and-respawn binds its port before
         #: loading and would otherwise inherit the old proof.
-        self._proved_ready: dict[str, datetime] = {}
+        self._proved_ready: dict[str, _Run] = {}
         # Why a stopped runtime is stopped — an observation, reported on
         # `Runtime.stopReason` and never replicated. Cleared the moment the
         # runtime is started. Only `operator` is also persisted, through
@@ -458,9 +458,9 @@ class RuntimeSupervisor:
         # SD1: (drafted, accepted) from each speculating engine's `/metrics`,
         # and when they were read, so the counters are read every few
         # seconds rather than on every readiness poll.
-        # Keyed on the process too (`last_restart`): counters count from the
+        # Keyed on the process too (`_run_of`): counters count from the
         # engine's start, so a restart's are new ones.
-        self._speculation: dict[str, tuple[datetime | None, float, int | None, int | None]] = {}
+        self._speculation: dict[str, tuple[_Run, float, int | None, int | None]] = {}
         # The declared model paths this loop last reconciled against.
         # None until the first pass, so a fresh agent reconciles once.
         self._last_declared: set[str] | None = None
@@ -1030,7 +1030,7 @@ class RuntimeSupervisor:
             return None
         sp = self._processes.get(spec.name)
         counters = self._speculation.get(spec.name) if status in _PROCESS_RUNNING else None
-        if counters is not None and sp is not None and counters[0] == sp.last_restart:
+        if counters is not None and sp is not None and counters[0] == _run_of(sp):
             view.draftedTokens, view.acceptedTokens = counters[2], counters[3]
         return view
 
@@ -1117,9 +1117,9 @@ class RuntimeSupervisor:
         adapter = adapter_for(spec.engine)
         if adapter is None:
             return
-        started_at = sp.last_restart
+        started_at = _run_of(sp)
         base = f"http://{spec.host or '127.0.0.1'}:{spec.port}"
-        established = started_at is not None and self._proved_ready.get(spec.name) == started_at
+        established = started_at[0] is not None and self._proved_ready.get(spec.name) == started_at
         # A credential the engine was started with (Kev's `KEV_API_KEY`):
         # passed only when there is one, so every other engine's probe
         # is called exactly as before.
@@ -1129,11 +1129,7 @@ class RuntimeSupervisor:
             if headers
             else adapter.probe_readiness(base, established=established)
         )
-        if (
-            self._processes.get(spec.name) is not sp
-            or sp.last_restart != started_at
-            or sp.pid is None
-        ):
+        if self._processes.get(spec.name) is not sp or _run_of(sp) != started_at or sp.pid is None:
             return
         # The probe saw the network. This is where what the supervisor
         # knows — the pid is alive, and for how long — is added: for an
@@ -1149,7 +1145,7 @@ class RuntimeSupervisor:
             elapsed_seconds=elapsed,
         )
         sp.observe_readiness(isinstance(outcome, Ready))
-        if isinstance(outcome, Ready) and started_at is not None:
+        if isinstance(outcome, Ready) and started_at[0] is not None:
             self._proved_ready[spec.name] = started_at
         if isinstance(outcome, Ready | Loading):
             self._readiness[spec.name] = outcome
@@ -1159,7 +1155,7 @@ class RuntimeSupervisor:
             await self._read_speculation(spec, adapter, base, started_at)
 
     async def _read_speculation(
-        self, spec: RuntimeSpec, adapter: EngineAdapter, base: str, started_at: datetime | None
+        self, spec: RuntimeSpec, adapter: EngineAdapter, base: str, started_at: _Run
     ) -> None:
         """The engine's drafted and accepted token counts, for the run's
         acceptance rate (SD1). A fact on the screen, never a decision."""
@@ -1176,6 +1172,15 @@ class RuntimeSupervisor:
                 self._speculation[spec.name] = (started_at, now, None, None)
             return
         self._speculation[spec.name] = (started_at, now, *counters)
+
+
+#: One run of a runtime's process: when it was spawned, and which spawn it was. The time
+#: alone does not tell two runs apart on Windows under Python 3.12 (15.6 ms ticks).
+_Run = tuple[datetime | None, int]
+
+
+def _run_of(sp: SupervisedProcess) -> _Run:
+    return (sp.last_restart, sp.spawns)
 
 
 # One installer per engine, created on demand and kept for the life of the

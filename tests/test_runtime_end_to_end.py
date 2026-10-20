@@ -573,6 +573,57 @@ async def test_late_ready_probe_cannot_belong_to_a_replacement(
         await probe
 
 
+async def test_a_late_ready_probe_is_not_the_replacements_when_both_started_in_one_tick(
+    controlled_runtime: _RuntimeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows under Python 3.12 the clock moves every 15.6 ms, so a respawn can carry the
+    very time of the run it replaced: what tells the runs apart is which spawn it was, not
+    when (agent#19, seen on the Windows CI runner)."""
+    from datetime import datetime
+
+    from eugene_plexus_agent import supervisor as supervisor_module
+
+    harness = controlled_runtime
+    process = await harness.next_process()
+    await harness.probe(Ready())
+    frozen = harness.supervisor._processes[harness.spec.name].last_restart
+    assert frozen is not None
+
+    class _OneTick:
+        """The clock has not moved since the first run started."""
+
+        @staticmethod
+        def now(tz: Any = None) -> datetime:
+            assert frozen is not None
+            return frozen
+
+    monkeypatch.setattr(supervisor_module, "datetime", _OneTick)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed(_base: str, *, established: bool = False) -> Ready:
+        entered.set()
+        await release.wait()
+        return Ready()
+
+    monkeypatch.setattr(harness.adapter, "probe_readiness", delayed)
+    probe = asyncio.create_task(harness.supervisor._probe_one(harness.spec))
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        process._finish(1)
+        replacement = await harness.next_process()
+        assert harness.supervisor._processes[harness.spec.name].last_restart == frozen
+        release.set()
+        await probe
+        replacement._finish(1)
+        await harness.settled()
+        assert harness.spawned.empty()
+        assert harness.backoffs == [2.0]
+    finally:
+        release.set()
+        await probe
+
+
 async def test_the_probe_carries_the_headers_the_adapter_asks_for(
     controlled_runtime: _RuntimeHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
