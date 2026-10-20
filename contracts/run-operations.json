@@ -1918,6 +1918,17 @@
                 "type": "null"
               }
             ]
+          },
+          "installEngine": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/EngineKind"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The engine the person agreed, at the click, to install if the node lacks it (CX3). Checking that stops for this engine goes straight on to installing; any other engine still waits for an answer."
           }
         },
         "additionalProperties": false,
