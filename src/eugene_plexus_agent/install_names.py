@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 
 import httpx
 
@@ -19,17 +20,35 @@ from ._http import internal_client
 log = logging.getLogger(__name__)
 
 _SUFFIXES = ("local", "home.arpa", "internal", "lan", "localhost")
+#: The install CA's permitted ranges, as control's `install_ca` has them.
+_NETWORKS = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "fc00::/7",
+        "fe80::/10",
+        "::1/128",
+    )
+)
+_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 def signable(name: str) -> bool:
-    """Whether the install CA may sign `name` (the root decides; this only
-    keeps names it would refuse out of the request)."""
+    """Whether the install CA may sign `name`: the root's rule
+    (`install_ca.permitted`), so a name it would refuse is never sent and
+    the rest are listed."""
     name = name.strip().rstrip(".").lower()
     try:
         address = ipaddress.ip_address(name.strip("[]"))
     except ValueError:
+        if not name or len(name) > 253 or not all(_LABEL.match(p) for p in name.split(".")):
+            return False
         return any(name == s or name.endswith("." + s) for s in _SUFFIXES)
-    return address.is_private or address in ipaddress.ip_network("100.64.0.0/10")
+    return any(address in network for network in _NETWORKS)
 
 
 async def add(control_url: str, node: str, names: list[str], authorization: str) -> None:

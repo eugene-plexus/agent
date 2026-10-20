@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import ssl
 from asyncio import sslproto
 from collections.abc import Callable
@@ -71,6 +72,19 @@ class Door:
     error: str | None = None
 
 
+def _source(peer: str) -> str:
+    """What the per-address cap counts: the address, or its /64 for IPv6."""
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is None:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return peer
+
+
 def feed(protocol: asyncio.BaseProtocol, data: bytes) -> None:
     """Hand bytes already read to a protocol, buffered or not."""
     if isinstance(protocol, asyncio.BufferedProtocol):
@@ -85,17 +99,24 @@ def feed(protocol: asyncio.BaseProtocol, data: bytes) -> None:
         protocol.data_received(data)  # type: ignore[attr-defined]
 
 
+_HOST = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(:[0-9]{1,5})?$")
+_PATH = re.compile(r"^/[!-~]*$")
+
+
 def _request_target(data: bytes) -> tuple[str | None, str]:
-    """The `Host` and the path of a plain request's first bytes, when they hold them."""
+    """The `Host` and the path of a plain request's first bytes, when they
+    hold them and are well formed: they are echoed in the refusal, so
+    anything else (a bare LF, a space, a quote) is dropped, never echoed."""
     head = data.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
-    lines = head.split("\r\n")
+    lines = head.replace("\r\n", "\n").split("\n")
     parts = lines[0].split(" ")
-    path = parts[1] if len(parts) >= 2 and parts[1].startswith("/") else "/"
+    path = parts[1] if len(parts) >= 2 and _PATH.match(parts[1]) else "/"
     host = None
     for line in lines[1:]:
         name, _, value = line.partition(":")
         if name.strip().lower() == "host":
-            host = value.strip() or None
+            value = value.strip()
+            host = value if _HOST.match(value) else None
     return host, path
 
 
@@ -103,6 +124,8 @@ def refusal(data: bytes, port: int, fallback_host: str | None) -> bytes:
     """A plain request from another machine, while plain is off: a 403 that
     names the same address over `https://`."""
     host, path = _request_target(data)
+    if fallback_host and ":" in fallback_host and not fallback_host.startswith("["):
+        fallback_host = f"[{fallback_host}]"
     authority = host or (f"{fallback_host}:{port}" if fallback_host else None)
     url = f"https://{authority}{path}" if authority else f"https on port {port}"
     body = (
@@ -143,21 +166,24 @@ class Doors:
     # ---- bookkeeping shared by every door ------------------------------------
 
     def admit(self, transport: asyncio.BaseTransport, peer: str) -> bool:
-        """Room for one more connection, in all and from this address.
+        """Room for one more connection from another machine, in all and from
+        this address (an IPv6 /64 counts as one: privacy addresses are free).
 
         Counted by transport, not by protocol: uvicorn replaces the protocol
         on a WebSocket upgrade, and a count kept by the protocol would leak.
-        Loopback has no per-address cap; every child of this agent is there.
+        Loopback is not counted: this machine's own children (Workbench to the
+        gateway, the `/link` pages) are never shut out by the LAN.
         """
+        if peer_module.is_loopback(peer):
+            return True
         for live in [t for t in self._live if t.is_closing()]:
             del self._live[live]
         if len(self._live) >= MAX_CONNECTIONS:
             return False
-        if not peer_module.is_loopback(peer) and (
-            sum(1 for p in self._live.values() if p == peer) >= MAX_PER_PEER
-        ):
+        source = _source(peer)
+        if sum(1 for p in self._live.values() if p == source) >= MAX_PER_PEER:
             return False
-        self._live[transport] = peer
+        self._live[transport] = source
         return True
 
     def count_plain(self, door: str, peer: str) -> None:
@@ -364,6 +390,10 @@ class _PumpDoor:
         self._doors, self._door, self._bind_host = doors, door, bind_host
         self._plain_target, self._tls_target = plain_target, tls_target
         self._fallback = fallback_target
+        #: Once the child has answered on its TLS port it listens there, so a
+        #: refused connection is a restart, not an app without one: no TLS
+        #: connection is then sent to the plain port (adversarial review).
+        self.tls_answered = False
         self._server: asyncio.Server | None = None
 
     async def start(self) -> None:
@@ -372,7 +402,12 @@ class _PumpDoor:
         def factory() -> asyncio.Protocol:
             def inner(tls: bool) -> asyncio.BaseProtocol:
                 if tls:
-                    return _Pump(self._tls_target, self._door.name, self._fallback)
+                    return _Pump(
+                        self._tls_target,
+                        self._door.name,
+                        None if self.tls_answered else self._fallback,
+                        on_connected=self._tls_connected,
+                    )
                 return _Pump(self._plain_target, self._door.name)
 
             return _Sniff(self._doors, self._door.name, self._door.port, inner)
@@ -400,6 +435,9 @@ class _PumpDoor:
             self._door.port,
         )
 
+    def _tls_connected(self) -> None:
+        self.tls_answered = True
+
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
@@ -415,8 +453,10 @@ class _Pump(asyncio.Protocol):
         target: Callable[[], int | None],
         door: str,
         fallback: Callable[[], int | None] | None = None,
+        on_connected: Callable[[], None] | None = None,
     ) -> None:
         self._target, self._door, self._fallback = target, door, fallback
+        self._on_connected = on_connected
         self._client: asyncio.Transport | None = None
         self._upstream: asyncio.Transport | None = None
         self._buffer: list[bytes] = []
@@ -448,9 +488,11 @@ class _Pump(asyncio.Protocol):
                 log.debug("%s door: 127.0.0.1:%d did not answer: %s", self._door, port, exc)
                 self.close()
                 return
-            self._fallback = None
+            self._fallback, self._on_connected = None, None
             await self._connect(fallback)
             return
+        if self._on_connected is not None:
+            self._on_connected()
         if self._closed:
             transport.close()
             return

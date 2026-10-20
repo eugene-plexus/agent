@@ -166,6 +166,17 @@ def build_table(
             and agent.startswith("http://")
             and not is_loopback_host(urlsplit(agent).hostname)
         ):
+            if agent == origin:
+                # The root's address is the root's: a node claiming it is
+                # ignored (adversarial review, 2026-10-20).
+                log.warning("%s claims the root's address %s; ignored", name, agent)
+                continue
+            if agent in routes and names.get(agent) != name:
+                # Two records claim one address: neither is carried there.
+                log.warning("%s and %s both claim %s; neither is trusted there",
+                            names.get(agent), name, agent)  # fmt: skip
+                routes[agent] = None
+                continue
             routes[agent] = (carried + "/agent") if carried else None
             names[agent] = name
     # Routes through a door that turned out contested carry nothing.

@@ -407,7 +407,9 @@ async def announce_address(
 
     if response.status_code != 200:
         detail = problem_detail(response)
-        later = response.status_code >= 500 or response.status_code in (408, 429)
+        # 409: another machine holds the address (LT2 review); it is let in
+        # once that one announces where it moved, so ask again later.
+        later = response.status_code >= 500 or response.status_code in (408, 409, 429)
         # 401 here has one likely cause and it is worth naming, because
         # the symptom (a node nothing can reach) is far away from it.
         if response.status_code == 401:

@@ -188,15 +188,18 @@ def _names_of(certificate: x509.Certificate) -> list[str]:
     return [str(n.value) for n in san if isinstance(n, x509.DNSName | x509.IPAddress)]
 
 
-def bundle_text(ca_pem: str) -> str:
-    """Certifi's roots, any bundle this process was already given, then the CA."""
+def bundle_text(ca_pem: str, *, inherited: bool = False) -> str:
+    """Certifi's roots, then the CA. With `inherited`, any bundle this process
+    was already given too (the container entry point's own CA): for this
+    machine's apps only, never the bundle served to other devices, which
+    must name no CA without the install CA's name constraint."""
     import os
 
     import certifi
 
     parts = [Path(certifi.where()).read_text(encoding="utf-8")]
     existing = os.environ.get("SSL_CERT_FILE")
-    if existing and Path(existing).name != BUNDLE_FILE:
+    if inherited and existing and Path(existing).name != BUNDLE_FILE:
         with contextlib.suppress(OSError):
             parts.append(Path(existing).read_text(encoding="utf-8"))
     parts.append(ca_pem)
@@ -271,7 +274,7 @@ class ClientTls:
         write_private(chain, key.rstrip() + "\n" + str(held["certificate"]).rstrip() + "\n")
         write_private(self.directory / KEY_FILE, key.rstrip() + "\n")
         write_private(self.directory / CERT_FILE, str(held["certificate"]).rstrip() + "\n")
-        write_private(self.directory / BUNDLE_FILE, bundle_text(str(held["ca"])))
+        write_private(self.directory / BUNDLE_FILE, bundle_text(str(held["ca"]), inherited=True))
         context = _server_context(chain, chain)
         # This agent's own clients trust the CA too: a proxy here may present
         # its leaf (the container's entry point), and so may every other node.
