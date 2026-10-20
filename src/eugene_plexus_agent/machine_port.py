@@ -398,15 +398,20 @@ class _Inner:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.bind(("127.0.0.1", 0))
         self.port = int(self.sock.getsockname()[1])
+        # No logging settings: `Config()` applies them to the process-wide
+        # `uvicorn.*` loggers, which silenced the agent's own server (its
+        # shutdown lines and access log). Access lines are turned off on this
+        # config alone, after it is built.
         config = uvicorn.Config(
             app,
             lifespan="off",
-            log_level="warning",
-            access_log=False,
+            log_config=None,
+            log_level=None,
             proxy_headers=False,
             forwarded_allow_ips=[],
             timeout_keep_alive=30,
         )
+        config.access_log = False
         config.load()
         config.ssl = context
         self.server = uvicorn.Server(config)
@@ -667,27 +672,20 @@ def move_control_behind(state: Any, machine_port: int) -> int | None:
 
 
 def bind_host_for(app: Any) -> str:
-    """Wide wherever control's port used to be: the agent binds wide, the node
-    advertises an address, or it is a container whose 8083 is published."""
-    import os
-
-    from . import node_identity
+    """Wide wherever what it fronts used to be: the agent binds wide, or
+    control or a driver the root dials would bind wide on its own (the node
+    advertises an address, or a container sets it). Behind a container's
+    HTTPS entry point control stays on loopback, and so does this port."""
+    from .app import _child_bind_host
 
     settings = app.state.settings
     bound = getattr(app.state, "bind_host", None) or settings.bind_host
     if bound in ("0.0.0.0", "::"):
         return "0.0.0.0"
-    advertise = node_identity.effective_advertise_url(
-        app.state.agent_state.get_config("advertiseUrl"),
-        app.state.node_identity.record.advertise_url,
-    )
-    if not node_identity.is_loopback_host(node_identity.advertise_host(advertise)):
-        return "0.0.0.0"
-    if settings.entrypoint_config or os.environ.get("EUGENE_PLEXUS_CONTROL_BIND_HOST") in (
-        "0.0.0.0",
-        "::",
-    ):
-        return "0.0.0.0"
+    for kind in ("control", "inference-driver"):
+        host = _child_bind_host(settings, app.state.agent_state, app.state.node_identity, kind)
+        if host in ("0.0.0.0", "::"):
+            return "0.0.0.0"
     return "127.0.0.1"
 
 

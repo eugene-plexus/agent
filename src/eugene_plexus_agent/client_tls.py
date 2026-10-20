@@ -550,7 +550,7 @@ class GatewayDoor:
     async def ensure(self, app: Any) -> None:
         """Open, move or close the door to match the topology and the bind
         the gateway would have had on its own. Never raises."""
-        from .app import _base_child_env
+        from .app import _child_bind_host
 
         state = app.state.agent_state
         entry = gateway_entry(state)
@@ -560,9 +560,9 @@ class GatewayDoor:
                 await self.doors.close("gateway")
                 self.inner, self.bind_host = None, None
             return
-        wanted = _base_child_env(app.state.settings, state, app.state.node_identity, "gateway").get(
-            "BIND_HOST", "127.0.0.1"
-        )
+        # The container sets the gateway's own bind (its `BIND_HOST`
+        # variable), which the agent never passes on: read it the same way.
+        wanted = _child_bind_host(app.state.settings, state, app.state.node_identity, "gateway")
         door = self.doors.doors.get("gateway")
         if door is not None and door.listening and wanted == self.bind_host and door.port == port:
             return

@@ -1058,6 +1058,28 @@ def _base_child_env(
     return env
 
 
+def _child_bind_host(
+    settings: Settings,
+    state: AgentState,
+    identity: node_identity.NodeIdentityStore,
+    kind: str,
+) -> str:
+    """The interface a child of `kind` would bind on its own: what the agent
+    tells it, else the `<PREFIX>_BIND_HOST` it inherits (the image sets one
+    per kind), else its loopback default. A port the agent now opens in
+    front of that child (the gateway's door, the machine port) binds here."""
+    import os
+
+    from .supervisor import _COMPONENT_SPECS
+
+    told = _base_child_env(settings, state, identity, kind).get("BIND_HOST")
+    if told:
+        return told
+    prefixes = [spec.env_prefix for k, spec in _COMPONENT_SPECS.items() if k.value == kind]
+    inherited = os.environ.get(f"{prefixes[0]}_BIND_HOST") if prefixes else None
+    return inherited or "127.0.0.1"
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build a FastAPI app with all routers mounted."""
     settings = settings or load_settings()
