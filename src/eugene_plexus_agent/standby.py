@@ -35,8 +35,9 @@ log = logging.getLogger(__name__)
 STANDBY_COMPONENT = "standby"
 #: Where its copy of the replication set lives, beside agent.yaml.
 STATE_DIR_NAME = "standby-state"
-#: A control root's port; a worker runs no other control.
-CONTROL_PORT = 8083
+#: Where a standby control looks for a free port: above the machine port,
+#: which takes 8083 on every node (LT1).
+CONTROL_PORT = 8084
 #: What a control root's `/healthz` says it is (`details.role`).
 ROLE_ACTIVE = "control"
 ROLE_STANDBY = "standby"
@@ -135,7 +136,10 @@ async def _reconcile(app: Any) -> None:
             log.error("this node holds the standby grant but records no control root to follow")
             return
         taken = {_port_of(e) for e in state.list_topology_entries()}
-        port = ports.first_free(CONTROL_PORT, reserved=(RESERVED_PORTS - {CONTROL_PORT}) | taken)
+        port = ports.first_free(
+            CONTROL_PORT,
+            reserved=(RESERVED_PORTS - {CONTROL_PORT}) | taken | {app.state.settings.machine_port},
+        )
         entry = state.add_topology_entry(
             ComponentEntry(
                 name=STANDBY_COMPONENT,

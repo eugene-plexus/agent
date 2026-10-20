@@ -262,6 +262,10 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
             flush=True,
         )
 
+    # The machine port (LT1): an install's agent always opens it, unless the
+    # environment said otherwise (two agents on one host in a dev run).
+    if "machine_port_enabled" not in settings.model_fields_set:
+        settings.machine_port_enabled = True
     app = create_app(settings)
     # The interface this process will actually listen on, recorded where
     # `GET /v1/node`'s `reach` can read it. Not the same thing as the

@@ -469,6 +469,10 @@ class _ComponentPlanner:
             else {}
         )
         for suffix, value in shared.items():
+            if suffix == "MACHINE_PINS_FILE":
+                # `_http`'s own variable, the same in every component (LT1).
+                env["EUGENE_PLEXUS_MACHINE_PINS_FILE"] = str(value)
+                continue
             env[f"{prefix}_{suffix}"] = str(value)
 
         if spawn.env:

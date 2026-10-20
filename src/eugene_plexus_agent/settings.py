@@ -40,6 +40,18 @@ class Settings(BaseSettings):
     (`EUGENE_PLEXUS_<KIND>_AGENT_URL`) from this value rather than from a
     loopback:8079 assumption that was only ever wrong about the port."""
 
+    machine_port: int = 8083
+    """This node's machine port (LT1, LT-C1): the one TLS door the other
+    machines of the install reach it through. 8083 on every node. Set
+    otherwise only to run two nodes on one host for development or an
+    acceptance run; another machine finds the port in the URL this node
+    announces, never by assuming 8083."""
+
+    machine_port_enabled: bool = False
+    """Whether this process opens the machine port. `build_server` turns it
+    on, so the agent an install runs always has one; an app built in a test
+    or a harness does not bind 8083 unless it asks."""
+
     safe_mode: bool = False
     """If true, skip loading the persistent state file at startup and run on
     built-in defaults — empty topology, default UI prefs. Provides a recovery

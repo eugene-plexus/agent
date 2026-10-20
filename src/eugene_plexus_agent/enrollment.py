@@ -39,6 +39,7 @@ import asyncio
 import logging
 import platform
 import random
+import re
 import socket
 import sys
 from collections.abc import Awaitable, Callable
@@ -48,7 +49,7 @@ from typing import Any
 import httpx
 
 from . import __version__, tokens
-from ._http import internal_client
+from ._http import internal_client, refused_pin
 from .node_identity import (
     NodeIdentityStore,
     address_message,
@@ -180,12 +181,21 @@ async def perform_enrollment(
     devices: list[dict[str, Any]] | None = None,
     label: str | None = None,
     transport: Any = None,
+    machine: dict[str, str] | None = None,
 ) -> EnrollmentOutcome:
     """Exchange a join token for membership, and persist the result.
 
     Raises `EnrollmentError` and records nothing if any step fails: a node
     that half-enrolled would hold an install's key without the install
     knowing it exists.
+
+    **A token that carries the root's machine key** (`<secret>.<pin>`, LT1)
+    is presented over TLS to the root's machine port, at the address given
+    for the root, and only after the key that port presents matches: so
+    nothing on the network can answer in the root's place, and the root's
+    identity key, pinned from this answer, is the real one. The pin is kept
+    for the calls that follow, until the root's signed machine list arrives.
+    `machine` is this node's own machine port and key, registered with it.
     """
     if store.record.enrolled:
         held = store.record
@@ -217,15 +227,31 @@ async def perform_enrollment(
     }
     if advertise_url is not None:
         payload["url"] = advertise_url
+    if machine:
+        payload.update(machine)
+    secret, root_pin = split_join_token(token)
+    payload["token"] = secret
     # The name people see (node-labels.md). The root checks it, before the
     # token is spent; omitted, a machine enrolling again keeps its label.
     if label is not None and label.strip():
         payload["label"] = label.strip()
 
+    enroll_url = f"{control_url}/v1/nodes/enroll"
+    if root_pin is not None and transport is None:
+        enroll_url, transport = pinned_enrolment(control_url, root_pin)
     try:
         async with internal_client(timeout=ENROLL_TIMEOUT_SECONDS, transport=transport) as client:
-            response = await client.post(f"{control_url}/v1/nodes/enroll", json=payload)
+            response = await client.post(enroll_url, json=payload)
     except httpx.HTTPError as exc:
+        pin = refused_pin(exc)
+        if pin is not None:
+            raise EnrollmentError(
+                "control-root-key-refused",
+                "Not the control root",
+                f"The machine at {control_url} presented a key ({pin}) that is not the one "
+                "in the join command. Something between this machine and the root answered "
+                "in its place; the join token was not sent.",
+            ) from exc
         raise EnrollmentError(
             "control-root-unreachable",
             "Control root unreachable",
@@ -305,13 +331,18 @@ async def perform_enrollment(
         recovery_public_key=_str_or_none(body.get("recoveryPublicKey")),
         advertise_url=advertise_url,
     )
+    store.record_control_pins([root_pin] if root_pin else [])
     return EnrollmentOutcome(
         name=granted_name, epoch=epoch, bundle=bundle, advertise_url=advertise_url
     )
 
 
 async def announce_address(
-    *, store: NodeIdentityStore, url: str, transport: Any = None
+    *,
+    store: NodeIdentityStore,
+    url: str,
+    transport: Any = None,
+    machine: dict[str, str] | None = None,
 ) -> AnnounceOutcome:
     """Tell the control root this node's address. Never raises.
 
@@ -327,17 +358,31 @@ async def announce_address(
     if not record.signing_private_key:
         return AnnounceOutcome(False, False, url, "this node has no signing key")
 
-    sequence = store.next_advertise_sequence()
-    message = address_message(name=record.name, sequence=sequence, url=url)
-    body = {
-        "url": url,
-        "sequence": sequence,
-        "signature": sign_address(signing_private_key=record.signing_private_key, message=message),
-    }
     target = f"{record.control_url.rstrip('/')}/v1/nodes/{record.name}"
+
+    def signed(fields: dict[str, str]) -> dict[str, Any]:
+        sequence = store.next_advertise_sequence()
+        message = address_message(name=record.name, sequence=sequence, url=url, machine=fields)
+        return {
+            "url": url,
+            "sequence": sequence,
+            "signature": sign_address(
+                signing_private_key=record.signing_private_key or "", message=message
+            ),
+            **fields,
+        }
+
     try:
         async with internal_client(timeout=ANNOUNCE_TIMEOUT_SECONDS, transport=transport) as client:
-            response = await client.patch(target, json=body)
+            response = await client.patch(target, json=signed(machine or {}))
+            if machine and response.status_code == 401:
+                # A root older than LT1 signs-checks three fields and refuses
+                # five; say where this node is without its machine port.
+                log.info(
+                    "the control root did not take this node's machine port (it runs an older "
+                    "version); announcing the address alone"
+                )
+                response = await client.patch(target, json=signed({}))
     except httpx.HTTPError as exc:
         log.warning("could not announce this node's address to %s: %s", record.control_url, exc)
         return AnnounceOutcome(False, False, url, str(exc), retry=True)
@@ -378,6 +423,7 @@ async def keep_address_announced(
     resolve: Callable[[bool], Awaitable[str | None]],
     transport: Any = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    machine: Callable[[], dict[str, str] | None] = lambda: None,
 ) -> None:
     """Tell the control root where this node is until it has heard, and
     again whenever the address moves (agent#8). Runs for the agent's life
@@ -400,8 +446,12 @@ async def keep_address_announced(
     An address a route has just announced (a config change, the Reach
     switch) is announced once more at the next check; the root answers
     *unchanged* and appends nothing.
+
+    `machine` is this node's machine port and key when it is listening
+    (LT1). It settles with the address: a port that starts listening, or a
+    key that changes, is announced at the next check like a new address.
     """
-    settled: str | None = None
+    settled: tuple[str, tuple[tuple[str, str], ...]] | None = None
     warned = False
     delay = ANNOUNCE_RETRY_FIRST_SECONDS
     quiet = False
@@ -421,17 +471,60 @@ async def keep_address_announced(
                         store.record.control_url,
                     )
                     warned = True
-            elif url != settled:
+            elif (url, tuple(sorted((machine() or {}).items()))) != settled:
                 warned = False
                 store.record_advertise_url(url)
-                outcome = await announce_address(store=store, url=url, transport=transport)
+                fields = machine() or {}
+                outcome = await announce_address(
+                    store=store, url=url, transport=transport, machine=fields
+                )
                 if outcome.announced or not outcome.retry:
-                    settled, delay = url, ANNOUNCE_RETRY_FIRST_SECONDS
+                    settled = (url, tuple(sorted(fields.items())))
+                    delay = ANNOUNCE_RETRY_FIRST_SECONDS
                 else:
                     await sleep(delay * random.uniform(0.8, 1.2))
                     delay = min(delay * 2, ANNOUNCE_RETRY_MAX_SECONDS)
                     continue
         await sleep(ADDRESS_RECHECK_SECONDS)
+
+
+_PIN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+
+
+def split_join_token(token: str) -> tuple[str, str | None]:
+    """`(secret, root pin)` from a join token; the pin is None when it carries
+    none (a root older than LT1, or a Job Site's token)."""
+    secret, dot, pin = token.strip().partition(".")
+    if dot and _PIN.match(pin):
+        return secret, pin
+    return token.strip(), None
+
+
+def pinned_enrolment(control_url: str, pin: str) -> tuple[str, Any]:
+    """The enrolment URL on the root's machine port, and a transport that
+    accepts that port only with the key `pin` names.
+
+    The root's machine port is at the address given for the root: the
+    first-byte switch on its 8083 answers TLS and plain HTTP alike, so the
+    same host and port that served plain enrolment serve it encrypted. An
+    address that is already `https` (a nodes name behind the entry point)
+    is used as it is.
+    """
+    from urllib.parse import urlsplit
+
+    from ._http import MachineTransport, parse_machine_table, ssl_context
+
+    parts = urlsplit(control_url)
+    if parts.scheme != "http" or not parts.hostname:
+        return f"{control_url}/v1/nodes/enroll", None
+    hostport = parts.netloc
+    table = parse_machine_table({"machines": {hostport: [pin]}, "names": {hostport: "the root"}})
+    transport = MachineTransport(
+        verify=ssl_context(),
+        limits=httpx.Limits(max_connections=4, keepalive_expiry=1.5),
+        table=lambda: table,
+    )
+    return f"https://{hostport}/control/v1/nodes/enroll", transport
 
 
 #: The control root's title for a label another machine has (`labelNode`).
@@ -491,6 +584,8 @@ __all__ = [
     "host_os",
     "keep_address_announced",
     "perform_enrollment",
+    "pinned_enrolment",
     "problem_detail",
     "resolve_advertise_url",
+    "split_join_token",
 ]

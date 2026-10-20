@@ -164,6 +164,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             "the control root's bundle" if trust.enrolled else "this node alone",
         )
 
+    # What this node holds about the other machines' TLS doors (LT1): the
+    # root's signed list kept on disk, re-verified, and the table every
+    # client here and every child uses, from before the first request.
+    from .machine_trust import MachineTrust
+
+    machine_trust = MachineTrust(settings.config_file.resolve().parent, identity)
+    machine_trust.load()
+    app.state.machine_trust = machine_trust
+
     # The sessions signed out before this start. Outside the `hasattr`
     # above, and in safe mode too: a sign-out that was not read back is
     # a live token on any node whose signing key survived the restart,
@@ -393,6 +402,36 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ", ".join(declared),
             )
 
+    # The machine port (LT1): on the root, control leaves 8083 first, so the
+    # port is free before anything binds it. Before the components start, so
+    # control is told it is behind the port and binds loopback.
+    from . import machine_port
+
+    if not settings.safe_mode and settings.machine_port_enabled:
+        machine_port.move_control_behind(state, int(settings.machine_port))
+    door = None if settings.safe_mode else await machine_port.start(app)
+
+    def _rebind_on_required(required: bool) -> None:
+        # Required moves the drivers to loopback (LT1b; control is there
+        # already, behind the machine port); the bind
+        # is fixed when a child starts, so those restart.
+        kinds = {"inference-driver", "tool-driver"}
+        names = [
+            e.name
+            for e in state.list_topology_entries()
+            if e.spawn is not None and e.kind.value in kinds
+        ]
+        log.warning(
+            "encryption between machines is %s now: restarting %s so %s",
+            "required" if required else "no longer required",
+            ", ".join(names) or "nothing",
+            "they listen on this machine only" if required else "other machines reach them again",
+        )
+        for name in names:
+            asyncio.get_running_loop().create_task(supervisor.restart(name))
+
+    machine_trust.on_required_changed = _rebind_on_required
+
     if not settings.safe_mode and owns_supervisor:
         for entry in state.list_topology_entries():
             supervisor.add_and_start(entry)
@@ -597,6 +636,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await runtime_supervisor.stop_all()
         if owns_supervisor:
             await supervisor.stop_all()
+        if door is not None:
+            await door.stop()
         # Last: the process-wide clients (`_http.shared_internal_client`)
         # -- the engine readiness probe and the library reads admission
         # makes. Last because everything above may still be probing on
@@ -617,6 +658,7 @@ async def _pull_trust_bundle(app: FastAPI) -> None:
     """
     from . import tokens
     from ._http import internal_client
+    from .machine_trust import pull as pull_machine_list
     from .node_identity import FencedError
     from .trust import BundleRollback
 
@@ -640,6 +682,9 @@ async def _pull_trust_bundle(app: FastAPI) -> None:
                         if held is None or taken.version != held.version:
                             log.info("pulled trust bundle %d", taken.version)
                         await standby.reconcile(app)
+                    # The machine list rides the same minute (LT1). Public
+                    # keys and addresses, signed; no credential is sent.
+                    await pull_machine_list(app.state.machine_trust, client, record.control_url)
                 except BundleRollback:
                     pass
                 except (tokens.BundleError, FencedError) as exc:
@@ -720,10 +765,13 @@ async def _announce_address(
         )
 
     try:
+        from . import machine_port
+
         await enrollment.keep_address_announced(
             store=identity,
             resolve=resolve,
             transport=getattr(app.state, "control_transport", None),
+            machine=lambda: machine_port.announced(app),
         )
     except asyncio.CancelledError:
         raise
@@ -799,6 +847,26 @@ async def resolve_gateway_for_apps(app: FastAPI) -> tuple[str | None, str | None
 _DIALLED_BY_THE_ROOT = frozenset({"inference-driver", "tool-driver"})
 
 
+#: The machine table this agent writes for its children (`machine_trust`).
+MACHINE_PINS_FILE = "machine_pins.json"
+
+
+def _machine_tls_required(identity: node_identity.NodeIdentityStore) -> bool:
+    """The root's signed list, as last taken, says encryption is required."""
+    from .machine_trust import LIST_FILE, MachineListError, verify
+
+    record = identity.record
+    if not record.enrolled or not record.control_public_key:
+        return False
+    try:
+        import json
+
+        kept = json.loads((identity.path.parent / LIST_FILE).read_text(encoding="utf-8"))
+        return bool(verify(str(kept["jws"]), record.control_public_key).get("required"))
+    except (OSError, ValueError, KeyError, MachineListError):
+        return False
+
+
 def _hosts_control(state: AgentState) -> bool:
     """This agent supervises the control root: it is the control host. A
     warm standby it runs does not count (warm-standby.md)."""
@@ -808,6 +876,33 @@ def _hosts_control(state: AgentState) -> bool:
 
 
 def shared_child_env(
+    settings: Settings,
+    state: AgentState,
+    identity: node_identity.NodeIdentityStore,
+    kind: str | None = None,
+) -> dict[str, str]:
+    """`_base_child_env`, with the machine port's part (LT1).
+
+    Every child reads the machine table this agent writes from the root's
+    signed list. Control is behind the machine port, so it listens on
+    loopback and is handed the port's key, which it signs into the list
+    and puts on join tokens. Once the install requires encryption (LT1b),
+    the drivers listen on loopback too: other machines reach them through
+    the machine port only.
+    """
+    env = _base_child_env(settings, state, identity, kind)
+    env["MACHINE_PINS_FILE"] = str(identity.path.parent / MACHINE_PINS_FILE)
+    if settings.machine_port_enabled:
+        if kind == "control":
+            if identity.record.tls_certificate:
+                env["MACHINE_PINS"] = node_identity.machine_pin(identity.record.tls_certificate)
+            env["BIND_HOST"] = "127.0.0.1"
+        elif kind in _DIALLED_BY_THE_ROOT and _machine_tls_required(identity):
+            env["BIND_HOST"] = "127.0.0.1"
+    return env
+
+
+def _base_child_env(
     settings: Settings,
     state: AgentState,
     identity: node_identity.NodeIdentityStore,

@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
+from .. import machine_port
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import Component, ComponentEntry, ComponentList, ComponentStatus
 from ..dependencies import require_operator_or_service, require_operator_session
@@ -70,6 +71,7 @@ def _compose(
     entry: ComponentEntry,
     supervisor: Supervisor | None,
     advertise: str | None = None,
+    machine_url: str | None = None,
 ) -> Component:
     """Combine the declarative entry with whatever live state the
     Supervisor knows about it. When no Supervisor is wired (some tests),
@@ -99,6 +101,7 @@ def _compose(
         kind=entry.kind,
         url=entry.url,
         advertiseUrl=advertise_url,  # type: ignore[arg-type]
+        machineUrl=machine_url,  # type: ignore[arg-type]
         spawn=entry.spawn,
         safeMode=entry.safeMode,
         status=live_status,
@@ -118,7 +121,13 @@ async def list_components(request: Request) -> ComponentList:
     supervisor = _supervisor(request)
     return ComponentList(
         components=[
-            _compose(e, supervisor, _advertise_host(request)) for e in state.list_topology_entries()
+            _compose(
+                e,
+                supervisor,
+                _advertise_host(request),
+                machine_port.component_machine_url(request.app, e),
+            )
+            for e in state.list_topology_entries()
         ],
     )
 

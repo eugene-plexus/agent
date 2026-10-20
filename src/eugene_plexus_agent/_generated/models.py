@@ -2169,6 +2169,37 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
+class MachinePort(BaseModel):
+    """
+    This node's machine port (LT1, `docs/design/tls-between-machines.md`):
+    the one TLS door every other machine of the install reaches it
+    through, and what this node holds about the others.
+
+    """
+
+    url: AnyUrl | None = Field(
+        None,
+        description="Where other machines reach it, as announced to the root:\n`https://<advertise host>:<port>`. The port is 8083, shifted by\nthe same offset as the agent's advertised port, or the\n`machineUrl` config field. `null` while this node advertises\nno address.\n",
+    )
+    port: int | None = Field(None, description='The port it listens on here.')
+    pin: str = Field(
+        ...,
+        description="Base64url SHA-256 of this node's machine key's\nSubjectPublicKeyInfo: what it registered, and what every other\nmachine checks.\n",
+    )
+    listening: bool
+    error: str | None = Field(
+        None, description='Why it is not listening, in the words of the failure.'
+    )
+    required: bool = Field(
+        ...,
+        description="The install requires encryption between machines, from the\nroot's signed list: plain HTTP from another machine is refused\nhere, and plain HTTP to another machine is refused.\n",
+    )
+    listAgeSeconds: int | None = Field(
+        None,
+        description="Seconds since this node last took the root's signed machine\nlist. `null` when it holds none.\n",
+    )
+
+
 class ComponentName(StrEnum):
     """
     One of the seven packages an install is made of (`tool-driver`
@@ -3967,6 +3998,10 @@ class Component(BaseModel):
         None,
         description="Where a **peer on another host** reaches this component: the\nagent's advertise host with this component's port. Derived,\nnever declared, and present only for a component this agent\nspawns on an agent that has an advertise address\n(`NodeIdentity.advertiseUrl`). `url` keeps its one meaning —\nwhat the agent binds and probes — and the gateway prefers this\nfield and falls back to `url`, which is the whole of what makes\na companion driver on one host routable from a gateway on\nanother. Absent on a single-host install, where the two would\nsay the same thing.\n",
     )
+    machineUrl: AnyUrl | None = Field(
+        None,
+        description="Where another machine reaches this component **over TLS**\n(LT1): this node's machine port with the component's path,\n`https://<host>:8083/drivers/<name>`. Present for an\ninference-driver or tool-driver this agent spawns, once the\nnode has a machine port. A caller that holds the node's pin\n(from the root's signed machine list) prefers it to\n`advertiseUrl`; one that does not, or an older one, keeps\n`advertiseUrl`, and that is how an install with old and new\nmachines keeps working.\n",
+    )
     spawn: SpawnConfig | None = Field(
         None,
         description="Present iff this component runs locally under agent\nsupervision. Absence means it's remote (the agent only\nmonitors reachability).\n",
@@ -5684,6 +5719,7 @@ class NodeIdentity(BaseModel):
         None,
         description="Where other hosts reach this agent — the `advertiseUrl` config\nfield, or the value derived at enrollment when none was set.\nWhat the control root holds as this node's `Node.url`.\n",
     )
+    machine: MachinePort | None = None
     trustBundleVersion: int | None = Field(
         None,
         description='The version of the trust bundle this agent holds. After a\nrevocation or a rotation, a node still below the root\'s\ncurrent version is the answer to "which host is stale", from\nthe host itself.\n',

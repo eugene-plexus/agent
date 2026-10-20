@@ -9,6 +9,9 @@ One file, `node.yaml`, beside `agent.yaml`:
     signingPrivateKey: <base64 Ed25519 seed>   signs address announcements
     signingPublicKey: <base64 Ed25519>
     tokenPrivateKey: <base64 Ed25519 seed>     signs this node's tokens
+    tlsPrivateKey: <PEM P-256>          the machine port's TLS key (LT1)
+    tlsCertificate: <PEM>               self-signed; other machines pin its key
+    controlPins: <pin>[,<pin>]          the root's machine key, from the join token
     advertiseSequence: 3               strictly increasing, mirrored at the root
     controlUrl: http://100.64.0.1:8083
     controlPublicKey: <base64 Ed25519>  the root's identity: signs every trust bundle
@@ -96,7 +99,9 @@ class FencedError(Exception):
 # --------------------------------------------------------------------------- #
 
 
-def address_message(*, name: str, sequence: int, url: str) -> bytes:
+def address_message(
+    *, name: str, sequence: int, url: str, machine: dict[str, str] | None = None
+) -> bytes:
     """The canonical bytes an address announcement is signed over —
     `NodeAddressAnnouncement.signature` in `control.yaml`, byte for byte.
 
@@ -105,12 +110,14 @@ def address_message(*, name: str, sequence: int, url: str) -> bytes:
     verifies against the raw request body for precisely this reason. Sign
     a parsed URL and every announcement fails with what looks like a
     crypto error.
+
+    `machine` is `machineUrl` and `tlsPin` when the body carries them
+    (LT1): they are signed under their own names, so the key this node
+    registers is covered by the same signature as its address.
     """
-    return json.dumps(
-        {"name": name, "sequence": sequence, "url": url},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    signed: dict[str, Any] = {"name": name, "sequence": sequence, "url": url}
+    signed.update(machine or {})
+    return json.dumps(signed, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def sign_address(*, signing_private_key: str, message: bytes) -> str:
@@ -301,6 +308,65 @@ def bind_host_for_advertised_node(
 
 
 # --------------------------------------------------------------------------- #
+# The machine key (LT1)
+# --------------------------------------------------------------------------- #
+
+#: A machine key's certificate outlives any install: its key is what other
+#: machines pin, and an expiry would only stop a working install.
+_MACHINE_CERT_YEARS = 50
+
+
+def generate_machine_key() -> tuple[str, str]:
+    """`(key PEM, certificate PEM)`: this node's machine port key, ECDSA P-256.
+
+    **A fourth key, separate from the other three**, so TLS never signs with
+    the key that signs address announcements or tokens; P-256 because every
+    TLS stack takes it. The certificate is self-signed and names nothing:
+    other machines check its key against the pin this node registered under
+    its signature, never a chain or a name (addresses move with DHCP).
+    """
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "eugene-plexus-machine")])
+    now = datetime.datetime.now(datetime.UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365 * _MACHINE_CERT_YEARS))
+        .sign(key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+    return key_pem, certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
+def machine_pin(certificate_pem: str) -> str:
+    """The pin of a machine key: base64url SHA-256 of its SubjectPublicKeyInfo."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    from ._http import spki_pin
+
+    der = x509.load_pem_x509_certificate(certificate_pem.encode("ascii")).public_bytes(
+        serialization.Encoding.DER
+    )
+    return spki_pin(der)
+
+
+# --------------------------------------------------------------------------- #
 # The record and its store
 # --------------------------------------------------------------------------- #
 
@@ -323,6 +389,12 @@ class IdentityRecord:
     epoch: int | None = None
     advertise_url: str | None = None
     enrolled_at: str | None = None
+    tls_private_key: str | None = None
+    tls_certificate: str | None = None
+    control_pins: str | None = None
+    """Comma-separated pins of the root's machine key, from the join token
+    this node enrolled with (LT1): what it checks the root against before
+    the first signed machine list arrives."""
 
     @property
     def enrolled(self) -> bool:
@@ -343,6 +415,9 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("epoch", "epoch"),
     ("advertiseUrl", "advertise_url"),
     ("enrolledAt", "enrolled_at"),
+    ("tlsPrivateKey", "tls_private_key"),
+    ("tlsCertificate", "tls_certificate"),
+    ("controlPins", "control_pins"),
 )
 
 
@@ -439,6 +514,13 @@ class NodeIdentityStore:
                 )
                 changed = True
                 log.info("generated this node's token key")
+            if not (self._record.tls_private_key and self._record.tls_certificate):
+                key_pem, certificate_pem = generate_machine_key()
+                self._record = replace(
+                    self._record, tls_private_key=key_pem, tls_certificate=certificate_pem
+                )
+                changed = True
+                log.info("generated this node's machine key (pin %s)", machine_pin(certificate_pem))
             if changed:
                 self._write_locked()
             return self._record
@@ -470,6 +552,15 @@ class NodeIdentityStore:
                 enrolled_at=datetime.now(UTC).isoformat(),
             )
             self._write_locked()
+            return self._record
+
+    def record_control_pins(self, pins: list[str]) -> IdentityRecord:
+        """Keep the root's machine key from the join token (LT1)."""
+        with self._lock:
+            value = ",".join(pins) or None
+            if value != self._record.control_pins:
+                self._record = replace(self._record, control_pins=value)
+                self._write_locked()
             return self._record
 
     def record_advertise_url(self, url: str | None) -> IdentityRecord:
@@ -526,6 +617,7 @@ class NodeIdentityStore:
                 advertise_url=None,
                 advertise_sequence=0,
                 enrolled_at=None,
+                control_pins=None,
             )
             self._write_locked()
             return self._record
@@ -580,8 +672,10 @@ __all__ = [
     "effective_advertise_url",
     "format_url",
     "generate_control_identity_for_tests",
+    "generate_machine_key",
     "is_loopback_host",
     "local_agent_url",
+    "machine_pin",
     "not_a_node_address",
     "sign_address",
 ]

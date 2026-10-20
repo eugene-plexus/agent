@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import __version__, default_topology, host_history, reach, standby, tokens
+from .. import __version__, default_topology, host_history, machine_port, reach, standby, tokens
 from .._generated.common_models import ConfigUpdateRequest, Problem, SignedTrustBundle
 from .._generated.models import (
     Arch,
@@ -46,6 +46,7 @@ from .._generated.models import (
     HostHistoryStepChoice,
     HostMetric,
     LocalStandby,
+    MachinePort,
     NodeIdentity,
     NodeReach,
     NodeReachRequest,
@@ -68,6 +69,7 @@ from ..enrollment import (
     resolve_advertise_url,
 )
 from ..firewall import FirewallQuery, read_firewall
+from ..machine_trust import pull as pull_machine_list
 from ..node_identity import (
     FencedError,
     NodeIdentityStore,
@@ -136,6 +138,28 @@ async def _devices(request: Request) -> DeviceSnapshot:
     return snapshot
 
 
+async def _refresh_machines(app: Any, control_url: str) -> None:
+    async with internal_client(timeout=10.0) as client:
+        await pull_machine_list(app.state.machine_trust, client, control_url)
+
+
+def _machine(request: Request) -> MachinePort | None:
+    """`NodeIdentity.machine`: this node's machine port, as it stands."""
+    door = getattr(request.app.state, "machine_port", None)
+    if door is None:
+        return None
+    trust = getattr(request.app.state, "machine_trust", None)
+    return MachinePort(
+        url=machine_port.machine_url(request.app),  # type: ignore[arg-type]
+        port=door.status.port,
+        pin=door.status.pin,
+        listening=door.status.listening,
+        error=door.status.error,
+        required=bool(trust is not None and trust.required),
+        listAgeSeconds=trust.age_seconds if trust is not None else None,
+    )
+
+
 def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
     """The identity as it stands, plus the live inventory."""
     record = _store(request).record
@@ -158,6 +182,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         controlUrl=record.control_url if record.enrolled else None,  # type: ignore[arg-type]
         epoch=record.epoch if record.enrolled else None,
         advertiseUrl=advertise,  # type: ignore[arg-type]
+        machine=_machine(request),
         trustBundleVersion=bundle.version if bundle is not None else None,
         trustBundleAgeSeconds=trust.heard_age_seconds() if record.enrolled else None,
         tokenPublicKey=token_public,
@@ -309,11 +334,18 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
             advertise_url=advertise,
             devices=[d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
             transport=getattr(request.app.state, "control_transport", None),
+            machine=machine_port.announced(request.app),
         )
     except EnrollmentError as exc:
         raise _from_enrollment_error(exc) from exc
 
     auth.trust.load()
+    # The table at once: the root's key from the join token carries the
+    # calls that follow, and the root's signed list comes with the first.
+    trust_machines = request.app.state.machine_trust
+    trust_machines.rebuild()
+    async with internal_client(timeout=10.0) as client:
+        await pull_machine_list(trust_machines, client, control_url)
     # Joining answers the one onboarding question, so nothing is left
     # for the wizard to do. Set here rather than only at the next boot
     # because enrolling does not restart this process -- without it the
@@ -390,6 +422,7 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
     store.unenroll()
     auth.trust.forget()
     auth.trust.become_standalone()
+    request.app.state.machine_trust.forget()
     log.warning(
         "left the install at %s (was %r); this node is its own authority again%s",
         previous_control_url,
@@ -482,6 +515,12 @@ async def take_trust_bundle(request: Request, body: SignedTrustBundle) -> NodeId
         raise _problem(status.HTTP_409_CONFLICT, "fenced", "Fenced", str(exc)) from exc
     log.info("took trust bundle %d at epoch %d", bundle.version, bundle.epoch)
     await standby.reconcile(request.app)
+    # A new bundle is a machine joining or leaving, so the machine list is
+    # fetched at once rather than at the next minute (LT1). In the
+    # background: the root is waiting for this answer.
+    record = _store(request).record
+    if record.control_url:
+        asyncio.get_running_loop().create_task(_refresh_machines(request.app, record.control_url))
     return _identity(request, await _devices(request))
 
 
@@ -512,6 +551,16 @@ def listeners_of(app: Any) -> list[reach.Listener]:
             bind_host=getattr(app.state, "bind_host", None) or settings.bind_host,
         )
     ]
+    # The machine port (LT1): what every other machine reaches this one on.
+    door = getattr(app.state, "machine_port", None)
+    if door is not None and door.status.listening:
+        out.append(
+            reach.Listener(
+                process="machine port",
+                port=door.status.port,
+                bind_host=machine_port.bind_host_for(app),
+            )
+        )
     state: AgentState = app.state.agent_state
     # Apps listen too, on their own ports, and a phone opening a chat app
     # needs the same three things a phone opening the console does.

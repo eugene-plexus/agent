@@ -291,6 +291,22 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.url,
     ),
     ConfigField(
+        key="machineUrl",
+        label="Machine port address",
+        description=(
+            "The address other machines use to reach this one over TLS, for example "
+            "`https://192.168.1.20:8083`.\n\n"
+            "Leave it empty: it is the advertise address's host on port 8083, shifted "
+            "by the same amount as the advertise address's port when a container "
+            "publishes its ports on others (8279 and 8283 for 8079 and 8083). Set it "
+            "only when another machine reaches port 8083 here through something "
+            "else. It is announced to the control root, under this machine's "
+            "signature, when it changes."
+        ),
+        category="node",
+        valueType=ConfigValueType.url,
+    ),
+    ConfigField(
         key="allowedHosts",
         label="Allowed host names",
         description=(
