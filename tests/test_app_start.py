@@ -952,3 +952,35 @@ def test_behind_its_door_an_app_signs_in_over_https_too_and_only_https_once_plai
     assert f"http://127.0.0.1:{port}/cb" in redirects
     # A site host is loopback only, with no door.
     assert all(r.startswith("http://") for r in manager.sign_in_redirects("site-host", "/cb"))
+
+
+async def test_an_app_reaches_a_gateway_on_another_machine_over_https_when_it_can(
+    monkeypatch,
+) -> None:
+    """LT2: once this node holds the install CA, another machine's console is
+    tried over https first; one that does not answer TLS stays plain."""
+    import httpx
+
+    from eugene_plexus_agent import _http
+    from eugene_plexus_agent.app import _over_tls
+
+    answers = {"https://192.168.1.10:8079/healthz": 200}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = answers.get(str(request.url))
+        if status is None:
+            raise httpx.ConnectError("no TLS here", request=request)
+        return httpx.Response(status)
+
+    real = _http.internal_client
+    monkeypatch.setattr(
+        _http,
+        "internal_client",
+        lambda **kw: real(transport=httpx.MockTransport(handler), **kw),
+    )
+    held = SimpleNamespace(ca_pem=lambda: "PEM")
+    app = SimpleNamespace(state=SimpleNamespace(client_tls=held))
+    assert await _over_tls(app, "http://192.168.1.10:8079") == "https://192.168.1.10:8079"  # type: ignore[arg-type]
+    assert await _over_tls(app, "http://192.168.1.11:8079") == "http://192.168.1.11:8079"  # type: ignore[arg-type]
+    held.ca_pem = lambda: None
+    assert await _over_tls(app, "http://192.168.1.10:8079") == "http://192.168.1.10:8079"  # type: ignore[arg-type]

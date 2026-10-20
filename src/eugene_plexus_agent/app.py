@@ -908,7 +908,34 @@ async def resolve_gateway_for_apps(app: FastAPI) -> tuple[str | None, str | None
         )
     except install_proxy.InstallLookupError as exc:
         return None, f"The gateway could not be found, so the app was given none: {exc}"
-    return owner.agent_url.rstrip("/") + "/api/proxy/gateway", None
+    return await _over_tls(app, owner.agent_url.rstrip("/")) + "/api/proxy/gateway", None
+
+
+async def _over_tls(app: FastAPI, agent_url: str) -> str:
+    """Another machine's console, over `https://` when its door answers TLS
+    with a certificate from the install CA (LT2): an app's prompts to a
+    gateway on another machine then cross the network encrypted, and keep
+    working once plain HTTP is off. Plain when this node holds no CA yet or
+    the other machine runs a version without client TLS."""
+    from urllib.parse import urlsplit
+
+    import httpx
+
+    from ._http import internal_client
+
+    tls = getattr(app.state, "client_tls", None)
+    parts = urlsplit(agent_url)
+    if tls is None or tls.ca_pem() is None or parts.scheme != "http":
+        return agent_url
+    secure = parts._replace(scheme="https").geturl()
+    try:
+        async with internal_client(timeout=5.0) as client:
+            answer = await client.get(secure + "/healthz")
+        if answer.status_code == 200:
+            return secure
+    except httpx.HTTPError as exc:
+        log.info("apps reach %s in plain HTTP: its TLS door did not answer (%s)", agent_url, exc)
+    return agent_url
 
 
 #: Component kinds the root's gateway reaches on another machine directly.
