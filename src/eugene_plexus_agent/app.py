@@ -386,10 +386,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     else None
                 ),
                 private_apps=bool(app.state.entrypoint_config),
-                # LT2: each app behind its door, once the doors are open.
+                # LT2: each app behind its door, once the doors are open, and
+                # given the install CA.
                 doors=lambda: (
                     getattr(app.state, "client_doors", None)
                     if settings.client_doors_enabled
+                    else None
+                ),
+                ca_bundle=lambda: (
+                    tls_.bundle_path()
+                    if (tls_ := getattr(app.state, "client_tls", None)) is not None
                     else None
                 ),
             )
@@ -443,6 +449,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     tls = None if settings.safe_mode else await client_tls.start(app)
     tls_task = asyncio.create_task(tls.run(), name="client-tls") if tls is not None else None
+    if tls is not None:
+
+        def _new_ca() -> None:
+            # Apps read the CA at start: the ones running get it now, once
+            # in an install's life (an install updated to LT2).
+            manager = getattr(app.state, "apps", None)
+            if manager is None:
+                return
+
+            async def restart() -> None:
+                for record in manager.store.installed():
+                    if record.enabled and manager.supervisor.is_running(record.id):
+                        log.info("restarting app %s so it trusts the install CA", record.id)
+                        await manager.restart(record)
+
+            asyncio.get_running_loop().create_task(restart())
+
+        tls.on_new_ca = _new_ca
 
     def _rebind_on_required(required: bool) -> None:
         # Required moves the drivers to loopback (LT1b; control is there

@@ -307,6 +307,31 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.url,
     ),
     ConfigField(
+        key="clientCertificateFile",
+        label="Your own certificate",
+        description=(
+            "A certificate for your own domain, PEM, that the console, the gateway and "
+            "apps present instead of the install's own.\n\n"
+            "Set it with your own key below, for example the files certbot, acme.sh or a "
+            "reverse proxy keeps renewed: a new file is taken within a minute, with no "
+            "restart. Devices then need no trust step, but must open Eugene by the names "
+            "the certificate holds. Leave it empty to use the install's certificate "
+            "authority."
+        ),
+        category="node",
+        valueType=ConfigValueType.file_path,
+    ),
+    ConfigField(
+        key="clientKeyFile",
+        label="Your certificate's key",
+        description=(
+            "The private key of your own certificate, PEM. Readable by the account Eugene "
+            "runs as; never sent anywhere."
+        ),
+        category="node",
+        valueType=ConfigValueType.file_path,
+    ),
+    ConfigField(
         key="allowedHosts",
         label="Allowed host names",
         description=(

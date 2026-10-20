@@ -183,3 +183,64 @@ def test_plain_counts_are_kept_by_door_and_client_for_seven_days(tmp_path: Path)
     old = (datetime.date.today() - datetime.timedelta(days=8)).isoformat()
     kept._data["console"]["192.168.1.41"] = {old: 5}
     assert kept.clients("console") == []
+
+
+def _self_signed(directory: Path) -> tuple[Path, Path]:
+    key, key_pem = _key_pem()
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "eugene.example.com")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(3)
+        .not_valid_before(now)
+        .not_valid_after(now + datetime.timedelta(days=90))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("eugene.example.com")]), critical=False
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cert_path, key_path = directory / "mine.crt", directory / "mine.key"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_text(key_pem, encoding="utf-8")
+    return cert_path, key_path
+
+
+async def test_the_owners_own_certificate_replaces_the_install_leaf_and_gives_way(
+    tmp_path: Path,
+) -> None:
+    _, key = _key_pem()
+    app = _app(key)
+    doors = client_doors.Doors()
+    tls = client_tls.ClientTls(tmp_path, app, doors)
+    await tls.request("first", transport=_root([]))
+    leaf = doors.context()
+    cert_path, key_path = _self_signed(tmp_path)
+    app.state.config.update(clientCertificateFile=str(cert_path), clientKeyFile=str(key_path))
+    tls.check_supplied()
+    status = tls.status()
+    assert status["source"] == "supplied" and status["names"] == ["eugene.example.com"]
+    assert doors.context() is not None and doors.context() is not leaf
+    # A key that does not open: said, and the install's leaf comes back.
+    key_path.write_text("not a key", encoding="utf-8")
+    tls.check_supplied()
+    assert tls.status()["source"] == "installCa"
+    assert "could not be loaded" in str(tls.status()["error"])
+    app.state.config.clear()
+    tls.check_supplied()
+    assert tls.status()["error"] is None and tls.status()["source"] == "installCa"
+
+
+async def test_apps_get_a_bundle_with_the_install_ca(tmp_path: Path) -> None:
+    _, key = _key_pem()
+    tls = client_tls.ClientTls(tmp_path, _app(key), client_doors.Doors())
+    told: list[bool] = []
+    tls.on_new_ca = lambda: told.append(True)
+    await tls.request("first", transport=_root([]))
+    bundle = tls.bundle_path()
+    assert bundle is not None and told == [True]
+    text = bundle.read_text(encoding="utf-8")
+    assert text.rstrip().endswith(str(tls.ca_pem()).rstrip())
+    assert text.count("BEGIN CERTIFICATE") > 50  # certifi's roots come first

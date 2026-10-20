@@ -934,7 +934,7 @@ async def delete_node_history(request: Request) -> Response:
 
 @router.get("/v1/trust/ca", response_class=Response)
 async def get_install_ca(
-    request: Request, format: str = Query(default="pem", pattern="^(pem|der)$")
+    request: Request, format: str = Query(default="pem", pattern="^(pem|der|bundle)$")
 ) -> Response:
     """The install CA that signed this node's client leaf (LT2), for a device
     to trust. Public: a certificate is not a secret, and a device fetches it
@@ -960,6 +960,14 @@ async def get_install_ca(
             der,
             media_type="application/pkix-cert",
             headers={"Content-Disposition": 'attachment; filename="eugene-plexus-ca.cer"'},
+        )
+    if format == "bundle":
+        from ..client_tls import bundle_text
+
+        return Response(
+            bundle_text(pem),
+            media_type="application/x-pem-file",
+            headers={"Content-Disposition": 'attachment; filename="eugene-plexus-ca-bundle.pem"'},
         )
     return Response(
         pem,

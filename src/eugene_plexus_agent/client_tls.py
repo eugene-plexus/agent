@@ -23,6 +23,7 @@ before LT2.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import json
 import logging
@@ -46,6 +47,12 @@ log = logging.getLogger(__name__)
 
 FILE = "client_tls.json"
 CHAIN_FILE = "client_tls.pem"
+#: The leaf and its key apart, for a proxy that loads them as files (Caddy).
+CERT_FILE = "client_tls.crt"
+KEY_FILE = "client_tls.key"
+#: Certifi's public roots with the install CA after them: what an app (and a
+#: Python client on another machine) reads as `SSL_CERT_FILE`.
+BUNDLE_FILE = "ca_bundle.pem"
 PLAIN_FILE = "client_plain.json"
 CERTIFICATE_PATH = "/v1/nodes/{name}/certificate"
 #: How often the leaf is looked at once it is held.
@@ -165,6 +172,37 @@ def _csr(key_pem: str, node_name: str) -> str:
     return csr.public_bytes(serialization.Encoding.PEM).decode("ascii")
 
 
+def _server_context(certfile: Path, keyfile: Path) -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.set_alpn_protocols(["http/1.1"])
+    context.load_cert_chain(certfile=str(certfile), keyfile=str(keyfile))
+    return context
+
+
+def _names_of(certificate: x509.Certificate) -> list[str]:
+    try:
+        san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        return []
+    return [str(n.value) for n in san if isinstance(n, x509.DNSName | x509.IPAddress)]
+
+
+def bundle_text(ca_pem: str) -> str:
+    """Certifi's roots, any bundle this process was already given, then the CA."""
+    import os
+
+    import certifi
+
+    parts = [Path(certifi.where()).read_text(encoding="utf-8")]
+    existing = os.environ.get("SSL_CERT_FILE")
+    if existing and Path(existing).name != BUNDLE_FILE:
+        with contextlib.suppress(OSError):
+            parts.append(Path(existing).read_text(encoding="utf-8"))
+    parts.append(ca_pem)
+    return "\n".join(p.rstrip() for p in parts) + "\n"
+
+
 def _same_key(certificate_pem: str, key_pem: str) -> bool:
     try:
         cert = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
@@ -188,6 +226,16 @@ class ClientTls:
         self.state = "none"
         self.error: str | None = None
         self._refused_for: tuple[str | None, float] | None = None
+        #: The owner's own certificate (`clientCertificateFile` and
+        #: `clientKeyFile`, LT2-C1's override): what it names, and why not.
+        self.supplied: dict[str, Any] | None = None
+        self.supplied_error: str | None = None
+        self._supplied_seen: tuple[Any, ...] | None = None
+        #: Called once a leaf from a CA this node did not hold before arrives
+        #: (the apps it fronts are given the CA when they start).
+        self.on_new_ca: Any = None
+        self._plain_seen: bool | None = None
+        self._refresh_task: asyncio.Task[None] | None = None
 
     # ---- what is held ----------------------------------------------------------
 
@@ -210,9 +258,9 @@ class ClientTls:
         except (OSError, ValueError) as exc:
             log.warning("the client certificate at %s is not usable: %s", self.path, exc)
             return
-        if not isinstance(held, dict) or not held.get("certificate"):
-            return
-        self._install(held)
+        if isinstance(held, dict) and held.get("certificate"):
+            self._install(held)
+        self.check_supplied()
 
     def _install(self, held: dict[str, Any]) -> None:
         key = self._record.tls_private_key
@@ -221,13 +269,68 @@ class ClientTls:
             return
         chain = self.directory / CHAIN_FILE
         write_private(chain, key.rstrip() + "\n" + str(held["certificate"]).rstrip() + "\n")
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.set_alpn_protocols(["http/1.1"])
-        context.load_cert_chain(certfile=str(chain), keyfile=str(chain))
+        write_private(self.directory / KEY_FILE, key.rstrip() + "\n")
+        write_private(self.directory / CERT_FILE, str(held["certificate"]).rstrip() + "\n")
+        write_private(self.directory / BUNDLE_FILE, bundle_text(str(held["ca"])))
+        context = _server_context(chain, chain)
         self.held = held
         self.state, self.error = "issued", None
+        if self.supplied is None:
+            self.doors.set_context(context)
+
+    def bundle_path(self) -> Path | None:
+        path = self.directory / BUNDLE_FILE
+        return path if self.held and path.is_file() else None
+
+    # ---- the owner's own certificate (LT2-C1's override) ---------------------
+
+    def check_supplied(self) -> None:
+        """Present the owner's certificate while both files are set and load;
+        the install CA's leaf otherwise. Read again when either file changes,
+        so a certificate renewed by certbot or a proxy is taken in place."""
+        config = self._app.state.agent_state.get_config
+        cert, key = config("clientCertificateFile"), config("clientKeyFile")
+        if not cert or not key:
+            if self.supplied is not None or self.supplied_error is not None:
+                self.supplied, self.supplied_error, self._supplied_seen = None, None, None
+                self._reinstall()
+            return
+        paths = (Path(str(cert)), Path(str(key)))
+        try:
+            seen: tuple[Any, ...] = tuple((str(p), p.stat().st_mtime_ns) for p in paths)
+        except OSError as exc:
+            seen = (str(exc),)
+        if seen == self._supplied_seen:
+            return
+        self._supplied_seen = seen
+        try:
+            context = _server_context(*paths)
+            certificate = x509.load_pem_x509_certificate(paths[0].read_bytes())
+        except (OSError, ValueError, ssl.SSLError) as exc:
+            self.supplied = None
+            self.supplied_error = (
+                f"Your certificate ({paths[0]}) and key ({paths[1]}) could not be loaded: "
+                f"{exc}. The doors present the install's certificate instead."
+            )
+            log.warning("%s", self.supplied_error)
+            self._reinstall()
+            return
+        self.supplied = {
+            "names": _names_of(certificate),
+            "notAfter": certificate.not_valid_after_utc,
+        }
+        self.supplied_error = None
         self.doors.set_context(context)
+        log.info(
+            "the doors present your own certificate, for %s", ", ".join(self.supplied["names"])
+        )
+
+    def _reinstall(self) -> None:
+        if self.held is not None:
+            held, self.held = self.held, None
+            self._install(held)
+        else:
+            self.doors.set_context(None)
 
     def ca_pem(self) -> str | None:
         return str(self.held["ca"]) if self.held and self.held.get("ca") else None
@@ -300,8 +403,11 @@ class ClientTls:
                 "issuedFor": advertise,
             }
             write_private(self.path, json.dumps(held))
+            new_ca = self.ca_pem() != held["ca"]
             self._install(held)
             self._refused_for = None
+            if new_ca and self.on_new_ca is not None:
+                self.on_new_ca()
             log.info(
                 "this node's doors present a certificate from the install CA for %s",
                 ", ".join(held["names"]),
@@ -326,11 +432,27 @@ class ClientTls:
         gateway = getattr(self._app.state, "gateway_door", None)
         if gateway is not None:
             await gateway.ensure(self._app)
+        self.check_supplied()
+        self._follow_plain()
         reason = self.wanted()
         if reason is not None:
             await self.request(reason)
         if self.doors.counts is not None:
             self.doors.counts.save()
+
+    def _follow_plain(self) -> None:
+        """Plain turned off or on at the root: apps' sign-in return addresses
+        follow (only https ones from another machine while it is off)."""
+        plain = self.doors.plain_allowed()
+        if self._plain_seen is not None and plain != self._plain_seen:
+            from . import sign_in_refresh
+
+            task = getattr(self, "_refresh_task", None)
+            if task is None or task.done():
+                self._refresh_task = asyncio.get_running_loop().create_task(
+                    sign_in_refresh.run(self._app), name="sign-in-addresses-plain"
+                )
+        self._plain_seen = plain
 
     async def run(self) -> None:
         while True:
@@ -362,14 +484,24 @@ class ClientTls:
                     "plainClients": clients,
                 }
             )
-        not_after = self._not_after()
-        renew = self.renew_at()
+        if self.supplied is not None:
+            return {
+                "state": "issued",
+                "source": "supplied",
+                "names": list(self.supplied["names"]),
+                "notAfter": self.supplied["notAfter"],
+                "renewAt": None,
+                "error": None,
+                "plainAllowed": self.doors.plain_allowed(),
+                "doors": doors,
+            }
         return {
             "state": state,
+            "source": "installCa" if self.held else None,
             "names": list((self.held or {}).get("names") or []),
-            "notAfter": not_after,
-            "renewAt": renew,
-            "error": self.error,
+            "notAfter": self._not_after(),
+            "renewAt": self.renew_at(),
+            "error": self.supplied_error or self.error,
             "plainAllowed": self.doors.plain_allowed(),
             "doors": doors,
         }

@@ -35,6 +35,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -912,3 +913,42 @@ def test_the_app_url_is_where_the_console_opens_it(tmp_path: Path) -> None:
     assert manager.sign_in_redirects("fake", "/cb")[0] == f"http://192.168.16.75:{port}/cb"
     manager._advertise_host = lambda: "fd7a::5"
     assert manager.app_url("fake") == f"http://[fd7a::5]:{port}"
+
+
+def test_behind_its_door_an_app_signs_in_over_https_too_and_only_https_once_plain_is_off(
+    tmp_path: Path,
+) -> None:
+    """LT2-C5: sign-in follows the page. Loopback stays plain."""
+
+    async def gateway() -> tuple[str | None, str | None]:
+        return None, None
+
+    plain = {"on": True}
+    doors = SimpleNamespace(plain_allowed=lambda: plain["on"])
+    manager = apps.AppManager(
+        store=apps.AppStore(tmp_path / apps.APPS_FILE),
+        catalogue=[],
+        get_config=lambda key: None,
+        bind_host=lambda: None,
+        advertise_host=lambda: "192.168.16.75",
+        node_name=lambda: "node-a",
+        resolve_gateway=gateway,
+        accounts=app_accounts.AccountSupport(None, "tests make no accounts"),
+        doors=lambda: doors,
+    )
+    port = manager.reserve_port("fake")
+    assert manager.sign_in_redirects("fake", "/cb") == [
+        f"http://192.168.16.75:{port}/cb",
+        f"https://192.168.16.75:{port}/cb",
+        f"http://127.0.0.1:{port}/cb",
+        f"https://127.0.0.1:{port}/cb",
+        f"http://localhost:{port}/cb",
+        f"https://localhost:{port}/cb",
+    ]
+    plain["on"] = False
+    redirects = manager.sign_in_redirects("fake", "/cb")
+    assert redirects[0] == f"https://192.168.16.75:{port}/cb"
+    assert f"http://192.168.16.75:{port}/cb" not in redirects
+    assert f"http://127.0.0.1:{port}/cb" in redirects
+    # A site host is loopback only, with no door.
+    assert all(r.startswith("http://") for r in manager.sign_in_redirects("site-host", "/cb"))

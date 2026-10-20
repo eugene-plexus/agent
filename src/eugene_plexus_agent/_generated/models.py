@@ -2200,6 +2200,11 @@ class MachinePort(BaseModel):
     )
 
 
+class ClientTlsSource(StrEnum):
+    installCa = 'installCa'
+    supplied = 'supplied'
+
+
 class ClientTlsState(StrEnum):
     """
     * `issued`: the doors present a leaf from the install CA.
@@ -4436,6 +4441,10 @@ class ClientTls(BaseModel):
     """
 
     state: ClientTlsState
+    source: ClientTlsSource | None = Field(
+        None,
+        description="What the doors present: a leaf from the install CA, or the owner's\nown certificate (`clientCertificateFile` and `clientKeyFile`,\nLT2-C1's override). `null` while they present nothing.\n",
+    )
     names: list[str] | None = Field(None, description='The names the leaf holds.')
     notAfter: AwareDatetime | None = None
     renewAt: AwareDatetime | None = Field(

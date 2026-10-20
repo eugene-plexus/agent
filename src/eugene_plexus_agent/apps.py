@@ -876,8 +876,10 @@ class _AppPlanner:
         oidc_backchannel: str | None = None,
         gateway_detail: Callable[[], str | None] = lambda: None,
         door_ports: tuple[int, int] | None = None,
+        ca_bundle: Path | None = None,
     ) -> None:
         self.record = record
+        self._ca_bundle = ca_bundle
         #: The app's two loopback ports behind its door (LT2): plain, and the
         #: one TLS connections arrive at, decrypted. None without a door.
         self._door_ports = door_ports
@@ -1066,6 +1068,11 @@ class _AppPlanner:
             env[f"{ENV_PREFIX}_BIND_PORT"] = str(self._door_ports[0])
             env[f"{ENV_PREFIX}_TLS_PORT"] = str(self._door_ports[1])
         env[f"{ENV_PREFIX}_DATA_DIR"] = str(data)
+        if self._ca_bundle is not None:
+            # Python's ssl, httpx and requests all read these: the app trusts
+            # this install's doors, the console's https sign-in included.
+            env["SSL_CERT_FILE"] = str(self._ca_bundle)
+            env["REQUESTS_CA_BUNDLE"] = str(self._ca_bundle)
         env[f"{ENV_PREFIX}_KEY_FILE"] = str(self._store.key_file(record.id))
         env[f"{ENV_PREFIX}_ADMIN_TOKEN"] = self.admin_token
         if self._public_origin:
@@ -1246,8 +1253,12 @@ class AppManager:
         oidc_backchannel: str | None = None,
         private_apps: bool = False,
         doors: Callable[[], Any] = lambda: None,
+        ca_bundle: Callable[[], Path | None] = lambda: None,
     ) -> None:
         self.store = store
+        #: Certifi's roots and the install CA (LT2): every app this agent
+        #: starts reads it as `SSL_CERT_FILE`, so it trusts the doors.
+        self._ca_bundle = ca_bundle
         #: `client_doors.Doors` when this agent fronts apps (LT2), else None.
         self._doors = doors
         self._oidc_issuer = oidc_issuer or (lambda: None)
@@ -1478,11 +1489,20 @@ class AppManager:
             return [origin]
         port = self.reserve_port(app_id)
         hosts = [self._advertise_host() or "127.0.0.1", "127.0.0.1", "localhost"]
+        # LT2: behind its door an app is opened over https too, and only over
+        # https from another machine once plain HTTP is off (LT2-C5: sign-in
+        # follows the page). Loopback stays plain.
+        doors = self._doors() if app_id not in SITE_HOST_IDS else None
+        plain = doors is None or doors.plain_allowed()
         out = []
         for host in dict.fromkeys(hosts):
             if ":" in host and not host.startswith("["):
                 host = f"[{host}]"
-            out.append(f"http://{host}:{port}")
+            local = host in ("127.0.0.1", "localhost")
+            if plain or local:
+                out.append(f"http://{host}:{port}")
+            if doors is not None:
+                out.append(f"https://{host}:{port}")
         return out
 
     def sign_in_redirects(self, app_id: str, path: str) -> list[str]:
@@ -1538,6 +1558,7 @@ class AppManager:
             record,
             store=self.store,
             door_ports=door_ports,
+            ca_bundle=self._ca_bundle(),
             gateway_url=lambda: self._gateway.get(record.id),
             gateway_detail=lambda: self._detail.get(record.id),
             bind_host=(lambda: "127.0.0.1") if record.id in SITE_HOST_IDS else self._bind_host,
