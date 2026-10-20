@@ -285,3 +285,16 @@ def test_config_schema_exposes_security_mode(authed_client: TestClient) -> None:
     assert field["valueType"] == "enum"
     assert set(field["enumValues"]) == {"prompt_on_startup", "os_keyring", "passphrase_file"}
     assert field["category"] == "security"
+
+
+def test_status_says_whether_first_run_setup_finished(authed_client: TestClient) -> None:
+    """CX2-C1: the console's gate reads this before it has a session, to
+    send a half-set-up install to setup rather than to sign-in."""
+    authed_client.patch("/v1/config", json={"firstRunComplete": False})
+    assert authed_client.get("/v1/auth/status").json()["firstRunComplete"] is False
+    assert authed_client.patch("/v1/config", json={"firstRunComplete": True}).status_code == 200
+    assert authed_client.get("/v1/auth/status").json()["firstRunComplete"] is True
+
+
+def test_status_leaves_first_run_out_before_there_is_an_install(client: TestClient) -> None:
+    assert "firstRunComplete" not in client.get("/v1/auth/status").json()

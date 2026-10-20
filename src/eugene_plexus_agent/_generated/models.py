@@ -2644,6 +2644,10 @@ class AuthStatus(BaseModel):
         None,
         description='True when this agent unlocks itself from a passphrase file:\n`securityMode` is `passphrase_file` and\n`EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE` names where the file\ngoes. The Linux system install, where the agent runs under\nits own account and has no keyring (2026-09-24). The wizard\nthen says the install unlocks itself after a restart, offers\nno keyring choice, and sets the control root to the same\nmode. Absent from an agent that predates the field, and false\neverywhere else.\n',
     )
+    firstRunComplete: bool | None = Field(
+        None,
+        description="The agent config's `firstRunComplete`: true once first-run\nsetup has finished (screen 2's Finish). Here so the console's\ngate can tell a half-set-up install from a finished one before\nit has a session (console-ux-pass.md CX2-C1). The half-set-up\none goes to setup, which signs in and carries on in one\npassphrase prompt; the finished one goes to sign-in. Present\nonly when `initialized` is true, and absent from an agent that\npredates the field, so a console treats absent as finished.\n",
+    )
 
 
 class AllowedModel(RootModel[str]):

@@ -122,7 +122,7 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     )
 
 
-@router.get("/v1/auth/status", response_model=AuthStatus)
+@router.get("/v1/auth/status", response_model=AuthStatus, response_model_exclude_none=True)
 async def auth_status(request: Request) -> AuthStatus:
     """Public probe — has a passphrase been set, is the process unlocked,
     and can this host's keyring keep it that way?
@@ -154,11 +154,17 @@ async def auth_status(request: Request) -> AuthStatus:
             KEYRING_PROBE_BUDGET_SECONDS,
         )
         available = None
+    initialized = state.has_passphrase()
     return AuthStatus(
-        initialized=state.has_passphrase(),
+        initialized=initialized,
         unlocked=auth.has_master_key(),
         keyringAvailable=available,
         passphraseFile=_unlocks_from_file(request, state),
+        # CX2-C1: the console's gate reads it before it has a session, so
+        # a half-set-up install goes to setup (one passphrase prompt) and
+        # a finished one to sign-in. Only once there is an install to ask
+        # about.
+        firstRunComplete=state.get_config("firstRunComplete") is True if initialized else None,
     )
 
 
