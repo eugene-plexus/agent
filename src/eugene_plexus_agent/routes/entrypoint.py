@@ -126,9 +126,10 @@ def _steps(config: EntryConfig) -> list[str]:
             )
     if config.internal_ca:
         steps.append(
-            "Trust /data/entrypoint/tls/pki/authorities/local/root.crt on each browser and "
-            "node. Keep CA private keys private. Eugene does not install trust on your "
-            "devices."
+            "Trust the install's certificate authority on each device: open /trust on the "
+            "console. Names ending .local, .lan, .internal or .home.arpa get a certificate "
+            "from it; until the root has issued one, the proxy uses its own, at "
+            "/data/entrypoint/tls/pki/authorities/local/root.crt."
         )
     if config.certificate:
         steps.append(
@@ -219,6 +220,21 @@ def _proxy_check(settings: object, config: EntryConfig) -> None:
         validate_with_proxy(settings, config, Path(scratch))
 
 
+async def _list_names(request: Request, config: EntryConfig) -> None:
+    """LT2: the names this setup answers for, listed at the root for this
+    node's certificate with the operator's own session, so the proxy can
+    present the install CA's leaf instead of a CA of its own. Best effort:
+    until the root has them, the proxy keeps its own CA."""
+    from .. import install_names
+
+    record = request.app.state.node_identity.record
+    authorization = request.headers.get("authorization")
+    if not record.enrolled or not record.control_url or not authorization:
+        return
+    hosts = [s.host for s in config.services()]
+    await install_names.add(str(record.control_url), str(record.name), hosts, authorization)
+
+
 @router.post("/v1/entrypoint/apply", response_model=EntryPointStatus, status_code=202)
 async def apply_entry_point(body: EntryPointPreviewRequest, request: Request) -> JSONResponse:
     settings = request.app.state.settings
@@ -234,6 +250,8 @@ async def apply_entry_point(body: EntryPointPreviewRequest, request: Request) ->
     confirm_by = await asyncio.to_thread(
         entrypoint_setup.save_applied, settings, json.dumps(_normalized(config), indent=2) + "\n"
     )
+    if config.internal_ca:
+        await _list_names(request, config)
     entrypoint_setup.schedule_restart(request.app, "Settings applied an HTTPS setup")
     answer = _status(request).model_copy(
         update={

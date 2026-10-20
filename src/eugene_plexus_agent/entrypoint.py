@@ -528,9 +528,18 @@ def _refusal(status: int, body: str) -> dict[str, Any]:
 
 
 def caddy_config(
-    config: EntryConfig, directory: Path, token: str, ports: dict[str, int | None]
+    config: EntryConfig,
+    directory: Path,
+    token: str,
+    ports: dict[str, int | None],
+    install_leaf: tuple[Path, Path] | None = None,
 ) -> dict[str, Any]:
-    """Generate structured configuration; never interpolate a Caddyfile or shell."""
+    """Generate structured configuration; never interpolate a Caddyfile or shell.
+
+    `install_leaf` (LT2): with `internal_ca`, this node's leaf from the
+    install CA, once it holds every name this setup answers for. Caddy then
+    loads it as files instead of making its own CA, so a person trusts one
+    CA, not two (`tls-for-clients.md` §5)."""
     routes: list[dict[str, Any]] = []
     address = config.nodes.host if config.nodes is not None and config.nodes.is_address else None
     if address and not config.private_http:
@@ -783,7 +792,12 @@ def caddy_config(
     )
     hosts = [s.host for s in config.services()]
     tls: dict[str, Any] = {}
-    if config.internal_ca:
+    own_ca = config.internal_ca and install_leaf is None
+    if config.internal_ca and install_leaf is not None:
+        tls["certificates"] = {
+            "load_files": [{"certificate": str(install_leaf[0]), "key": str(install_leaf[1])}]
+        }
+    elif config.internal_ca:
         tls["automation"] = {"policies": [{"subjects": hosts, "issuers": [{"module": "internal"}]}]}
     elif config.acme:
         authority = (
@@ -846,7 +860,7 @@ def caddy_config(
                         "max_header_bytes": 32768,
                         "automatic_https": {
                             "disable_redirects": True,
-                            "disable_certificates": not (config.internal_ca or config.acme),
+                            "disable_certificates": not (own_ca or config.acme),
                         },
                         "tls_connection_policies": _connection_policies(config, hosts),
                         "routes": routes,
@@ -870,7 +884,7 @@ def caddy_config(
         server["automatic_https"] = {"disable": True}
         server["protocols"] = ["h1"]
         document["apps"].pop("tls")
-    if not config.internal_ca:
+    if not own_ca:
         document["apps"].pop("pki")
     return document
 
@@ -1080,7 +1094,9 @@ class EntryPoint:
                 or report.get("originIsolation") != 1
             ):
                 current["workbench"] = None
-        document = caddy_config(self.config, self.directory, self.token, current)
+        document = caddy_config(
+            self.config, self.directory, self.token, current, self.install_leaf()
+        )
         if self.process is None or self.process.returncode is not None:
             path = self.directory / "caddy.json"
             write_private(path, json.dumps(document))
@@ -1105,11 +1121,32 @@ class EntryPoint:
             self._applied_certificates = certificates
             log.info("HTTPS entry point updated its local service routes")
 
+    def install_leaf(self) -> tuple[Path, Path] | None:
+        """This node's leaf from the install CA, when `internal_ca` is chosen
+        and the leaf holds every name this setup answers for (the owner's
+        names, registered at the root when the setup was applied)."""
+        if not self.config.internal_ca:
+            return None
+        tls = getattr(self.app.state, "client_tls", None)
+        if tls is None or tls.held is None or tls.supplied is not None:
+            return None
+        names = {str(n).lower() for n in tls.held.get("names") or []}
+        if not {s.host.lower() for s in self.config.services()} <= names:
+            return None
+        from .client_tls import CERT_FILE, KEY_FILE
+
+        return tls.directory / CERT_FILE, tls.directory / KEY_FILE
+
     def certificate_fingerprint(self) -> str | None:
-        if not self.config.certificate or not self.config.private_key:
+        files = (
+            (self.config.certificate, self.config.private_key)
+            if self.config.certificate and self.config.private_key
+            else self.install_leaf()
+        )
+        if not files:
             return None
         digest = hashlib.sha256()
-        for path in (self.config.certificate, self.config.private_key):
+        for path in files:
             digest.update(path.read_bytes())
         return digest.hexdigest()
 

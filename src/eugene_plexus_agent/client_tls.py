@@ -273,6 +273,12 @@ class ClientTls:
         write_private(self.directory / CERT_FILE, str(held["certificate"]).rstrip() + "\n")
         write_private(self.directory / BUNDLE_FILE, bundle_text(str(held["ca"])))
         context = _server_context(chain, chain)
+        # This agent's own clients trust the CA too: a proxy here may present
+        # its leaf (the container's entry point), and so may every other node.
+        from ._http import ssl_context
+
+        with contextlib.suppress(ssl.SSLError, ValueError):
+            ssl_context().load_verify_locations(cadata=str(held["ca"]))
         self.held = held
         self.state, self.error = "issued", None
         if self.supplied is None:

@@ -614,3 +614,70 @@ def test_only_the_nodes_name_may_be_a_bare_address():
             workbench={"origin": "https://203.0.113.5:8443", "networks": ["0.0.0.0/0"]},
             nodes=NODES,
         )
+
+
+def test_the_proxy_presents_the_install_ca_leaf_once_it_covers_every_name(tmp_path):
+    """LT2: one CA to trust, not two. With the leaf, Caddy loads it as files
+    and makes no CA of its own; without it, it keeps its own (as before)."""
+    leaf = (tmp_path / "client_tls.crt", tmp_path / "client_tls.key")
+    own = caddy_config(config(), tmp_path, "secret", {"agent": 8079})
+    assert own["apps"]["tls"]["automation"]["policies"][0]["issuers"] == [{"module": "internal"}]
+    assert "pki" in own["apps"]
+    loaded = caddy_config(config(), tmp_path, "secret", {"agent": 8079}, leaf)
+    assert loaded["apps"]["tls"] == {
+        "certificates": {"load_files": [{"certificate": str(leaf[0]), "key": str(leaf[1])}]}
+    }
+    assert "pki" not in loaded["apps"]
+    server = loaded["apps"]["http"]["servers"]["entry"]
+    assert server["automatic_https"]["disable_certificates"] is True
+
+
+def test_the_install_leaf_is_used_only_when_it_holds_every_name(tmp_path):
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent.entrypoint import EntryPoint
+
+    entry = config()
+    hosts = [s.host for s in entry.services()]
+    tls = SimpleNamespace(
+        held={"names": ["192.168.1.20", *hosts[:-1]]}, supplied=None, directory=tmp_path
+    )
+    app = SimpleNamespace(state=SimpleNamespace(client_tls=tls, apps=None))
+    point = EntryPoint(app, entry, tmp_path, "secret")
+    assert point.install_leaf() is None
+    tls.held["names"].append(hosts[-1].upper())
+    assert point.install_leaf() == (tmp_path / "client_tls.crt", tmp_path / "client_tls.key")
+    tls.supplied = {"names": []}
+    assert point.install_leaf() is None
+
+
+async def test_applying_lists_the_setups_names_at_the_root(monkeypatch):
+    import httpx
+
+    from eugene_plexus_agent import install_names
+
+    seen: list[tuple[str, str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path, request.content))
+        if request.method == "GET":
+            return httpx.Response(200, json={"certificateNames": ["box.lan"]})
+        return httpx.Response(200, json={})
+
+    real = install_names.internal_client
+    monkeypatch.setattr(
+        install_names,
+        "internal_client",
+        lambda **kw: real(transport=httpx.MockTransport(handler), **kw),
+    )
+    await install_names.add(
+        "http://192.168.1.10:8083",
+        "agent-a",
+        ["Eugene.lan", "eugene.example.com", "192.168.1.20"],
+        "Bearer operator",
+    )
+    assert [s[:2] for s in seen] == [
+        ("GET", "/v1/nodes/agent-a"),
+        ("PUT", "/v1/nodes/agent-a/certificate-names"),
+    ]
+    assert seen[1][2] == b'{"names":["box.lan","eugene.lan","192.168.1.20"]}'
