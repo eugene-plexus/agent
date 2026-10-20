@@ -144,6 +144,19 @@ def _hardlink(source: Path, link: Path) -> None:
     os.link(source, link)
 
 
+_OLLAMA_BLOB = re.compile(r"sha256-[0-9a-f]{64}")
+
+
+def _in_ollama_store(gguf: Path) -> bool:
+    """Whether `gguf` is a blob in an Ollama model store (CX9).
+
+    Ollama keeps its models as `<store>/blobs/sha256-<64 hex>`; the Library lists them
+    in place and never writes in that folder, so nothing here may probe it, mark it
+    or join a junction to it. Read from the path alone: no contract field says so.
+    """
+    return gguf.parent.name == "blobs" and _OLLAMA_BLOB.fullmatch(gguf.name) is not None
+
+
 def _junction(view: Path, folder: Path) -> bool:
     """On Windows, `view` made a junction to the local folder `folder`, which
     needs no privilege a symlink needs (never to a share: Windows refuses)."""
@@ -487,12 +500,17 @@ class StrataPreparation:
         hard link on the same drive; on Windows without either, the folder
         joined to the Library's when that is on a local drive this node can
         write (setup's marks then go beside the shards); copies otherwise,
-        said as they go, and removed once the library lists the model."""
+        said as they go, and removed once the library lists the model. A blob in
+        an Ollama store is never joined or probed: links or copies only."""
         progress.step = "Finding the model's files"
         shards = shards_of(self.gguf)
         view = self.view
-        if os.path.isjunction(view) and _junction(view, self.gguf.parent):
-            return view
+        joinable = not _in_ollama_store(self.gguf)
+        if os.path.isjunction(view):
+            if joinable and _junction(view, self.gguf.parent):
+                return view
+            if not joinable:
+                os.rmdir(view)  # a link only; never a file in the store
         view.mkdir(parents=True, exist_ok=True)
         why: OSError | None = None
         for make in (_symlink, _hardlink):
@@ -502,7 +520,7 @@ class StrataPreparation:
                 return view
             except OSError as exc:
                 why = why or exc
-        if _writable(self.gguf.parent) and _junction(view, self.gguf.parent):
+        if joinable and _writable(self.gguf.parent) and _junction(view, self.gguf.parent):
             return view
         view.mkdir(parents=True, exist_ok=True)
         total = sum(s.stat().st_size for s in shards)

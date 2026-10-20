@@ -11,6 +11,7 @@ Library folder: nothing is written in the Library folder.
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -472,6 +473,57 @@ def test_on_windows_without_links_a_local_folder_is_joined(build, monkeypatch):
         args[args.index("--native") + 1]
         == f"../ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/{FIRST}"
     )
+
+
+def _store_blob(folder: Path) -> Path:
+    blob = folder / "ollama" / "blobs" / ("sha256-" + "ab" * 32)
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"GGUF blob")
+    return blob
+
+
+def test_a_gguf_is_in_an_ollama_store_by_its_blob_path_only(tmp_path):
+    blob = _store_blob(tmp_path)
+    assert strata_prepare._in_ollama_store(blob)
+    assert not strata_prepare._in_ollama_store(blob.with_name("sha256-" + "AB" * 32))
+    assert not strata_prepare._in_ollama_store(blob.parent.parent / ("sha256-" + "ab" * 32))
+    assert not strata_prepare._in_ollama_store(tmp_path / FIRST)
+
+
+def test_nothing_is_written_in_or_joined_to_an_ollama_store(build, monkeypatch):
+    """CX9: with no link at all a blob is copied; no probe file or junction is made in
+    or to the store's `blobs/`."""
+    _root, folder, _gguf = build
+    blob = _store_blob(folder)
+    monkeypatch.setattr(strata_prepare, "_symlink", _refuse)
+    monkeypatch.setattr(strata_prepare, "_hardlink", _refuse)
+    touched: list[Path] = []
+    monkeypatch.setattr(strata_prepare, "_writable", lambda f: touched.append(f) or True)
+    monkeypatch.setattr(strata_prepare, "_junction", lambda v, f: touched.append(f) or True)
+    before = {p.name: p.stat().st_mtime_ns for p in blob.parent.iterdir()}
+    recipe = dataclasses.replace(_plan(build), gguf=blob)
+    view = recipe._sources(Progress())
+    assert touched == []
+    assert not os.path.isjunction(view)
+    assert (view / blob.name).read_bytes() == b"GGUF blob"
+    assert not os.path.samefile(view / blob.name, blob)
+    assert {p.name: p.stat().st_mtime_ns for p in blob.parent.iterdir()} == before
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a junction is Windows'")
+def test_a_junction_left_to_an_ollama_store_is_removed_without_touching_it(build, monkeypatch):
+    import _winapi
+
+    _root, folder, _gguf = build
+    blob = _store_blob(folder)
+    monkeypatch.setattr(strata_prepare, "_symlink", _refuse)
+    monkeypatch.setattr(strata_prepare, "_hardlink", _refuse)
+    recipe = dataclasses.replace(_plan(build), gguf=blob)
+    recipe.view.parent.mkdir(parents=True, exist_ok=True)
+    _winapi.CreateJunction(str(blob.parent), str(recipe.view))
+    view = recipe._sources(Progress())
+    assert not os.path.isjunction(view)
+    assert [p.name for p in blob.parent.iterdir()] == [blob.name]
 
 
 def test_a_path_outside_the_models_files_is_refused(build, monkeypatch, tmp_path):

@@ -2008,7 +2008,7 @@
           "name": {
             "type": "string",
             "title": "Name",
-            "description": "The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n"
+            "description": "The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`, or the first Ollama tag\nfor a model in an Ollama store. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n"
           },
           "displayName": {
             "anyOf": [
@@ -2160,6 +2160,16 @@
             "anyOf": [
               {
                 "$ref": "#/components/schemas/PreparedDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ollama": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OllamaDetail"
               },
               {
                 "type": "null"
@@ -2584,6 +2594,37 @@
         ],
         "title": "ModelStatus",
         "description": "* `present` — found on disk and readable.\n* `missing` — not found by the last scan, but profiles are\n  saved against it, so the entry survives. **Moving a model\n  produces this**, plus a new entry at the new path: nothing\n  guesses that a file which vanished from one root and appeared\n  in another is the same file, because a wrong guess silently\n  applies one model's tuning to another. The profiles stay here\n  to be copied across by hand.\n* `unreadable` — the files are there and something about them\n  did not work. `error` says what."
+      },
+      "OllamaDetail": {
+        "properties": {
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Tags",
+            "description": "`model:tag` names, as `ollama list` shows them, sorted. Several\ntags can share one file. A model outside Ollama's own library\nkeeps its namespace (`user/model:tag`); one from another\nregistry keeps its host.\n"
+          },
+          "needsMigration": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Needsmigration",
+            "description": "Its family is one Ollama rewrites for llama.cpp\n(`compatmigrate`) and this file is the older layout, so\nupstream llama.cpp may not load it until Ollama has updated\nit. Run is not refused for it.\n"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tags"
+        ],
+        "title": "OllamaDetail",
+        "description": "A model read from an Ollama store (CX9): which of Ollama's names\npoint at this file. Present only for a model in a folder of kind\n`ollama`. Its `name` is the first of `tags`, and is what\n`Runtime.modelAlias` is set to, since the file's own name is a\nhash. Ollama manages the file: the library never writes or\ndeletes it."
       },
       "Operation": {
         "properties": {

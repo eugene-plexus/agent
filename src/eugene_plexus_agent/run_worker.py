@@ -57,11 +57,17 @@ def runtime_spec(model: dict[str, Any], profile: dict[str, Any], *, start: bool)
     suffix = (
         "" if profile.get("default") else "-" + re.sub("[^a-z0-9]+", "-", profile["name"].lower())
     )
+    fields: dict[str, Any] = {}
+    if model.get("ollama"):
+        # A model from an Ollama store (CX9) is a hash-named blob: the file's own name
+        # would be served as the model id. It is served under the name Ollama calls it.
+        fields["modelAlias"] = model["name"]
     return RuntimeSpec.model_validate(
         {
             "name": (base + suffix)[:60].rstrip("-"),
             "engine": profile["engine"],
             "modelPath": model["path"],
+            **fields,
             # Copied like every other launch field (MR3): the profile's say about
             # what the model is, or `auto`, which reads the file's header.
             "mode": profile.get("mode") or "auto",
