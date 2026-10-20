@@ -1669,6 +1669,10 @@ class AppManager:
             await self.supervisor.remove(app_id, purge=purge)
         else:
             await self.supervisor.stop(app_id)
+        # Its door goes with it: nothing listens on its port once it is gone.
+        doors = self._doors()
+        if doors is not None:
+            await doors.close(f"app:{app_id}")
         self.store.remove(app_id)
         self._gateway.pop(app_id, None)
         self._detail.pop(app_id, None)

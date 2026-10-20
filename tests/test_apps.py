@@ -845,3 +845,19 @@ def test_the_install_tools_get_no_hub_variables(
     assert len(seen) == 3  # venv, install, verify
     assert all(not any(k.startswith("EUGENE_PLEXUS_") for k in env) for env in seen)
     assert (target / apps.INSTALL_METADATA).is_file()
+
+
+def test_an_uninstalled_app_leaves_nothing_listening_on_its_port(tmp_path: Path) -> None:
+    """LT2: the agent's door holds an app's port; uninstalling the app
+    closes it (found by C4's "nothing listens on its port")."""
+    closed: list[str] = []
+
+    class Doors:
+        async def close(self, name: str) -> None:
+            closed.append(name)
+
+    manager = _manager(tmp_path)
+    manager._doors = Doors  # type: ignore[assignment]
+    manager.store.put(_record(_manifest()))
+    asyncio.run(manager.uninstall("tiny", purge=False))
+    assert closed == ["app:tiny"]
