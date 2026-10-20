@@ -928,6 +928,12 @@ async def _over_tls(app: FastAPI, agent_url: str) -> str:
     if tls is None or tls.ca_pem() is None or parts.scheme != "http":
         return agent_url
     secure = parts._replace(scheme="https").geturl()
+    trust = getattr(app.state, "machine_trust", None)
+    if trust is not None and trust.required:
+        # Every machine runs a version with a TLS door (the install requires
+        # encryption between machines): no probe, so nobody in the middle can
+        # turn an app's traffic plain by blocking TLS.
+        return secure
     try:
         async with internal_client(timeout=5.0) as client:
             answer = await client.get(secure + "/healthz")

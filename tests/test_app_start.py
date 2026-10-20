@@ -982,5 +982,9 @@ async def test_an_app_reaches_a_gateway_on_another_machine_over_https_when_it_ca
     app = SimpleNamespace(state=SimpleNamespace(client_tls=held))
     assert await _over_tls(app, "http://192.168.1.10:8079") == "https://192.168.1.10:8079"  # type: ignore[arg-type]
     assert await _over_tls(app, "http://192.168.1.11:8079") == "http://192.168.1.11:8079"  # type: ignore[arg-type]
+    # Required between machines: https with no probe, so blocking TLS cannot
+    # turn an app's traffic plain.
+    app.state.machine_trust = SimpleNamespace(required=True)
+    assert await _over_tls(app, "http://192.168.1.11:8079") == "https://192.168.1.11:8079"  # type: ignore[arg-type]
     held.ca_pem = lambda: None
     assert await _over_tls(app, "http://192.168.1.10:8079") == "http://192.168.1.10:8079"  # type: ignore[arg-type]
