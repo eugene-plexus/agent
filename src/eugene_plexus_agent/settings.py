@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     on, so the agent an install runs always has one; an app built in a test
     or a harness does not bind 8083 unless it asks."""
 
+    client_doors_enabled: bool = False
+    """Whether the console, the gateway and apps take TLS beside plain HTTP
+    on their ports (LT2, `client_doors`). `build_server` turns it on, as it
+    does the machine port; a test app does not front a gateway unless it
+    asks."""
+
     safe_mode: bool = False
     """If true, skip loading the persistent state file at startup and run on
     built-in defaults — empty topology, default UI prefs. Provides a recovery

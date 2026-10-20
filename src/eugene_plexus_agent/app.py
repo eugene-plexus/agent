@@ -277,13 +277,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         supervisor = Supervisor(
             log=log,
             auth_state=app.state.auth_state,
-            shared_child_env=lambda kind=None: shared_child_env(
-                settings,
-                state,
-                identity,
-                kind,
-                door_up=lambda: getattr(app.state, "machine_port", None) is not None,
-            ),
+            shared_child_env=lambda kind=None: {
+                **shared_child_env(
+                    settings,
+                    state,
+                    identity,
+                    kind,
+                    door_up=lambda: getattr(app.state, "machine_port", None) is not None,
+                ),
+                # LT2: a gateway behind its door listens on loopback.
+                **(
+                    app.state.gateway_door.child_env()
+                    if kind == "gateway" and getattr(app.state, "gateway_door", None)
+                    else {}
+                ),
+            },
             standby_env=lambda: standby.spawn_env(app),
         )
         owns_supervisor = True
@@ -378,6 +386,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                     else None
                 ),
                 private_apps=bool(app.state.entrypoint_config),
+                # LT2: each app behind its door, once the doors are open.
+                doors=lambda: (
+                    getattr(app.state, "client_doors", None)
+                    if settings.client_doors_enabled
+                    else None
+                ),
             )
     app_manager: apps.AppManager | None = app.state.apps
 
@@ -423,6 +437,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not settings.safe_mode and settings.machine_port_enabled:
         machine_port.move_control_behind(state, int(settings.machine_port))
     door = None if settings.safe_mode else await machine_port.start(app)
+    # The client doors (LT2): the leaf they present, and the gateway's door,
+    # before the gateway starts and is told its loopback port.
+    from . import client_tls
+
+    tls = None if settings.safe_mode else await client_tls.start(app)
+    tls_task = asyncio.create_task(tls.run(), name="client-tls") if tls is not None else None
 
     def _rebind_on_required(required: bool) -> None:
         # Required moves the drivers to loopback (LT1b; control is there
@@ -651,6 +671,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await supervisor.stop_all()
         if door is not None:
             await door.stop()
+        if tls_task is not None:
+            tls_task.cancel()
+            await asyncio.gather(tls_task, return_exceptions=True)
+        client_doors_ = getattr(app.state, "client_doors", None)
+        if client_doors_ is not None:
+            await client_doors_.close_all()
+            if client_doors_.counts is not None:
+                client_doors_.counts.save()
         # Last: the process-wide clients (`_http.shared_internal_client`)
         # -- the engine readiness probe and the library reads admission
         # makes. Last because everything above may still be probing on

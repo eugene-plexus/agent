@@ -40,6 +40,7 @@ from .. import __version__, default_topology, host_history, machine_port, reach,
 from .._generated.common_models import ConfigUpdateRequest, Problem, SignedTrustBundle
 from .._generated.models import (
     Arch,
+    ClientTls,
     ComponentStatus,
     EnrollRequest,
     HostHistory,
@@ -160,6 +161,12 @@ def _machine(request: Request) -> MachinePort | None:
     )
 
 
+def _client_tls(request: Request) -> ClientTls | None:
+    """`NodeIdentity.clientTls`: this node's client doors and their leaf (LT2)."""
+    tls = getattr(request.app.state, "client_tls", None)
+    return ClientTls.model_validate(tls.status()) if tls is not None else None
+
+
 def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
     """The identity as it stands, plus the live inventory."""
     record = _store(request).record
@@ -183,6 +190,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         epoch=record.epoch if record.enrolled else None,
         advertiseUrl=advertise,  # type: ignore[arg-type]
         machine=_machine(request),
+        clientTls=_client_tls(request),
         trustBundleVersion=bundle.version if bundle is not None else None,
         trustBundleAgeSeconds=trust.heard_age_seconds() if record.enrolled else None,
         tokenPublicKey=token_public,
@@ -922,3 +930,39 @@ async def delete_node_history(request: Request) -> Response:
     await asyncio.to_thread(store.clear)
     log.info("host history deleted at an operator's request")
     return Response(status_code=204)
+
+
+@router.get("/v1/trust/ca", response_class=Response)
+async def get_install_ca(
+    request: Request, format: str = Query(default="pem", pattern="^(pem|der)$")
+) -> Response:
+    """The install CA that signed this node's client leaf (LT2), for a device
+    to trust. Public: a certificate is not a secret, and a device fetches it
+    before it trusts anything."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import serialization
+
+    tls = getattr(request.app.state, "client_tls", None)
+    pem = tls.ca_pem() if tls is not None else None
+    if not pem:
+        raise _problem(
+            404,
+            "no-install-ca",
+            "No install CA here yet",
+            "This machine holds no certificate from the install's certificate authority: "
+            "it is not joined to an install, or the root has not issued it one yet.",
+        )
+    if format == "der":
+        der = x509.load_pem_x509_certificate(pem.encode("ascii")).public_bytes(
+            serialization.Encoding.DER
+        )
+        return Response(
+            der,
+            media_type="application/pkix-cert",
+            headers={"Content-Disposition": 'attachment; filename="eugene-plexus-ca.cer"'},
+        )
+    return Response(
+        pem,
+        media_type="application/x-pem-file",
+        headers={"Content-Disposition": 'inline; filename="eugene-plexus-ca.pem"'},
+    )

@@ -2200,6 +2200,48 @@ class MachinePort(BaseModel):
     )
 
 
+class ClientTlsState(StrEnum):
+    """
+    * `issued`: the doors present a leaf from the install CA.
+    * `pending`: this node has asked and holds no leaf yet (the root is
+      sealed, or has no CA yet).
+    * `none`: not enrolled; a node alone has no CA, and its doors take
+      plain HTTP only.
+    * `error`: the root refused the request; `error` says why.
+
+    """
+
+    issued = 'issued'
+    pending = 'pending'
+    none = 'none'
+    error = 'error'
+
+
+class PlainClient(BaseModel):
+    address: str
+    count: int
+    lastSeen: AwareDatetime
+
+
+class ClientDoor(BaseModel):
+    name: str = Field(..., description='`console`, `gateway`, or `app:<id>`.')
+    port: int
+    listening: bool
+    tls: bool = Field(
+        ..., description='TLS is served on this port now (a leaf is held).'
+    )
+    error: str | None = Field(
+        None, description='Why it is not listening, in the words of the failure.'
+    )
+    plainConnections: int = Field(
+        ...,
+        description='Plain HTTP connections from other machines in the last 7 days.\nConnections, not requests: one connection carries many.\n',
+    )
+    plainClients: list[PlainClient] = Field(
+        ..., description='The same, by client address, most recent first.'
+    )
+
+
 class ComponentName(StrEnum):
     """
     One of the seven packages an install is made of (`tool-driver`
@@ -4385,6 +4427,31 @@ class ComponentEntry(BaseModel):
     safeMode: bool | None = False
 
 
+class ClientTls(BaseModel):
+    """
+    This node's client doors and the certificate they present (LT2,
+    `docs/design/tls-for-clients.md`). Each door takes TLS and plain
+    HTTP on the same port, told apart by the first byte.
+
+    """
+
+    state: ClientTlsState
+    names: list[str] | None = Field(None, description='The names the leaf holds.')
+    notAfter: AwareDatetime | None = None
+    renewAt: AwareDatetime | None = Field(
+        None,
+        description='When this node asks for a new leaf: two thirds through its life,\nor at once when its address leaves the names.\n',
+    )
+    error: str | None = Field(
+        None, description="The root's refusal, or the failure, in its own words."
+    )
+    plainAllowed: bool = Field(
+        ...,
+        description="Plain HTTP from another machine is still taken here (LT2-C4,\nthe root's `clientPlainHttp`). Loopback is always plain.\n",
+    )
+    doors: list[ClientDoor]
+
+
 class InstalledComponent(BaseModel):
     name: ComponentName
     state: InstalledComponentState
@@ -5720,6 +5787,7 @@ class NodeIdentity(BaseModel):
         description="Where other hosts reach this agent — the `advertiseUrl` config\nfield, or the value derived at enrollment when none was set.\nWhat the control root holds as this node's `Node.url`.\n",
     )
     machine: MachinePort | None = None
+    clientTls: ClientTls | None = None
     trustBundleVersion: int | None = Field(
         None,
         description='The version of the trust bundle this agent holds. After a\nrevocation or a rotation, a node still below the root\'s\ncurrent version is the answer to "which host is stale", from\nthe host itself.\n',

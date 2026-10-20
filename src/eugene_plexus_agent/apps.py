@@ -875,8 +875,12 @@ class _AppPlanner:
         public_origin: str | None = None,
         oidc_backchannel: str | None = None,
         gateway_detail: Callable[[], str | None] = lambda: None,
+        door_ports: tuple[int, int] | None = None,
     ) -> None:
         self.record = record
+        #: The app's two loopback ports behind its door (LT2): plain, and the
+        #: one TLS connections arrive at, decrypted. None without a door.
+        self._door_ports = door_ports
         self._store = store
         self._gateway_url = gateway_url
         #: Why there is no gateway address, when the agent knows: said when an app
@@ -1006,9 +1010,11 @@ class _AppPlanner:
         carries why there is none (`gatewayDetail`), for the words of the
         refusal when the app names `{gatewayUrl}`."""
         manifest = self.record.manifest
+        # Behind its door (LT2), an app listens where the door pipes to.
+        door = self._door_ports
         values: dict[str, str] = {
-            "bindHost": self._bind_host() or "127.0.0.1",
-            "port": str(self.record.port),
+            "bindHost": "127.0.0.1" if door else (self._bind_host() or "127.0.0.1"),
+            "port": str(door[0] if door else self.record.port),
         }
         gateway = self._gateway_url()
         if gateway:
@@ -1053,6 +1059,12 @@ class _AppPlanner:
         env = child_environment()
         env[f"{ENV_PREFIX}_ID"] = record.id
         env[f"{ENV_PREFIX}_BIND_PORT"] = str(record.port)
+        if self._door_ports is not None:
+            # Behind its door (LT2): the agent holds `record.port` and pipes
+            # each connection here, a TLS one to the second port, so the app
+            # knows the page's scheme from where it arrived.
+            env[f"{ENV_PREFIX}_BIND_PORT"] = str(self._door_ports[0])
+            env[f"{ENV_PREFIX}_TLS_PORT"] = str(self._door_ports[1])
         env[f"{ENV_PREFIX}_DATA_DIR"] = str(data)
         env[f"{ENV_PREFIX}_KEY_FILE"] = str(self._store.key_file(record.id))
         env[f"{ENV_PREFIX}_ADMIN_TOKEN"] = self.admin_token
@@ -1060,7 +1072,7 @@ class _AppPlanner:
             env[f"{ENV_PREFIX}_PUBLIC_ORIGIN"] = self._public_origin
         if self._oidc_backchannel:
             env[f"{ENV_PREFIX}_OIDC_BACKCHANNEL"] = self._oidc_backchannel
-        host = self._bind_host()
+        host = "127.0.0.1" if self._door_ports is not None else self._bind_host()
         if host:
             env[f"{ENV_PREFIX}_BIND_HOST"] = host
         gateway = self._gateway_url()
@@ -1233,8 +1245,11 @@ class AppManager:
         public_origin: Callable[[str], str | None] | None = None,
         oidc_backchannel: str | None = None,
         private_apps: bool = False,
+        doors: Callable[[], Any] = lambda: None,
     ) -> None:
         self.store = store
+        #: `client_doors.Doors` when this agent fronts apps (LT2), else None.
+        self._doors = doors
         self._oidc_issuer = oidc_issuer or (lambda: None)
         self._public_origin = public_origin or (lambda app_id: None)
         self._oidc_backchannel = oidc_backchannel
@@ -1518,9 +1533,11 @@ class AppManager:
         url, detail = await self._resolve_gateway() if record.manifest.uses else (None, None)
         self._gateway[record.id] = url
         self._detail[record.id] = detail
+        door_ports = await self._open_door(record)
         planner = _AppPlanner(
             record,
             store=self.store,
+            door_ports=door_ports,
             gateway_url=lambda: self._gateway.get(record.id),
             gateway_detail=lambda: self._detail.get(record.id),
             bind_host=(lambda: "127.0.0.1") if record.id in SITE_HOST_IDS else self._bind_host,
@@ -1537,6 +1554,39 @@ class AppManager:
         if self.before_stop:
             await self.before_stop(app_id)
         await self.supervisor.stop(app_id)
+        doors = self._doors()
+        if doors is not None:
+            await doors.close(f"app:{app_id}")
+
+    async def _open_door(self, record: InstalledApp) -> tuple[int, int] | None:
+        """The app's door on its port (LT2): TLS beside plain HTTP, in front
+        of two loopback ports of the app's own. None when this agent fronts
+        no apps, for the site hosts (loopback only), or when the port is held
+        (the app then binds it itself, plain only, as before)."""
+        from .client_tls import free_loopback_port
+
+        doors = self._doors()
+        if doors is None or record.id in SITE_HOST_IDS:
+            return None
+        plain, tls = free_loopback_port(), free_loopback_port()
+        try:
+            await doors.open_pump(
+                f"app:{record.id}",
+                bind_host=self._bind_host() or "127.0.0.1",
+                port=record.port,
+                plain_target=lambda: plain,
+                tls_target=lambda: tls,
+                fallback_target=lambda: plain,
+            )
+        except OSError as exc:
+            log.warning(
+                "app %s: its door could not open on %d (%s); it takes plain HTTP only",
+                record.id,
+                record.port,
+                exc,
+            )
+            return None
+        return plain, tls
 
     async def restart(self, record: InstalledApp) -> None:
         await self.stop(record.id)

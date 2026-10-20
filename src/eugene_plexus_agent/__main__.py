@@ -38,6 +38,7 @@ import argparse
 import contextlib
 import logging
 import sys
+from typing import Any
 
 import uvicorn
 
@@ -266,6 +267,10 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # environment said otherwise (two agents on one host in a dev run).
     if "machine_port_enabled" not in settings.model_fields_set:
         settings.machine_port_enabled = True
+    # The client doors (LT2): TLS beside plain HTTP on 8079, the gateway's
+    # port and app ports, the same way.
+    if "client_doors_enabled" not in settings.model_fields_set:
+        settings.client_doors_enabled = True
     app = create_app(settings)
     # The interface this process will actually listen on, recorded where
     # `GET /v1/node`'s `reach` can read it. Not the same thing as the
@@ -283,8 +288,18 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # as `peer.PEER_HEADER` instead, which is trustworthy because it is
     # stripped on the way in. See `peer.py`; review §6.1 #1, roadmap
     # R1.2.
+    #
+    # **The console's protocol is `client_doors`'** when the doors are on: it
+    # reads a connection's first byte and hands it to uvicorn's own HTTP
+    # protocol, through TLS when it is a handshake (LT2).
+    http: Any = "auto"
+    if settings.client_doors_enabled:
+        from . import client_doors
+
+        app.state.client_doors = client_doors.Doors()
+        http = app.state.client_doors.console_protocol(port)
     config = uvicorn.Config(
-        app, host=bind_host, port=port, log_level=log_level, forwarded_allow_ips=[]
+        app, host=bind_host, port=port, log_level=log_level, forwarded_allow_ips=[], http=http
     )
     server = uvicorn.Server(config)
     # How a restart asked for by Settings stops this server (`entrypoint_setup`).
