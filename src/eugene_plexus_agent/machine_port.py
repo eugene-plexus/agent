@@ -297,6 +297,15 @@ class MachineApp:
         )
 
 
+def _job_site_path(path: str) -> bool:
+    """A Job Site's own routes at the root (`/v1/sites/...`, and the TLS key
+    list it pins against). Job Sites keep the door they have (design §2: out
+    of LT1's scope): one that joined at a plain LAN address of the root
+    reaches it there whatever `machineEncryption` says, and one that joined
+    at the nodes name is HTTPS through the entry point already."""
+    return path.startswith("/v1/sites/") or path == "/v1/trust/tls"
+
+
 class PlainApp:
     """The plain branch: control, as 8083 always was, while it is allowed."""
 
@@ -308,7 +317,7 @@ class PlainApp:
             return
         self.peers.restore(scope)
         local = peer_module.is_loopback(_peer_of(scope))
-        if not local and self.routes.required():
+        if not local and self.routes.required() and not _job_site_path(scope["path"]):
             log.info("refused plain HTTP from %s on the machine port", _peer_of(scope))
             await _problem(
                 send,
