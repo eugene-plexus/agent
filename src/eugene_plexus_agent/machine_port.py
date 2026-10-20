@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import socket
 import ssl
 from collections.abc import AsyncIterator, Callable
@@ -61,6 +62,12 @@ MACHINE_PORT = 8083
 FIRST_BYTE_SECONDS = 15.0
 #: How often a port another process holds is tried again.
 RETRY_BIND_SECONDS = 15.0
+#: A connection that moves no byte either way for this long is closed. Long,
+#: because a model can think for minutes before its first token.
+IDLE_SECONDS = 900.0
+#: Open connections at once: in all, and from one address.
+MAX_CONNECTIONS = 2048
+MAX_PER_PEER = 512
 _PUMP_CHUNK = 64 * 1024
 
 HOP_BY_HOP = frozenset(
@@ -232,6 +239,25 @@ class _Forwarder:
             await upstream.aclose()
 
 
+_REFUSED_IN_PATHS = ("%2e", "\\")
+
+
+def _raw_path(scope: dict[str, Any]) -> str | None:
+    """The path as it came on the wire, or None when it is not one this port
+    takes: a `.` or `..` segment, an encoded dot, or a backslash
+    (adversarial review, 2026-10-20). Routing and the plain branch's Job Site
+    rule read this, and the forwarders send it as it is, so no hop can read a
+    path another hop normalised differently (`/v1/sites/../nodes/enroll`)."""
+    raw = scope.get("raw_path")
+    text = raw.decode("latin-1") if isinstance(raw, bytes | bytearray) else str(scope["path"])
+    lowered = text.lower()
+    if not text.startswith("/") or any(token in lowered for token in _REFUSED_IN_PATHS):
+        return None
+    if any(segment in (".", "..") for segment in text.split("/")):
+        return None
+    return text
+
+
 def _split(path: str, prefix: str) -> str | None:
     """The rest of `path` under `prefix`, or None when it is not under it."""
     if path == prefix:
@@ -251,12 +277,17 @@ class MachineApp:
         if scope["type"] != "http":
             return
         self.peers.restore(scope)
-        path: str = scope["path"]
+        path = _raw_path(scope)
+        if path is None:
+            await _problem(send, 400, "Not a path", "This machine port takes no such path.")
+            return
         rest = _split(path, "/agent")
         if rest is not None:
+            from urllib.parse import unquote
+
             inner = dict(scope)
-            inner["path"] = rest
-            inner["raw_path"] = rest.encode("utf-8")
+            inner["path"] = unquote(rest)
+            inner["raw_path"] = rest.encode("latin-1")
             inner["root_path"] = ""
             inner["scheme"] = "https"
             inner["headers"] = _clean_headers(scope)
@@ -297,13 +328,21 @@ class MachineApp:
         )
 
 
+_PUBLIC_PLAIN = re.compile(r"^(/v1/sites/[A-Za-z0-9_/-]+|/v1/trust/tls|/v1/trust/machines)$")
+
+
 def _job_site_path(path: str) -> bool:
-    """A Job Site's own routes at the root (`/v1/sites/...`, and the TLS key
-    list it pins against). Job Sites keep the door they have (design §2: out
-    of LT1's scope): one that joined at a plain LAN address of the root
-    reaches it there whatever `machineEncryption` says, and one that joined
-    at the nodes name is HTTPS through the entry point already."""
-    return path.startswith("/v1/sites/") or path == "/v1/trust/tls"
+    """What another machine may still ask the root in plain HTTP once
+    encryption is required, read from the raw path (`_raw_path`).
+
+    A Job Site's own routes (`/v1/sites/...`, and the TLS key list it pins
+    against): Job Sites keep the door they have (design §2, out of LT1's
+    scope), so one that joined at a plain LAN address of the root reaches it
+    there whatever `machineEncryption` says. And the signed machine list: a
+    node whose pinned key for the root no longer matches (the root's machine
+    was set up again) fetches it here to learn the root's new key, which it
+    takes only if the list verifies against the root's identity key."""
+    return bool(_PUBLIC_PLAIN.match(path))
 
 
 class PlainApp:
@@ -316,8 +355,12 @@ class PlainApp:
         if scope["type"] != "http":
             return
         self.peers.restore(scope)
+        path = _raw_path(scope)
+        if path is None:
+            await _problem(send, 400, "Not a path", "This machine port takes no such path.")
+            return
         local = peer_module.is_loopback(_peer_of(scope))
-        if not local and self.routes.required() and not _job_site_path(scope["path"]):
+        if not local and self.routes.required() and not _job_site_path(path):
             log.info("refused plain HTTP from %s on the machine port", _peer_of(scope))
             await _problem(
                 send,
@@ -336,7 +379,7 @@ class PlainApp:
                 "Other machines reach this one here over TLS (https).",
             )
             return
-        await self.forward(scope, receive, send, target, scope["path"])
+        await self.forward(scope, receive, send, target, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -411,6 +454,7 @@ class MachinePort:
         self._front: asyncio.Server | None = None
         self._binder: asyncio.Task[None] | None = None
         self._connections: set[asyncio.Task[None]] = set()
+        self._per_peer: dict[str, int] = {}
         self.on_listening: Callable[[], None] | None = None
 
     async def start(self) -> None:
@@ -462,9 +506,19 @@ class MachinePort:
                 return
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        remote = writer.get_extra_info("peername") or ("unknown", 0)
+        source = str(remote[0])
+        if (
+            len(self._connections) >= MAX_CONNECTIONS
+            or self._per_peer.get(source, 0) >= MAX_PER_PEER
+        ):
+            log.warning("machine port: too many connections; closed one from %s", source)
+            writer.close()
+            return
         task = asyncio.current_task()
         if task is not None:
             self._connections.add(task)
+        self._per_peer[source] = self._per_peer.get(source, 0) + 1
         inner_writer: asyncio.StreamWriter | None = None
         local_port: int | None = None
         try:
@@ -474,17 +528,25 @@ class MachinePort:
                 return
             if not first:
                 return
-            remote = writer.get_extra_info("peername")
             target = self._tls if first[0] == 0x16 else self._plain
             inner_reader, inner_writer = await asyncio.open_connection("127.0.0.1", target.port)
             local_port = int(inner_writer.get_extra_info("sockname")[1])
             # Before a byte reaches the inner listener: the request it reads
             # is attributed to this peer, never to loopback.
-            self._peers.add(local_port, (str(remote[0]), int(remote[1])))
+            self._peers.add(local_port, (source, int(remote[1])))
             inner_writer.write(first)
-            await asyncio.gather(
-                _pump(reader, inner_writer), _pump(inner_reader, writer), return_exceptions=True
+            upstream = asyncio.create_task(_pump(reader, inner_writer))
+            downstream = asyncio.create_task(_pump(inner_reader, writer))
+            done, _ = await asyncio.wait(
+                {upstream, downstream}, return_when=asyncio.FIRST_COMPLETED
             )
+            if upstream in done and not downstream.done():
+                # The caller finished sending: let the answer finish, within
+                # the idle bound the pump applies itself.
+                await asyncio.wait({downstream})
+            for pump in (upstream, downstream):
+                pump.cancel()
+            await asyncio.gather(upstream, downstream, return_exceptions=True)
         except (ConnectionError, OSError) as exc:
             log.debug("machine port connection ended: %s", exc)
         finally:
@@ -493,6 +555,11 @@ class MachinePort:
             for w in (inner_writer, writer):
                 if w is not None:
                     w.close()
+            left = self._per_peer.get(source, 1) - 1
+            if left > 0:
+                self._per_peer[source] = left
+            else:
+                self._per_peer.pop(source, None)
             if task is not None:
                 self._connections.discard(task)
 
@@ -512,13 +579,19 @@ class MachinePort:
 
 
 async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Copy one direction until it ends or idles for `IDLE_SECONDS`."""
     try:
         while True:
-            chunk = await reader.read(_PUMP_CHUNK)
+            try:
+                chunk = await asyncio.wait_for(reader.read(_PUMP_CHUNK), IDLE_SECONDS)
+            except TimeoutError:
+                break
             if not chunk:
                 break
             writer.write(chunk)
             await writer.drain()
+    except (ConnectionError, OSError):
+        pass
     finally:
         with contextlib.suppress(Exception):
             if writer.can_write_eof():
@@ -565,7 +638,20 @@ def move_control_behind(state: Any, machine_port: int) -> int | None:
     entry = active_control_entry(state)
     if entry is None or _port_of(str(entry.url)) != machine_port:
         return None
-    taken = {_port_of(str(e.url)) for e in state.list_topology_entries()} - {None}
+    if not ports.is_free(machine_port, host="0.0.0.0"):
+        # Something other than control holds it (control is not started yet).
+        # Moving control would leave it behind a door that cannot open, so it
+        # keeps the port, and the machine port does not start (`start`).
+        log.warning(
+            "port %d is held by %s; control keeps it and this machine opens no machine "
+            "port, so other machines reach it in plain HTTP",
+            machine_port,
+            ports.describe_holder(machine_port) or "another process",
+        )
+        return None
+    taken = {
+        port for e in state.list_topology_entries() if (port := _port_of(str(e.url))) is not None
+    }
     port = ports.first_free(machine_port + 1, reserved=RESERVED_PORTS | taken | {machine_port})
     state.update_topology_entry(
         entry.name, entry.model_copy(update={"url": f"http://127.0.0.1:{port}"})
@@ -631,6 +717,10 @@ def machine_url(app: Any) -> str | None:
     host = node_identity.advertise_host(advertise)
     if not host or node_identity.is_loopback_host(host):
         return None
+    if ":" in host:
+        # The machine port listens on IPv4 (`bind_host_for`): an IPv6 address
+        # would name a door nothing answers at. Set `machineUrl` to override.
+        return None
     advertised_port = urlsplit(advertise or "").port
     offset = (advertised_port - int(app.state.settings.bind_port)) if advertised_port else 0
     return node_identity.format_url(host, door.status.port + offset, scheme="https")
@@ -660,6 +750,9 @@ async def start(app: Any) -> MachinePort | None:
     settings = app.state.settings
     if not settings.machine_port_enabled:
         return None
+    control_entry = active_control_entry(app.state.agent_state)
+    if control_entry is not None and _port_of(str(control_entry.url)) == int(settings.machine_port):
+        return None  # control kept the port (`move_control_behind`)
     record = app.state.node_identity.record
     if not (record.tls_private_key and record.tls_certificate):
         log.error("this node has no machine key, so it opens no machine port")

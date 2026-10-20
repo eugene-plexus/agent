@@ -23,6 +23,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "engineBinaryRoots",
         "allowUnrestrictedEngineLaunch",
         "advertiseUrl",
+        "machineUrl",
         "allowedHosts",
         "pathMappings",
         "shareCredentials",

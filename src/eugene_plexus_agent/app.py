@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -170,6 +170,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     from .machine_trust import MachineTrust
 
     machine_trust = MachineTrust(settings.config_file.resolve().parent, identity)
+    # This machine under the address the others know it by: its own requests
+    # to it are not a crossing to another machine.
+    machine_trust.own_urls = lambda: (
+        node_identity.effective_advertise_url(
+            state.get_config("advertiseUrl"), identity.record.advertise_url
+        ),
+    )
     machine_trust.load()
     app.state.machine_trust = machine_trust
 
@@ -270,7 +277,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         supervisor = Supervisor(
             log=log,
             auth_state=app.state.auth_state,
-            shared_child_env=lambda kind=None: shared_child_env(settings, state, identity, kind),
+            shared_child_env=lambda kind=None: shared_child_env(
+                settings,
+                state,
+                identity,
+                kind,
+                door_up=lambda: getattr(app.state, "machine_port", None) is not None,
+            ),
             standby_env=lambda: standby.spawn_env(app),
         )
         owns_supervisor = True
@@ -767,11 +780,14 @@ async def _announce_address(
     try:
         from . import machine_port
 
+        trust = app.state.machine_trust
         await enrollment.keep_address_announced(
             store=identity,
             resolve=resolve,
             transport=getattr(app.state, "control_transport", None),
             machine=lambda: machine_port.announced(app),
+            recorded=trust.own_record,
+            old_root=lambda: trust.root_has_list is False,
         )
     except asyncio.CancelledError:
         raise
@@ -880,6 +896,7 @@ def shared_child_env(
     state: AgentState,
     identity: node_identity.NodeIdentityStore,
     kind: str | None = None,
+    door_up: Callable[[], bool] | None = None,
 ) -> dict[str, str]:
     """`_base_child_env`, with the machine port's part (LT1).
 
@@ -892,7 +909,9 @@ def shared_child_env(
     """
     env = _base_child_env(settings, state, identity, kind)
     env["MACHINE_PINS_FILE"] = str(identity.path.parent / MACHINE_PINS_FILE)
-    if settings.machine_port_enabled:
+    # Only behind a machine port that started: one that did not (8083 held
+    # by another process, an unreadable key) leaves control where it was.
+    if settings.machine_port_enabled and (door_up is None or door_up()):
         if kind == "control":
             if identity.record.tls_certificate:
                 env["MACHINE_PINS"] = node_identity.machine_pin(identity.record.tls_certificate)

@@ -295,7 +295,9 @@ async def test_a_port_another_process_holds_is_reported_and_retried(tmp_path: Pa
 # --------------------------------------------------------------------------- #
 
 
-def test_control_moves_off_the_machine_port_once(tmp_path: Path) -> None:
+def test_control_moves_off_the_machine_port_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from eugene_plexus_agent._generated.models import ComponentEntry, SpawnConfig
     from eugene_plexus_agent.state import AgentState
 
@@ -309,6 +311,13 @@ def test_control_moves_off_the_machine_port_once(tmp_path: Path) -> None:
             spawn=SpawnConfig(configFile="control.yaml"),
         )
     )
+    from eugene_plexus_agent import ports
+
+    # Held by another process: control keeps it, and nothing moves.
+    monkeypatch.setattr(ports, "is_free", lambda port, **_: port != 8083)
+    assert machine_port.move_control_behind(state, 8083) is None
+    assert str(state.get_topology_entry("control").url).rstrip("/") == "http://127.0.0.1:8083"
+    monkeypatch.setattr(ports, "is_free", lambda port, **_: True)
     moved = machine_port.move_control_behind(state, 8083)
     assert moved is not None and moved > 8083
     assert str(state.get_topology_entry("control").url).rstrip("/") == f"http://127.0.0.1:{moved}"
@@ -424,7 +433,9 @@ def test_a_join_token_gives_up_the_root_s_key() -> None:
     secret = "abcDEF_-123"
     assert enrollment.split_join_token(f"{secret}.{PIN_R}") == (secret, PIN_R)
     assert enrollment.split_join_token(secret) == (secret, None)
-    assert enrollment.split_join_token(f"{secret}.short") == (f"{secret}.short", None)
+    # A pin cut short when the command was copied is an error, never a plain join.
+    with pytest.raises(ValueError, match="damaged"):
+        enrollment.split_join_token(f"{secret}.short")
     url, transport = enrollment.pinned_enrolment("http://10.0.0.5:8083", PIN_R)
     assert url == "https://10.0.0.5:8083/control/v1/nodes/enroll"
     assert isinstance(transport, _http.MachineTransport)
@@ -491,6 +502,7 @@ async def test_the_announcement_signs_the_machine_port_and_falls_back_for_an_old
         url="http://10.0.0.6:8079",
         transport=httpx.MockTransport(answer),
         machine=machine,
+        old_root=lambda: True,  # it serves no machine list
     )
     assert outcome.announced
     first, second = bodies

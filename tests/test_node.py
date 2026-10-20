@@ -788,7 +788,11 @@ def test_children_are_told_their_agents_url_and_a_bind_host_when_advertising(
     env = shared_child_env(
         Settings(config_file=settings.config_file, bind_port=8084), state, identity
     )
-    assert env == {"AGENT_URL": "http://127.0.0.1:8084"}
+    # And every child reads the machine table this agent writes (LT1).
+    assert env == {
+        "AGENT_URL": "http://127.0.0.1:8084",
+        "MACHINE_PINS_FILE": str(tmp_path / "machine_pins.json"),
+    }
 
     # A wildcard bind still resolves children to loopback.
     wildcard = Settings(config_file=settings.config_file, bind_host="0.0.0.0", bind_port=8079)

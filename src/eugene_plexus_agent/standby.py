@@ -138,7 +138,9 @@ async def _reconcile(app: Any) -> None:
         taken = {_port_of(e) for e in state.list_topology_entries()}
         port = ports.first_free(
             CONTROL_PORT,
-            reserved=(RESERVED_PORTS - {CONTROL_PORT}) | taken | {app.state.settings.machine_port},
+            reserved=(RESERVED_PORTS - {CONTROL_PORT})
+            | taken
+            | {getattr(getattr(app.state, "settings", None), "machine_port", 8083)},
         )
         entry = state.add_topology_entry(
             ComponentEntry(

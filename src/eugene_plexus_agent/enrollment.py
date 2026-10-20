@@ -117,6 +117,9 @@ class AnnounceOutcome:
     #: Worth trying again: no answer, or one that says "later" (408, 429,
     #: 5xx). Any other refusal is definite for this address.
     retry: bool = False
+    #: The machine port and key the root accepted with it (LT1); empty when
+    #: it accepted the address alone.
+    sent: dict[str, str] | None = None
 
 
 def host_os() -> str | None:
@@ -229,7 +232,14 @@ async def perform_enrollment(
         payload["url"] = advertise_url
     if machine:
         payload.update(machine)
-    secret, root_pin = split_join_token(token)
+    try:
+        secret, root_pin = split_join_token(token)
+    except ValueError as exc:
+        raise EnrollmentError(
+            "join-token-damaged",
+            "Join token damaged",
+            f"{exc}. Copy the whole join command again; nothing was sent.",
+        ) from exc
     payload["token"] = secret
     # The name people see (node-labels.md). The root checks it, before the
     # token is spent; omitted, a machine enrolling again keeps its label.
@@ -343,6 +353,7 @@ async def announce_address(
     url: str,
     transport: Any = None,
     machine: dict[str, str] | None = None,
+    old_root: Callable[[], bool] = lambda: False,
 ) -> AnnounceOutcome:
     """Tell the control root this node's address. Never raises.
 
@@ -358,11 +369,12 @@ async def announce_address(
     if not record.signing_private_key:
         return AnnounceOutcome(False, False, url, "this node has no signing key")
 
-    target = f"{record.control_url.rstrip('/')}/v1/nodes/{record.name}"
+    node_name = record.name
+    target = f"{record.control_url.rstrip('/')}/v1/nodes/{node_name}"
 
     def signed(fields: dict[str, str]) -> dict[str, Any]:
         sequence = store.next_advertise_sequence()
-        message = address_message(name=record.name, sequence=sequence, url=url, machine=fields)
+        message = address_message(name=node_name, sequence=sequence, url=url, machine=fields)
         return {
             "url": url,
             "sequence": sequence,
@@ -372,17 +384,23 @@ async def announce_address(
             **fields,
         }
 
+    sent = dict(machine or {})
     try:
         async with internal_client(timeout=ANNOUNCE_TIMEOUT_SECONDS, transport=transport) as client:
-            response = await client.patch(target, json=signed(machine or {}))
-            if machine and response.status_code == 401:
-                # A root older than LT1 signs-checks three fields and refuses
-                # five; say where this node is without its machine port.
+            response = await client.patch(target, json=signed(sent))
+            if sent and response.status_code == 401 and old_root():
+                # A root older than LT1 checks a signature over three fields
+                # and refuses five. Only a root shown to be older (it serves
+                # no machine list) gets the address alone: a 401 by itself is
+                # also what a party in the middle produces by stripping the
+                # key, and falling back then would let it clear the key at a
+                # root that would have taken it (adversarial review).
                 log.info(
-                    "the control root did not take this node's machine port (it runs an older "
+                    "the control root does not take machine ports (it runs an older "
                     "version); announcing the address alone"
                 )
-                response = await client.patch(target, json=signed({}))
+                sent = {}
+                response = await client.patch(target, json=signed(sent))
     except httpx.HTTPError as exc:
         log.warning("could not announce this node's address to %s: %s", record.control_url, exc)
         return AnnounceOutcome(False, False, url, str(exc), retry=True)
@@ -414,7 +432,7 @@ async def announce_address(
     changed = bool(payload.get("changed")) if isinstance(payload, dict) else False
     if changed:
         log.info("told the control root this node is now reachable at %s", url)
-    return AnnounceOutcome(True, changed, url)
+    return AnnounceOutcome(True, changed, url, sent=sent)
 
 
 async def keep_address_announced(
@@ -424,6 +442,8 @@ async def keep_address_announced(
     transport: Any = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     machine: Callable[[], dict[str, str] | None] = lambda: None,
+    recorded: Callable[[], tuple[str | None, tuple[str, ...]] | None] = lambda: None,
+    old_root: Callable[[], bool] = lambda: False,
 ) -> None:
     """Tell the control root where this node is until it has heard, and
     again whenever the address moves (agent#8). Runs for the agent's life
@@ -450,6 +470,9 @@ async def keep_address_announced(
     `machine` is this node's machine port and key when it is listening
     (LT1). It settles with the address: a port that starts listening, or a
     key that changes, is announced at the next check like a new address.
+    And it is checked against what the root says it recorded (`recorded`,
+    from the root's signed machine list): a record that differs, however it
+    came to differ, is announced again.
     """
     settled: tuple[str, tuple[tuple[str, str], ...]] | None = None
     warned = False
@@ -471,15 +494,25 @@ async def keep_address_announced(
                         store.record.control_url,
                     )
                     warned = True
-            elif (url, tuple(sorted((machine() or {}).items()))) != settled:
+            elif (want := (url, tuple(sorted((machine() or {}).items())))) != settled or (
+                _recorded_differs(machine() or {}, recorded())
+            ):
                 warned = False
                 store.record_advertise_url(url)
                 fields = machine() or {}
                 outcome = await announce_address(
-                    store=store, url=url, transport=transport, machine=fields
+                    store=store, url=url, transport=transport, machine=fields, old_root=old_root
                 )
                 if outcome.announced or not outcome.retry:
-                    settled = (url, tuple(sorted(fields.items())))
+                    # Settled on what the root took. An older root took the
+                    # address alone, and that is all it can take until it is
+                    # updated, so this node does not keep asking.
+                    sent = outcome.sent if outcome.announced else None
+                    settled = (
+                        want
+                        if sent == {} and old_root()
+                        else (url, tuple(sorted((sent or fields).items())))
+                    )
                     delay = ANNOUNCE_RETRY_FIRST_SECONDS
                 else:
                     await sleep(delay * random.uniform(0.8, 1.2))
@@ -493,11 +526,15 @@ _PIN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 def split_join_token(token: str) -> tuple[str, str | None]:
     """`(secret, root pin)` from a join token; the pin is None when it carries
-    none (a root older than LT1, or a Job Site's token)."""
+    none (a root older than LT1). Raises `ValueError` for a token whose pin is
+    damaged (cut short when it was copied): joining without the pin would
+    send the secret where nobody checked who answers."""
     secret, dot, pin = token.strip().partition(".")
-    if dot and _PIN.match(pin):
-        return secret, pin
-    return token.strip(), None
+    if not dot:
+        return secret, None
+    if not _PIN.match(pin):
+        raise ValueError("the root's key at the end of the join token is damaged")
+    return secret, pin
 
 
 def pinned_enrolment(control_url: str, pin: str) -> tuple[str, Any]:
@@ -525,6 +562,16 @@ def pinned_enrolment(control_url: str, pin: str) -> tuple[str, Any]:
         table=lambda: table,
     )
     return f"https://{hostport}/control/v1/nodes/enroll", transport
+
+
+def _recorded_differs(
+    fields: dict[str, str], recorded: tuple[str | None, tuple[str, ...]] | None
+) -> bool:
+    """The root's signed list records another machine port or key for this
+    node than the one it has. None (no list held) is no evidence either way."""
+    if recorded is None or not fields:
+        return False
+    return recorded != (fields["machineUrl"].rstrip("/"), (fields["tlsPin"],))
 
 
 #: The control root's title for a label another machine has (`labelNode`).

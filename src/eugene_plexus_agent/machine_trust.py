@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
 import jwt
 
 from . import _http, tokens
@@ -90,37 +91,30 @@ def build_table(
     own_name: str | None,
     control_url: str | None,
     token_pins: list[str],
+    own_urls: tuple[str | None, ...] = (),
 ) -> dict[str, Any]:
-    """The machine table, in the JSON form `_http.parse_machine_table` reads."""
+    """The machine table, in the JSON form `_http.parse_machine_table` reads.
+
+    **One claimant per door, never a union of keys** (adversarial review,
+    2026-10-20). The root's door comes first and is authoritative: its keys
+    are the ones the root signed as its own, or, before the first list, the
+    one in the join token. A node that registered the same `host:port` with
+    the same keys is the root's own machine and adds nothing; one with any
+    other key is left out. Two nodes claiming one door are both left out.
+    Otherwise a node whose keys were stolen could add its key to the root's
+    address or another machine's, and every caller would accept a man in the
+    middle there.
+    """
     machines: dict[str, set[str]] = {}
     routes: dict[str, str | None] = {}
     names: dict[str, str] = {}
+    contested: set[str] = set()
+    control_door: str | None = None
 
-    def door(url: str, pins: list[str], who: str) -> str | None:
-        origin = _origin(url)
-        if origin is None or not origin.startswith("https://"):
-            return None
-        hostport = origin.removeprefix("https://")
-        machines.setdefault(hostport, set()).update(p for p in pins if isinstance(p, str))
-        names.setdefault(hostport, who)
-        return origin
-
-    for node in (claims or {}).get("nodes") or []:
-        if not isinstance(node, dict) or node.get("name") == own_name:
-            continue
-        name = str(node.get("name") or "a machine")
-        agent = _origin(str(node.get("url") or ""))
-        pins = [p for p in node.get("pins") or [] if isinstance(p, str)]
-        machine_url = node.get("machineUrl")
-        carried = (
-            door(str(machine_url), pins, name) if isinstance(machine_url, str) and pins else None
-        )
-        if agent is not None and agent.startswith("http://"):
-            routes[agent] = (carried + "/agent") if carried else None
-            names[agent] = name
-
-    control_pins = [p for p in (claims or {}).get("controlPins") or [] if isinstance(p, str)]
-    control_pins += [p for p in token_pins if p not in control_pins]
+    listed = [p for p in (claims or {}).get("controlPins") or [] if isinstance(p, str)]
+    # The join token's key carries the calls until the root's signed list
+    # arrives; after that the list alone says which keys are the root's.
+    control_pins = listed or [p for p in token_pins if p]
     origin = _origin(control_url or "")
     if (
         origin is not None
@@ -129,18 +123,66 @@ def build_table(
     ):
         hostport = origin.removeprefix("http://")
         if control_pins:
-            door("https://" + hostport, control_pins, "the control root")
+            machines[hostport] = set(control_pins)
+            names[hostport] = "the control root"
+            control_door = hostport
             routes[origin] = f"https://{hostport}/control"
         else:
             routes[origin] = None
         names[origin] = "the control root"
 
+    nodes = [n for n in (claims or {}).get("nodes") or [] if isinstance(n, dict)]
+    for node in sorted(nodes, key=lambda n: str(n.get("name") or "")):
+        if node.get("name") == own_name:
+            continue
+        name = str(node.get("name") or "a machine")
+        agent = _origin(str(node.get("url") or ""))
+        pins = {p for p in node.get("pins") or [] if isinstance(p, str)}
+        machine_url = node.get("machineUrl")
+        door = _origin(machine_url) if isinstance(machine_url, str) and pins else None
+        carried: str | None = None
+        if door is not None and door.startswith("https://"):
+            hostport = door.removeprefix("https://")
+            if hostport == control_door:
+                if pins <= machines[hostport]:
+                    carried = door
+                else:
+                    log.warning(
+                        "%s registered the root's address %s with another key; ignored",
+                        name,
+                        hostport,
+                    )
+            elif hostport in machines or hostport in contested:
+                log.warning("%s and %s both registered %s; neither is trusted there",
+                            names.get(hostport), name, hostport)  # fmt: skip
+                machines.pop(hostport, None)
+                contested.add(hostport)
+            else:
+                machines[hostport] = pins
+                names[hostport] = name
+                carried = door
+        if (
+            agent is not None
+            and agent.startswith("http://")
+            and not is_loopback_host(urlsplit(agent).hostname)
+        ):
+            routes[agent] = (carried + "/agent") if carried else None
+            names[agent] = name
+    # Routes through a door that turned out contested carry nothing.
+    for key, target in list(routes.items()):
+        if target is not None:
+            door_of = _origin(target)
+            if door_of is None or door_of.removeprefix("https://") not in machines:
+                routes[key] = None
+
+    local = sorted({o for o in (_origin(u or "") for u in own_urls) if o})
     return {
         "version": int((claims or {}).get("version") or 0),
         "required": bool((claims or {}).get("required")),
         "machines": {hp: sorted(pins) for hp, pins in sorted(machines.items())},
         "routes": dict(sorted(routes.items())),
         "names": dict(sorted(names.items())),
+        "local": local,
     }
 
 
@@ -155,6 +197,10 @@ class MachineTrust:
         self.taken_at: float | None = None
         self._written: str | None = None
         self.on_required_changed: Any = None
+        self.own_urls: Any = lambda: ()
+        #: Whether the root serves a machine list: False once it answered 404
+        #: (a root older than LT1), None until it has answered at all.
+        self.root_has_list: bool | None = None
 
     @property
     def required(self) -> bool:
@@ -215,7 +261,23 @@ class MachineTrust:
             own_name=record.name,
             control_url=record.control_url,
             token_pins=[p for p in (record.control_pins or "").split(",") if p],
+            own_urls=tuple(self.own_urls()),
         )
+
+    def own_record(self) -> tuple[str | None, tuple[str, ...]] | None:
+        """`(machineUrl, pins)` the root has recorded for this node, per the
+        list held; None when no list is held."""
+        if self.claims is None:
+            return None
+        name = self._identity.record.name
+        for node in self.claims.get("nodes") or []:
+            if isinstance(node, dict) and node.get("name") == name:
+                machine_url = node.get("machineUrl")
+                return (
+                    str(machine_url).rstrip("/") if isinstance(machine_url, str) else None,
+                    tuple(sorted(p for p in node.get("pins") or [] if isinstance(p, str))),
+                )
+        return (None, ())
 
     def rebuild(self) -> None:
         """Install the table here and write it for the children."""
@@ -238,12 +300,39 @@ class MachineTrust:
 
 async def pull(trust: MachineTrust, client: Any, control_url: str) -> None:
     """Fetch and take the root's machine list. Never raises: a root that is
-    down is a normal state, and the list held keeps working."""
+    down is a normal state, and the list held keeps working.
+
+    **A root whose machine key changed** (its machine set up again) presents
+    a key this node does not hold for it, and every call to it is refused,
+    the list's included. The list is public, signed with the root's identity
+    key and versioned, so this node then fetches it once in plain HTTP and
+    takes it only if it verifies and is newer: a party in the middle can show
+    it nothing it could use, and the root's new key comes with it.
+    """
+    url = control_url.rstrip("/") + LIST_PATH
     try:
-        response = await client.get(control_url.rstrip("/") + LIST_PATH)
+        try:
+            response = await client.get(url)
+        except httpx.HTTPError as exc:
+            pin = _http.refused_pin(exc)
+            if pin is None:
+                log.debug("could not pull the machine list: %s", exc)
+                return
+            log.warning(
+                "the root presented a machine key this node does not hold for it (%s); "
+                "checking the root's signed machine list for it",
+                pin,
+            )
+            async with httpx.AsyncClient(
+                trust_env=False, timeout=10, transport=httpx.AsyncHTTPTransport(trust_env=False)
+            ) as plain:
+                response = await plain.get(url)
         if response.status_code == 200:
+            trust.root_has_list = True
             trust.accept(str(response.json()["jws"]))
-        elif response.status_code != 404:
+        elif response.status_code == 404:
+            trust.root_has_list = False
+        else:
             log.debug("the root answered %d for its machine list", response.status_code)
     except MachineListError as exc:
         log.warning("refused the root's machine list: %s", exc)
