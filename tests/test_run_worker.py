@@ -253,6 +253,28 @@ async def test_experts_context_uses_free_memory_on_the_target_node(app, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_llama_cpp_never_starts_below_the_planned_context(app, monkeypatch):
+    """CX4: the verdict was judged at the planned context, so Run starts there
+    and lets llama.cpp spill, not at the smaller all-on-GPU context."""
+
+    async def admission(context, spec):
+        return SimpleNamespace(maxContextLength=6144, fit="too_large")
+
+    monkeypatch.setattr(runtimes, "_admission_for", admission)
+
+    class Library:
+        async def operation_request(self, method, path, **kwargs):
+            assert path.endswith("/fit") and "params" not in kwargs
+            return {"fit": {"contextLength": 16384}}
+
+    node = NodeActions(app)
+    assert await node.context_size(Library(), MODEL, "llama_cpp") == 16384
+    # Never past the model's own, and vLLM (which cannot spill) keeps the fit.
+    assert await node.context_size(Library(), {**MODEL, "contextLength": 8192}, "llama_cpp") == 8192
+    assert await node.context_size(Library(), MODEL, "vllm") == 6144
+
+
+@pytest.mark.asyncio
 async def test_a_run_suggests_vllm_context_in_its_own_flag(app, monkeypatch):
     """Admission's fitting context survives settings and runtime composition."""
 

@@ -325,6 +325,22 @@ class NodeActions:
                 raise
             return (await actions.get_engine_install(engine)).model_dump(mode="json")
 
+    async def planned_context(
+        self, library: LibraryFitClient | None, model: dict[str, Any]
+    ) -> int | None:
+        """The context the console plans for (the library's `guidanceContextLength`,
+        CX4): what its fit answer is judged at when no context is asked for."""
+        if library is None:
+            return None
+        try:
+            answer = await library.operation_request(
+                "GET", f"/v1/models/{quote(model['id'], safe='')}/fit"
+            )
+        except (httpx.HTTPError, HTTPException, ValueError, KeyError):
+            return None
+        planned = ((answer or {}).get("fit") or {}).get("contextLength")
+        return planned if isinstance(planned, int) and planned > 0 else None
+
     async def context_size(
         self, library: LibraryFitClient, model: dict[str, Any], engine: str
     ) -> int | None:
@@ -349,6 +365,14 @@ class NodeActions:
             maximum = answer.maxContextLength
             own = model.get("contextLength")
             if maximum and maximum > 0 and (own is None or maximum < own):
+                if engine == "llama_cpp":
+                    # CX4: never below the context every fit verdict was judged
+                    # at. llama.cpp's own fit puts what the card cannot hold in
+                    # system memory, which is what the verdict said would happen.
+                    planned = await self.planned_context(library, model)
+                    floor = min(planned, own) if planned and own else planned
+                    if floor and floor > maximum:
+                        return floor
                 return maximum
             if str(answer.fit) in {"fits", "unknown"} or engine != "llama_cpp":
                 return None
