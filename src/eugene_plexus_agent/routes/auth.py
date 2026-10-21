@@ -249,8 +249,7 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
             status.HTTP_403_FORBIDDEN,
             "Set up from this machine",
             "This machine left an install and has no passphrase yet. Set one from this "
-            "machine itself: open the console in a browser on it, at "
-            "http://127.0.0.1:8079.",
+            f"machine itself: open the console in a browser on it, at {_here(request)}.",
         )
 
     if state.lost_its_passphrase():
@@ -501,6 +500,7 @@ async def _forward_login(
             heard,
             control_url=control_url,
             own_passphrase=request.app.state.agent_state.has_passphrase(),
+            here=_here(request),
         )
     log.info("operator signed in through the control root%s", f" from {remote}" if remote else "")
     return signed_in
@@ -523,15 +523,22 @@ def _audience(session: str) -> tuple[str, ...]:
     return ()
 
 
-def _removed(heard: leaving.Heard, *, control_url: str, own_passphrase: bool) -> HTTPException:
+def _here(request: Request) -> str:
+    """This machine's console as a browser on it opens it."""
+    settings = getattr(request.app.state, "settings", None)
+    return f"http://127.0.0.1:{getattr(settings, 'bind_port', 8079)}"
+
+
+def _removed(
+    heard: leaving.Heard, *, control_url: str, own_passphrase: bool, here: str
+) -> HTTPException:
     """The 409 for a sign-in the root no longer addresses to this machine."""
     title = "This machine was removed from the install"
     if heard is leaving.Heard.LEFT:
         then = (
             "Sign in again with this machine's own passphrase."
             if own_passphrase
-            else "It has no passphrase yet: set one from this machine itself, at "
-            "http://127.0.0.1:8079."
+            else f"It has no passphrase yet: set one from this machine itself, at {here}."
         )
         return _problem(
             status.HTTP_409_CONFLICT,
