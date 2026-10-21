@@ -430,6 +430,11 @@ def _no_llama_server_places_models_by_itself(monkeypatch: pytest.MonkeyPatch) ->
 
 
 @pytest.fixture(autouse=True)
+def _no_ollama_store_from_machine(monkeypatch, tmp_path_factory):
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path_factory.getbasetemp() / "no-ollama-here"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_ambient_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [k for k in os.environ if k.startswith("EUGENE_PLEXUS_")]:
         monkeypatch.delenv(key, raising=False)

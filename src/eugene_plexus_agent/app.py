@@ -591,7 +591,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         update_task = asyncio.create_task(
             update_routes.checker_for(app).run_forever(install_info.describe), name="update-check"
         )
+    from . import ollama_report
     from .run_worker import RunWorker
+
+    ollama_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(ollama_report.run(app), name="ollama-report")
+    )
 
     run_task = (
         None
@@ -652,7 +659,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         all_updates = getattr(app.state, "update_all", None)
         if all_updates is not None:
             await all_updates.close()
-        for task in (approval_task, sign_in_task, firewall_task, history_task):
+        for task in (approval_task, sign_in_task, firewall_task, history_task, ollama_task):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -1139,6 +1146,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(apps_routes.router)
     # This host's identity and devices; reads only, operator or service.
     app.include_router(node_routes.router)
+    from .routes import ollama as ollama_routes
+
+    app.include_router(ollama_routes.router)
     # Checking for and installing a newer version; operator-only.
     app.include_router(update_routes.router)
     app.include_router(logs_routes.router)
