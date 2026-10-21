@@ -69,19 +69,14 @@ def test_it_changes_nothing_else(tmp_path: Any) -> None:
     that declared fields would reset every absent one to its default.
     `ConfigUpdateRequest` declares none and allows extras, which is what
     makes a one-key patch safe -- asserted rather than assumed, because
-    the blast radius is the operator's entire agent config.
-
-    (`uiTheme`'s enum is `light`/`dark`/`auto` -- a v0.2 field that
-    matches none of the UI's real themes and that nothing reads. A first
-    draft of this test used "modern" and was rejected by validation,
-    which is at least proof the patch path validates.)"""
+    the blast radius is the operator's entire agent config."""
     state = _state(tmp_path)
-    state.apply_config_patch(_patch(uiTheme="dark", uiFontSize="large"))
+    state.apply_config_patch(_patch(modelCopyMinFreeGb=60, updateChecks=False))
 
     default_topology.mark_onboarded(state)
 
-    assert state.get_config("uiTheme") == "dark"
-    assert state.get_config("uiFontSize") == "large"
+    assert state.get_config("modelCopyMinFreeGb") == 60
+    assert state.get_config("updateChecks") is False
 
 
 def test_an_enrolled_node_does_not_get_a_control_plane(tmp_path: Any) -> None:

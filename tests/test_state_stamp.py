@@ -25,7 +25,9 @@ def _write(path: Path, text: str) -> str:
 
 def test_an_unstamped_file_loads_and_is_not_rewritten_by_the_load(tmp_path: Path) -> None:
     path = tmp_path / "agent.yaml"
-    before = _write(path, "firstRunComplete: true\nuiTheme: dark\ncomponents: []\nruntimes: []\n")
+    before = _write(
+        path, "firstRunComplete: true\nmodelCopyMinFreeGb: 60\ncomponents: []\nruntimes: []\n"
+    )
 
     state = AgentState(path)
     state.load()
@@ -40,7 +42,7 @@ def test_the_stamp_arrives_with_the_next_write(tmp_path: Path) -> None:
     state = AgentState(path)
     state.load()
 
-    state.apply_config_patch(ConfigUpdateRequest.model_validate({"uiTheme": "dark"}))
+    state.apply_config_patch(ConfigUpdateRequest.model_validate({"modelCopyMinFreeGb": 60}))
 
     assert yaml.safe_load(path.read_text(encoding="utf-8"))["stateVersion"] == STATE_VERSION
 

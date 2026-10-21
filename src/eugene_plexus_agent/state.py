@@ -13,8 +13,6 @@ flash attention in a saved runtime is refused when the runtime starts, naming v0
 
     stateVersion: 2
     firstRunComplete: false
-    uiTheme: auto
-    uiFontSize: medium
     components:
       - name: gateway
         kind: gateway
@@ -30,10 +28,8 @@ flash attention in a saved runtime is refused when the runtime starts, naming v0
         safeMode: false
       - ...
 
-Flat config-field naming (uiTheme, uiFontSize) rather than a nested `ui:`
-section because the existing ConfigField machinery is flat — `category:
-"ui"` provides the UI's grouping hint without forcing the YAML into a
-shape the generic config editor doesn't natively understand.
+Config fields are flat keys (`firstRunComplete`, `securityMode`, ...) because
+the ConfigField machinery is flat; `category` is the UI's grouping hint.
 """
 
 from __future__ import annotations
@@ -149,26 +145,6 @@ CONFIG_FIELDS: list[ConfigField] = [
         # PATCH time (`routes/config.py`), and the mode is read at the next
         # start. The flag put "restart required" on a field no restart was
         # for.
-    ),
-    ConfigField(
-        key="uiTheme",
-        label="Theme",
-        description="Color theme for the Eugene Plexus UI.",
-        category="ui",
-        valueType=ConfigValueType.enum,
-        default="auto",
-        enumValues=["light", "dark", "auto"],
-        enumLabels=["Light", "Dark", "Auto (follow system)"],
-    ),
-    ConfigField(
-        key="uiFontSize",
-        label="Font size",
-        description="Base font size for the Eugene Plexus UI.",
-        category="ui",
-        valueType=ConfigValueType.enum,
-        default="medium",
-        enumValues=["small", "medium", "large"],
-        enumLabels=["Small", "Medium", "Large"],
     ),
     ConfigField(
         key="engineBinaryRoots",
@@ -554,7 +530,6 @@ CATEGORY_LABELS: dict[str, str] = {
     "setup": "Setup",
     "updates": "Updates",
     "security": "Security",
-    "ui": "Appearance",
     "engines": "Engines",
     "node": "Node",
     "storage": "Library",
@@ -564,6 +539,14 @@ CATEGORY_LABELS: dict[str, str] = {
 }
 
 _CONFIG_FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in CONFIG_FIELDS}
+
+#: Settings that no longer exist, and why. A PATCH of one is refused with this
+#: message and not "unknown field"; a file that still holds one loads, and the
+#: next write leaves it out (`load` reads only the fields that exist).
+RETIRED: dict[str, str] = {
+    key: "retired: nothing read it; the console's look is set in the console"
+    for key in ("uiTheme", "uiFontSize")
+}
 
 
 def _config_defaults() -> dict[str, Any]:
@@ -802,7 +785,9 @@ class AgentState:
             for key, new_value in patch.items():
                 field = _CONFIG_FIELDS_BY_KEY.get(key)
                 if field is None:
-                    rejected.append(ConfigFieldError(key=key, message="unknown field"))
+                    rejected.append(
+                        ConfigFieldError(key=key, message=RETIRED.get(key, "unknown field"))
+                    )
                     continue
                 err = _validate(field, new_value)
                 if err is not None:

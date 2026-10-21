@@ -204,16 +204,16 @@ def test_an_interrupted_write_leaves_the_previous_config_intact(
     path = tmp_path / "agent.yaml"
     state = AgentState(path)
     state.load()
-    state.apply_config_patch(ConfigUpdateRequest(uiFontSize="large"))
+    state.apply_config_patch(ConfigUpdateRequest(modelCopyMinFreeGb=60))
     before = path.read_text(encoding="utf-8")
-    assert "large" in before
+    assert "modelCopyMinFreeGb: 60" in before
 
     def die(*_args: Any, **_kwargs: Any) -> None:
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(yaml, "safe_dump", die)
     with pytest.raises(OSError):
-        state.apply_config_patch(ConfigUpdateRequest(uiFontSize="small"))
+        state.apply_config_patch(ConfigUpdateRequest(modelCopyMinFreeGb=70))
 
     assert path.read_text(encoding="utf-8") == before, "the interrupted write destroyed the file"
 
@@ -282,7 +282,7 @@ def test_a_degraded_load_keeps_none_of_the_topology_it_half_read(
     assert state.list_topology_entries() == [], "a half-read topology is not a topology"
 
     # And the repair write does not persist the half-read half.
-    state.apply_config_patch(ConfigUpdateRequest(uiFontSize="large"))
+    state.apply_config_patch(ConfigUpdateRequest(modelCopyMinFreeGb=60))
     written = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert written["components"] == []
     # The operator's own file is still there to restore from.
@@ -306,7 +306,7 @@ def test_an_interrupted_write_leaves_no_temp_file_behind(
 
     monkeypatch.setattr(yaml, "safe_dump", die)
     with pytest.raises(OSError):
-        state.apply_config_patch(ConfigUpdateRequest(uiFontSize="small"))
+        state.apply_config_patch(ConfigUpdateRequest(modelCopyMinFreeGb=70))
 
     leftovers = [p.name for p in tmp_path.iterdir() if ".tmp-" in p.name]
     assert leftovers == [], f"left behind {leftovers}"

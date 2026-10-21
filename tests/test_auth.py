@@ -28,7 +28,7 @@ def test_protected_routes_locked_before_initialize(client: TestClient) -> None:
     for r in [
         client.get("/v1/config"),
         client.get("/v1/components"),
-        client.patch("/v1/config", json={"uiTheme": "dark"}),
+        client.patch("/v1/config", json={"modelCopyMinFreeGb": 60}),
     ]:
         assert r.status_code == 401, f"expected 401 from {r.request.url}, got {r.status_code}"
 

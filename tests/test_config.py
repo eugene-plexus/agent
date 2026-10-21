@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
+
+from eugene_plexus_agent.state import AgentState
 
 
 def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> None:
@@ -14,8 +18,6 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
     assert keys == {
         "firstRunComplete",
         "securityMode",
-        "uiTheme",
-        "uiFontSize",
         "vllmBinary",
         "mlxBinary",
         "kevPython",
@@ -82,29 +84,60 @@ def test_get_config_returns_defaults_on_first_run(authed_client: TestClient) -> 
     assert response.status_code == 200
     body = response.json()
     assert body["firstRunComplete"] is False
-    assert body["uiTheme"] == "auto"
-    assert body["uiFontSize"] == "medium"
+    assert body["securityMode"] == "prompt_on_startup"
 
 
 def test_patch_config_applies_valid_change(authed_client: TestClient) -> None:
-    response = authed_client.patch("/v1/config", json={"uiTheme": "dark"})
+    response = authed_client.patch("/v1/config", json={"modelCopyMinFreeGb": 60})
     assert response.status_code == 200
     body = response.json()
-    assert "uiTheme" in body["applied"]
+    assert "modelCopyMinFreeGb" in body["applied"]
     assert body["rejected"] == []
-    # Agent config never requires restart in v0.1 — UI prefs can apply live.
+    # Nothing here is read only at start, so a save applies live.
     assert body["requiresRestart"] is False
 
     follow = authed_client.get("/v1/config")
-    assert follow.json()["uiTheme"] == "dark"
+    assert follow.json()["modelCopyMinFreeGb"] == 60
 
 
 def test_patch_config_rejects_invalid_enum(authed_client: TestClient) -> None:
-    response = authed_client.patch("/v1/config", json={"uiTheme": "neon"})
+    response = authed_client.patch("/v1/config", json={"securityMode": "neon"})
     assert response.status_code == 200
     body = response.json()
     assert body["applied"] == []
-    assert any(r["key"] == "uiTheme" for r in body["rejected"])
+    assert any(r["key"] == "securityMode" for r in body["rejected"])
+
+
+def test_ui_theme_and_font_size_are_retired(authed_client: TestClient, tmp_path: Path) -> None:
+    """Nothing read either (the console keeps its look in the browser), so a
+    setting that offered them showed a choice with no effect. Gone from the
+    schema and the document; a PATCH is refused as retired, not as unknown; a
+    file an older build wrote, holding them, still loads."""
+    schema = authed_client.get("/v1/config/schema").json()
+    assert not {"uiTheme", "uiFontSize"} & {f["key"] for f in schema["fields"]}
+    assert "ui" not in schema["categories"], "no field is left in Appearance"
+    document = authed_client.get("/v1/config").json()
+    assert "uiTheme" not in document and "uiFontSize" not in document
+
+    for key, value in (("uiTheme", "dark"), ("uiFontSize", "large")):
+        body = authed_client.patch("/v1/config", json={key: value}).json()
+        assert body["applied"] == []
+        [refused] = body["rejected"]
+        assert refused["key"] == key
+        assert "retired" in refused["message"], refused
+        assert "unknown" not in refused["message"]
+
+    path = tmp_path / "old-agent.yaml"
+    path.write_text(
+        "firstRunComplete: true\nuiTheme: dark\nuiFontSize: large\ncomponents: []\nruntimes: []\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    state = AgentState(path)
+    state.load()
+    loaded = state.as_config_document().model_dump()
+    assert loaded["firstRunComplete"] is True
+    assert "uiTheme" not in loaded and "uiFontSize" not in loaded
 
 
 def test_patch_config_rejects_unknown_field(authed_client: TestClient) -> None:

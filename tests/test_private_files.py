@@ -174,7 +174,7 @@ def test_a_config_an_older_build_left_world_readable_is_tightened_on_its_next_wr
     temp file's mode on the next config write."""
     path = tmp_path / "agent.yaml"
     os.chmod(path, 0o644)
-    assert authed_client.patch("/v1/config", json={"uiFontSize": "large"}).status_code == 200
+    assert authed_client.patch("/v1/config", json={"modelCopyMinFreeGb": 60}).status_code == 200
     assert _mode(path) == 0o600
 
 
