@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -338,7 +339,7 @@ __all__ = [
 ]
 
 
-def local_models():
+def local_models() -> Iterator[tuple[Path, StoreModel]]:
     """Only this machine's detected stores; callers never supply a path."""
     from .ollama_detect import find_stores
 

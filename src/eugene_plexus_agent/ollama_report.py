@@ -5,6 +5,8 @@ import json
 import logging
 from urllib.parse import quote
 
+from fastapi import FastAPI
+
 from ._generated.models import ComponentKind
 from .ollama_store import report_body
 from .routes.runtimes import library_client_for
@@ -13,7 +15,7 @@ from .runtime_context import NodeContext
 log = logging.getLogger(__name__)
 
 
-async def run(app):
+async def run(app: FastAPI) -> None:
     previous = None
     while True:
         try:

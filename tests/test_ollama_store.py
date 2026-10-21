@@ -133,6 +133,86 @@ async def test_send_resumes_only_reserved_roles(ollama):
     assert calls[-1][1].endswith("/files/complete")
 
 
+@pytest.mark.asyncio
+async def test_proxy_uses_machine_identity_only_for_library_keep(app, client):
+    from starlette.requests import Request
+
+    from eugene_plexus_agent import tokens
+    from eugene_plexus_agent.routes.proxy import _translate
+
+    from .conftest import FakeRoot, enroll_app, local_service_token
+
+    root = FakeRoot()
+    enroll_app(app, root, "library")
+    local = local_service_token(app, "library")
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "headers": [],
+        "path": "/api/proxy/node:worker/v1/ollama/send",
+    }
+    translated = await _translate(Request(scope), local, "node:worker")
+    assert translated is not None
+    claims = tokens.verify(
+        translated, bundle=root.bundle(), recipient="node:worker", classes=(tokens.TYP_SERVICE,)
+    )
+    assert claims.sub == "agent" and claims.iss == "node:library"
+    scope["path"] = "/api/proxy/node:worker/v1/runtimes"
+    assert await _translate(Request(scope), local, "node:worker") is None
+
+
+def test_send_route_accepts_only_library_machine_for_assigned_job(app, client, monkeypatch):
+    from eugene_plexus_agent import tokens
+    from eugene_plexus_agent.install_proxy import RemoteNode
+    from eugene_plexus_agent.routes import ollama as route
+
+    from .conftest import FakeRoot, enroll_app
+
+    root = FakeRoot()
+    library = tokens.Signer(tokens.generate_private_key(), "node:library")
+    stranger = tokens.Signer(tokens.generate_private_key(), "node:stranger")
+    root.register("library", library.key.public_key())
+    root.register("stranger", stranger.key.public_key())
+    enroll_app(app, root, "worker")
+    reads = []
+
+    class Topology:
+        async def owner_of(self, target, **kwargs):
+            assert target == "library"
+            return RemoteNode("library", "http://library.invalid")
+
+    class Library:
+        async def operation_request(self, method, path, **kwargs):
+            reads.append(path)
+            return {"node": "worker", "state": "running", "digest": "sha256:" + "a" * 64}
+
+    async def library_client(context):
+        return Library()
+
+    app.state.install_topology = Topology()
+    monkeypatch.setattr(route, "library_client_for", library_client)
+    monkeypatch.setattr(route, "local_models", lambda: [])
+    body = {"job": "assigned", "digest": "sha256:" + "a" * 64}
+    for signer, expected in [(stranger, 403), (library, 404)]:
+        token, _ = signer.mint(
+            typ=tokens.TYP_SERVICE, sub="agent", aud=["node:worker"], ttl_seconds=300
+        )
+        response = client.post(
+            "/v1/ollama/send", json=body, headers={"Authorization": "Bearer " + token}
+        )
+        assert response.status_code == expected, response.text
+    assert reads == ["/v1/keep-jobs/assigned"]
+    # Even the Library cannot choose another digest for an existing job.
+    body["digest"] = "sha256:" + "b" * 64
+    assert (
+        client.post(
+            "/v1/ollama/send", json=body, headers={"Authorization": "Bearer " + token}
+        ).status_code
+        == 409
+    )
+
+
 def test_send_route_refuses_paths_and_urls(authed_client):
     response = authed_client.post(
         "/v1/ollama/send",

@@ -15,6 +15,7 @@ import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, TypedDict, Unpack
 
 from .ollama_store import is_store
 
@@ -25,9 +26,11 @@ LINUX_SERVICE_STORE = "/usr/share/ollama/.ollama/models"
 
 def windows_profiles() -> tuple[str | None, list[tuple[str, Path, str | None]]]:
     """Machine override and real profiles, with loaded users' overrides."""
+    if sys.platform != "win32":
+        return None, []
     import winreg
 
-    def value(hive, key, name):
+    def value(hive: Any, key: str, name: str) -> str | None:
         try:
             with winreg.OpenKey(hive, key) as opened:
                 return os.path.expandvars(str(winreg.QueryValueEx(opened, name)[0]))
@@ -114,7 +117,13 @@ def find_store(
     return None
 
 
-def find_stores(**kwargs) -> list[Path]:
+class _DetectionOptions(TypedDict, total=False):
+    environ: Mapping[str, str] | None
+    home: Path | None
+    platform: str | None
+
+
+def find_stores(**kwargs: Unpack[_DetectionOptions]) -> list[Path]:
     """All detected stores, retaining a candidate whose read was denied."""
     # Keep the singular entry point for callers that inject detection in tests.
     first = find_store(**kwargs)
