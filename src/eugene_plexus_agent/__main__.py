@@ -144,6 +144,12 @@ def main(argv: list[str] | None = None) -> None:
     _serve(settings, unattended=args.unattended)
 
 
+#: How long a stop waits for open requests before it ends them and stops the
+#: children anyway (agent#20). A browser's request ends in well under this;
+#: what is still open after it never ends by itself.
+GRACEFUL_SHUTDOWN_SECONDS = 5
+
+
 def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Server:
     """Everything `_serve` does except block on the socket.
 
@@ -298,8 +304,21 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
 
         app.state.client_doors = client_doors.Doors()
         http = app.state.client_doors.console_protocol(port)
+    #
+    # **`timeout_graceful_shutdown`: a stop never waits for ever (agent#20).**
+    # uvicorn runs the lifespan shutdown, which stops every child, only
+    # after each open request ends, and a log follow or a proxied stream
+    # does not end by itself. Without a bound, a stopped service left the
+    # agent and all its children running. After the bound, uvicorn ends
+    # what is still open, and `open_requests` names it in the log.
     config = uvicorn.Config(
-        app, host=bind_host, port=port, log_level=log_level, forwarded_allow_ips=[], http=http
+        app,
+        host=bind_host,
+        port=port,
+        log_level=log_level,
+        forwarded_allow_ips=[],
+        http=http,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
     server = uvicorn.Server(config)
     # How a restart asked for by Settings stops this server (`entrypoint_setup`).

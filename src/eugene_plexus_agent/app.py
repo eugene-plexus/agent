@@ -40,6 +40,7 @@ from . import (
     keyring_store,
     node_identity,
     off_host,
+    open_requests,
     passphrase_file,
     process_signals,
     response_headers,
@@ -1080,6 +1081,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # the outermost layer and covers the two above's own answers too --
     # a refused host name is still a page a browser renders.
     response_headers.install(app)
+    # Every HTTP request a stop ends is named in the log (agent#20).
+    open_requests.install(app)
     from . import entrypoint
 
     entrypoint.install(app)
