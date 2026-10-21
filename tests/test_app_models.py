@@ -832,7 +832,11 @@ def test_a_change_of_address_or_key_still_resets(tmp_path: Path, gateway: FakeGa
 
 def test_the_two_model_placeholders_are_placeholders() -> None:
     assert set(app_launcher.MODEL_SURFACES) <= app_launcher.PLACEHOLDERS
-    assert app_launcher.MODEL_SURFACES == {"embeddingModel": "embeddings", "rerankModel": "rerank"}
+    assert app_launcher.MODEL_SURFACES == {
+        "embeddingModel": "embeddings",
+        "rerankModel": "rerank",
+        "imageModel": "image",
+    }
     # Neither is a secret: a model's id may ride in an argument.
     assert not set(app_launcher.MODEL_SURFACES) & app_launcher.SECRET_PLACEHOLDERS
     apps.validate_manifest(

@@ -40,6 +40,7 @@ from .._generated.models import (
     AppList,
     AppManifest,
     AppOrigin,
+    AppRestartRequest,
     ClientKeyCreateRequest,
     ClientKeyLimits,
 )
@@ -215,7 +216,9 @@ async def remove_custom(request: Request, app_id: str) -> Response:
 @router.get("/v1/apps/{app_id}", response_model=App, response_model_exclude_none=True)
 async def get_app(request: Request, app_id: str) -> App:
     manager = _apps(request)
-    return manager.view(_record_or_404(manager, app_id))
+    record = _record_or_404(manager, app_id)
+    await manager.refresh_image_offer(record)
+    return manager.view(record)
 
 
 async def _revoke_key(request: Request, manager: AppManager, app_id: str) -> None:
@@ -507,10 +510,12 @@ async def stop(request: Request, app_id: str) -> App:
 
 
 @router.post("/v1/apps/{app_id}/restart", response_model=App, response_model_exclude_none=True)
-async def restart(request: Request, app_id: str) -> App:
+async def restart(request: Request, app_id: str, body: AppRestartRequest | None = None) -> App:
     _not_node_capability(app_id)
     manager = _apps(request)
     record = _record_or_404(manager, app_id)
+    if body and body.resetSettings and not record.manifest.resetOnConnectionChange:
+        raise _problem(409, "No settings to reset", "This app has no settings for Eugene to reset.")
     if not record.enabled:
         raise _problem(
             status.HTTP_409_CONFLICT,
@@ -519,6 +524,13 @@ async def restart(request: Request, app_id: str) -> App:
         )
     await _ensure_sign_in(request, manager, record.manifest)
     try:
+        if body and body.resetSettings:
+            from .. import app_launcher
+
+            manager.require_settings_access()
+            path = manager.store.data_dir(app_id) / app_launcher.CONNECTION_FILE
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_private(path, "reset-requested")
         await manager.restart(record)
     except Exception as exc:
         raise _problem(
@@ -527,6 +539,18 @@ async def restart(request: Request, app_id: str) -> App:
             f"{record.manifest.name} did not stop to be restarted: {exc}",
         ) from exc
     return manager.view(record)
+
+
+@router.post("/v1/apps/{app_id}/rollback", response_model=App, response_model_exclude_none=True)
+async def rollback(request: Request, app_id: str) -> App:
+    _not_node_capability(app_id)
+    manager = _apps(request)
+    record = _record_or_404(manager, app_id)
+    try:
+        await manager.rollback(record)
+    except AppInstallError as exc:
+        raise _problem(409, "Could not go back", str(exc)) from exc
+    return manager.view(_record_or_404(manager, app_id))
 
 
 # --------------------------------------------------------------------------- #

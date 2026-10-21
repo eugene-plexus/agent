@@ -48,9 +48,9 @@
     licence. Installed unmodified. About 1.8 GB on disk and up to 2 GB of
     memory.
   homepage: https://openwebui.com
-  licenseUrl: https://github.com/open-webui/open-webui/blob/v0.11.4/LICENSE
+  licenseUrl: https://github.com/open-webui/open-webui/blob/v0.12.3/LICENSE
   source: pypi
-  version: 0.11.4
+  version: 0.12.3
   package: open-webui
   entry: open_webui:app
   args: [serve, --host, "{bindHost}", --port, "{port}"]
@@ -63,6 +63,7 @@
   healthPath: /ready
   localActions: true
   resetOnConnectionChange: RESET_CONFIG_ON_START
+  updateBackup: [webui.db, vector_db]
   environment:
     DATA_DIR: "{dataDir}"
     STATIC_DIR: "{dataDir}/static"
@@ -95,6 +96,26 @@
     AUDIO_TTS_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
     AUDIO_TTS_OPENAI_API_KEY: "{clientKey}"
     ENABLE_OLLAMA_API: "false"
+    # Row 34: v0.12.3 backend/open_webui/config.py, one-based lines:
+    # ENABLE_WEB_SEARCH 1051, WEB_SEARCH_ENGINE 1060, EXTERNAL_WEB_SEARCH_URL
+    # 1201, EXTERNAL_WEB_SEARCH_API_KEY 1203, WEB_SEARCH_RESULT_COUNT 1068,
+    # WEB_SEARCH_CONCURRENT_REQUESTS 1083, BYPASS_WEB_SEARCH_WEB_LOADER 1066,
+    # ENABLE_IMAGE_GENERATION 1228, IMAGE_GENERATION_ENGINE 1230,
+    # IMAGE_GENERATION_MODEL 1232. env.py ENABLE_PLUGINS 1051 (default true).
+    # OFFLINE_MODE remains: env.py 1067-1071 blocks HF downloads and version
+    # checks; config.py 1051 does not gate web search on it.
+    # Source tag inspected; the scratch-wheel check needs network access.
+    ENABLE_WEB_SEARCH: "true"
+    WEB_SEARCH_ENGINE: external
+    EXTERNAL_WEB_SEARCH_URL: "{gatewayUrl}/v1/web_search"
+    EXTERNAL_WEB_SEARCH_API_KEY: "{clientKey}"
+    WEB_SEARCH_RESULT_COUNT: "5"
+    WEB_SEARCH_CONCURRENT_REQUESTS: "2"
+    BYPASS_WEB_SEARCH_WEB_LOADER: "true"
+    ENABLE_IMAGE_GENERATION: "{imageModelSet}"
+    IMAGE_GENERATION_ENGINE: openai
+    IMAGE_GENERATION_MODEL: "{imageModel}"
+    ENABLE_PLUGINS: "true"
     # Document search through Eugene's own door (MR6, specs
     # docs/design/workbench-memory-and-documents.md). Open WebUI copies these
     # into its database at its first start and its database wins after, so what
