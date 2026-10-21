@@ -444,6 +444,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not settings.safe_mode and settings.machine_port_enabled:
         machine_port.move_control_behind(state, int(settings.machine_port))
     door = None if settings.safe_mode else await machine_port.start(app)
+    # Row 3: a change of this machine's key, resumed from `node.yaml`; on the
+    # root, the door file control reads the machine port's keys from, written
+    # before control starts.
+    from . import machine_key_change
+
+    key_change = machine_key_change.from_app(app) if door is not None else None
+    app.state.machine_key_change = key_change
+    if key_change is not None:
+        key_change.write_door()
     # The client doors (LT2): the leaf they present, and the gateway's door,
     # before the gateway starts and is told its loopback port.
     from . import client_tls
@@ -562,6 +571,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         announce_task = asyncio.create_task(
             _announce_address(app, settings, state, identity), name="address-announce"
         )
+    key_change_task = (
+        asyncio.create_task(key_change.run(), name="machine-key-change")
+        if key_change is not None
+        else None
+    )
 
     registry = ClientKeyRegistry(app)
     app.state.client_key_registry = registry
@@ -673,6 +687,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
             await asyncio.gather(announce_task, return_exceptions=True)
+        if key_change_task is not None:
+            key_change_task.cancel()
+            await asyncio.gather(key_change_task, return_exceptions=True)
         permissions_task = app.state.install_permissions_task
         if not permissions_task.done():
             permissions_task.cancel()
@@ -975,6 +992,12 @@ def shared_child_env(
         if kind == "control":
             if identity.record.tls_certificate:
                 env["MACHINE_PINS"] = node_identity.machine_pin(identity.record.tls_certificate)
+            # Row 3: the keys again, from a file this agent rewrites while
+            # the machine key changes; control reads it while it runs.
+            # `MACHINE_PINS` stays for a control older than row 3.
+            from .machine_key_change import DOOR_FILE
+
+            env["MACHINE_DOOR_FILE"] = str(identity.path.parent / DOOR_FILE)
             env["BIND_HOST"] = "127.0.0.1"
         elif kind in _DIALLED_BY_THE_ROOT and _machine_tls_required(identity):
             env["BIND_HOST"] = "127.0.0.1"

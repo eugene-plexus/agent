@@ -54,7 +54,7 @@ from typing import Any
 import httpx
 
 from . import standby, tokens
-from ._http import internal_client
+from ._http import internal_client, refused_pin
 from .machine_trust import pull as pull_machine_list
 from .node_identity import FencedError
 from .trust import BundleRollback
@@ -223,6 +223,35 @@ async def _leave_if_removed(
     )
 
 
+async def bundle_response(
+    client: httpx.AsyncClient, control_url: str, machines: Any
+) -> httpx.Response:
+    """`GET /v1/trust/bundle` at the root, through a change of the root's
+    machine key that this machine missed (row 3).
+
+    A machine that was off for the whole change holds a machine list with
+    only the root's old key, so its pinned call to the root is refused
+    before a byte is sent, the bundle's included, and the machine list is
+    never reached. So, on that refusal, it fetches the root's signed machine
+    list first: `machine_trust.pull` takes it in plain HTTP when the pinned
+    call is refused, and only if it verifies against the root's identity key,
+    which never changes. With the list taken, the bundle is asked for again,
+    over TLS to the root's new key. A list that does not verify changes
+    nothing, and the refusal stands."""
+    url = f"{control_url}/v1/trust/bundle"
+    try:
+        return await client.get(url)
+    except httpx.HTTPError as exc:
+        if refused_pin(exc) is None:
+            raise
+        before = machines.claims
+        await pull_machine_list(machines, client, control_url)
+        if machines.claims is before:
+            raise
+        log.info("took the root's new machine key from its signed machine list")
+        return await client.get(url)
+
+
 async def pull_once(app: Any, client: httpx.AsyncClient) -> Heard:
     """Ask the root for its bundle once, take it, and act on it.
 
@@ -243,7 +272,7 @@ async def pull_once(app: Any, client: httpx.AsyncClient) -> Heard:
     taken: tokens.TrustBundle | None = None
     held: tokens.TrustBundle | None = None
     try:
-        response = await client.get(f"{control_url}/v1/trust/bundle")
+        response = await bundle_response(client, control_url, app.state.machine_trust)
         if response.status_code == 200:
             try:
                 jws = str(response.json()["jws"])

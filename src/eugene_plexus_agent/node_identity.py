@@ -11,6 +11,9 @@ One file, `node.yaml`, beside `agent.yaml`:
     tokenPrivateKey: <base64 Ed25519 seed>     signs this node's tokens
     tlsPrivateKey: <PEM P-256>          the machine port's TLS key (LT1)
     tlsCertificate: <PEM>               self-signed; other machines pin its key
+    tlsNextPrivateKey: <PEM P-256>      the next machine key, during a change (row 3)
+    tlsNextCertificate: <PEM>
+    machineKeyChange: {state: ..., ...} the last machine key change (row 3)
     controlPins: <pin>[,<pin>]          the root's machine key, from the join token
     advertiseSequence: 3               strictly increasing, mirrored at the root
     controlUrl: http://100.64.0.1:8083
@@ -59,6 +62,7 @@ checks it against the key it pinned at enrollment.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import ipaddress
 import json
@@ -395,6 +399,13 @@ class IdentityRecord:
     """Comma-separated pins of the root's machine key, from the join token
     this node enrolled with (LT1): what it checks the root against before
     the first signed machine list arrives."""
+    tls_next_private_key: str | None = None
+    tls_next_certificate: str | None = None
+    """The next machine key while it changes (row 3,
+    `machine_key_change`): made at the start, swapped in at the switch,
+    deleted when the change stops or fails."""
+    machine_key_change: dict[str, Any] | None = None
+    """The last machine key change, as `machine_key_change` keeps it."""
 
     @property
     def enrolled(self) -> bool:
@@ -418,6 +429,9 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("tlsPrivateKey", "tls_private_key"),
     ("tlsCertificate", "tls_certificate"),
     ("controlPins", "control_pins"),
+    ("tlsNextPrivateKey", "tls_next_private_key"),
+    ("tlsNextCertificate", "tls_next_certificate"),
+    ("machineKeyChange", "machine_key_change"),
 )
 
 
@@ -428,6 +442,8 @@ class NodeIdentityStore:
         self._path = path
         self._lock = threading.Lock()
         self._record = IdentityRecord()
+        #: Held while an address announcement is in flight (`enrollment`).
+        self.announcing = asyncio.Lock()
 
     @property
     def path(self) -> Path:
@@ -453,6 +469,8 @@ class NodeIdentityStore:
                 value = raw.get(wire)
                 if attr == "epoch":
                     values[attr] = int(value) if isinstance(value, int) else None
+                elif attr == "machine_key_change":
+                    values[attr] = dict(value) if isinstance(value, dict) else None
                 elif attr == "advertise_sequence":
                     values[attr] = int(value) if isinstance(value, int) else 0
                 else:
@@ -563,6 +581,67 @@ class NodeIdentityStore:
                 self._write_locked()
             return self._record
 
+    # ----- the machine key change (row 3) -----------------------------------
+
+    def begin_machine_key_change(self, change: dict[str, Any]) -> IdentityRecord:
+        """Make the next machine key and record the change, in one write.
+
+        `change` is the change's state as `machine_key_change` keeps it;
+        `nextPin` is filled in here, from the key made."""
+        key_pem, certificate_pem = generate_machine_key()
+        with self._lock:
+            self._record = replace(
+                self._record,
+                tls_next_private_key=key_pem,
+                tls_next_certificate=certificate_pem,
+                machine_key_change={**change, "nextPin": machine_pin(certificate_pem)},
+            )
+            self._write_locked()
+            log.info("made this node's next machine key (pin %s)", machine_pin(certificate_pem))
+            return self._record
+
+    def update_machine_key_change(self, **fields: Any) -> IdentityRecord:
+        """Merge `fields` into the change's state; written only if it moved."""
+        with self._lock:
+            change = dict(self._record.machine_key_change or {})
+            merged = {**change, **fields}
+            if merged != change:
+                self._record = replace(self._record, machine_key_change=merged)
+                self._write_locked()
+            return self._record
+
+    def switch_machine_key(self, **fields: Any) -> IdentityRecord:
+        """The switch: the next key becomes the machine key, and the old
+        private key is gone from this file, in one write. `fields` go into
+        the change's state in the same write."""
+        with self._lock:
+            record = self._record
+            if not (record.tls_next_private_key and record.tls_next_certificate):
+                raise ValueError("there is no next machine key to switch to")
+            self._record = replace(
+                record,
+                tls_private_key=record.tls_next_private_key,
+                tls_certificate=record.tls_next_certificate,
+                tls_next_private_key=None,
+                tls_next_certificate=None,
+                machine_key_change={**(record.machine_key_change or {}), **fields},
+            )
+            self._write_locked()
+            return self._record
+
+    def drop_next_machine_key(self, **fields: Any) -> IdentityRecord:
+        """A change that stopped or failed: the next key is deleted, the
+        machine key stays, and `fields` go into the change's state."""
+        with self._lock:
+            self._record = replace(
+                self._record,
+                tls_next_private_key=None,
+                tls_next_certificate=None,
+                machine_key_change={**(self._record.machine_key_change or {}), **fields},
+            )
+            self._write_locked()
+            return self._record
+
     def record_advertise_url(self, url: str | None) -> IdentityRecord:
         """Persist what this node currently believes its address to be.
 
@@ -618,6 +697,10 @@ class NodeIdentityStore:
                 advertise_sequence=0,
                 enrolled_at=None,
                 control_pins=None,
+                # A machine key change belongs to the install it was for.
+                tls_next_private_key=None,
+                tls_next_certificate=None,
+                machine_key_change=None,
             )
             self._write_locked()
             return self._record

@@ -218,6 +218,12 @@ class MachineTrust:
         return bool((self.claims or {}).get("required"))
 
     @property
+    def version(self) -> int | None:
+        """The `version` of the list held (`MachinePort.listVersion`)."""
+        held = (self.claims or {}).get("version")
+        return held if isinstance(held, int) else None
+
+    @property
     def age_seconds(self) -> int | None:
         if self.taken_at is None:
             return None
