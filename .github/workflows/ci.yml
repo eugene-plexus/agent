@@ -42,6 +42,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    # bash on Windows too, for every step (W0.13). The runner's default pwsh
+    # fails a step only on the exit code of its last native command: a block
+    # with a failing command followed by a passing one is green, and a pytest
+    # step reported success with 2 failed tests (run 39625880014, 2026-10-21).
+    # bash -e -o pipefail stops at the first failing command.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
 
@@ -55,13 +63,11 @@ jobs:
       # has none.
       - name: Use a venv on Windows
         if: runner.os == 'Windows'
-        shell: bash
         run: |
           python -m venv "$RUNNER_TEMP\\venv"
           echo "$RUNNER_TEMP\\venv\\Scripts" >> "$GITHUB_PATH"
 
       - name: Install package + dev deps
-        shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             pip install -e ".[dev,service,tray]"
@@ -83,10 +89,7 @@ jobs:
 
       # In parallel, one worker per CPU: the tests mostly wait (servers and
       # child processes starting), so more workers than physical cores pay.
-      # bash on Windows too: the runner's default pwsh did not fail the step
-      # when pytest did (2 failed tests, green job).
       - name: Pytest
-        shell: bash
         run: pytest -n logical
 
   codegen-freshness:
