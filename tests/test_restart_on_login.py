@@ -23,6 +23,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from eugene_plexus_agent import process_signals
 from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentKind,
@@ -154,8 +155,26 @@ class _FakeProcess:
 
 
 @pytest.fixture
+def no_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stops go out as `terminate()`, the way an agent with no console sends them.
+
+    The fake children carry a made-up pid, so on Windows a real console event
+    sent to it either fails or reaches nothing, depending on whether this
+    process was handed a console: `app_launcher.run`, which other tests call in
+    process, allocates one, and then the event "sent" and the fake never exited
+    (the 5 s escalation, `terminated` False). These tests mean the fallback.
+    """
+
+    def refused(pid: int, sig: int) -> None:
+        raise OSError(6, "The handle is invalid")
+
+    monkeypatch.setattr(process_signals.os, "kill", refused)
+
+
+@pytest.fixture
 def supervisor_with_processes(
     monkeypatch: pytest.MonkeyPatch,
+    no_console: None,
 ) -> Iterator[tuple[Supervisor, list[_FakeProcess]]]:
     spawned: list[_FakeProcess] = []
 
@@ -257,6 +276,7 @@ async def test_restart_all_survives_one_failing_restart(
 
 async def test_respawn_after_master_key_set_includes_master_key_env_var(
     monkeypatch: pytest.MonkeyPatch,
+    no_console: None,
 ) -> None:
     """End-to-end mechanics: spawn a child with no master_key, set
     master_key on AuthState, restart_all, observe that the respawn's
