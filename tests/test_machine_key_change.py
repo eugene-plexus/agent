@@ -502,6 +502,35 @@ async def test_the_root_s_own_change_waits_for_agents_that_cannot_recover(
         assert worker.state() == "done"
 
 
+async def test_the_root_announces_both_keys_only_once_its_door_file_names_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second review's should-fix: if the door file cannot be written,
+    the root's node entry would name both keys while controlPins names the
+    old one, and every other machine would ignore the root's own entry. So
+    nothing is announced until control is told both keys."""
+    async with Node(tmp_path, hosts_control=True) as node:
+        real = machine_key_change.write_private
+
+        def full(path: Path, text: str) -> None:
+            if path.name == machine_key_change.DOOR_FILE:
+                raise OSError(28, "No space left on device")
+            real(path, text)
+
+        monkeypatch.setattr(machine_key_change, "write_private", full)
+        await node.change.start()
+        next_pin = node.store.record.machine_key_change["nextPin"]  # type: ignore[index]
+        await node.change.step()
+        assert node.control.announcements == []
+        error = str((node.change.status() or {}).get("error"))
+        assert "door file" in error and "No space left on device" in error
+        assert node.door_pins() == [node.old_pin]
+        monkeypatch.setattr(machine_key_change, "write_private", real)
+        await node.change.step()
+        assert node.control.announcements[-1]["tlsNextPin"] == next_pin
+        assert node.control.doors_at_announcement[-1] == [node.old_pin, next_pin]
+
+
 def _list(root: FakeRoot, version: int, pins: list[str]) -> str:
     return jwt.encode(
         {"iat": 1, "version": version, "required": False, "controlPins": pins, "nodes": []},

@@ -185,6 +185,8 @@ class MachineKeyChange:
         self._lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._door_written: str | None = None
+        #: Why the door file could not be written, while it could not.
+        self.door_error: str | None = None
         #: The last step's failure when `node.yaml` could not hold it either
         #: (a full disk): reported until a step gets past it.
         self._fault: str | None = None
@@ -199,26 +201,32 @@ class MachineKeyChange:
 
     # ---- the root's door file ------------------------------------------------
 
-    def write_door(self) -> None:
+    def write_door(self) -> bool:
         """On the machine that runs the root, the machine port's keys for
         control (`door_pins`); nothing elsewhere. Rewritten only when it
         changes. Owner-only, beside `node.yaml`: whoever can write it can
-        already read the machine key itself."""
+        already read the machine key itself.
+
+        Returns whether the file holds what it should (True where there is
+        nothing to write). Its failure is kept in `door_error`."""
         if not self.w.hosts_control() or self.w.door() is None:
-            return
+            return True
         pins = door_pins(self.w.store.record)
         if not pins:
-            return
+            return True
         rendered = json.dumps({"pins": pins, "url": self.w.machine_url()}, sort_keys=True)
         if rendered == self._door_written:
-            return
+            return True
         try:
             write_private(self.w.door_file, rendered)
         except OSError as exc:
+            self.door_error = f"could not write the machine door file ({exc})"
             log.warning("could not write the machine door file %s: %s", self.w.door_file, exc)
-            return
+            return False
         self._door_written = rendered
+        self.door_error = None
         log.info("control is told the machine port presents %s", ", ".join(pins))
+        return True
 
     # ---- start and stop --------------------------------------------------------
 
@@ -416,6 +424,14 @@ class MachineKeyChange:
             self.w.store.drop_next_machine_key(
                 state=FAILED, finishedAt=_now(), error="the next key was lost", settled=False
             )
+            return
+        if not change.get("announced") and not self.write_door():
+            # On the root, control must be told both keys before any list
+            # names both for the root's own node: otherwise every other
+            # machine ignores the root's own entry (its keys are not all in
+            # controlPins) and refuses calls to the root's agent. Tried
+            # again at the next step; nothing is announced meanwhile.
+            self._update(error=f"waiting: {self.door_error}")
             return
         if not change.get("announcing"):
             if self.w.hosts_control():
