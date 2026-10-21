@@ -409,6 +409,8 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
 
     if not record.enrolled:
         raise _not_enrolled()
+    if standby.hosts_active_control(request.app.state.agent_state):
+        raise _runs_the_root()
 
     previous_name = str(record.name)
     previous_control_url = str(record.control_url)
@@ -438,6 +440,16 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
         previousName=previous_name,
         previousControlUrl=previous_control_url,  # type: ignore[arg-type]
         detail=detail,
+    )
+
+
+def _runs_the_root() -> HTTPException:
+    return _problem(
+        status.HTTP_409_CONFLICT,
+        "runs-the-root",
+        "This machine runs the install's control root",
+        "It does not leave the install: that would take the install's root off its own "
+        "authority. Move the root to another machine first.",
     )
 
 
@@ -524,13 +536,7 @@ async def _leave_by_passphrase(request: Request, passphrase: str) -> UnenrollRes
     previous_name = str(record.name)
     previous_control_url = str(record.control_url)
     if standby.hosts_active_control(state):
-        raise _problem(
-            status.HTTP_409_CONFLICT,
-            "runs-the-root",
-            "This machine runs the install's control root",
-            "It does not leave by passphrase: that would take the install's root off its own "
-            "authority. Sign in and leave with that session.",
-        )
+        raise _runs_the_root()
     heard = await leaving.ask_now(request.app)
     if heard is leaving.Heard.UNTRUSTED:
         raise _problem(

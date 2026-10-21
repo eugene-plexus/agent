@@ -1231,6 +1231,24 @@ def test_the_machine_that_runs_the_root_does_not_leave_by_passphrase(
     assert _enrolled_now(authed_client)
 
 
+def test_the_machine_that_runs_the_root_does_not_leave_with_a_session(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    state.add_topology_entry(
+        ComponentEntry(
+            name="control",
+            kind=ComponentKind.control,
+            url="http://127.0.0.1:1",  # type: ignore[arg-type]
+        )
+    )
+    response = authed_client.post("/v1/node/unenroll", json={"notifyControl": False})
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["title"] == "This machine runs the install's control root"
+    assert _enrolled_now(authed_client)
+
+
 def _leave_by_passphrase(client: TestClient, passphrase: str = TEST_PASSPHRASE) -> httpx.Response:
     return client.post(
         "/v1/node/unenroll", json={"passphrase": passphrase}, headers={"Authorization": ""}
