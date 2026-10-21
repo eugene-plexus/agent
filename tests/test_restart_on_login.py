@@ -181,11 +181,20 @@ def supervisor_with_processes(
     async def fake_create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
         proc = _FakeProcess()
         spawned.append(proc)
+        # The real call hands the process back a moment after it exists, and
+        # `restart` signals only the process the supervisor holds. A slow runner
+        # showed the gap (two Windows failures, 2026-10-21); this makes it certain.
+        await asyncio.sleep(0.02)
         return proc
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
     sup = Supervisor(log=logging.getLogger("test"))
     yield sup, spawned
+
+
+def _held(sup: Supervisor, spawned: list[_FakeProcess], count: int) -> bool:
+    """`count` processes spawned and taken up by the supervisor (`_proc` set)."""
+    return len(spawned) >= count and all(sp._proc is not None for sp in sup._processes.values())
 
 
 async def _wait_for(condition: Any, max_iterations: int = 100) -> None:
@@ -212,7 +221,7 @@ async def test_restart_all_terminates_each_supervised_process(
     for entry in entries:
         sup.add_and_start(entry)
 
-    await _wait_for(lambda: len(spawned) >= 2)
+    await _wait_for(lambda: _held(sup, spawned, 2))
 
     restarted = await sup.restart_all()
     assert set(restarted) == {"left", "right"}
@@ -249,7 +258,7 @@ async def test_restart_all_survives_one_failing_restart(
         )
         sup.add_and_start(entry)
 
-    await _wait_for(lambda: len(spawned) >= 2)
+    await _wait_for(lambda: _held(sup, spawned, 2))
 
     async def boom() -> None:
         raise RuntimeError("simulated restart failure")
