@@ -35,9 +35,10 @@ argument). The guards, from the review of this change:
   followed by an old one is not enough;
 * a machine that runs the install's active control root never leaves
   this way;
-* a machine with no passphrase of its own never leaves this way: once
-  standalone, the first caller to set a passphrase would own it, and a
-  worker binds an address other machines reach;
+* a machine with no passphrase of its own leaves, and its first-run
+  wizard then accepts a passphrase only from the machine itself
+  (agent#22, Troy 2026-10-21): it still listens where other machines
+  reached it, and the first person on the network to set one would own it;
 * the leave happens only if the enrollment is still the one the pull
   started with, so a re-join in between is not undone.
 """
@@ -198,11 +199,6 @@ async def _leave_if_removed(
         why_not = "the root's machine list still names it, so the root still has it registered"
     elif standby.hosts_active_control(app.state.agent_state):
         why_not = "this machine runs the install's control root"
-    elif not app.state.agent_state.has_passphrase():
-        why_not = (
-            "it has no passphrase of its own, and standalone it would belong to whoever "
-            "set one first"
-        )
     if why_not is not None:
         if getattr(app.state, "removed_said", None) != (bundle.version, why_not):
             app.state.removed_said = (bundle.version, why_not)
@@ -213,6 +209,10 @@ async def _leave_if_removed(
                 why_not,
             )
         return None
+    state = app.state.agent_state
+    if not state.has_passphrase():
+        # Before leaving, so no moment exists where the wizard answers anyone.
+        state.require_setup_here()
     return await leave(
         app,
         notified=True,

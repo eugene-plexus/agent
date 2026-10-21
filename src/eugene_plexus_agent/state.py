@@ -1065,6 +1065,22 @@ class AgentState:
             value = self._auth.get("masterSalt")
             return value if isinstance(value, str) else None
 
+    def require_setup_here(self) -> None:
+        """Accept the first-run passphrase only from this machine (agent#22).
+
+        Set when a machine with no passphrase of its own leaves an install
+        that removed it. It still listens where other machines reached it,
+        and the wizard sets the passphrase that owns it, so the first
+        person on the network to open it would own it. `set_passphrase`
+        clears this."""
+        with self._lock:
+            self._auth = {**self._auth, "setupHereOnly": True}
+            self._write_locked()
+
+    def setup_here_only(self) -> bool:
+        with self._lock:
+            return bool(self._auth.get("setupHereOnly"))
+
     def set_passphrase(self, *, passphrase_hash: str, master_salt_b64: str) -> None:
         """Persist the wizard's passphrase hash + master-key salt.
 

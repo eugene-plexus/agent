@@ -1160,25 +1160,36 @@ def test_a_key_the_root_left_out_while_it_still_has_the_machine_is_not_a_removal
     assert _enrolled_now(authed_client)
 
 
-def test_a_removed_machine_with_no_passphrase_of_its_own_does_not_leave_by_itself(
+def test_a_removed_machine_with_no_passphrase_leaves_and_is_set_up_from_itself(
     authed_client: TestClient, control: FakeControl
 ) -> None:
-    """Standalone with no passphrase, the first caller to set one would own
-    it. It stays, and its sign-in says why."""
-    from eugene_plexus_agent import leaving
-
+    """agent#22 (Troy, 2026-10-21): it leaves and needs its first-run wizard,
+    and the wizard takes a passphrase only from this machine: it still
+    listens where other machines reached it."""
     assert _enroll(authed_client, control).status_code == 200
     state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
     state._auth.pop("passphraseHash", None)
     _remove_at_root(control)
-    authed_client.portal.call(leaving.ask_now, authed_client.app)  # type: ignore[union-attr]
-    assert _enrolled_now(authed_client)
     refused = authed_client.post(
         "/v1/auth/login", json={"passphrase": TEST_PASSPHRASE}, headers={"Authorization": ""}
     )
     assert refused.status_code == 409, refused.text
-    assert "no passphrase of its own" in refused.json()["detail"]["detail"]
-    assert _enrolled_now(authed_client)
+    assert "has left it" in refused.json()["detail"]["detail"]
+    assert "127.0.0.1" in refused.json()["detail"]["detail"]
+    assert not _enrolled_now(authed_client)
+    assert state.setup_here_only()
+    # Another machine on the network cannot claim it.
+    claimed = authed_client.post(
+        "/v1/auth/initialize", json={"passphrase": "a passphrase from elsewhere"}
+    )
+    assert claimed.status_code == 403, claimed.text
+    assert claimed.json()["detail"]["title"] == "Set up from this machine"
+    assert not state.has_passphrase()
+    # From this machine, the wizard works, and the restriction ends.
+    here = TestClient(authed_client.app, client=("127.0.0.1", 50123))
+    done = here.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
+    assert done.status_code == 200, done.text
+    assert state.has_passphrase() and not state.setup_here_only()
 
 
 def test_an_answer_the_machine_does_not_trust_does_not_let_it_leave_by_passphrase(

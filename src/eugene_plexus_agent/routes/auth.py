@@ -239,6 +239,20 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
             "are sealed with it.",
         )
 
+    if state.setup_here_only() and not peer.is_loopback(
+        request.client.host if request.client else None
+    ):
+        # agent#22: this machine left an install with no passphrase of its
+        # own and still listens where other machines reached it. The peer
+        # is the TCP peer, or the entry point's verified client address.
+        raise _problem(
+            status.HTTP_403_FORBIDDEN,
+            "Set up from this machine",
+            "This machine left an install and has no passphrase yet. Set one from this "
+            "machine itself: open the console in a browser on it, at "
+            "http://127.0.0.1:8079.",
+        )
+
     if state.lost_its_passphrase():
         # **The file held a passphrase and we cannot read it** (review
         # §6.1 #6). `yaml.safe_dump` sorts keys, so a half-written
@@ -513,28 +527,26 @@ def _removed(heard: leaving.Heard, *, control_url: str, own_passphrase: bool) ->
     """The 409 for a sign-in the root no longer addresses to this machine."""
     title = "This machine was removed from the install"
     if heard is leaving.Heard.LEFT:
-        then = "Sign in again with this machine's own passphrase."
+        then = (
+            "Sign in again with this machine's own passphrase."
+            if own_passphrase
+            else "It has no passphrase yet: set one from this machine itself, at "
+            "http://127.0.0.1:8079."
+        )
         return _problem(
             status.HTTP_409_CONFLICT,
             title,
             f"The install at {control_url} no longer lists this machine, so it has left it "
             f"and works on its own now. {then} To join an install again, use a new join token.",
         )
-    if not own_passphrase:
-        then = (
-            "It has no passphrase of its own, so it does not leave by itself (standalone, "
-            "anyone who set one first would own it). Uninstall and install it again to set "
-            "it up."
-        )
-    elif heard is leaving.Heard.LISTED:
+    if heard is leaving.Heard.LISTED:
         then = (
             "The root still has it registered, so it has not left. Remove it from Machines "
             "on the install, then sign in here again."
         )
     else:
-        then = (
-            "It leaves by itself once the root answers its trust pull; or leave now with "
-            "this machine's own passphrase."
+        then = "It leaves by itself once the root answers its trust pull" + (
+            "; or leave now with this machine's own passphrase." if own_passphrase else "."
         )
     return _problem(
         status.HTTP_409_CONFLICT,
