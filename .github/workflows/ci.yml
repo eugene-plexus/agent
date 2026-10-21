@@ -82,7 +82,7 @@ jobs:
         run: mypy src/
 
       - name: Pytest
-        run: pytest
+        run: pytest -n auto
 
   codegen-freshness:
     name: Codegen freshness
