@@ -3469,6 +3469,26 @@ class CopyProgress(BaseModel):
     )
 
 
+class OllamaSendRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    job: str = Field(
+        ...,
+        description="The Library's Keep job id, used to discover the authorized destination.",
+    )
+    digest: str = Field(..., pattern='^sha256:[0-9a-f]{64}$')
+
+
+class OllamaSendResult(BaseModel):
+    job: str
+    bytesSent: int = Field(
+        ...,
+        description='Bytes sent in this request, including a projector when present.',
+        ge=0,
+    )
+
+
 class ModelCopySkipped(BaseModel):
     path: str
     runtime: str | None = Field(
