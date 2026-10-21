@@ -198,6 +198,76 @@ def _persist_passphrase_if_file_mode(request: Request, state: AgentState, passph
     passphrase_file.store_passphrase(_passphrase_path(request), passphrase)
 
 
+async def _keep_local_root_on_the_file(request: Request, state: AgentState, session: str) -> None:
+    """The root this machine runs unlocks from the same file as this agent.
+
+    **A Mac install that moved from its LaunchAgent to the daemon** (specs
+    row 8) kept its control root on `os_keyring`. The root holds that in
+    its own applied state, which no file the installer could rewrite
+    holds, and the daemon's account has no Keychain: every boot would
+    leave the root sealed. The move tells the person to sign in once. That
+    sign-in writes this agent's passphrase file (above), and here sets the
+    root to the same file with the session the root just issued -- what
+    the wizard does on a fresh install, where the root takes the agent's
+    mode.
+
+    Narrow on purpose: only when this agent unlocks from a file that now
+    exists, only the root this agent itself runs (never a worker's root,
+    which is another machine's), only from `os_keyring`, and only when
+    this account has no keyring, so the root's keyring could not work
+    either. A root on `prompt_on_startup` was chosen so and stays. Never
+    fails a sign-in: what it could not do, it logs.
+    """
+    if state.get_config("securityMode") != "passphrase_file":
+        return
+    path = _passphrase_path(request)
+    if path is None or not path.is_file():
+        return
+    from ..machine_port import active_control_entry
+
+    entry = active_control_entry(state)
+    if entry is None:
+        return
+    try:
+        available: bool | None = await asyncio.wait_for(
+            asyncio.to_thread(keyring_store.probe_sync), timeout=KEYRING_PROBE_BUDGET_SECONDS
+        )
+    except TimeoutError:
+        available = None
+    if available:
+        return
+    root = str(entry.url).rstrip("/")
+    headers = {"Authorization": f"Bearer {session}"}
+    transport = getattr(request.app.state, "control_transport", None)
+    try:
+        async with internal_client(timeout=_FORWARD_TIMEOUT_SECONDS, transport=transport) as client:
+            current = await client.get(f"{root}/v1/config", headers=headers)
+            if current.status_code != 200 or current.json().get("securityMode") != "os_keyring":
+                return
+            changed = await client.patch(
+                f"{root}/v1/config", json={"securityMode": "passphrase_file"}, headers=headers
+            )
+    except (httpx.HTTPError, ValueError) as exc:
+        log.warning(
+            "the control root on this machine still unlocks from an OS keyring this account "
+            "cannot reach, and could not be moved to the passphrase file: %s",
+            str(exc) or type(exc).__name__,
+        )
+        return
+    if changed.status_code == 200:
+        log.info(
+            "the control root on this machine now unlocks from %s, as this agent does: this "
+            "account has no OS keyring",
+            path,
+        )
+    else:
+        log.warning(
+            "the control root on this machine refused to unlock from the passphrase file (%s): %s",
+            changed.status_code,
+            changed.text[:300],
+        )
+
+
 class _InitializeRequest(BaseModel):
     """The wizard's payload for first-run passphrase setup.
 
@@ -420,7 +490,9 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
         await connect_shares(request)
 
     if enrolled:
-        return await _forward_login(request, body.passphrase, remote=remote)
+        signed_in = await _forward_login(request, body.passphrase, remote=remote)
+        await _keep_local_root_on_the_file(request, state, signed_in.sessionToken)
+        return signed_in
     token, exp = auth.trust.mint_local_session()
     log.info("operator login from %s", remote)
     return AuthLoginResponse(
