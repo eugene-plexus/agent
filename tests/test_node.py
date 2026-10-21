@@ -16,7 +16,9 @@ import base64
 import itertools
 import json
 import logging
+import select
 import socket
+import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -89,7 +91,26 @@ class FakeControl:
         self.list_version = 0
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
-        self._listener.listen(1)
+        self._listener.listen()
+        # The agent's calls that do not go through `transport()` (the machine
+        # list pulled right after enrolling) reach this socket for real. Left
+        # unaccepted, Linux dropped the connect past two and the read waited its
+        # whole 10 s timeout otherwise: 10 s a test, 600 s of CI's 797. Accepting
+        # and hanging up fails them at once, as a root that is down would.
+        self._wake_read, self._wake_write = socket.socketpair()
+        self._acceptor = threading.Thread(target=self._hang_up_on_callers, daemon=True)
+        self._acceptor.start()
+
+    def _hang_up_on_callers(self) -> None:
+        while True:
+            readable, _, _ = select.select([self._listener, self._wake_read], [], [])
+            if self._wake_read in readable:
+                return
+            try:
+                caller, _ = self._listener.accept()
+            except OSError:
+                return
+            caller.close()
 
     @property
     def url(self) -> str:
@@ -100,7 +121,11 @@ class FakeControl:
         return self.root.public
 
     def close(self) -> None:
+        self._wake_write.send(b"x")
+        self._acceptor.join(timeout=5)
         self._listener.close()
+        self._wake_read.close()
+        self._wake_write.close()
 
     def transport(self) -> httpx.MockTransport:
         def handle(request: httpx.Request) -> httpx.Response:
