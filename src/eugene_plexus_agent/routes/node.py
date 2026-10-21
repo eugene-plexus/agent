@@ -170,7 +170,14 @@ def _machine(request: Request) -> MachinePort | None:
     trust = getattr(request.app.state, "machine_trust", None)
     from .. import machine_key_change
 
-    change = machine_key_change.status(_store(request).record)
+    running = getattr(request.app.state, "machine_key_change", None)
+    # The running change's own view, which keeps a failure node.yaml could
+    # not hold (a full disk); the record's otherwise.
+    change = (
+        running.status()
+        if running is not None
+        else machine_key_change.status(_store(request).record)
+    )
     return MachinePort(
         url=machine_port.machine_url(request.app),  # type: ignore[arg-type]
         port=door.status.port,

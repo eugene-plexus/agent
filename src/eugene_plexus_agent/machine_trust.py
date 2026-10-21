@@ -47,6 +47,9 @@ TYP_MACHINES = "ep-machines+jwt"
 LIST_FILE = "machine_list.json"
 PINS_FILE = "machine_pins.json"
 LIST_PATH = "/v1/trust/machines"
+#: The children read the table file again at most once a second
+#: (`_http._TABLE_RECHECK_SECONDS`); a version is acknowledged after this.
+CHILD_CACHE_SECONDS = 1.5
 
 
 class MachineListError(Exception):
@@ -207,6 +210,12 @@ class MachineTrust:
         self.claims: dict[str, Any] | None = None
         self.taken_at: float | None = None
         self._written: str | None = None
+        #: The list version whose table is in the file the children read,
+        #: and when it got there; and the last version acknowledged, once the
+        #: children's cache had passed (review blocker 3).
+        self._installed: tuple[int | None, float] | None = None
+        self._acknowledged: int | None = None
+        self._write_failed = False
         self.on_required_changed: Any = None
         self.own_urls: Any = lambda: ()
         #: Whether the root serves a machine list: False once it answered 404
@@ -219,9 +228,16 @@ class MachineTrust:
 
     @property
     def version(self) -> int | None:
-        """The `version` of the list held (`MachinePort.listVersion`)."""
-        held = (self.claims or {}).get("version")
-        return held if isinstance(held, int) else None
+        """`MachinePort.listVersion`: the list version this machine's
+        children can read, which the root takes as "this machine has the
+        keys in it" (row 3 review, blocker 3). Not the version held while
+        the table file could not be written, and not before the children's
+        one-second cache has passed since it was."""
+        if self._installed is not None:
+            version, at = self._installed
+            if time.perf_counter() - at >= CHILD_CACHE_SECONDS:
+                self._acknowledged = version
+        return self._acknowledged
 
     @property
     def age_seconds(self) -> int | None:
@@ -257,6 +273,9 @@ class MachineTrust:
         self.taken_at = time.time()
         write_private(self.list_path, json.dumps({"jws": jws, "takenAt": self.taken_at}))
         if claims["version"] == held:
+            if self._write_failed:
+                # The same list again: write the table it could not.
+                self.rebuild()
             return False
         was_required = self.required
         self.claims = claims
@@ -296,17 +315,28 @@ class MachineTrust:
                 )
         return (None, ())
 
-    def rebuild(self) -> None:
-        """Install the table here and write it for the children."""
+    def rebuild(self) -> bool:
+        """Install the table here and write it for the children. Returns
+        whether the file holds it; the version is acknowledged only then."""
         document = self.table()
         _http.set_machine_table(_http.parse_machine_table(document))
         rendered = json.dumps(document, sort_keys=True)
         if rendered != self._written:
             try:
                 write_private(self.pins_path, rendered)
-                self._written = rendered
             except OSError as exc:
+                self._write_failed = True
                 log.warning("could not write the machine table to %s: %s", self.pins_path, exc)
+                return False
+            self._written = rendered
+        self._write_failed = False
+        version = document.get("version")
+        installed = self._installed[0] if self._installed is not None else None
+        if self._installed is None or installed != version:
+            _ = self.version  # what was acknowledged stays so
+            listed = version if isinstance(version, int) and version > 0 else None
+            self._installed = (listed, time.perf_counter())
+        return True
 
     def forget(self) -> None:
         """Leaving the install: no list, no table."""

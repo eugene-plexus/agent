@@ -97,6 +97,11 @@ class FakeControl:
         self.version = 0
         self._listed: Any = None
         self.waiting_on: list[str] = ["nas"]
+        self.not_ready: list[str] = []
+        #: A root restarted sealed: it records announcements, and serves the
+        #: last list it signed, because it cannot sign another.
+        self.locked = False
+        self._last_jws: str | None = None
         self.announcements: list[dict[str, Any]] = []
         self.doors_at_announcement: list[Any] = []
         self.door_file: Path | None = None
@@ -104,10 +109,16 @@ class FakeControl:
         self.down = False
 
     def signed_list(self) -> str:
+        if self.locked and self._last_jws is not None:
+            return self._last_jws
+        control_pins = self.control_pins
+        if self.door_file is not None and self.door_file.exists():
+            # As control does: the root's keys from the door file.
+            control_pins = json.loads(self.door_file.read_text(encoding="utf-8"))["pins"]
         content = {
             "required": False,
             "keyChange": True,
-            "controlPins": sorted(self.control_pins),
+            "controlPins": sorted(control_pins),
             "nodes": [
                 {
                     "name": NAME,
@@ -120,12 +131,13 @@ class FakeControl:
         if content != self._listed:
             self.version += 1
             self._listed = content
-        return jwt.encode(
+        self._last_jws = jwt.encode(
             {"iat": 1, "version": self.version, **content},
             self.root.identity,
             algorithm="EdDSA",
             headers={"typ": machine_trust.TYP_MACHINES},
         )
+        return self._last_jws
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         if self.down:
@@ -162,6 +174,8 @@ class FakeControl:
             )
         if request.method == "GET" and path == machine_trust.LIST_PATH:
             return httpx.Response(200, json={"jws": self.signed_list()})
+        if request.method == "GET" and path == "/v1/auth/status":
+            return httpx.Response(200, json={"initialized": True, "unlocked": not self.locked})
         if request.method == "GET" and path == f"/v1/nodes/{NAME}":
             change = None
             if self.next_pin is not None:
@@ -170,6 +184,7 @@ class FakeControl:
                     "listVersion": self.version,
                     "waitingOn": list(self.waiting_on),
                     "unreachable": [],
+                    "notReady": list(self.not_ready),
                 }
             return httpx.Response(
                 200, json={"name": NAME, "tlsPins": self.pins, "machineKeyChange": change}
@@ -287,6 +302,11 @@ async def test_switch_waits_for_coverage_then_presents_new_key(tmp_path: Path) -
 
             node.control.waiting_on = []
             await node.change.step()
+            # The step took the root's list, which rebuilt this process's
+            # table; the test's own pin for the session goes back in.
+            _http.set_machine_table(
+                _http.parse_machine_table({"machines": {hostport: [node.old_pin]}})
+            )
 
             # A new handshake gets the new key, with no restart.
             assert await node.presented() == next_pin
@@ -410,6 +430,144 @@ async def test_a_refused_next_key_is_deleted_and_says_why(tmp_path: Path) -> Non
         assert "the root refused it (Machine port cannot be a node's)" in str(status["error"])
         assert node.store.record.tls_next_private_key is None
         assert await node.presented() == node.old_pin
+
+
+# --------------------------------------------------------------------------- #
+# The adversarial review's blockers (2026-10-21), each by fault injection
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_switch_node_yaml_cannot_keep_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 1: node.yaml cannot be written at the switch (a full disk).
+    Nothing switches, in memory or on the port, and the status says why; once
+    it can be written the change goes on, and node.yaml, the port and the
+    root agree on one key."""
+    async with Node(tmp_path) as node:
+        await node.change.start()
+        await node.change.step()
+        next_pin = node.store.record.machine_key_change["nextPin"]  # type: ignore[index]
+        node.control.waiting_on = []
+        real = node_identity.write_private
+
+        def full(path: Path, text: str) -> None:
+            if path.name == "node.yaml":
+                raise OSError(28, "No space left on device")
+            real(path, text)
+
+        monkeypatch.setattr(node_identity, "write_private", full)
+        await node.change.step()
+        assert node_identity.machine_pin(node.store.record.tls_certificate or "") == node.old_pin
+        assert node.state() == "waiting"
+        assert await node.presented() == node.old_pin
+        status = node.change.status()
+        assert status is not None and "No space left on device" in str(status["error"])
+        monkeypatch.setattr(node_identity, "write_private", real)
+        await node.change.step()
+        assert node.state() == "done"
+        on_disk = yaml.safe_load((tmp_path / "node.yaml").read_text(encoding="utf-8"))
+        assert node_identity.machine_pin(on_disk["tlsCertificate"]) == next_pin
+        assert await node.presented() == next_pin
+        assert node.control.pins == [next_pin]
+
+
+async def test_the_root_s_own_change_waits_for_agents_that_cannot_recover(
+    tmp_path: Path,
+) -> None:
+    """Blocker 2: an agent older than row 3 that misses the root's key change
+    never takes the new key. The root's change does not switch while the
+    root names one, past the 3-minute bound too; another machine's change
+    is not held up by it."""
+    async with Node(tmp_path, hosts_control=True) as node:
+        await node.change.start()
+        await node.change.step()
+        node.control.waiting_on = []
+        node.control.not_ready = ["old-nas"]
+        node.store.update_machine_key_change(listedAt=1.0)
+        await node.change.step()
+        assert node.state() == "waiting"
+        assert await node.presented() == node.old_pin
+        error = str((node.change.status() or {}).get("error"))
+        assert "old-nas" in error and "update" in error
+        node.control.not_ready = []
+        await node.change.step()
+        assert node.state() == "done"
+    async with Node(tmp_path / "worker") as worker:
+        await worker.change.start()
+        await worker.change.step()
+        worker.control.waiting_on = []
+        worker.control.not_ready = ["old-nas"]
+        await worker.change.step()
+        assert worker.state() == "done"
+
+
+def _list(root: FakeRoot, version: int, pins: list[str]) -> str:
+    return jwt.encode(
+        {"iat": 1, "version": version, "required": False, "controlPins": pins, "nodes": []},
+        root.identity,
+        algorithm="EdDSA",
+        headers={"typ": machine_trust.TYP_MACHINES},
+    )
+
+
+def test_a_list_is_acknowledged_only_once_its_table_is_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Blocker 3: the version this node reports (which the root reads to stop
+    waiting for it) is the one its children can read: not while the table
+    file cannot be written, and not before their one-second cache passes. The
+    same list taken again writes the table it could not."""
+    root = FakeRoot()
+    store = NodeIdentityStore(tmp_path / "node.yaml")
+    store.load()
+    enroll_store(store, root, NAME, control_url="http://10.0.0.5:8083")
+    trust = machine_trust.MachineTrust(tmp_path, store)
+    trust.load()
+    monkeypatch.setattr(machine_trust, "CHILD_CACHE_SECONDS", 0.0)
+    trust.accept(_list(root, 1, ["R" * 43]))
+    assert trust.version == 1
+    real = machine_trust.write_private
+
+    def failing(path: Path, text: str) -> None:
+        if path.name == machine_trust.PINS_FILE:
+            raise OSError(28, "No space left on device")
+        real(path, text)
+
+    monkeypatch.setattr(machine_trust, "write_private", failing)
+    trust.accept(_list(root, 2, ["S" * 43]))
+    assert trust.version == 1, "the children still read list 1"
+    monkeypatch.setattr(machine_trust, "write_private", real)
+    monkeypatch.setattr(machine_trust, "CHILD_CACHE_SECONDS", 60.0)
+    trust.accept(_list(root, 2, ["S" * 43]))
+    on_disk = json.loads((tmp_path / machine_trust.PINS_FILE).read_text(encoding="utf-8"))
+    assert on_disk["version"] == 2
+    # Written, but within the children's cache: still the previous one.
+    assert trust.version == 1
+    monkeypatch.setattr(machine_trust, "CHILD_CACHE_SECONDS", 0.0)
+    assert trust.version == 2
+
+
+async def test_done_only_once_a_signed_list_drops_the_old_key(tmp_path: Path) -> None:
+    """Blocker 4: a root restarted sealed takes the drop but cannot sign a
+    list, and keeps serving both keys, so the old key is still accepted. The
+    change is not done until a verified list drops it, and says what it
+    waits for."""
+    async with Node(tmp_path) as node:
+        await node.change.start()
+        await node.change.step()
+        next_pin = node.store.record.machine_key_change["nextPin"]  # type: ignore[index]
+        node.control.signed_list()  # the overlap, as published
+        node.control.locked = True
+        node.control.waiting_on = []
+        await node.change.step()
+        assert node.control.pins == [next_pin]  # the root took the drop...
+        assert node.state() == "switched"  # ...and the list still has both
+        assert "unlocked" in str((node.change.status() or {}).get("error"))
+        node.control.locked = False
+        await node.change.step()
+        assert node.state() == "done"
+        assert node.trust.own_record() == (node.machine_url, (next_pin,))
 
 
 async def test_a_change_needs_a_root_that_takes_a_next_key(tmp_path: Path) -> None:

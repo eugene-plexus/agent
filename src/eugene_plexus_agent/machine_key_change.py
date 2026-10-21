@@ -129,7 +129,7 @@ def door_pins(record: IdentityRecord) -> list[str]:
     other: Any = None
     if state == WAITING:
         other = change.get("nextPin")
-    elif state == SWITCHED:
+    elif state == SWITCHED and not change.get("dropAnnounced"):
         other = change.get("previousPin")
     elif state in (STOPPED, FAILED) and not change.get("settled"):
         other = change.get("nextPin")
@@ -185,11 +185,17 @@ class MachineKeyChange:
         self._lock = asyncio.Lock()
         self._wake = asyncio.Event()
         self._door_written: str | None = None
+        #: The last step's failure when `node.yaml` could not hold it either
+        #: (a full disk): reported until a step gets past it.
+        self._fault: str | None = None
 
     # ---- what GET /v1/node says --------------------------------------------
 
     def status(self) -> dict[str, Any] | None:
-        return status(self.w.store.record)
+        held = status(self.w.store.record)
+        if held is not None and self._fault is not None:
+            held["error"] = self._fault
+        return held
 
     # ---- the root's door file ------------------------------------------------
 
@@ -329,18 +335,25 @@ class MachineKeyChange:
 
     async def step(self) -> None:
         async with self._lock:
-            self.write_door()
-            record = self.w.store.record
-            change = record.machine_key_change or {}
-            if not record.enrolled:
-                return
-            state = change.get("state")
-            if state == WAITING:
-                await self._wait(record, change)
-            elif state == SWITCHED:
-                await self._drop()
-            elif state in (STOPPED, FAILED) and not change.get("settled"):
-                await self._settle()
+            self._fault = None
+            try:
+                self.write_door()
+                record = self.w.store.record
+                change = record.machine_key_change or {}
+                if not record.enrolled:
+                    return
+                state = change.get("state")
+                if state == WAITING:
+                    await self._wait(record, change)
+                elif state == SWITCHED:
+                    await self._drop()
+                elif state in (STOPPED, FAILED) and not change.get("settled"):
+                    await self._settle()
+            except OSError as exc:
+                # node.yaml could not be written: nothing moved past what it
+                # holds, and the cause is shown until a step gets past it.
+                self._fault = f"could not write {self.w.store.path.name} ({exc})"
+                log.warning("the machine key change is held: %s", self._fault)
 
     # ---- the steps -------------------------------------------------------------
 
@@ -449,6 +462,21 @@ class MachineKeyChange:
             self._update(announced=False, error="waiting for the root to record both keys")
             return
         seen = observed.get("machineKeyChange") or {}
+        not_ready = [str(n) for n in seen.get("notReady") or ()]
+        if not_ready and self.w.hosts_control():
+            # Review blocker 2: an agent older than row 3 that misses the
+            # root's key change never takes the new one. No bound here: the
+            # old key keeps serving until they are updated or removed.
+            self._update(
+                error=f"waiting: {', '.join(not_ready)} "
+                + ("runs" if len(not_ready) == 1 else "run")
+                + " a version that cannot take this machine's new key if "
+                + ("it misses" if len(not_ready) == 1 else "they miss")
+                + " the change; update "
+                + ("it" if len(not_ready) == 1 else "them")
+                + ", or remove a machine that is gone"
+            )
+            return
         waiting = [str(n) for n in seen.get("waitingOn") or ()]
         if waiting and time.time() - float(listed_at) < WAIT_BOUND_SECONDS:
             self._update(error=None)
@@ -484,9 +512,12 @@ class MachineKeyChange:
                 error=None,
             )
         except Exception as exc:
-            # `node.yaml` still names the old key: the port presents it again,
-            # or a restart would present a key the list has dropped.
+            # `node.yaml` still names the old key, and so does this process
+            # (it holds a record only once it is written): the port presents
+            # the old key again, or a restart would present a key the root's
+            # list has dropped.
             door.reload(str(record.tls_certificate), str(record.tls_private_key), current)
+            self._fault = f"nothing switched: could not write {self.w.store.path.name} ({exc})"
             log.error("could not keep the new machine key, so nothing switched: %s", exc)
             return
         self.write_door()
@@ -503,13 +534,53 @@ class MachineKeyChange:
         await self._drop()
 
     async def _drop(self) -> None:
-        outcome = await self._announce()
-        if not outcome.announced:
-            self._update(error=f"waiting for the root to drop the old key ({outcome.detail})")
+        change = self.w.store.record.machine_key_change or {}
+        if not change.get("dropAnnounced"):
+            outcome = await self._announce()
+            if not outcome.announced:
+                self._update(error=f"waiting for the root to drop the old key ({outcome.detail})")
+                return
+            self._update(dropAnnounced=True, error=None)
+            # The root recorded the new key alone: the door file follows.
+            self.write_door()
+        # Review blocker 4: done only once a list the root signed, verified
+        # here, no longer names the old key. A root restarted sealed takes
+        # the drop but signs nothing, and keeps serving both keys.
+        if self.w.pull is not None:
+            await self.w.pull()
+        if self._dropped():
+            self._update(state=DONE, finishedAt=_now(), error=None, settled=True)
+            log.info("machine key change done: the root's signed list names the new key alone")
             return
-        self._update(state=DONE, finishedAt=_now(), error=None, settled=True)
-        self.write_door()
-        log.info("machine key change done: the root records the new key alone")
+        if await self._root_locked():
+            self._update(
+                error="waiting for the root to be unlocked: its machine list still names "
+                "the old key"
+            )
+        else:
+            self._update(error="waiting for the root's machine list to drop the old key")
+
+    def _dropped(self) -> bool:
+        """The list this node holds names its current key alone (and, on
+        the root, in `controlPins`)."""
+        current = _current_pin(self.w.store.record)
+        own = self.w.trust.own_record()
+        if current is None or own is None or own[1] != (current,):
+            return False
+        if self.w.hosts_control():
+            return list((self.w.trust.claims or {}).get("controlPins") or ()) == [current]
+        return True
+
+    async def _root_locked(self) -> bool:
+        """The root says it is sealed (`GET /v1/auth/status`)."""
+        record = self.w.store.record
+        url = f"{str(record.control_url).rstrip('/')}/v1/auth/status"
+        try:
+            async with internal_client(timeout=10.0, transport=self.w.transport()) as client:
+                response = await client.get(url)
+            return response.status_code == 200 and response.json().get("unlocked") is False
+        except (httpx.HTTPError, ValueError, AttributeError):
+            return False
 
     async def _settle(self) -> None:
         """After a stop or a refusal: the current key alone, at the root and
