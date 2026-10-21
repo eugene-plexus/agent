@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -53,9 +54,11 @@ from .._generated.models import (
     Policy,
     PythonEngine,
     RuntimeCapabilities,
+    RuntimePromptCache,
     RuntimeSpec,
 )
 from ..child_env import child_environment
+from . import prompt_cache
 from .base import (
     DiscoveredBinary,
     EngineAdapter,
@@ -255,10 +258,23 @@ class VllmAdapter(EngineAdapter):
         die on a clean host. The traceback is forty frames of someone
         else's code and mentions the fix in none of them.
         """
+        short = _SHM_SPACE_RE.search(output_tail)
+        if short:
+            needed, free = int(short.group(1)), int(short.group(2))
+            return (
+                f"vLLM could not keep {needed / 1024:g} GiB of prompt cache in system memory: "
+                f"it holds that buffer in /dev/shm, which has {free} MiB free. Lower Prompt "
+                "cache in system memory on this profile, or give /dev/shm more room "
+                "(--shm-size or --ipc=host for a container)."
+            )
         for signature, explanation in _EXIT_EXPLANATIONS:
             if signature in output_tail:
                 return explanation
         return None
+
+    def prompt_cache_view(self, spec: RuntimeSpec, argv: list[str]) -> RuntimePromptCache | None:
+        """CPU KV offload as this runtime was started with it (PC7), from its command line."""
+        return prompt_cache.vllm_view(spec, argv)
 
     def manual_install(self, host: HostAccelerator) -> ManualInstall:
         """The install command for this host, copied from upstream's
@@ -304,6 +320,8 @@ class VllmAdapter(EngineAdapter):
 
         flags = spec.flags or {}
         for field in self.flag_schema().fields:
+            if field.key == prompt_cache.KV_OFFLOAD_KEY:
+                continue
             if field.key not in flags:
                 continue
             value = flags[field.key]
@@ -320,6 +338,27 @@ class VllmAdapter(EngineAdapter):
                     argv.append(cli)
             else:
                 argv += [cli, str(value)]
+
+        # CPU KV offload (row 9, PC7), only when the profile asks for it and this build's
+        # own `--help` lists it: a flag it does not know ends the engine on an argument
+        # error, and a build whose help could not be read is not guessed at.
+        offload = prompt_cache.kv_offload_gib(flags)
+        if offload is not None:
+            offered = _supported_long_flags(binary.path)
+            if offered is not None and prompt_cache.KV_OFFLOAD_FLAG in offered:
+                argv += [
+                    prompt_cache.KV_OFFLOAD_BACKEND_FLAG,
+                    "native",
+                    prompt_cache.KV_OFFLOAD_FLAG,
+                    f"{offload:g}",
+                ]
+            else:
+                log.warning(
+                    "%s: this vLLM does not list %s (or its help could not be read), so Prompt "
+                    "cache in system memory is not passed",
+                    spec.name,
+                    prompt_cache.KV_OFFLOAD_FLAG,
+                )
 
         # Verbatim, last, so an operator can always override something the
         # curated surface generated above.
@@ -790,6 +829,9 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     "enforceEager": "--enforce-eager",  # ModelConfig.enforce_eager
     "trustRemoteCode": "--trust-remote-code",  # ModelConfig.trust_remote_code
     "tokenizer": "--tokenizer",  # ModelConfig.tokenizer
+    # CacheConfig.kv_offloading_size, GiB; passed with `--kv-offloading-backend native` and
+    # only to a build whose help lists it (`build_argv`).
+    prompt_cache.KV_OFFLOAD_KEY: prompt_cache.KV_OFFLOAD_FLAG,
 }
 
 _FLAG_FIELDS: list[ConfigField] = [
@@ -957,6 +999,26 @@ _FLAG_FIELDS: list[ConfigField] = [
         requiresRestart=True,
     ),
     ConfigField(
+        key=prompt_cache.KV_OFFLOAD_KEY,
+        label="Prompt cache in system memory",
+        description=(
+            "Keeps recent conversations in system memory, so their next turn is not read "
+            "again.\n\n"
+            "The size is in GiB; 0 or empty turns it off. It holds the KV cache that no "
+            "longer fits on the card. vLLM sets the buffer aside when it starts (a file in "
+            "`/dev/shm`) and refuses to "
+            "start if it does not fit. Eugene counts the whole size against the memory a "
+            "second model needs. It needs a vLLM that lists `--kv-offloading-size` (0.29 and "
+            "0.30 do) and a CUDA-like or Intel XPU card; the running model shows whether it "
+            "was passed."
+        ),
+        category="memory",
+        valueType=ConfigValueType.number,
+        minimum=0,
+        unsetMeans="Not set: off, vLLM's own default. Nothing is kept in system memory.",
+        requiresRestart=True,
+    ),
+    ConfigField(
         key="tokenizer",
         label="Tokenizer path",
         description=(
@@ -1009,6 +1071,48 @@ _EXIT_EXPLANATIONS: tuple[tuple[str, str], ...] = (
         "4.19.121 floor, which `wsl --update` fixes.",
     ),
 )
+
+
+# vLLM 0.30.0's own words when the offload buffer does not fit in `/dev/shm`
+# (`vllm/distributed/device_communicators/shm_broadcast.py`, `check_shm_free_space`).
+_SHM_SPACE_RE = re.compile(r"Insufficient space in /dev/shm: (\d+) MiB required, (\d+) MiB free")
+
+_HELP_TIMEOUT_SECONDS = 60.0
+_LONG_FLAG_RE = re.compile(r"--[a-z0-9][a-z0-9-]*")
+
+# `vllm serve --help=all` imports PyTorch: seconds, not milliseconds. Read once per
+# binary (path, mtime, size) and only from `build_argv`, which runs off the event loop.
+_help_flags_cache: dict[tuple[str, float, int], frozenset[str]] = {}
+
+
+def _supported_long_flags(binary: Path) -> frozenset[str] | None:
+    """Every `--long-flag` this build's `vllm serve --help=all` lists, or None when it
+    could not be asked (which is not "it lists nothing")."""
+    try:
+        stat = binary.stat()
+        key = (str(binary), stat.st_mtime, stat.st_size)
+    except OSError:
+        return None
+    cached = _help_flags_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            [str(binary), "serve", "--help=all"],
+            capture_output=True,
+            env=child_environment(),
+            text=True,
+            timeout=_HELP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("help probe for %s failed: %s", binary, e)
+        return None
+    found = frozenset(_LONG_FLAG_RE.findall((proc.stdout or "") + (proc.stderr or "")))
+    if not found:
+        return None
+    _help_flags_cache[key] = found
+    return found
 
 
 def _is_wsl() -> bool:

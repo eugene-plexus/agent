@@ -684,7 +684,7 @@ def test_every_schema_flag_has_a_cli_mapping(adapter: VllmAdapter) -> None:
     assert {f.key for f in adapter.flag_schema().fields} == set(_FLAG_CLI_NAMES)
 
 
-def test_the_curated_surface_is_the_designed_twelve(adapter: VllmAdapter) -> None:
+def test_the_curated_surface_is_the_designed_twelve_and_the_cache(adapter: VllmAdapter) -> None:
     """The M4 design's flag table, checked against `vllm/engine/arg_utils.py`
     at v0.29.0 — every one is an `add_argument` there. Model path, host,
     port and `--served-model-name` are the adapter's, not the operator's,
@@ -703,6 +703,8 @@ def test_the_curated_surface_is_the_designed_twelve(adapter: VllmAdapter) -> Non
         "enforceEager",
         "trustRemoteCode",
         "tokenizer",
+        # Row 9: CPU KV offload, offered only where the build lists it.
+        "kvOffloadGb",
     }
     assert "servedModelName" not in keys
     assert "model" not in keys
@@ -896,3 +898,113 @@ def test_llama_cpp_explains_nothing_yet() -> None:
     )
     assert LlamaCppAdapter().default_env(spec, _fake_binary()) == {}
     assert LlamaCppAdapter().explain_exit(1, "RuntimeError: UVA is not available") is None
+
+
+# --------------------------------------------------------------------------- #
+# Row 9 (PC7): CPU KV offload, only where the build offers it
+# --------------------------------------------------------------------------- #
+
+_OFFERS = frozenset({"--kv-offloading-size", "--kv-offloading-backend", "--max-model-len"})
+
+
+def _after(argv: list[str], flag: str) -> str:
+    return argv[argv.index(flag) + 1]
+
+
+def test_kv_offload_only_when_the_build_offers_it(
+    adapter: VllmAdapter, binary: DiscoveredBinary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`vllm serve --help=all` is the build's own list. A flag it lacks kills the
+    engine on an argparse error, so it is never passed to a build that does not list it."""
+    from eugene_plexus_agent.engines import vllm
+
+    monkeypatch.setattr(vllm, "_supported_long_flags", lambda path: _OFFERS)
+    argv = adapter.build_argv(_spec(flags={"kvOffloadGb": 16}), binary, port=8090)
+    assert _after(argv, "--kv-offloading-backend") == "native"
+    assert _after(argv, "--kv-offloading-size") == "16"
+    half = adapter.build_argv(_spec(flags={"kvOffloadGb": 0.5}), binary, port=8090)
+    assert _after(half, "--kv-offloading-size") == "0.5"
+
+    # Unset or 0 is off, which is vLLM's own default: nothing is passed.
+    for flags in ({}, {"kvOffloadGb": 0}, {"kvOffloadGb": None}):
+        quiet = adapter.build_argv(_spec(flags=flags), binary, port=8090)
+        assert "--kv-offloading-size" not in quiet and "--kv-offloading-backend" not in quiet
+
+    # A build without the flag, and a build whose help could not be read: not passed.
+    for lacking in (frozenset({"--max-model-len"}), None):
+        monkeypatch.setattr(vllm, "_supported_long_flags", lambda path, f=lacking: f)
+        argv = adapter.build_argv(_spec(flags={"kvOffloadGb": 16}), binary, port=8090)
+        assert "--kv-offloading-size" not in argv and "--kv-offloading-backend" not in argv
+
+
+def test_kv_offload_help_is_read_once_per_binary(
+    binary: DiscoveredBinary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`vllm serve --help=all` imports torch: seconds, and it must not run on every start."""
+    from eugene_plexus_agent.engines import vllm
+
+    vllm._help_flags_cache.clear()
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="  --kv-offloading-size KV_OFFLOADING_SIZE\n  --max-model-len N\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(vllm.subprocess, "run", fake_run)
+    first = vllm._supported_long_flags(binary.path)
+    second = vllm._supported_long_flags(binary.path)
+    assert first == second and first is not None and "--kv-offloading-size" in first
+    assert len(calls) == 1
+    assert calls[0][1:] == ["serve", "--help=all"]
+    # A binary that changed on disk is another binary.
+    text = binary.path.read_text(encoding="utf-8")
+    binary.path.write_text(text + "# upgraded\n", encoding="utf-8")
+    vllm._supported_long_flags(binary.path)
+    assert len(calls) == 2
+
+
+def test_the_running_view_says_what_was_started(
+    adapter: VllmAdapter, binary: DiscoveredBinary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_agent._generated.models import PromptCacheSource
+    from eugene_plexus_agent.engines import vllm
+
+    monkeypatch.setattr(vllm, "_supported_long_flags", lambda path: _OFFERS)
+    spec = _spec(flags={"kvOffloadGb": 16})
+    view = adapter.prompt_cache_view(spec, adapter.build_argv(spec, binary, port=8090))
+    assert view is not None
+    assert (view.bytes, view.source) == (16 * 1024**3, PromptCacheSource.profile)
+
+    plain = _spec()
+    view = adapter.prompt_cache_view(plain, adapter.build_argv(plain, binary, port=8090))
+    assert view is not None
+    assert (view.bytes, view.source) == (0, PromptCacheSource.off)
+
+    # Asked for, and the build does not list it: a note, not a size.
+    monkeypatch.setattr(vllm, "_supported_long_flags", lambda path: frozenset())
+    view = adapter.prompt_cache_view(spec, adapter.build_argv(spec, binary, port=8090))
+    assert view is not None
+    assert view.bytes is None and view.source is PromptCacheSource.unsupported
+    assert view.note is not None and "--kv-offloading-size" in view.note
+
+    # Before there is a command line, the view is what the launch will pass.
+    planned = adapter.prompt_cache_view(spec, [])
+    assert planned is not None and planned.bytes == 16 * 1024**3
+
+
+def test_vllm_says_why_it_could_not_keep_the_cache(adapter: VllmAdapter) -> None:
+    """The buffer is a file in /dev/shm, made when the engine starts: vLLM 0.30.0's
+    own words (`check_shm_free_space`) when it does not fit are named for the setting."""
+    reason = adapter.explain_exit(
+        1,
+        "RuntimeError: Insufficient space in /dev/shm: 24576 MiB required, 64 MiB free. "
+        "Increase /dev/shm (e.g. --shm-size or --ipc=host).",
+    )
+    assert reason is not None
+    assert "Prompt cache in system memory" in reason
+    assert "24 GiB" in reason and "/dev/shm" in reason

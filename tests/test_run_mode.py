@@ -274,7 +274,8 @@ def test_chat_on_an_embedding_file_is_the_command_line_of_a_chat_model(
     adapter: LlamaCppAdapter, binary: DiscoveredBinary, tmp_path: Path
 ) -> None:
     """auto against an explicit chat: same file, the two answers differ and the
-    override's is exactly what a chat model got before MR3."""
+    override's is exactly what a chat model got before MR3, plus the prompt cache
+    settings every chat model carries since row 9 (and an embedder does not)."""
     model = g.qwen3_embedding(tmp_path / "m.gguf")
     auto = _argv(adapter, binary, model)
     chat = _argv(adapter, binary, model, mode="chat")
@@ -289,7 +290,14 @@ def test_chat_on_an_embedding_file_is_the_command_line_of_a_chat_model(
         "8090",
         "--alias",
         "m",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ]
+    assert "--cache-ram" not in auto
 
 
 def test_the_mode_flags_come_after_the_curated_flags_and_before_extra_args(

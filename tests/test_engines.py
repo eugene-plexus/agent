@@ -706,3 +706,94 @@ def test_the_engine_list_carries_what_each_adapter_publishes(tmp_path, monkeypat
         "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
         "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Row 9 (PC7): the engine's cache settings are always on the command line
+# --------------------------------------------------------------------------- #
+
+
+def _after(argv: list[str], flag: str) -> str:
+    return argv[argv.index(flag) + 1]
+
+
+def test_cache_flags_are_always_passed(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unset, the profile still gives llama-server the three numbers, so an
+    upstream change of default cannot make the setting a profile shows wrong.
+
+    Before this row `--cache-ram` was never set: llama.cpp's own 8 GiB always
+    applied, and a profile could not change it."""
+    from eugene_plexus_agent.engines import llama_cpp
+
+    argv = adapter.build_argv(_spec(), binary, port=8090)
+    assert _after(argv, "--cache-ram") == "8192"
+    assert _after(argv, "--cache-reuse") == "0"
+    assert _after(argv, "--ctx-checkpoints") == "32"
+
+    # The profile's size is in GiB, the command line's in MiB.
+    sized = adapter.build_argv(_spec(flags={"cacheRam": 24}), binary, port=8090)
+    assert _after(sized, "--cache-ram") == "24576"
+    half = adapter.build_argv(_spec(flags={"cacheRam": 0.5}), binary, port=8090)
+    assert _after(half, "--cache-ram") == "512"
+    # Off is a number llama-server takes, not an absent flag (which would leave its 8 GiB).
+    off = adapter.build_argv(_spec(flags={"cacheRam": 0}), binary, port=8090)
+    assert _after(off, "--cache-ram") == "0"
+
+    both = adapter.build_argv(
+        _spec(flags={"cacheReuse": 256, "ctxCheckpoints": 8}), binary, port=8090
+    )
+    assert _after(both, "--cache-reuse") == "256"
+    assert _after(both, "--ctx-checkpoints") == "8"
+
+    # A flag this build's own --help lacks is left out; the ones it has stay.
+    monkeypatch.setattr(
+        llama_cpp, "_supported_long_flags", lambda path: frozenset({"--cache-ram", "--ctx-size"})
+    )
+    older = adapter.build_argv(_spec(), binary, port=8090)
+    assert _after(older, "--cache-ram") == "8192"
+    assert "--cache-reuse" not in older and "--ctx-checkpoints" not in older
+
+
+def test_extra_args_still_override_the_cache_flags(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary
+) -> None:
+    argv = adapter.build_argv(
+        _spec(flags={"cacheRam": 4}, extraArgs=["--cache-ram", "1024"]), binary, port=8090
+    )
+    assert argv[-2:] == ["--cache-ram", "1024"]
+    assert argv.index("--cache-ram") < len(argv) - 2
+
+
+def test_a_search_model_gets_no_prompt_cache(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary
+) -> None:
+    """An embedder or a reranker answers each input once: it keeps nothing to reuse."""
+    argv = adapter.build_argv(_spec(mode="embedding"), binary, port=8090)
+    assert "--embeddings" in argv
+    assert not {"--cache-ram", "--cache-reuse", "--ctx-checkpoints"} & set(argv)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("cacheRam", -1), ("cacheRam", "lots"), ("cacheReuse", -5), ("ctxCheckpoints", 1.5)],
+)
+def test_a_cache_setting_that_makes_no_sense_is_refused_by_name(
+    adapter: LlamaCppAdapter, binary: DiscoveredBinary, key: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=key):
+        adapter.build_argv(_spec(flags={key: value}), binary, port=8090)
+
+
+def test_the_cache_settings_show_the_default_that_is_passed(adapter: LlamaCppAdapter) -> None:
+    """Settings never lie: each field's default is the number the command line carries."""
+    fields = {f.key: f for f in adapter.flag_schema().fields}
+    assert fields["cacheRam"].default == 8
+    assert fields["cacheRam"].minimum == 0
+    assert fields["cacheRam"].category == "memory"
+    assert fields["cacheReuse"].default == 0
+    assert fields["ctxCheckpoints"].default == 32
+    for key in ("cacheRam", "cacheReuse", "ctxCheckpoints"):
+        assert fields[key].unsetMeans, key
+        assert fields[key].requiresRestart is True

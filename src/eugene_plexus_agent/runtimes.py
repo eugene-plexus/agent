@@ -39,6 +39,7 @@ from ._generated.models import (
     RuntimeCapabilities,
     RuntimeLocalPathSource,
     RuntimeMode,
+    RuntimePromptCache,
     RuntimeSpec,
     RuntimeSpeculation,
     RuntimeStatus,
@@ -99,6 +100,9 @@ def _companions(spec: RuntimeSpec) -> tuple[str, ...]:
 
 # The statuses in which a process holds the file its plan opened.
 _PROCESS_RUNNING = frozenset({RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.ready})
+#: Every status in which a runtime holds memory, or is on its way to it: `copying` too, where
+#: no process exists yet (the same set admission counts).
+_MEMORY_HOLDING = _PROCESS_RUNNING | {RuntimeStatus.copying}
 
 # `key -> value` over the agent's own config. What an adapter's
 # `configured_binary_key` is read through: config lives in `AgentState`,
@@ -1014,7 +1018,25 @@ class RuntimeSupervisor:
             lastError=last_error,
             loadProgress=load_progress,
             speculation=self._speculation_for(spec, adapter, argv, status),
+            promptCache=self._prompt_cache_for(spec, adapter, argv, status),
         )
+
+    def _prompt_cache_for(
+        self,
+        spec: RuntimeSpec,
+        adapter: EngineAdapter | None,
+        argv: list[str],
+        status: RuntimeStatus,
+    ) -> RuntimePromptCache | None:
+        """The prompt cache a runtime that holds memory was started with (row 9, PC7).
+
+        From the command line the process was launched with; before there is one (`copying`)
+        it is what the launch will pass, since the memory is promised from the moment the
+        runtime is on its way up. A stopped or crashed runtime holds none, and says nothing.
+        """
+        if adapter is None or status not in _MEMORY_HOLDING:
+            return None
+        return adapter.prompt_cache_view(spec, argv)
 
     def _speculation_for(
         self,

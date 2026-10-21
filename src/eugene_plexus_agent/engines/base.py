@@ -43,6 +43,7 @@ from .._generated.models import (
     PythonEngine,
     RuntimeCapabilities,
     RuntimeMode,
+    RuntimePromptCache,
     RuntimeSpec,
     RuntimeSpeculation,
     SupportedModel,
@@ -685,6 +686,12 @@ class EngineAdapter(abc.ABC):
 
     def speculation_view(self, spec: RuntimeSpec, argv: list[str]) -> RuntimeSpeculation | None:
         """Speculative decoding as this runtime was started with it (SD1)."""
+        return None
+
+    def prompt_cache_view(self, spec: RuntimeSpec, argv: list[str]) -> RuntimePromptCache | None:
+        """The prompt cache this runtime was started with (row 9, PC7), from its command
+        line; `argv` empty is a runtime that has not started yet, and the view is what the
+        launch will pass. None for an engine with no such setting, and for a search model."""
         return None
 
     async def read_speculation(self, base_url: str) -> tuple[int | None, int | None] | None:

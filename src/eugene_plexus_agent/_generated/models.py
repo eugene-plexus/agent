@@ -3270,6 +3270,29 @@ class RuntimeMode(StrEnum):
     reranking = 'reranking'
 
 
+class PromptCacheSource(StrEnum):
+    """
+    Where a runtime's prompt cache size comes from. `profile` is the
+    runtime's own setting (the profile's `cacheRam` for llama.cpp,
+    `kvOffloadGb` for vLLM). `engine_default` is the default the setting
+    shows when the profile leaves it unset, which Eugene always passes so
+    that an upstream change of default cannot make the setting wrong.
+    `extra_args` is a size typed into `extraArgs`, which comes after the
+    profile on the command line and wins, or set in the runtime's `env`
+    (`LLAMA_ARG_CACHE_RAM`), which Eugene does not override with its
+    default. `off` is a cache of zero bytes.
+    `unsupported` is a build that does not list the flag, so nothing was
+    passed.
+
+    """
+
+    profile = 'profile'
+    engine_default = 'engine_default'
+    extra_args = 'extra_args'
+    off = 'off'
+    unsupported = 'unsupported'
+
+
 class RuntimeSpeculation(BaseModel):
     """
     Speculative decoding as this runtime was started with it, and how
@@ -4727,94 +4750,37 @@ class RuntimeSpec(BaseModel):
     profile: RuntimeProfile | None = None
 
 
-class Runtime(BaseModel):
+class RuntimePromptCache(BaseModel):
     """
-    Combined declarative + operational view of one engine process.
-    The declarative half is `RuntimeSpec` and is persisted; the
-    operational half is observed and is not.
+    The memory this runtime's engine keeps for recent conversations, as
+    it was started with it (row 9, `docs/design/prompt-cache.md` PC7).
+    llama.cpp's RAM prompt cache (`--cache-ram`) and vLLM's CPU KV
+    offload (`--kv-offloading-size`). Read from the command line the
+    engine was launched with, so it is the value in effect and never the
+    profile's wish: a setting a build does not offer reads
+    `unsupported`, and a size typed into `extraArgs` or the runtime's
+    `env` reads `extra_args`.
+
+    An engine's prompt cache fills over time, so this is a limit and
+    not a reading of what is held. Admission counts the whole limit
+    against system memory for as long as the runtime holds memory.
+
+    Absent for a runtime that is not starting or running, for a search
+    model (an embedder or a reranker keeps no prompt cache), and for an
+    engine with no such setting.
 
     """
 
-    name: str
-    engine: EngineKind
-    modelPath: str
-    localPath: str | None = Field(
+    bytes: int | None = Field(
         None,
-        description="Where **this host** opens the model: `modelPath` resolved\nthrough the Library folder's `mounts` for this OS and this\nnode's `pathMappings` overrides, or `modelPath` itself when\nno rule applies (M11; the folder half 2026-09-14). Observed,\nnever declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n\n**A local copy is resolved one step ahead of all of that**\n(`docs/design/node-local-model-copy.md`): where this node\nkeeps a valid copy of the file, `localPath` is the copy and\n`localPathSource` says `copy`. Turning the copy off reverts\nthis by itself, because nothing is stored — the answer is\nrecomputed on every read.\n",
+        description='The limit in bytes. `0` when it is off. Null when the build\noffers no such setting (`unsupported`), and when `extraArgs` asks\nfor no limit (`--cache-ram -1`): then the cache grows until\nmemory runs out, and `note` says so.\n',
+        ge=0,
     )
-    localPathSource: RuntimeLocalPathSource | None = None
-    openedPath: str | None = Field(
+    source: PromptCacheSource
+    note: str | None = Field(
         None,
-        description="The model file the **running** process was started with,\nresolved exactly as `localPath` is, at that start. Null when\nno process is running (`stopped`, `exited`, `crashed`,\n`copying`).\n\n`localPath` is recomputed on every read, so the two differ\nexactly when the rules changed after this process started — a\nLibrary folder's mount, this node's overrides, or its local\ncopy. The process keeps the file it opened; a restart opens\n`localPath` instead. (2026-09-27: a folder change on ten nodes\nshould say which models still run from the old path, not ask\nanyone to reboot the nodes.)\n",
+        description="Why the size is not what the profile asked for or what is\nunusual about it: a build that does not offer a setting, a size\nfrom `extraArgs` that overrides the profile's. Null when the\nsize is what the profile says.\n",
     )
-    localPathNote: str | None = Field(
-        None,
-        description='Why this node is **not** opening a local copy, when it is\nnot and the operator asked for one: not enough free space to\nleave the configured headroom, the copy failed, the source\ncould not be read. Absent when the copy was used, and absent\nwhen copying is switched off — a node that was never asked\nhas nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
-    )
-    copyProgress: CopyProgress | None = None
-    modelAlias: str | None = Field(
-        None,
-        description='Resolved alias — the declared value, or the derived filename.',
-    )
-    mode: RuntimeMode | None = Field(
-        None,
-        description='As declared (`RuntimeSpec.mode`). `auto` is what was asked,\nnot what the file turned out to be: `capabilities.embeddings`\nand `capabilities.reranking` say what is running.\n',
-    )
-    host: str | None = None
-    port: int | None = Field(
-        None, description='Resolved port, including one assigned by the agent.'
-    )
-    autoStart: bool | None = None
-    autoDriver: bool | None = None
-    idleUnloadSeconds: int | None = Field(
-        None,
-        description='What is in effect, which is what the gateway reads: the\ndeclared value, or absent for a running search model\n(`RuntimeSpec.mode`), which is never unloaded for being idle.\n',
-    )
-    startOnDemand: bool | None = Field(
-        None,
-        description='What is in effect: the declared value, or absent for a\nrunning search model, which is never started on demand.\n',
-    )
-    flags: dict[str, Any] | None = None
-    extraArgs: list[str] | None = None
-    env: dict[str, str] | None = None
-    workingDirectory: str | None = None
-    binary: str | None = None
-    profile: RuntimeProfile | None = None
-    driver: str | None = Field(
-        None,
-        description="Name of the companion `inference-driver` component the agent\ndeclared for this runtime, when `autoDriver` is true. What\nthe gateway's routing table calls this backend, and the\nentry to read in `GET /v1/components` for its health. Absent\nwhen the operator fronts the runtime by hand.\n",
-    )
-    status: RuntimeStatus
-    stopReason: StopReason | None = Field(
-        None,
-        description='Why a `stopped` runtime is stopped. Present only in that\nstate; cleared on start. An observation, not a declaration\n— it is never replicated, and after a control-root\npromotion the answer is re-read from this agent.\n',
-    )
-    url: AnyUrl | None = Field(
-        None,
-        description="Where this engine is actually listening\n(`http://<host>:<port>`). This is the value an\ninference-driver's `baseUrl` points at, and the reason a\ndriver never needs to know about ports or argv.\n",
-    )
-    argv: list[str] | None = Field(
-        None,
-        description='The exact command line the agent spawned, as the adapter\nresolved it. Read-only and reported deliberately: the first\nquestion anyone debugging a local engine asks is "what\ncommand did you actually run", and every tool that hides the\nanswer makes that debugging worse. Copy-pasteable.\n',
-    )
-    pid: int | None = Field(
-        None, description='OS process id. Set only while the engine is alive.'
-    )
-    node: str | None = Field(
-        None,
-        description='The node this runtime runs on — always *this* agent\'s node,\nsince an agent supervises only its own host.\n\nReported anyway, and this is why: the control root relays\nthese into a union view across every node, and a runtime that\narrived without a node would be a runtime the operator cannot\nlocate. Filled from the agent\'s own identity rather than\ndeclared, so it cannot disagree with reality. Absent on an\nagent that has not enrolled, which is the only state in which\n"which node" has no answer.\n',
-    )
-    engineVersion: str | None = Field(
-        None, description='Version reported by the binary that is actually running.'
-    )
-    capabilities: RuntimeCapabilities | None = None
-    lastRestart: AwareDatetime | None = None
-    lastError: str | None = Field(
-        None,
-        description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
-    )
-    loadProgress: LoadProgress | None = None
-    speculation: RuntimeSpeculation | None = None
 
 
 class ModelCopyClearResult(BaseModel):
@@ -4921,6 +4887,11 @@ class Admission(BaseModel):
     maxContextLength: int | None = Field(
         None,
         description='The largest `contextSize` at which this file fits entirely in\nthe target device\'s free memory, from the library\'s fit model\nscored against the budget this agent measured. Rounded down\nto a multiple of 256. `null` when the library was not\nconsulted (`basis: file_size`), and `0` when the weights\nalone do not fit, so no context makes it true.\n\n**This is the number a refusal should hand back.** Added\n2026-09-15 after Discover scored a 27B Q6 as `fits` at its\n8,192-token guidance context, the operator made a default\nprofile that left `contextSize` to the engine, and admission\nrefused it at the model\'s own 262,144 — 41 GiB against 30 —\nwith advice to "lower contextSize" and no number. The two\nscreens had never disagreed about the model, only about the\ncontext, and neither said so. A profile form prefills from\nthis; a refusal offers it as a one-click fix.\n',
+        ge=0,
+    )
+    promptCacheBytes: int | None = Field(
+        None,
+        description="The prompt cache this launch would keep in system memory\n(llama.cpp's `--cache-ram`, vLLM's CPU KV offload), from the\nprofile's setting or the default it shows, in bytes. `0` when it\nis off. Null when the engine has none, and for a search model.\n\nRow 9. Other runtimes' prompt caches count against system memory\nwhen this launch needs some, whole, because a cache fills over\ntime: the memory they hold is named in `reason` and each holder is\nin `blockers`. A launch's own cache is not counted against itself.\n",
         ge=0,
     )
     blockers: list[AdmissionBlocker] | None = Field(
@@ -5703,8 +5674,95 @@ class NodeReachResult(BaseModel):
     )
 
 
-class RuntimeList(BaseModel):
-    runtimes: list[Runtime]
+class Runtime(BaseModel):
+    """
+    Combined declarative + operational view of one engine process.
+    The declarative half is `RuntimeSpec` and is persisted; the
+    operational half is observed and is not.
+
+    """
+
+    name: str
+    engine: EngineKind
+    modelPath: str
+    localPath: str | None = Field(
+        None,
+        description="Where **this host** opens the model: `modelPath` resolved\nthrough the Library folder's `mounts` for this OS and this\nnode's `pathMappings` overrides, or `modelPath` itself when\nno rule applies (M11; the folder half 2026-09-14). Observed,\nnever declared, and\ncomputed from the current mapping each time it is read — so\na stopped runtime shows what its next start would open, and\na mapping changed after declaration is visible before\nanything restarts. Equal to `modelPath` on every single-host\ninstall.\n\n**A local copy is resolved one step ahead of all of that**\n(`docs/design/node-local-model-copy.md`): where this node\nkeeps a valid copy of the file, `localPath` is the copy and\n`localPathSource` says `copy`. Turning the copy off reverts\nthis by itself, because nothing is stored — the answer is\nrecomputed on every read.\n",
+    )
+    localPathSource: RuntimeLocalPathSource | None = None
+    openedPath: str | None = Field(
+        None,
+        description="The model file the **running** process was started with,\nresolved exactly as `localPath` is, at that start. Null when\nno process is running (`stopped`, `exited`, `crashed`,\n`copying`).\n\n`localPath` is recomputed on every read, so the two differ\nexactly when the rules changed after this process started — a\nLibrary folder's mount, this node's overrides, or its local\ncopy. The process keeps the file it opened; a restart opens\n`localPath` instead. (2026-09-27: a folder change on ten nodes\nshould say which models still run from the old path, not ask\nanyone to reboot the nodes.)\n",
+    )
+    localPathNote: str | None = Field(
+        None,
+        description='Why this node is **not** opening a local copy, when it is\nnot and the operator asked for one: not enough free space to\nleave the configured headroom, the copy failed, the source\ncould not be read. Absent when the copy was used, and absent\nwhen copying is switched off — a node that was never asked\nhas nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
+    )
+    copyProgress: CopyProgress | None = None
+    modelAlias: str | None = Field(
+        None,
+        description='Resolved alias — the declared value, or the derived filename.',
+    )
+    mode: RuntimeMode | None = Field(
+        None,
+        description='As declared (`RuntimeSpec.mode`). `auto` is what was asked,\nnot what the file turned out to be: `capabilities.embeddings`\nand `capabilities.reranking` say what is running.\n',
+    )
+    host: str | None = None
+    port: int | None = Field(
+        None, description='Resolved port, including one assigned by the agent.'
+    )
+    autoStart: bool | None = None
+    autoDriver: bool | None = None
+    idleUnloadSeconds: int | None = Field(
+        None,
+        description='What is in effect, which is what the gateway reads: the\ndeclared value, or absent for a running search model\n(`RuntimeSpec.mode`), which is never unloaded for being idle.\n',
+    )
+    startOnDemand: bool | None = Field(
+        None,
+        description='What is in effect: the declared value, or absent for a\nrunning search model, which is never started on demand.\n',
+    )
+    flags: dict[str, Any] | None = None
+    extraArgs: list[str] | None = None
+    env: dict[str, str] | None = None
+    workingDirectory: str | None = None
+    binary: str | None = None
+    profile: RuntimeProfile | None = None
+    driver: str | None = Field(
+        None,
+        description="Name of the companion `inference-driver` component the agent\ndeclared for this runtime, when `autoDriver` is true. What\nthe gateway's routing table calls this backend, and the\nentry to read in `GET /v1/components` for its health. Absent\nwhen the operator fronts the runtime by hand.\n",
+    )
+    status: RuntimeStatus
+    stopReason: StopReason | None = Field(
+        None,
+        description='Why a `stopped` runtime is stopped. Present only in that\nstate; cleared on start. An observation, not a declaration\n— it is never replicated, and after a control-root\npromotion the answer is re-read from this agent.\n',
+    )
+    url: AnyUrl | None = Field(
+        None,
+        description="Where this engine is actually listening\n(`http://<host>:<port>`). This is the value an\ninference-driver's `baseUrl` points at, and the reason a\ndriver never needs to know about ports or argv.\n",
+    )
+    argv: list[str] | None = Field(
+        None,
+        description='The exact command line the agent spawned, as the adapter\nresolved it. Read-only and reported deliberately: the first\nquestion anyone debugging a local engine asks is "what\ncommand did you actually run", and every tool that hides the\nanswer makes that debugging worse. Copy-pasteable.\n',
+    )
+    pid: int | None = Field(
+        None, description='OS process id. Set only while the engine is alive.'
+    )
+    node: str | None = Field(
+        None,
+        description='The node this runtime runs on — always *this* agent\'s node,\nsince an agent supervises only its own host.\n\nReported anyway, and this is why: the control root relays\nthese into a union view across every node, and a runtime that\narrived without a node would be a runtime the operator cannot\nlocate. Filled from the agent\'s own identity rather than\ndeclared, so it cannot disagree with reality. Absent on an\nagent that has not enrolled, which is the only state in which\n"which node" has no answer.\n',
+    )
+    engineVersion: str | None = Field(
+        None, description='Version reported by the binary that is actually running.'
+    )
+    capabilities: RuntimeCapabilities | None = None
+    lastRestart: AwareDatetime | None = None
+    lastError: str | None = Field(
+        None,
+        description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
+    )
+    loadProgress: LoadProgress | None = None
+    speculation: RuntimeSpeculation | None = None
+    promptCache: RuntimePromptCache | None = None
 
 
 class LibraryFolderReach(BaseModel):
@@ -5914,6 +5972,10 @@ class EngineDescriptor(BaseModel):
         None,
         description='Present when this engine is a Python package rather than a\nself-contained binary, describing the environment it lives\nin. Absent for llama.cpp.\n',
     )
+
+
+class RuntimeList(BaseModel):
+    runtimes: list[Runtime]
 
 
 class MessageContent1(

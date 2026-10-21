@@ -14,6 +14,12 @@ resolves, which is the path that has to end in "add nothing".
 
 A failure here means a chat model would start differently. That is never the right
 thing to fix by editing the pin.
+
+**One deliberate change, row 9 (PC7, LD-C5):** every chat line now ends its profile flags with
+`--cache-ram 8192 --cache-reuse 0 --ctx-checkpoints 32`. Eugene passes the prompt cache
+settings always, so the profile's numbers are the ones in effect and an upstream change of
+default cannot make them wrong. The values are llama.cpp's own defaults in the build Eugene
+installs (b10948), so no chat model behaves differently until its profile sets one.
 """
 
 from __future__ import annotations
@@ -65,6 +71,10 @@ PROFILES: dict[str, dict[str, Any]] = {
         }
     },
     "a quantised cache": {"flags": {"cacheType": "q4_0", "contextSize": 4096}},
+    "the cache settings edited": {
+        "flags": {"cacheRam": 24, "cacheReuse": 256, "ctxCheckpoints": 8},
+    },
+    "the cache off": {"flags": {"cacheRam": 0}},
     "load mode": {"flags": {"noMmap": True, "mlock": True}},
     "extra arguments come last": {
         "flags": {"contextSize": 8192},
@@ -93,6 +103,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "8090",
         "--alias",
         "Qwen3-30B-A3B-Q4_K_M",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ],
     "alias host and port": [
         "--model",
@@ -103,6 +119,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "8090",
         "--alias",
         "qwen",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ],
     "the settings edited most": [
         "--model",
@@ -121,6 +143,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "4",
         "--tensor-split",
         "0.6,0.4",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ],
     "every curated flag": [
         "--model",
@@ -164,6 +192,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "row",
         "--tensor-split",
         "0.5,0.5",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ],
     "a quantised cache": [
         "--model",
@@ -182,6 +216,44 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "q4_0",
         "--flash-attn",
         "on",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
+    ],
+    "the cache settings edited": [
+        "--model",
+        "{model}",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8090",
+        "--alias",
+        "Qwen3-30B-A3B-Q4_K_M",
+        "--cache-ram",
+        "24576",
+        "--cache-reuse",
+        "256",
+        "--ctx-checkpoints",
+        "8",
+    ],
+    "the cache off": [
+        "--model",
+        "{model}",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8090",
+        "--alias",
+        "Qwen3-30B-A3B-Q4_K_M",
+        "--cache-ram",
+        "0",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ],
     "load mode": [
         "--model",
@@ -194,6 +266,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "Qwen3-30B-A3B-Q4_K_M",
         "--load-mode",
         "mlock",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ],
     "extra arguments come last": [
         "--model",
@@ -206,6 +284,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "Qwen3-30B-A3B-Q4_K_M",
         "--ctx-size",
         "8192",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
         "--lora",
         "adapter.gguf",
         "--ctx-size",
@@ -221,6 +305,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "8090",
         "--alias",
         "Qwen3-30B-A3B-Q4_K_M",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
     ],
     "the old embedding workaround in extra arguments": [
         "--model",
@@ -231,6 +321,12 @@ TODAYS_ARGV: dict[str, list[str]] = {
         "8090",
         "--alias",
         "Qwen3-30B-A3B-Q4_K_M",
+        "--cache-ram",
+        "8192",
+        "--cache-reuse",
+        "0",
+        "--ctx-checkpoints",
+        "32",
         "--embeddings",
         "--pooling",
         "mean",
@@ -300,6 +396,9 @@ def test_the_pin_covers_what_a_profile_can_hold() -> None:
         "cacheType",
         "noMmap",
         "mlock",
+        "cacheRam",
+        "cacheReuse",
+        "ctxCheckpoints",
     } <= flags
     assert any(body.get("extraArgs") for body in PROFILES.values())
     assert any(body.get("env") for body in PROFILES.values())
