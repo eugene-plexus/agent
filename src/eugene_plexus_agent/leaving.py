@@ -166,6 +166,11 @@ async def leave(
             return None
         left = Left(name=str(record.name), control_url=str(record.control_url))
         trust = app.state.auth_state.trust
+        state = app.state.agent_state
+        if not state.has_passphrase():
+            # Every way out (agent#22): before forgetting, so no moment exists
+            # where the wizard answers the network. A failed write stops here.
+            state.require_setup_here()
         store.unenroll()
         trust.forget()
         trust.become_standalone()
@@ -209,10 +214,6 @@ async def _leave_if_removed(
                 why_not,
             )
         return None
-    state = app.state.agent_state
-    if not state.has_passphrase():
-        # Before leaving, so no moment exists where the wizard answers anyone.
-        state.require_setup_here()
     return await leave(
         app,
         notified=True,

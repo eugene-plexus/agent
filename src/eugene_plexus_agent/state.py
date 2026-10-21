@@ -102,6 +102,10 @@ UNREADABLE_SUFFIX = ".unreadable"
 #: `auth` is written first and a half-finished file keeps it and loses
 #: the tail — which is exactly the shape the old non-atomic write left
 #: behind.
+#: `setupHereOnly` in a file that will not load (agent#22): kept, so a damaged
+#: file does not open the first-run wizard to the network.
+_SETUP_HERE_MARKER = re.compile(r"^\s+setupHereOnly\s*:", re.MULTILINE)
+
 _AUTH_MARKERS = (
     re.compile(r"^\s+masterSalt\s*:", re.MULTILINE),
     re.compile(r"^\s+passphraseHash\s*:", re.MULTILINE),
@@ -613,6 +617,7 @@ class AgentState:
         # Whether the file we could not read carried auth keys. Decides
         # whether first-run setup is offered or refused.
         self._lost_passphrase = False
+        self._lost_setup_here = False
 
     @property
     def path(self) -> Path:
@@ -707,6 +712,7 @@ class AgentState:
                 self._auth = {}
                 self._degraded_reason = reason
                 self._lost_passphrase = any(m.search(raw_text) for m in _AUTH_MARKERS)
+                self._lost_setup_here = bool(_SETUP_HERE_MARKER.search(raw_text))
             self._preserve_unreadable()
             log.error(
                 "%s could not be read (%s); running on defaults with no topology. A copy is "
@@ -720,6 +726,7 @@ class AgentState:
         with self._lock:
             self._degraded_reason = None
             self._lost_passphrase = False
+            self._lost_setup_here = False
         return None
 
     def _preserve_unreadable(self) -> None:
@@ -1079,7 +1086,7 @@ class AgentState:
 
     def setup_here_only(self) -> bool:
         with self._lock:
-            return bool(self._auth.get("setupHereOnly"))
+            return bool(self._auth.get("setupHereOnly")) or self._lost_setup_here
 
     def set_passphrase(self, *, passphrase_hash: str, master_salt_b64: str) -> None:
         """Persist the wizard's passphrase hash + master-key salt.
@@ -1097,6 +1104,7 @@ class AgentState:
                 "passphraseHash": passphrase_hash,
                 "masterSalt": master_salt_b64,
             }
+            self._lost_setup_here = False
             self._write_locked()
 
     # ----- internals --------------------------------------------------

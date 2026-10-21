@@ -239,12 +239,9 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
             "are sealed with it.",
         )
 
-    if state.setup_here_only() and not peer.is_loopback(
-        request.client.host if request.client else None
-    ):
+    if state.setup_here_only() and not _from_this_machine(request):
         # agent#22: this machine left an install with no passphrase of its
-        # own and still listens where other machines reached it. The peer
-        # is the TCP peer, or the entry point's verified client address.
+        # own and still listens where other machines reached it.
         raise _problem(
             status.HTTP_403_FORBIDDEN,
             "Set up from this machine",
@@ -521,6 +518,33 @@ def _audience(session: str) -> tuple[str, ...]:
     if isinstance(aud, list):
         return tuple(str(a) for a in aud)
     return ()
+
+
+_LOCAL_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _from_this_machine(request: Request) -> bool:
+    """Whether a request was made by a browser or program on this machine.
+
+    From the adversarial review of agent#22, all three must hold:
+    - **the real peer is loopback**: the TCP peer, or, behind this agent's
+      own proxy (`/api/proxy/agent/...` reaches it over loopback), the peer
+      that proxy saw (`peer.PEER_HEADER`), as sign-in reads it;
+    - **no forwarding header**: a reverse proxy or tunnel on this host
+      makes every caller loopback, and sends one;
+    - **a loopback Host**: a proxied request, and a DNS-rebinding page,
+      carry the public name.
+    """
+    seen = peer.peer_of(
+        request.client.host if request.client else None,
+        request.headers.get(peer.PEER_HEADER),
+    )
+    if not peer.is_loopback(seen):
+        return False
+    if any(name in request.headers for name in peer.FORWARDING_HEADERS):
+        return False
+    host = (request.url.hostname or "").strip("[]").lower()
+    return host in _LOCAL_NAMES or peer.is_loopback(host)
 
 
 def _here(request: Request) -> str:

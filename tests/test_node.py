@@ -32,6 +32,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_agent import enrollment, node_identity, tokens
+from eugene_plexus_agent import peer as peer_module
 from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind, SpawnConfig
 from eugene_plexus_agent.app import create_app, shared_child_env
 from eugene_plexus_agent.node_identity import NodeIdentityStore
@@ -1186,7 +1187,9 @@ def test_a_removed_machine_with_no_passphrase_leaves_and_is_set_up_from_itself(
     assert claimed.json()["detail"]["title"] == "Set up from this machine"
     assert not state.has_passphrase()
     # From this machine, the wizard works, and the restriction ends.
-    here = TestClient(authed_client.app, client=("127.0.0.1", 50123))
+    here = TestClient(
+        authed_client.app, base_url="http://127.0.0.1:8079", client=("127.0.0.1", 50123)
+    )
     done = here.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
     assert done.status_code == 200, done.text
     assert state.has_passphrase() and not state.setup_here_only()
@@ -1229,6 +1232,60 @@ def test_the_machine_that_runs_the_root_does_not_leave_by_passphrase(
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["title"] == "This machine runs the install's control root"
     assert _enrolled_now(authed_client)
+
+
+def _left_without_a_passphrase(client: TestClient, control: FakeControl) -> Any:
+    assert _enroll(client, control).status_code == 200
+    state = client.app.state.agent_state  # type: ignore[attr-defined]
+    state._auth.pop("passphraseHash", None)
+    left = client.post("/v1/node/unenroll", json={"notifyControl": False})
+    assert left.status_code == 200, left.text
+    return state
+
+
+def test_leaving_with_a_session_also_keeps_the_wizard_on_this_machine(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Review of agent#22, A2: every way out sets it, not only the trust pull."""
+    state = _left_without_a_passphrase(authed_client, control)
+    assert state.setup_here_only()
+    claimed = authed_client.post("/v1/auth/initialize", json={"passphrase": "from elsewhere"})
+    assert claimed.status_code == 403, claimed.text
+
+
+@pytest.mark.parametrize(
+    ("headers", "why"),
+    [
+        ({peer_module.PEER_HEADER: "192.0.2.50"}, "through this agent's own proxy"),
+        ({"X-Forwarded-For": "192.0.2.50"}, "through a reverse proxy on this host"),
+        ({"Host": "gpu-box.example:8079"}, "with a public name (a rebinding page)"),
+    ],
+)
+def test_a_loopback_connection_that_speaks_for_someone_else_cannot_set_it_up(
+    authed_client: TestClient, control: FakeControl, headers: dict[str, str], why: str
+) -> None:
+    """Review of agent#22, A1 and A3: loopback is not enough."""
+    state = _left_without_a_passphrase(authed_client, control)
+    here = TestClient(
+        authed_client.app, base_url="http://127.0.0.1:8079", client=("127.0.0.1", 50124)
+    )
+    claimed = here.post(
+        "/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE}, headers=headers
+    )
+    assert claimed.status_code == 403, f"{why}: {claimed.text}"
+    assert not state.has_passphrase()
+
+
+def test_a_damaged_config_file_keeps_the_wizard_on_this_machine(tmp_path: Any) -> None:
+    """Review of agent#22, A6: the flag is not lost with the file."""
+    from eugene_plexus_agent.state import AgentState
+
+    path = tmp_path / "agent.yaml"
+    path.write_text("auth:\n  setupHereOnly: true\nfirstRunComplete: [unclosed\n", encoding="utf-8")
+    state = AgentState(path)
+    state.load_or_degrade()
+    assert state.setup_here_only()
+    assert not state.lost_its_passphrase()
 
 
 def test_the_machine_that_runs_the_root_does_not_leave_with_a_session(
