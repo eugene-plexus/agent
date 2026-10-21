@@ -573,6 +573,7 @@ async def _translate(request: Request, token: str, destination: str) -> str | No
         # carried by its host agent; no child token gains a grant to travel.
         if (
             claims.sub == "library"
+            and tokens.node_of(destination) is not None
             and request.method == "POST"
             and request.url.path == f"/api/proxy/{destination}/v1/ollama/send"
         ):

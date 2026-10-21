@@ -162,6 +162,28 @@ async def test_proxy_uses_machine_identity_only_for_library_keep(app, client):
     assert await _translate(Request(scope), local, "node:worker") is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("destination", ["control", "node:"])
+async def test_proxy_keep_does_not_issue_agent_token_to_non_node(app, client, destination):
+    from starlette.requests import Request
+
+    from eugene_plexus_agent.routes.proxy import _translate
+
+    from .conftest import FakeRoot, enroll_app, local_service_token
+
+    root = FakeRoot()
+    enroll_app(app, root, "library")
+    local = local_service_token(app, "library")
+    scope = {
+        "type": "http",
+        "app": app,
+        "method": "POST",
+        "headers": [],
+        "path": f"/api/proxy/{destination}/v1/ollama/send",
+    }
+    assert await _translate(Request(scope), local, destination) is None
+
+
 def test_send_route_accepts_only_library_machine_for_assigned_job(app, client, monkeypatch):
     from eugene_plexus_agent import tokens
     from eugene_plexus_agent.install_proxy import RemoteNode
