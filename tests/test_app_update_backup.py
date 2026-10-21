@@ -18,9 +18,28 @@ def test_update_refuses_systemd_private_data_without_a_helper(tmp_path):
 
     manager, _, new = installed(tmp_path)
     manager.accounts = AccountSupport("systemd")
-    with pytest.raises(apps.AppInstallError, match="private"):
+    with pytest.raises(
+        apps.AppInstallError, match=r"systemd account of its own.*newer install helper"
+    ):
         asyncio.run(manager.installed_callback(new, AppOrigin.custom))
     assert manager.store.get("tiny").version == "v1"
+
+
+def test_systemd_refusals_name_the_cause_and_change_nothing(app, authed_client):
+    from eugene_plexus_agent.app_accounts import AccountSupport
+    from tests.test_apps import FakeAppSupervisor
+
+    manager = app.state.apps
+    manager.supervisor = FakeAppSupervisor()
+    manager.accounts = AccountSupport("systemd")
+    manager.store.put(_record(_manifest(resetOnConnectionChange="RESET_CONFIG_ON_START")))
+    reset = authed_client.post("/v1/apps/tiny/restart", json={"resetSettings": True})
+    assert reset.status_code == 409, reset.text
+    assert "systemd account of its own" in reset.text
+    assert not (manager.store.data_dir("tiny") / "connection.sha256").exists()
+    back = authed_client.post("/v1/apps/tiny/rollback")
+    assert back.status_code == 409, back.text
+    assert "systemd account of its own" in back.text
 
 
 def test_backup_refuses_directory_links(tmp_path):

@@ -522,12 +522,16 @@ async def restart(request: Request, app_id: str, body: AppRestartRequest | None 
             "App is stopped",
             f"{record.manifest.name} is stopped. Start it instead.",
         )
+    if body and body.resetSettings:
+        try:
+            manager.require_settings_access(record.manifest.name, "reset")
+        except AppInstallError as exc:
+            raise _problem(409, "Could not reset it", str(exc)) from exc
     await _ensure_sign_in(request, manager, record.manifest)
     try:
         if body and body.resetSettings:
             from .. import app_launcher
 
-            manager.require_settings_access()
             path = manager.store.data_dir(app_id) / app_launcher.CONNECTION_FILE
             path.parent.mkdir(parents=True, exist_ok=True)
             write_private(path, "reset-requested")

@@ -95,16 +95,22 @@
     AUDIO_STT_OPENAI_API_KEY: "{clientKey}"
     AUDIO_TTS_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
     AUDIO_TTS_OPENAI_API_KEY: "{clientKey}"
+    AUDIO_REALTIME_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
+    AUDIO_REALTIME_OPENAI_API_KEY: "{clientKey}"
     ENABLE_OLLAMA_API: "false"
-    # Row 34: v0.12.3 backend/open_webui/config.py, one-based lines:
-    # ENABLE_WEB_SEARCH 1051, WEB_SEARCH_ENGINE 1060, EXTERNAL_WEB_SEARCH_URL
-    # 1201, EXTERNAL_WEB_SEARCH_API_KEY 1203, WEB_SEARCH_RESULT_COUNT 1068,
-    # WEB_SEARCH_CONCURRENT_REQUESTS 1083, BYPASS_WEB_SEARCH_WEB_LOADER 1066,
-    # ENABLE_IMAGE_GENERATION 1228, IMAGE_GENERATION_ENGINE 1230,
-    # IMAGE_GENERATION_MODEL 1232. env.py ENABLE_PLUGINS 1051 (default true).
-    # OFFLINE_MODE remains: env.py 1067-1071 blocks HF downloads and version
-    # checks; config.py 1051 does not gate web search on it.
-    # Source tag inspected; the scratch-wheel check needs network access.
+    # Row 34, checked against the 0.12.3 wheel (specs scripts/open-webui-drift.py):
+    # config.py ENABLE_WEB_SEARCH 1168, WEB_SEARCH_ENGINE 1177,
+    # BYPASS_WEB_SEARCH_WEB_LOADER 1184, WEB_SEARCH_RESULT_COUNT 1186,
+    # WEB_SEARCH_CONCURRENT_REQUESTS 1203, EXTERNAL_WEB_SEARCH_URL 1330,
+    # EXTERNAL_WEB_SEARCH_API_KEY 1332, ENABLE_IMAGE_GENERATION 1360,
+    # IMAGE_GENERATION_ENGINE 1362, IMAGE_GENERATION_MODEL 1364;
+    # env.py ENABLE_PLUGINS 1194 (default true; written here so a change of
+    # default upstream changes nothing). The external engine posts
+    # {query, count} and reads {link, title, snippet} (retrieval/web/external.py).
+    # OFFLINE_MODE (env.py 1213) blocks model downloads and the version check
+    # only; it does not turn web search off.
+    # 0.12.3 added a realtime-voice section whose address falls back to
+    # api.openai.com (config.py 1656); set above with the others.
     ENABLE_WEB_SEARCH: "true"
     WEB_SEARCH_ENGINE: external
     EXTERNAL_WEB_SEARCH_URL: "{gatewayUrl}/v1/web_search"

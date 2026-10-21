@@ -1687,7 +1687,7 @@ class AppManager:
         async with self._lock:
             existing = self.store.get(manifest.id)
             if existing and existing.version != manifest.version and manifest.updateBackup:
-                self.require_settings_access()
+                self.require_settings_access(manifest.name, "updated")
                 paths = [p.root for p in manifest.updateBackup]
                 try:
                     await asyncio.to_thread(
@@ -1747,7 +1747,7 @@ class AppManager:
             prune_versions(self.store, record.id, keep)
 
     async def rollback(self, record: InstalledApp) -> None:
-        self.require_settings_access()
+        self.require_settings_access(record.manifest.name, "put back to its earlier version")
         async with self._lock:
             if self.installer.running(record.id):
                 raise AppInstallError(
@@ -1789,11 +1789,21 @@ class AppManager:
                 ) from exc
             await self.start(restored)
 
-    def require_settings_access(self) -> None:
+    def require_settings_access(self, name: str, action: str) -> None:
+        """Refuse what needs the app's data folder, where the agent cannot reach it.
+
+        On a Linux system install an app runs in a systemd account of its own, and its data
+        is in that unit's private state. The root helper (`apps-ctl`) takes only start, stop,
+        restart and clean, so it cannot copy that data for a backup or a restore, and the
+        agent cannot read it. A backup the agent cannot make is not skipped: an update
+        without one could lose chats. Nothing changed, and the app keeps running.
+        """
         if self.accounts.kind == "systemd":
             raise AppInstallError(
-                "Open WebUI's data is in systemd private state. The installed app helper "
-                "cannot back up, restore or reset those settings yet. The app was not changed."
+                f"{name} was not {action}. On this install it runs in a systemd account of its "
+                "own, and Eugene cannot yet copy its data there to keep a backup. It keeps "
+                "running as it is, with its chats and settings. Update, Reset and Go back for "
+                "it need a newer install helper (eugene-plexus/specs#103)."
             )
 
     async def uninstall(self, app_id: str, *, purge: bool) -> None:

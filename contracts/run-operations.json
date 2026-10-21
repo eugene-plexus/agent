@@ -2228,6 +2228,30 @@
             "title": "Modifiedat",
             "description": "Filesystem mtime of the weights. Part of the incremental-rescan key."
           },
+          "fingerprint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fingerprint",
+            "description": "What the contents were when the scan last read them: `v1:` and\na SHA-256 over the format, each file's role and size, the first\n1 MiB of each file (a safetensors file's whole JSON header\ninstead, up to 100 MiB), eight evenly spaced 64 KiB blocks and\nthe last 64 KiB. About 1.6 MiB is read per file, never the whole\nof a model.\n\nIt is **proof that two files are the same file**, which the\n`id` cannot be: it names no path and no date, so a file that\nmoved has the same fingerprint at its new path\n(`POST /v1/models/{id}/relocate`). Sampled, so two files agree\nonly when their sizes, headers and samples all agree. Kept on a\n`missing` entry, which is how a moved file is recognised.\nAbsent when the files could not be read, and on an entry no\nscan has read since fingerprints began.\n"
+          },
+          "movedTo": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Movedto",
+            "description": "On a `missing` entry: the `id` of the one `present` entry with\nthe same `fingerprint`, which is where the file went. Absent\nwhen no entry matches, and when several do (then\n`GET /v1/models/{id}/relocate-candidates` lists them and the\nperson picks). Worked out when the list is read, never stored.\nNothing moves because of it: moving the profiles is\n`POST /v1/models/{id}/relocate`, after a click.\n"
+          },
           "error": {
             "anyOf": [
               {
@@ -2593,7 +2617,7 @@
           "unreadable"
         ],
         "title": "ModelStatus",
-        "description": "* `present` — found on disk and readable.\n* `missing` — not found by the last scan, but profiles are\n  saved against it, so the entry survives. **Moving a model\n  produces this**, plus a new entry at the new path: nothing\n  guesses that a file which vanished from one root and appeared\n  in another is the same file, because a wrong guess silently\n  applies one model's tuning to another. The profiles stay here\n  to be copied across by hand.\n* `unreadable` — the files are there and something about them\n  did not work. `error` says what."
+        "description": "* `present` — found on disk and readable.\n* `missing` — not found by the last scan, but profiles are\n  saved against it, so the entry survives. **Moving a model\n  produces this**, plus a new entry at the new path: nothing\n  guesses that a file which vanished from one root and appeared\n  in another is the same file, because a wrong guess silently\n  applies one model's tuning to another. The profiles stay here\n  until the person moves them (`POST /v1/models/{id}/relocate`),\n  which needs a `fingerprint` that proves the new file has the\n  same contents, or an explicit confirmation when none was saved.\n* `unreadable` — the files are there and something about them\n  did not work. `error` says what."
       },
       "OllamaDetail": {
         "properties": {

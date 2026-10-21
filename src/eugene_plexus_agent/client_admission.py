@@ -171,6 +171,7 @@ def decide(
     model: str | None,
     now: float,
     principal: dict[str, str] | None = None,
+    purpose: str = "inference",
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """No mutation until the caller persists the returned candidate atomically."""
     limits = validate_limits(key.get("limits")) if key else None
@@ -216,11 +217,18 @@ def decide(
         existing["until"] = now + LEASE_SECONDS
         result["leaseSeconds"] = LEASE_SECONDS
     elif action == "acquire":
-        if not model:
-            raise AdmissionRefusal(422, "A model is required for inference admission.")
-        allowed = limits.get("allowedModels") if limits else None
-        if allowed is not None and not model_permitted(allowed, model):
-            raise AdmissionRefusal(403, "This client key does not permit the requested model.")
+        if purpose == "search":
+            # A web search names no model, so the key's model list does not apply. The
+            # gateway checks the key's tool scope and `localOnly`; this counts it.
+            if model:
+                raise AdmissionRefusal(422, "A search admission names no model.")
+            model = ""
+        else:
+            if not model:
+                raise AdmissionRefusal(422, "A model is required for inference admission.")
+            allowed = limits.get("allowedModels") if limits else None
+            if allowed is not None and not model_permitted(allowed, model):
+                raise AdmissionRefusal(403, "This client key does not permit the requested model.")
         if existing is not None:
             if (
                 not existing["active"]
