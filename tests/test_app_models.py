@@ -922,7 +922,9 @@ OPENAI_ADDRESSES = (
     "AUDIO_TTS_OPENAI_API_BASE_URL",
     "AUDIO_REALTIME_OPENAI_API_BASE_URL",
 )
-OPENAI_KEYS = tuple(a.replace("BASE_URL", "KEY") for a in OPENAI_ADDRESSES)
+#: The entry is at the contract's 64-variable limit: the realtime-voice key (off by default) is
+#: the one address's key it leaves out.
+OPENAI_KEYS = tuple(a.replace("BASE_URL", "KEY") for a in OPENAI_ADDRESSES if "REALTIME" not in a)
 
 
 def test_open_webui_names_the_gateway_for_every_address_it_would_default_to_openai() -> None:

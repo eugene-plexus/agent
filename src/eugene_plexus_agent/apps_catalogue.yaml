@@ -96,7 +96,6 @@
     AUDIO_TTS_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
     AUDIO_TTS_OPENAI_API_KEY: "{clientKey}"
     AUDIO_REALTIME_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
-    AUDIO_REALTIME_OPENAI_API_KEY: "{clientKey}"
     ENABLE_OLLAMA_API: "false"
     # Row 34, checked against the 0.12.3 wheel (specs scripts/open-webui-drift.py):
     # config.py ENABLE_WEB_SEARCH 1168, WEB_SEARCH_ENGINE 1177,
@@ -110,13 +109,20 @@
     # OFFLINE_MODE (env.py 1213) blocks model downloads and the version check
     # only; it does not turn web search off.
     # 0.12.3 added a realtime-voice section whose address falls back to
-    # api.openai.com (config.py 1656); set above with the others.
+    # api.openai.com (config.py 1656); set above with the others. Its key is not set:
+    # the entry is at the contract's 64-variable limit, and realtime is off by default.
     ENABLE_WEB_SEARCH: "true"
     WEB_SEARCH_ENGINE: external
     EXTERNAL_WEB_SEARCH_URL: "{gatewayUrl}/v1/web_search"
     EXTERNAL_WEB_SEARCH_API_KEY: "{clientKey}"
     WEB_SEARCH_RESULT_COUNT: "5"
     WEB_SEARCH_CONCURRENT_REQUESTS: "2"
+    # With the page loader bypassed Open WebUI still embeds the snippets into
+    # its vector store unless this is set too (config.py 1179), and with no
+    # search model running that fails the whole search ("Failed to embed and
+    # store the retrieved web pages"; found by the row's C4 run). The snippets
+    # go straight to the chat instead.
+    BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL: "true"
     BYPASS_WEB_SEARCH_WEB_LOADER: "true"
     ENABLE_IMAGE_GENERATION: "{imageModelSet}"
     IMAGE_GENERATION_ENGINE: openai
