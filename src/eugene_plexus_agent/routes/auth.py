@@ -513,22 +513,33 @@ def _removed(heard: leaving.Heard, *, control_url: str, own_passphrase: bool) ->
     """The 409 for a sign-in the root no longer addresses to this machine."""
     title = "This machine was removed from the install"
     if heard is leaving.Heard.LEFT:
-        then = (
-            "Sign in again with this machine's own passphrase."
-            if own_passphrase
-            else "It has no passphrase of its own, so set one up here."
-        )
+        then = "Sign in again with this machine's own passphrase."
         return _problem(
             status.HTTP_409_CONFLICT,
             title,
             f"The install at {control_url} no longer lists this machine, so it has left it "
             f"and works on its own now. {then} To join an install again, use a new join token.",
         )
+    if not own_passphrase:
+        then = (
+            "It has no passphrase of its own, so it does not leave by itself (standalone, "
+            "anyone who set one first would own it). Uninstall and install it again to set "
+            "it up."
+        )
+    elif heard is leaving.Heard.LISTED:
+        then = (
+            "The root still has it registered, so it has not left. Remove it from Machines "
+            "on the install, then sign in here again."
+        )
+    else:
+        then = (
+            "It leaves by itself once the root answers its trust pull; or leave now with "
+            "this machine's own passphrase."
+        )
     return _problem(
         status.HTTP_409_CONFLICT,
         title,
-        f"The install at {control_url} no longer lists this machine. It leaves the install "
-        "by itself within a minute; then sign in with this machine's own passphrase.",
+        f"The install at {control_url} did not sign you in to this machine. {then}",
     )
 
 

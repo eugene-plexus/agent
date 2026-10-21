@@ -427,8 +427,10 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
             request, control_url=previous_control_url, name=previous_name
         )
 
-    if await leaving.leave(request.app, notified=notified, why="an operator asked") is None:
+    left = await leaving.leave(request.app, notified=notified, why="an operator asked")
+    if left is None and store.record.enrolled:
         raise _not_enrolled()
+    # None and not enrolled: a trust pull left at the same moment.
 
     return UnenrollResult(
         identity=_identity(request, await _devices(request)),
@@ -521,7 +523,24 @@ async def _leave_by_passphrase(request: Request, passphrase: str) -> UnenrollRes
 
     previous_name = str(record.name)
     previous_control_url = str(record.control_url)
+    if standby.hosts_active_control(state):
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "runs-the-root",
+            "This machine runs the install's control root",
+            "It does not leave by passphrase: that would take the install's root off its own "
+            "authority. Sign in and leave with that session.",
+        )
     heard = await leaving.ask_now(request.app)
+    if heard is leaving.Heard.UNTRUSTED:
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "untrusted-answer",
+            "The control root's answer was refused",
+            f"The control root at {previous_control_url} answered with a trust bundle this "
+            "machine does not take (the agent's log says why), so it cannot tell whether the "
+            "install still lists this machine and does not leave by passphrase.",
+        )
     if heard is leaving.Heard.LISTED:
         raise _problem(
             status.HTTP_409_CONFLICT,
@@ -539,7 +558,7 @@ async def _leave_by_passphrase(request: Request, passphrase: str) -> UnenrollRes
             notified=False,
             why="its own passphrase was given while the control root did not answer",
         )
-        if left is None:
+        if left is None and _store(request).record.enrolled:
             raise _not_enrolled()
         notified = False
         detail = (

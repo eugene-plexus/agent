@@ -25,6 +25,7 @@ from unittest import mock
 from urllib.parse import urlparse
 
 import httpx
+import jwt
 import nacl.exceptions
 import nacl.signing
 import pytest
@@ -84,6 +85,7 @@ class FakeControl:
         self.refuse_revoke: int | None = None
         self.logins: list[dict[str, Any]] = []
         self.sign_outs: list[str] = []
+        self.list_version = 0
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
         self._listener.listen(1)
@@ -111,6 +113,8 @@ class FakeControl:
                 return httpx.Response(204)
             if path == "/v1/trust/bundle":
                 return httpx.Response(200, json={"jws": self.root.bundle().jws})
+            if path == "/v1/trust/machines":
+                return httpx.Response(200, json={"jws": self.machine_list()})
             if path.startswith("/v1/nodes/") and request.method == "PATCH":
                 return self._announce(path.rsplit("/", 1)[-1], request)
             if path.startswith("/v1/nodes/") and request.method == "DELETE":
@@ -118,6 +122,23 @@ class FakeControl:
             return httpx.Response(404, json={"detail": "no such route on the fake control"})
 
         return httpx.MockTransport(handle)
+
+    def machine_list(self) -> str:
+        """The root's signed machine list (LT1): every registered machine."""
+        self.list_version += 1
+        payload = {
+            "iat": int(time.time()),
+            "version": self.list_version,
+            "required": False,
+            "controlPins": [],
+            "nodes": [
+                {"name": name, "url": None, "machineUrl": None, "pins": []}
+                for name in sorted(self.nodes)
+            ],
+        }
+        return jwt.encode(
+            payload, self.root.identity, algorithm="EdDSA", headers={"typ": "ep-machines+jwt"}
+        )
 
     def _enroll(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
@@ -1121,6 +1142,81 @@ def test_the_machine_that_runs_the_root_never_leaves_by_the_bundle(
     )
     _remove_at_root(control)
     authed_client.portal.call(leaving.ask_now, authed_client.app)  # type: ignore[union-attr]
+    assert _enrolled_now(authed_client)
+
+
+def test_a_key_the_root_left_out_while_it_still_has_the_machine_is_not_a_removal(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """The root leaves a duplicated or unreadable key out of the bundle
+    while the machine stays registered; its signed machine list still
+    names the machine, and the machine stays."""
+    from eugene_plexus_agent import leaving
+
+    assert _enroll(authed_client, control).status_code == 200
+    control.root.members.pop("gpu-box")
+    heard = authed_client.portal.call(leaving.ask_now, authed_client.app)  # type: ignore[union-attr]
+    assert heard is leaving.Heard.LISTED
+    assert _enrolled_now(authed_client)
+
+
+def test_a_removed_machine_with_no_passphrase_of_its_own_does_not_leave_by_itself(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """Standalone with no passphrase, the first caller to set one would own
+    it. It stays, and its sign-in says why."""
+    from eugene_plexus_agent import leaving
+
+    assert _enroll(authed_client, control).status_code == 200
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    state._auth.pop("passphraseHash", None)
+    _remove_at_root(control)
+    authed_client.portal.call(leaving.ask_now, authed_client.app)  # type: ignore[union-attr]
+    assert _enrolled_now(authed_client)
+    refused = authed_client.post(
+        "/v1/auth/login", json={"passphrase": TEST_PASSPHRASE}, headers={"Authorization": ""}
+    )
+    assert refused.status_code == 409, refused.text
+    assert "no passphrase of its own" in refused.json()["detail"]["detail"]
+    assert _enrolled_now(authed_client)
+
+
+def test_an_answer_the_machine_does_not_trust_does_not_let_it_leave_by_passphrase(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    stranger = FakeRoot()
+
+    def foreign(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"jws": stranger.bundle().jws})
+
+    authed_client.app.state.control_transport = httpx.MockTransport(foreign)  # type: ignore[attr-defined]
+    response = _leave_by_passphrase(authed_client)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["title"] == "The control root's answer was refused"
+    assert _enrolled_now(authed_client)
+
+
+def test_the_machine_that_runs_the_root_does_not_leave_by_passphrase(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    state.add_topology_entry(
+        ComponentEntry(
+            name="control",
+            kind=ComponentKind.control,
+            url="http://127.0.0.1:1",  # type: ignore[arg-type]
+        )
+    )
+
+    def dead(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("control root is down")
+
+    authed_client.app.state.control_transport = httpx.MockTransport(dead)  # type: ignore[attr-defined]
+    response = _leave_by_passphrase(authed_client)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["title"] == "This machine runs the install's control root"
     assert _enrolled_now(authed_client)
 
 
