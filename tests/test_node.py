@@ -996,6 +996,241 @@ def test_unenroll_restarts_children_and_is_409_when_not_enrolled(
 
 
 # --------------------------------------------------------------------------- #
+# A machine the install removed while it ran (agent#21)
+# --------------------------------------------------------------------------- #
+
+
+def _remove_at_root(control: FakeControl, name: str = "gpu-box") -> None:
+    """What `DELETE /v1/nodes/{name}` does at a root this agent cannot see."""
+    control.nodes.pop(name, None)
+    control.root.members.pop(name, None)
+
+
+def _enrolled_now(client: TestClient) -> bool:
+    return bool(client.app.state.node_identity.record.enrolled)  # type: ignore[attr-defined]
+
+
+def test_a_removed_machines_sign_in_says_so_and_it_can_join_again(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """CX6 step 8, the defect: the removed machine's sign-in went to the
+    root, came back addressed to `control` only, and its own agent then
+    refused that session for `POST /v1/node/unenroll`. Now the sign-in is
+    a 409 that says why, the machine has left by the time it answers, its
+    own passphrase signs in, and a new join token joins it again."""
+    assert _enroll(authed_client, control).status_code == 200
+    _remove_at_root(control)
+
+    refused = authed_client.post(
+        "/v1/auth/login", json={"passphrase": TEST_PASSPHRASE}, headers={"Authorization": ""}
+    )
+    assert refused.status_code == 409, refused.text
+    problem = refused.json()["detail"]
+    assert problem["title"] == "This machine was removed from the install"
+    assert "has left it" in problem["detail"]
+    assert not _enrolled_now(authed_client)
+
+    signed_in = authed_client.post(
+        "/v1/auth/login", json={"passphrase": TEST_PASSPHRASE}, headers={"Authorization": ""}
+    )
+    assert signed_in.status_code == 200, signed_in.text
+    own = signed_in.json()["sessionToken"]
+    assert _auth(authed_client).trust.verify(own, classes=(tokens.TYP_SESSION,)).aud == (
+        "node:local",
+    )
+    authed_client.headers["Authorization"] = f"Bearer {own}"
+    assert _enroll(authed_client, control).status_code == 200
+    assert _enrolled_now(authed_client)
+    assert "gpu-box" in control.root.members
+
+
+def test_a_removed_machine_leaves_at_its_next_trust_pull(
+    authed_client: TestClient, control: FakeControl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B: nobody signs in; the minute's pull takes a bundle without this
+    machine's key, and the machine leaves by itself."""
+    import asyncio
+    import contextlib
+
+    from eugene_plexus_agent import app as app_module
+
+    assert _enroll(authed_client, control).status_code == 200
+    before = _restarts(authed_client)
+    _remove_at_root(control)
+    monkeypatch.setattr(app_module, "TRUST_PULL_INTERVAL_SECONDS", 0.01)
+
+    async def run() -> None:
+        task = asyncio.create_task(app_module._pull_trust_bundle(authed_client.app))  # type: ignore[arg-type]
+        try:
+            for _ in range(500):
+                if not _enrolled_now(authed_client):
+                    return
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    authed_client.portal.call(run)  # type: ignore[union-attr]
+    assert not _enrolled_now(authed_client)
+    assert _restarts(authed_client) == before + 1
+    # Its own authority again: the root's sessions no longer verify here.
+    assert authed_client.get("/v1/node").status_code == 401
+
+
+def test_a_listed_machine_does_not_leave_at_a_trust_pull(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    from eugene_plexus_agent import leaving
+
+    assert _enroll(authed_client, control).status_code == 200
+    heard = authed_client.portal.call(leaving.ask_now, authed_client.app)  # type: ignore[union-attr]
+    assert heard is leaving.Heard.LISTED
+    assert _enrolled_now(authed_client)
+
+
+def test_a_bundle_with_no_root_key_is_not_evidence_of_removal(control: FakeControl) -> None:
+    """The real root lists no key at all when its own is unreadable (it
+    fails closed). That must not send every machine away."""
+    from eugene_plexus_agent import leaving
+
+    key = tokens.generate_private_key()
+    kid = tokens.thumbprint(key)
+    empty = tokens.build_bundle(authority=control.root.identity, version=9, epoch=1, keys=[])
+    assert not leaving.removed_from(empty, own_kid=kid)
+    control.root.register("other", tokens.generate_private_key().public_key())
+    without = control.root.bundle()
+    assert leaving.removed_from(without, own_kid=kid)
+    control.root.register("gpu-box", key.public_key())
+    assert not leaving.removed_from(control.root.bundle(), own_kid=kid)
+
+
+def test_the_machine_that_runs_the_root_never_leaves_by_the_bundle(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    from eugene_plexus_agent import leaving
+
+    assert _enroll(authed_client, control).status_code == 200
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    state.add_topology_entry(
+        ComponentEntry(
+            name="control",
+            kind=ComponentKind.control,
+            url="http://127.0.0.1:1",  # type: ignore[arg-type]
+        )
+    )
+    _remove_at_root(control)
+    authed_client.portal.call(leaving.ask_now, authed_client.app)  # type: ignore[union-attr]
+    assert _enrolled_now(authed_client)
+
+
+def _leave_by_passphrase(client: TestClient, passphrase: str = TEST_PASSPHRASE) -> httpx.Response:
+    return client.post(
+        "/v1/node/unenroll", json={"passphrase": passphrase}, headers={"Authorization": ""}
+    )
+
+
+def test_a_removed_machine_leaves_by_its_own_passphrase(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    _remove_at_root(control)
+    response = _leave_by_passphrase(authed_client)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["controlNotified"] is True
+    assert body["previousName"] == "gpu-box"
+    assert body["identity"]["enrolled"] is False
+    assert control.revoked == []
+
+
+def test_a_machine_whose_root_is_gone_leaves_by_its_own_passphrase(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+
+    def dead(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("control root is gone")
+
+    authed_client.app.state.control_transport = httpx.MockTransport(dead)  # type: ignore[attr-defined]
+    response = _leave_by_passphrase(authed_client)
+    assert response.status_code == 200, response.text
+    assert response.json()["controlNotified"] is False
+    assert "DELETE /v1/nodes/gpu-box" in response.json()["detail"]
+    assert not _enrolled_now(authed_client)
+
+
+def test_a_listed_machine_does_not_leave_by_passphrase(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    response = _leave_by_passphrase(authed_client)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["title"] == "The install still lists this machine"
+    assert _enrolled_now(authed_client)
+
+
+def test_leaving_by_passphrase_checks_it_and_is_rate_limited(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    _remove_at_root(control)
+    for _ in range(5):
+        wrong = _leave_by_passphrase(authed_client, "not the passphrase")
+        assert wrong.status_code == 401, wrong.text
+    limited = _leave_by_passphrase(authed_client)
+    assert limited.status_code == 429, limited.text
+    assert _enrolled_now(authed_client)
+    # The same count as sign-in: alternating the two buys no guesses.
+    signing_in = authed_client.post(
+        "/v1/auth/login", json={"passphrase": TEST_PASSPHRASE}, headers={"Authorization": ""}
+    )
+    assert signing_in.status_code == 429, signing_in.text
+
+
+def test_a_machine_with_no_passphrase_of_its_own_cannot_leave_by_one(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    state = authed_client.app.state.agent_state  # type: ignore[attr-defined]
+    state._auth.pop("passphraseHash", None)
+    _remove_at_root(control)
+    response = _leave_by_passphrase(authed_client)
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["title"] == "This machine has no passphrase of its own"
+    assert _enrolled_now(authed_client)
+
+
+def test_with_a_session_the_passphrase_is_not_what_is_checked(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    """A bearer takes the session path: a wrong passphrase beside a good
+    session does not matter, and a bad session is refused whatever
+    passphrase rides along."""
+    assert _enroll(authed_client, control).status_code == 200
+    refused = authed_client.post(
+        "/v1/node/unenroll",
+        json={"passphrase": TEST_PASSPHRASE, "notifyControl": False},
+        headers={"Authorization": "Bearer not-a-token"},
+    )
+    assert refused.status_code == 401, refused.text
+    assert _enrolled_now(authed_client)
+    left = authed_client.post(
+        "/v1/node/unenroll", json={"passphrase": "not the passphrase", "notifyControl": False}
+    )
+    assert left.status_code == 200, left.text
+
+
+def test_leaving_without_a_session_or_a_passphrase_is_refused(
+    authed_client: TestClient, control: FakeControl
+) -> None:
+    assert _enroll(authed_client, control).status_code == 200
+    response = authed_client.post("/v1/node/unenroll", headers={"Authorization": ""})
+    assert response.status_code == 401, response.text
+    assert _enrolled_now(authed_client)
+
+
+# --------------------------------------------------------------------------- #
 # Saying where this host is (M9) - the defect that was live for four
 # milestones: announced once at enrollment, never again.
 # --------------------------------------------------------------------------- #

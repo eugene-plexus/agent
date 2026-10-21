@@ -719,43 +719,17 @@ async def _pull_trust_bundle(app: FastAPI) -> None:
 
     Never raises and never stops: a root that is down is a normal state,
     and the bundle this node holds keeps working meanwhile (it has no
-    hard expiry, by design; its age is on `GET /v1/node`).
+    hard expiry, by design; its age is on `GET /v1/node`). A bundle that
+    no longer lists this machine makes it leave the install (agent#21,
+    `leaving`).
     """
-    from . import tokens
+    from . import leaving
     from ._http import internal_client
-    from .machine_trust import pull as pull_machine_list
-    from .node_identity import FencedError
-    from .trust import BundleRollback
 
     transport = getattr(app.state, "control_transport", None)
-    async with internal_client(timeout=10.0, transport=transport) as client:
+    async with internal_client(timeout=leaving.PULL_TIMEOUT_SECONDS, transport=transport) as client:
         while True:
-            trust = app.state.auth_state.trust
-            record = app.state.node_identity.record
-            # Before asking: a bundle the root pushed once, and that could
-            # not be written then, reaches the file even while the root
-            # this node joined does not answer (after a promotion).
-            trust.save_pending()
-            if trust.enrolled and record.control_url:
-                try:
-                    response = await client.get(
-                        f"{str(record.control_url).rstrip('/')}/v1/trust/bundle"
-                    )
-                    if response.status_code == 200:
-                        held = trust.bundle
-                        taken = trust.accept(str(response.json()["jws"]))
-                        if held is None or taken.version != held.version:
-                            log.info("pulled trust bundle %d", taken.version)
-                        await standby.reconcile(app)
-                    # The machine list rides the same minute (LT1). Public
-                    # keys and addresses, signed; no credential is sent.
-                    await pull_machine_list(app.state.machine_trust, client, record.control_url)
-                except BundleRollback:
-                    pass
-                except (tokens.BundleError, FencedError) as exc:
-                    log.warning("refused the control root's trust bundle: %s", exc)
-                except Exception as exc:
-                    log.debug("could not pull the trust bundle: %s", exc)
+            await leaving.pull_once(app, client)
             await asyncio.sleep(TRUST_PULL_INTERVAL_SECONDS)
 
 

@@ -51,11 +51,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
-from .. import client_keys, keyring_store, passphrase_file, peer, security, tokens
+from .. import client_keys, keyring_store, leaving, passphrase_file, peer, security, tokens
 from .._generated.common_models import (
     AuthLoginRequest,
     AuthLoginResponse,
@@ -476,8 +477,59 @@ async def _forward_login(
         )
     if remote is not None:
         auth.clear_login_failures(remote)
+    signed_in = AuthLoginResponse.model_validate(response.json())
+    if auth.trust.recipient not in _audience(signed_in.sessionToken):
+        # The root addresses a session to this machine only while the
+        # install lists it (agent#21). Ask the root now, rather than at the
+        # minute's pull, so the answer can say this machine has left.
+        heard = await leaving.ask_now(request.app)
+        raise _removed(
+            heard,
+            control_url=control_url,
+            own_passphrase=request.app.state.agent_state.has_passphrase(),
+        )
     log.info("operator signed in through the control root%s", f" from {remote}" if remote else "")
-    return AuthLoginResponse.model_validate(response.json())
+    return signed_in
+
+
+def _audience(session: str) -> tuple[str, ...]:
+    """Who a session is addressed to, read without checking it.
+
+    Used only to refuse: a session that does not name this machine is
+    never returned, and one that does is still verified on every use."""
+    try:
+        claims = jwt.decode(session, options={"verify_signature": False})
+    except jwt.PyJWTError:
+        return ()
+    aud = claims.get("aud")
+    if isinstance(aud, str):
+        return (aud,)
+    if isinstance(aud, list):
+        return tuple(str(a) for a in aud)
+    return ()
+
+
+def _removed(heard: leaving.Heard, *, control_url: str, own_passphrase: bool) -> HTTPException:
+    """The 409 for a sign-in the root no longer addresses to this machine."""
+    title = "This machine was removed from the install"
+    if heard is leaving.Heard.LEFT:
+        then = (
+            "Sign in again with this machine's own passphrase."
+            if own_passphrase
+            else "It has no passphrase of its own, so set one up here."
+        )
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            title,
+            f"The install at {control_url} no longer lists this machine, so it has left it "
+            f"and works on its own now. {then} To join an install again, use a new join token.",
+        )
+    return _problem(
+        status.HTTP_409_CONFLICT,
+        title,
+        f"The install at {control_url} no longer lists this machine. It leaves the install "
+        "by itself within a minute; then sign in with this machine's own passphrase.",
+    )
 
 
 def _persist_master_key_if_keyring_mode(state: AgentState, master_key: bytes) -> None:

@@ -2671,6 +2671,10 @@ class UnenrollRequest(BaseModel):
         True,
         description="Call `DELETE /v1/nodes/{name}` at the control root first, so\nthe install drops this node's key and stops trusting it. Set false to skip the attempt entirely — it does not\nchange what happens *here*, only whether the root is told.\n",
     )
+    passphrase: str | None = Field(
+        None,
+        description="Leave with no session, by this machine's own passphrase\n(agent#21). Only when no `Authorization` header is sent; see\nthe operation for when it is allowed. The root is not told.\n",
+    )
 
 
 class AuthStatus(BaseModel):

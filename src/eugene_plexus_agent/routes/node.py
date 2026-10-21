@@ -35,8 +35,20 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi.security import HTTPAuthorizationCredentials
 
-from .. import __version__, default_topology, host_history, machine_port, reach, standby, tokens
+from .. import (
+    __version__,
+    default_topology,
+    host_history,
+    leaving,
+    machine_port,
+    peer,
+    reach,
+    security,
+    standby,
+    tokens,
+)
 from .._generated.common_models import ConfigUpdateRequest, Problem, SignedTrustBundle
 from .._generated.models import (
     Arch,
@@ -94,6 +106,11 @@ _write_auth = [Depends(require_operator_session)]
 # detach on, which is why exceeding it still leaves this node
 # un-enrolled with `controlNotified: false`.
 _REVOKE_TIMEOUT_SECONDS = 20.0
+
+# Leaving by passphrase is limited as sign-in is, and in the same count
+# (`routes/auth.py`), so the two cannot be alternated for more guesses.
+_LEAVE_RATE_WINDOW_SECONDS = 60
+_LEAVE_RATE_MAX_FAILURES = 5
 
 
 def _problem(code: int, slug: str, title: str, detail: str) -> HTTPException:
@@ -232,26 +249,7 @@ def _local_standby(request: Request, state: AgentState, control_url: Any) -> Loc
 
 
 async def _restart_children(request: Request, *, why: str) -> None:
-    """Every supervised component reads the bundle's path and the pinned
-    authority from its environment at spawn, so a change of authority
-    reaches them only through a respawn. A newer bundle from the same
-    authority does not need one: they reload the file. Engines are not
-    touched: they have no auth."""
-    supervisor = getattr(request.app.state, "supervisor", None)
-    if supervisor is None:
-        return
-    try:
-        restarted = await supervisor.restart_all()
-    except Exception as exc:  # pragma: no cover - defensive
-        log.warning("could not restart supervised components after %s: %s", why, exc)
-        return
-    if restarted:
-        log.info(
-            "%s; restarting %d supervised component(s) so they trust the new authority: %s",
-            why,
-            len(restarted),
-            ", ".join(restarted),
-        )
+    await leaving.restart_children(request.app, why=why)
 
 
 # --------------------------------------------------------------------------- #
@@ -375,7 +373,6 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
     "/v1/node/unenroll",
     response_model=UnenrollResult,
     response_model_exclude_none=True,
-    dependencies=_write_auth,
 )
 async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -> UnenrollResult:
     """Leave an install - the exact inverse of enrolling.
@@ -397,18 +394,21 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
 
     Like enrollment, this logs out every session on this node, because
     this node no longer trusts the authority that signed them.
+
+    **With no `Authorization` header and a `passphrase`**, this machine's
+    own passphrase stands in for the session a removed machine cannot get
+    (agent#21; `_leave_by_passphrase`).
     """
+    passphrase = body.passphrase if body is not None else None
+    if passphrase is not None and not request.headers.get("authorization"):
+        return await _leave_by_passphrase(request, passphrase)
+    require_operator_session(request, _credentials(request))
+
     store = _store(request)
-    auth: AuthState = request.app.state.auth_state
     record = store.record
 
     if not record.enrolled:
-        raise _problem(
-            status.HTTP_409_CONFLICT,
-            "not-enrolled",
-            "Not enrolled",
-            "This agent is not enrolled with any control root, so there is nothing to leave.",
-        )
+        raise _not_enrolled()
 
     previous_name = str(record.name)
     previous_control_url = str(record.control_url)
@@ -427,18 +427,126 @@ async def unenroll_node(request: Request, body: UnenrollRequest | None = None) -
             request, control_url=previous_control_url, name=previous_name
         )
 
-    store.unenroll()
-    auth.trust.forget()
-    auth.trust.become_standalone()
-    request.app.state.machine_trust.forget()
-    log.warning(
-        "left the install at %s (was %r); this node is its own authority again%s",
-        previous_control_url,
-        previous_name,
-        "" if notified else "; THE CONTROL ROOT WAS NOT TOLD",
-    )
-    await _restart_children(request, why="left the install and became its own authority")
+    if await leaving.leave(request.app, notified=notified, why="an operator asked") is None:
+        raise _not_enrolled()
 
+    return UnenrollResult(
+        identity=_identity(request, await _devices(request)),
+        controlNotified=notified,
+        previousName=previous_name,
+        previousControlUrl=previous_control_url,  # type: ignore[arg-type]
+        detail=detail,
+    )
+
+
+def _not_enrolled() -> HTTPException:
+    return _problem(
+        status.HTTP_409_CONFLICT,
+        "not-enrolled",
+        "Not enrolled",
+        "This agent is not enrolled with any control root, so there is nothing to leave.",
+    )
+
+
+def _credentials(request: Request) -> HTTPAuthorizationCredentials | None:
+    scheme, _, value = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return None
+    return HTTPAuthorizationCredentials(scheme=scheme, credentials=value.strip())
+
+
+async def _leave_by_passphrase(request: Request, passphrase: str) -> UnenrollResult:
+    """Leave with this machine's own passphrase and no session (agent#21, A).
+
+    A removed machine, or one whose root is gone, has no session its own
+    agent accepts, because sessions come from the root. Its own stored
+    passphrase is what this machine still trusts, so it stands in, under
+    the sign-in rate limit. Then the root is asked for its bundle: a
+    bundle that no longer lists this machine makes it leave (as the
+    minute's pull would), no answer lets it leave, and a bundle that still
+    lists it is refused, because then a session can still be had.
+
+    Leaving can only disarm this machine, never make the install trust
+    it; that is why a passphrase is enough.
+    """
+    state: AgentState = request.app.state.agent_state
+    auth: AuthState = request.app.state.auth_state
+    remote = (
+        peer.peer_of(
+            request.client.host if request.client else None,
+            request.headers.get(peer.PEER_HEADER),
+        )
+        or "unknown"
+    )
+    record = _store(request).record
+    if not record.enrolled:
+        raise _not_enrolled()
+    if auth.is_login_rate_limited(
+        remote,
+        window_seconds=_LEAVE_RATE_WINDOW_SECONDS,
+        max_in_window=_LEAVE_RATE_MAX_FAILURES,
+    ):
+        raise _problem(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "rate-limited",
+            "Rate limited",
+            f"Too many failed attempts from {remote}. Wait {_LEAVE_RATE_WINDOW_SECONDS} "
+            "seconds and try again.",
+        )
+    stored = state.get_passphrase_hash()
+    if stored is None:
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "no-own-passphrase",
+            "This machine has no passphrase of its own",
+            "It joined the install without one, so it cannot leave by passphrase. It leaves "
+            "by itself within a minute of the control root no longer listing it. While the "
+            "install still lists it, sign in and leave with that session.",
+        )
+    if not security.verify_passphrase(passphrase, stored):
+        auth.record_login_failure(
+            remote,
+            window_seconds=_LEAVE_RATE_WINDOW_SECONDS,
+            max_in_window=_LEAVE_RATE_MAX_FAILURES,
+        )
+        log.warning("failed leave-by-passphrase attempt from %s", remote)
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "wrong-passphrase",
+            "Wrong passphrase",
+            "That is not this machine's passphrase. Repeated failures from one source are "
+            "rate-limited.",
+        )
+    auth.clear_login_failures(remote)
+
+    previous_name = str(record.name)
+    previous_control_url = str(record.control_url)
+    heard = await leaving.ask_now(request.app)
+    if heard is leaving.Heard.LISTED:
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "still-listed",
+            "The install still lists this machine",
+            f"The control root at {previous_control_url} still lists this machine as "
+            f"{previous_name!r}. Sign in and leave with that session, or remove the machine "
+            "from Machines on the install first.",
+        )
+    if heard is leaving.Heard.LEFT:
+        notified, detail = True, "The install had already removed this machine."
+    else:
+        left = await leaving.leave(
+            request.app,
+            notified=False,
+            why="its own passphrase was given while the control root did not answer",
+        )
+        if left is None:
+            raise _not_enrolled()
+        notified = False
+        detail = (
+            f"The control root at {previous_control_url} did not answer, so it was not told. "
+            f"If the install still lists this machine as {previous_name!r}, remove it there "
+            f"(DELETE /v1/nodes/{previous_name})."
+        )
     return UnenrollResult(
         identity=_identity(request, await _devices(request)),
         controlNotified=notified,
