@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from eugene_plexus_agent import process_signals
 from eugene_plexus_agent._generated.models import (
     ComponentEntry,
     ComponentKind,
@@ -87,6 +88,24 @@ def _auth() -> AuthState:
     from .conftest import standalone_auth
 
     return standalone_auth(Path(tempfile.mkdtemp()))
+
+
+@pytest.fixture(autouse=True)
+def no_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stops go out as `terminate()`, the way an agent with no console sends them.
+
+    The fake children carry a made-up pid, so on Windows a real console event
+    sent to it either fails or reaches nothing, depending on whether this
+    process was handed a console (tests that call `app_launcher.run` in process
+    allocate one). When it reaches nothing the fake never exits, the 5 s
+    escalation kills it and `terminated` stays False (CI, 2026-10-21, the
+    stop_all test). These tests mean the fallback.
+    """
+
+    def refused(pid: int, sig: int) -> None:
+        raise OSError(6, "The handle is invalid")
+
+    monkeypatch.setattr(process_signals.os, "kill", refused)
 
 
 @pytest.fixture
