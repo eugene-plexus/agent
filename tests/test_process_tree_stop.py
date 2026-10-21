@@ -51,6 +51,26 @@ async def until(predicate) -> None:
             await asyncio.sleep(0.01)
 
 
+def child_pid(path: Path) -> int | None:
+    """The pid the child wrote, or None until it can be read.
+
+    Existing is not readable: the file can be seen before its content is
+    there, and on Windows opening a file that has only just appeared is
+    refused for a moment (PermissionError). Both showed on loaded CI runners.
+    """
+    try:
+        return int(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+async def wait_for_child_pid(path: Path) -> int:
+    async with asyncio.timeout(5):
+        while (pid := child_pid(path)) is None:  # noqa: ASYNC110 - observing a file an OS process writes
+            await asyncio.sleep(0.01)
+    return pid
+
+
 @pytest.mark.parametrize("action", ["stop", "restart", "kill"])
 async def test_launcher_exit_waits_for_its_descendant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
@@ -72,19 +92,23 @@ async def test_launcher_exit_waits_for_its_descendant(
         )
         + "    while True: time.sleep(.01)\n"
         "else:\n"
-        "    (p / 'child').write_text(str(os.getpid()))\n"
+        # Written whole, then renamed: `write_text` creates the file empty first, and
+        # the test, which waits for the file to exist, read it empty on a loaded runner.
+        "    (p / 'child.tmp').write_text(str(os.getpid()))\n"
+        "    os.replace(p / 'child.tmp', p / 'child')\n"
         "    while not (p / 'release').exists(): time.sleep(.01)\n",
         encoding="utf-8",
     )
     planner = Planner(script, tmp_path)
     sp = SupervisedProcess(planner, logging.getLogger("tree-test"))
     descendants: list[psutil.Process] = []
+    leaf_pids: list[int] = []
 
     def stop_parent(proc, **kwargs):
         # Model a launcher exiting while a native engine keeps freeing memory.
         root = psutil.Process(proc.pid)
         descendants.extend(root.children(recursive=True))
-        leaf_pid = int((tmp_path / "child").read_text())
+        leaf_pid = leaf_pids[0]
         for process in reversed(descendants):
             if process.pid != leaf_pid:
                 with contextlib.suppress(psutil.NoSuchProcess):
@@ -96,8 +120,8 @@ async def test_launcher_exit_waits_for_its_descendant(
     pending = None
     try:
         sp.start()
-        await until(lambda: (tmp_path / "child").exists())
-        leaf = psutil.Process(int((tmp_path / "child").read_text()))
+        leaf_pids.append(await wait_for_child_pid(tmp_path / "child"))
+        leaf = psutil.Process(leaf_pids[0])
         original = sp._proc
         pending = asyncio.create_task(getattr(sp, "stop" if action == "kill" else action)())
         await until(lambda: original.returncode is not None)
