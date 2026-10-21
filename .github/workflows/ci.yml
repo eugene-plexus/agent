@@ -81,8 +81,13 @@ jobs:
       - name: Mypy
         run: mypy src/
 
+      # In parallel, one worker per CPU: the tests mostly wait (servers and
+      # child processes starting), so more workers than physical cores pay.
+      # bash on Windows too: the runner's default pwsh did not fail the step
+      # when pytest did (2 failed tests, green job).
       - name: Pytest
-        run: pytest -n auto
+        shell: bash
+        run: pytest -n logical
 
   codegen-freshness:
     name: Codegen freshness
