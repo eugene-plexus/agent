@@ -2008,7 +2008,7 @@
           "name": {
             "type": "string",
             "title": "Name",
-            "description": "The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`, or the first Ollama tag\nfor a model in an Ollama store. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n"
+            "description": "The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. An Ollama model keeps\nthe tag it was first listed under while that tag exists;\nif it disappears, use the first remaining tag and log the\nchange. A kept copy retains `keptFrom.servedName`.\n**Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n"
           },
           "displayName": {
             "anyOf": [
@@ -2176,6 +2176,16 @@
               }
             ]
           },
+          "keptFrom": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OllamaKept"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "profileCount": {
             "anyOf": [
               {
@@ -2275,6 +2285,14 @@
         ],
         "title": "LibraryModel",
         "description": "One launchable model on this host.\n\nThe format-independent facts are here; exactly one of `gguf`,\n`safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness — a\nquant tier is a GGUF concept and an exact parameter count is a\nsafetensors one, and flattening both into one object would\nproduce a schema half of whose fields are null for any given\nmodel."
+      },
+      "Method": {
+        "type": "string",
+        "enum": [
+          "link",
+          "copy"
+        ],
+        "title": "Method"
       },
       "MlxQuantization": {
         "properties": {
@@ -2648,7 +2666,65 @@
           "tags"
         ],
         "title": "OllamaDetail",
-        "description": "A model read from an Ollama store (CX9): which of Ollama's names\npoint at this file. Present only for a model in a folder of kind\n`ollama`. Its `name` is the first of `tags`, and is what\n`Runtime.modelAlias` is set to, since the file's own name is a\nhash. Ollama manages the file: the library never writes or\ndeletes it."
+        "description": "A model read from an Ollama store (CX9): which of Ollama's names\npoint at this file. Present only for a model in a folder of kind\n`ollama`. Its `name` is the tag it was first listed under,\nwhile that tag exists. If it disappears, take the first remaining\ntag and log the change. Adding a tag never renames a model.\n`Runtime.modelAlias` is set to `name`, since the file's own name\nis a hash. Ollama manages the file: the library never writes or\ndeletes it."
+      },
+      "OllamaKept": {
+        "properties": {
+          "servedName": {
+            "type": "string",
+            "title": "Servedname"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Tags"
+          },
+          "digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest",
+            "description": "Ollama's weights digest, used to verify copies and match a node's blob."
+          },
+          "store": {
+            "type": "string",
+            "title": "Store",
+            "description": "Absolute path of the source Ollama store on its machine."
+          },
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node",
+            "description": "Source machine for a remote Keep; absent for the Library's own machine."
+          },
+          "keptAt": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Keptat"
+          },
+          "method": {
+            "$ref": "#/components/schemas/Method"
+          }
+        },
+        "type": "object",
+        "required": [
+          "servedName",
+          "tags",
+          "digest",
+          "store",
+          "keptAt",
+          "method"
+        ],
+        "title": "OllamaKept",
+        "description": "Provenance stored against the kept file's path and reapplied on\nscans. The ordinary Library model keeps `servedName` as `name`\nand `Runtime.modelAlias`, even if Ollama removes every tag.\nThe Library never opens a kept file for writing: a link shares\nOllama's bytes. A node only holds a copy of this Library file."
       },
       "Operation": {
         "properties": {
