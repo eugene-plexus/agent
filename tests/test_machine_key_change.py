@@ -486,6 +486,14 @@ async def test_a_machine_off_for_the_root_s_key_change_takes_the_new_key_by_itse
     # The machine port here stands in for the root's, at a loopback address;
     # the table treats it as another machine.
     monkeypatch.setattr(machine_trust, "is_loopback_host", lambda host: False)
+    plain_calls: list[str] = []
+    plain_app = machine_port.PlainApp.__call__
+
+    async def counted(self: Any, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        plain_calls.append(str(scope.get("path")))
+        await plain_app(self, scope, receive, send)
+
+    monkeypatch.setattr(machine_port.PlainApp, "__call__", counted)
     root = FakeRoot()
     control = _RootApp()
     server, sock, control_port = await _serve(control)
@@ -550,6 +558,9 @@ async def test_a_machine_off_for_the_root_s_key_change_takes_the_new_key_by_itse
         assert trust.claims is not None and trust.claims["version"] == 9
         assert _http.machine_table().machines[f"127.0.0.1:{port}"] == frozenset({new_root_pin})
         assert control.paths[-1] == "/v1/trust/bundle"
+        # Over TLS throughout, checking no key for the list: nothing plain
+        # crossed between the machines.
+        assert plain_calls == []
     finally:
         await door.stop()
         await server.shutdown(sockets=[sock])

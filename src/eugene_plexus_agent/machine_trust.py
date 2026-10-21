@@ -315,14 +315,40 @@ class MachineTrust:
         self.rebuild()
 
 
+async def _unpinned(url: str) -> httpx.Response:
+    """The root's machine list without the key this node holds for the root:
+    over TLS to the root's machine port, checking no key (row 3: the capture
+    then holds no plain connection between machines), or, when that port does
+    not answer TLS, in plain HTTP. Either way the list is taken only if it
+    verifies (`MachineTrust.accept`)."""
+    import ssl
+
+    parts = urlsplit(url)
+    if parts.scheme == "http" and parts.netloc:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        async with httpx.AsyncClient(trust_env=False, timeout=10, verify=context) as unpinned:
+            try:
+                return await unpinned.get(f"https://{parts.netloc}/control{LIST_PATH}")
+            except httpx.HTTPError as exc:
+                log.debug("the root's machine port did not answer TLS for its list: %s", exc)
+    async with httpx.AsyncClient(
+        trust_env=False, timeout=10, transport=httpx.AsyncHTTPTransport(trust_env=False)
+    ) as plain:
+        return await plain.get(url)
+
+
 async def pull(trust: MachineTrust, client: Any, control_url: str) -> None:
     """Fetch and take the root's machine list. Never raises: a root that is
     down is a normal state, and the list held keeps working.
 
-    **A root whose machine key changed** (its machine set up again) presents
-    a key this node does not hold for it, and every call to it is refused,
-    the list's included. The list is public, signed with the root's identity
-    key and versioned, so this node then fetches it once in plain HTTP and
+    **A root whose machine key changed** (its machine set up again, or its
+    key changed while this node was off, row 3) presents a key this node does
+    not hold for it, and every call to it is refused, the list's included.
+    The list is public, signed with the root's identity key and versioned,
+    so this node then fetches it once without that key (`_unpinned`) and
     takes it only if it verifies and is newer: a party in the middle can show
     it nothing it could use, and the root's new key comes with it.
     """
@@ -340,10 +366,7 @@ async def pull(trust: MachineTrust, client: Any, control_url: str) -> None:
                 "checking the root's signed machine list for it",
                 pin,
             )
-            async with httpx.AsyncClient(
-                trust_env=False, timeout=10, transport=httpx.AsyncHTTPTransport(trust_env=False)
-            ) as plain:
-                response = await plain.get(url)
+            response = await _unpinned(url)
         if response.status_code == 200:
             trust.root_has_list = True
             trust.accept(str(response.json()["jws"]))
