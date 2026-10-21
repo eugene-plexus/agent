@@ -187,7 +187,8 @@ def read(app_dir: Path, version: str | None) -> dict[str, Any] | None:
         if present and not path.exists():
             raise ValueError(f"The update backup is missing {name}")
         _size(path)
-    return record
+    checked: dict[str, Any] = record
+    return checked
 
 
 def restore(app_dir: Path, data: Path, record: dict[str, Any]) -> None:
