@@ -194,7 +194,7 @@ def schedule_restart(app: Any, why: str, *, delay: float = 1.0) -> None:
     """Restart this agent in place, after the answer that asked for it is sent.
 
     The server exits the way a stop does, so every child -- the proxy, the
-    components and the apps -- is shut down by the lifespan, and `_serve`
+    components and the apps -- is shut down by the lifespan, and `serve`
     then replaces this process with a new one (`reexec`). In a container the
     process keeps its pid and the container keeps running.
     """

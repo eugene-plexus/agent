@@ -491,7 +491,7 @@ def test_the_site_command_never_starts_the_agent(
 
     ran: list[Any] = []
     monkeypatch.setenv("EUGENE_PLEXUS_AGENT_CONFIG_FILE", str(tmp_path / "agent.yaml"))
-    monkeypatch.setattr(entry, "_serve", lambda *a, **k: ran.append("serve"))
+    monkeypatch.setattr(entry, "serve", lambda *a, **k: ran.append("serve"))
     monkeypatch.setattr(site_cli, "run", lambda args, settings: ran.append(args) or 0)
     with pytest.raises(SystemExit) as done:
         entry.main(

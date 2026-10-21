@@ -38,6 +38,8 @@ import argparse
 import contextlib
 import logging
 import sys
+import threading
+from collections.abc import Callable
 from typing import Any
 
 import uvicorn
@@ -141,7 +143,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "site":
         raise SystemExit(site_cli.run(args, settings))
 
-    _serve(settings, unattended=args.unattended)
+    serve(settings, unattended=args.unattended)
 
 
 #: How long a stop waits for open requests before it ends them and stops the
@@ -151,7 +153,7 @@ GRACEFUL_SHUTDOWN_SECONDS = 5
 
 
 def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Server:
-    """Everything `_serve` does except block on the socket.
+    """Everything `serve` does except block on the socket.
 
     Split out at install-paths §9 step 3 so a Windows service can own the
     run loop. `uvicorn.run()` builds a `Server` and calls `.run()` on it,
@@ -326,9 +328,31 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     return server
 
 
-def _serve(settings: Settings, *, unattended: bool = False) -> None:
+def serve(
+    settings: Settings,
+    *,
+    unattended: bool = False,
+    should_stop: Callable[[], bool] | None = None,
+) -> None:
+    """Run the agent the way an install does, and return when it has stopped.
+
+    The command line (which every unit file and scheduled task runs) and the
+    acceptance harness both start here, and the Windows service starts at
+    `build_server`, so a check through any of them tests the start path an
+    install runs: the entry point, the bind-host rule, the machine port, the
+    client doors and the console log copy.
+
+    `should_stop` is for a caller with no signal to send -- the harness stops
+    through a file, and Windows has no clean stop signal for a child. It is
+    called every 0.1 s on a thread of its own; when it says True the server
+    exits the way a SIGTERM makes it, so the lifespan shutdown still stops
+    every child. `None` is the unchanged path.
+    """
     server = build_server(settings, unattended=unattended)
-    server.run()
+    if should_stop is None:
+        server.run()
+    else:
+        _run_until(server, should_stop)
     # Settings applied or turned off the HTTPS entry point: start again, in
     # this same process, so a container keeps running (`entrypoint_setup`).
     state = getattr(server.config.app, "state", None)
@@ -336,6 +360,36 @@ def _serve(settings: Settings, *, unattended: bool = False) -> None:
         from .entrypoint_setup import reexec
 
         reexec()
+
+
+def _run_until(server: uvicorn.Server, should_stop: Callable[[], bool]) -> None:
+    """`server.run()`, with a thread that sets `should_exit` when told to stop.
+
+    `run()` itself, not a loop of our own, so the event loop and the signal
+    handlers are the ones the service gets. Setting `should_exit` from another
+    thread is what uvicorn's own signal handler does, and the main loop reads
+    it every 0.1 s.
+    """
+    finished = threading.Event()
+
+    def watch() -> None:
+        while not finished.wait(0.1):
+            try:
+                stop = should_stop()
+            except Exception as exc:  # a stop check that fails stops the agent, and says why
+                print(f"agent: stopping because should_stop failed: {exc!r}", flush=True)
+                stop = True
+            if stop:
+                server.should_exit = True
+                return
+
+    watcher = threading.Thread(target=watch, name="should-stop", daemon=True)
+    watcher.start()
+    try:
+        server.run()
+    finally:
+        finished.set()
+        watcher.join(timeout=2)
 
 
 if __name__ == "__main__":
