@@ -475,13 +475,20 @@ class MachineKeyChange:
             log.error("the next machine key did not load, so nothing switched: %s", exc)
             self._update(error=f"the next key did not load ({exc})")
             return
-        self.w.store.switch_machine_key(
-            state=SWITCHED,
-            previousPin=current,
-            switchedAt=_now(),
-            announcing=False,
-            error=None,
-        )
+        try:
+            self.w.store.switch_machine_key(
+                state=SWITCHED,
+                previousPin=current,
+                switchedAt=_now(),
+                announcing=False,
+                error=None,
+            )
+        except Exception as exc:
+            # `node.yaml` still names the old key: the port presents it again,
+            # or a restart would present a key the list has dropped.
+            door.reload(str(record.tls_certificate), str(record.tls_private_key), current)
+            log.error("could not keep the new machine key, so nothing switched: %s", exc)
+            return
         self.write_door()
         log.warning(
             "this machine's machine port presents its new key %s; the old key %s is deleted",
