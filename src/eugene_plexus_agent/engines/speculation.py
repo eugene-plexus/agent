@@ -38,7 +38,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from ..gguf_context import drafting_facts
+from ..gguf_context import DraftingFacts, drafting_facts
 from ..model_paths import is_windows_shaped
 
 REUSE_TEXT_KEY = "reuseRepeatedText"
@@ -53,7 +53,10 @@ DRAFT_WITH_CHOICES = ("off", "mtpHead", "companion")
 NGRAM = "ngram-mod"
 DRAFT_MTP = "draft-mtp"
 DRAFT_SIMPLE = "draft-simple"
-TYPES = (NGRAM, DRAFT_MTP, DRAFT_SIMPLE)
+DRAFT_DFLASH = "draft-dflash"
+DRAFT_DSPARK = "draft-dspark"
+DRAFT_EAGLE3 = "draft-eagle3"
+TYPES = (NGRAM, DRAFT_MTP, DRAFT_SIMPLE, DRAFT_DFLASH, DRAFT_DSPARK, DRAFT_EAGLE3)
 
 #: Flags and variables that mean speculation is being set by hand.
 _BY_HAND_FLAGS = frozenset(
@@ -65,9 +68,11 @@ _BY_HAND_FLAGS = frozenset(
         "--spec-draft-n-max",
         "--draft-max",
         "--draft",
+        "--spec-default",
+        "--spec-draft-hf",
     }
 )
-_BY_HAND_ENV = ("LLAMA_ARG_SPEC_TYPE", "LLAMA_ARG_SPEC_DRAFT_MODEL")
+_BY_HAND_ENV = ("LLAMA_ARG_SPEC_TYPE", "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_SPEC_DEFAULT")
 
 METRICS_FLAG = "--metrics"
 
@@ -159,6 +164,8 @@ def plan(
                 f"{Path(draft_model).name} is not a file llama.cpp can draft with: it has "
                 "neither an MTP head nor a model's first block."
             )
+        if facts.architecture in {"dflash", "eagle3"}:
+            _check_target(facts, draft_model, model_path)
         wanted.append(kind)
     if not wanted:
         return Plan()
@@ -177,7 +184,7 @@ def plan(
         if missing:
             what = (
                 "speculative decoding"
-                if not types
+                if not types and choice == "off"
                 else " or ".join(_WORDS.get(t, t) for t in missing)
             )
             note = NOT_OFFERED.format(what=what)
@@ -200,7 +207,44 @@ _WORDS = {
     NGRAM: "reusing repeated text (ngram-mod)",
     DRAFT_MTP: "drafting with an MTP head (draft-mtp)",
     DRAFT_SIMPLE: "drafting with a draft model (draft-simple)",
+    DRAFT_DFLASH: "drafting with DFlash (draft-dflash)",
+    DRAFT_DSPARK: "drafting with DSpark (draft-dspark)",
+    DRAFT_EAGLE3: "drafting with EAGLE3 (draft-eagle3)",
 }
+
+
+def _check_target(draft: DraftingFacts, draft_path: str, model_path: str) -> None:
+    draft_name = Path(draft_path).name
+    if draft.target_problem is not None:
+        raise ValueError(f"{draft_name} cannot pair: {draft.target_problem}.")
+    model = drafting_facts(model_path)
+    model_name = Path(model_path).name
+    if model is None:
+        raise ValueError(f"The target model {model_name} cannot be read as a GGUF.")
+    if (
+        model.embedding_length != draft.target_hidden_size
+        or model.block_count is None
+        or model.block_count < draft.target_min_layers
+    ):
+        hidden = (
+            model.embedding_length if model.embedding_length is not None else "unknown hidden size"
+        )
+        blocks = model.block_count if model.block_count is not None else "unknown layer count"
+        raise ValueError(
+            f"{draft_name} was made for a model with hidden size {draft.target_hidden_size} "
+            f"and at least {draft.target_min_layers} layers. {model_name} has "
+            f"{hidden} and {blocks}. "
+            "Choose a companion made for this model."
+        )
+    if (
+        draft.vocab_size is not None
+        and model.vocab_size is not None
+        and draft.vocab_size != model.vocab_size
+    ):
+        raise ValueError(
+            f"{draft_name} needs vocabulary size {draft.vocab_size}. {model_name} has "
+            f"{model.vocab_size}. Choose a companion made for this model."
+        )
 
 
 def metrics_argv(argv: Sequence[str]) -> list[str]:
