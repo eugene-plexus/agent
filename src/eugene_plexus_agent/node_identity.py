@@ -375,16 +375,17 @@ def generate_machine_key() -> tuple[str, str]:
     return key_pem, machine_certificate(key_pem)
 
 
-def machine_key_made_at(certificate_pem: str) -> Any:
+def machine_key_made_at(certificate_pem: str) -> datetime:
     """When a machine key was made (part 3b): its certificate's start, which
     `machine_certificate` sets a day before. A key's age is what the yearly
     change counts; the key itself never expires."""
-    import datetime
+    from datetime import timedelta
 
     from cryptography import x509
 
     certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
-    return certificate.not_valid_before_utc + datetime.timedelta(days=_MACHINE_CERT_BACKDATE)
+    made: datetime = certificate.not_valid_before_utc + timedelta(days=_MACHINE_CERT_BACKDATE)
+    return made
 
 
 def machine_pin(certificate_pem: str) -> str:
