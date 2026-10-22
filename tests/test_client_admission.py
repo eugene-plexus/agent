@@ -164,3 +164,31 @@ def test_write_logs_must_be_a_boolean():
     with pytest.raises(ValueError):
         validate_limits({"writeLogs": 1})
     assert validate_limits({"writeLogs": False}) == validate_limits({})
+
+
+def test_an_enrolled_agent_passes_on_the_roots_queue_band(app, client):
+    """Row 70: the root answers a verified person's `queueBand`. An agent
+    whose models predate it fails the whole forward (`extra='forbid'`);
+    this one passes it on to the gateway, for row 11's queue."""
+    import httpx
+
+    from tests.test_acting_for_operator import _enrolled, _root
+
+    root = _enrolled(app)
+    answer = {
+        "keyId": "k1",
+        "keyName": "app:workbench@gpu-box",
+        "personId": "p1",
+        "appClientId": "c1",
+        "queueBand": "background",
+    }
+    seen = _root(app, lambda request: httpx.Response(200, json=answer))
+    session = root.session("node:gpu-box", "control")
+    forwarded = client.post(
+        "/v1/auth/client-keys/admission",
+        json={"action": "check", "keyId": "k1", "requestId": "r1", "personToken": "proof"},
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert forwarded.status_code == 200, forwarded.text
+    assert forwarded.json()["queueBand"] == "background"
+    assert seen[0].url.path == "/v1/auth/client-keys/admission"
