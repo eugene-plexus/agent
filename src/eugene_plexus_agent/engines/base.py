@@ -429,6 +429,7 @@ class EngineAdapter(abc.ABC):
 
         managed = self.managed_store().current()
         if managed is not None:
+            self.refuse_untrusted(managed.binary)
             return DiscoveredBinary(
                 path=managed.binary,
                 origin=Origin.managed,
@@ -449,8 +450,19 @@ class EngineAdapter(abc.ABC):
         The one place a found executable gets inspected, so an adapter
         that learns more than a version from it (a Python engine reads
         its whole environment) overrides this rather than every caller.
+        Every override starts with `refuse_untrusted`.
         """
+        self.refuse_untrusted(path)
         return DiscoveredBinary(path=path, origin=origin, version=self.probe_version(path))
+
+    def refuse_untrusted(self, path: Path) -> None:
+        """In Eugene's own account, a program anyone else can change is
+        never run, not even for its version (row 8, `exec_trust`)."""
+        from .. import exec_trust
+
+        reason = exec_trust.untrusted(path)
+        if reason is not None:
+            raise EngineUnavailableError(reason)
 
     def probe_version(self, binary: Path) -> str | None:
         """Ask the binary what it is. None when it won't say.

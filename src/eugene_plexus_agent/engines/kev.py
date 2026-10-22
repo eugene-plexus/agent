@@ -163,6 +163,7 @@ class KevAdapter(EngineAdapter):
 
     def describe(self, path: Path, origin: Origin) -> DiscoveredBinary:
         """Ask the interpreter whether it can actually serve Kev."""
+        self.refuse_untrusted(path)
         probed = _probe_packages(str(path)) or {}
 
         def text(key: str) -> str | None:

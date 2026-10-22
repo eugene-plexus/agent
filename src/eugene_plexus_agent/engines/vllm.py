@@ -192,6 +192,7 @@ class VllmAdapter(EngineAdapter):
     def describe(self, path: Path, origin: Origin) -> DiscoveredBinary:
         """Inspect the console script's environment once, for both the
         version and the `python` block on the descriptor."""
+        self.refuse_untrusted(path)
         env = inspect_python_environment(path)
         return DiscoveredBinary(
             path=path,

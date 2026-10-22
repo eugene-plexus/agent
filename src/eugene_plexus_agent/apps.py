@@ -60,7 +60,7 @@ import httpx
 import yaml
 from pydantic import AnyUrl, ValidationError
 
-from . import app_accounts, app_launcher, ports
+from . import app_accounts, app_launcher, exec_trust, ports
 from ._generated.models import (
     App,
     AppCatalogue,
@@ -1313,13 +1313,23 @@ class AppManager:
         return None
 
     def uv(self) -> Path | None:
+        """The uv to install apps with, or None -- also when Eugene runs in
+        its own account and anyone else could change that uv (row 8,
+        `exec_trust`)."""
         configured = self._get_config("uvBinary")
-        return find_uv(str(configured) if configured else None)
+        found = find_uv(str(configured) if configured else None)
+        if found is not None and exec_trust.untrusted(found) is not None:
+            return None
+        return found
 
     def installable(self, *, enrolled: bool) -> str | None:
         """None when this node can install apps, otherwise why not."""
         if self.uv() is None:
             configured = self._get_config("uvBinary")
+            found = find_uv(str(configured) if configured else None)
+            why = exec_trust.untrusted(found) if found is not None else None
+            if why is not None:
+                return why
             if configured:
                 return (
                     f"uvBinary is set to {configured}, which is not a file. Fix it under Config, "
