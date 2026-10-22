@@ -266,3 +266,23 @@ def test_the_list_is_kept_with_its_control_block(tmp_path: Path) -> None:
     trust.accept(_list(root, 5, control=_naming(2, ROOT_B)))
     kept = json.loads((tmp_path / machine_trust.LIST_FILE).read_text(encoding="utf-8"))
     assert jwt.decode(kept["jws"], options={"verify_signature": False})["control"]["epoch"] == 2
+
+
+def test_a_root_address_no_other_machine_reaches_is_not_followed(tmp_path: Path) -> None:
+    """A list at a new epoch that names a loopback or link-local address, or
+    none, does not move the node: it would leave it with a root it cannot
+    reach. It still holds the epoch, which fences the old root."""
+    root = FakeRoot()
+    store = NodeIdentityStore(tmp_path / "node.yaml")
+    store.load()
+    store.ensure_keypair()
+    enroll_store(store, root, "me", control_url=ROOT_A)
+    trust = machine_trust.MachineTrust(tmp_path, store)
+    for version, url in (
+        (2, "http://127.0.0.1:8083"),
+        (3, "http://169.254.169.254:8083"),
+        (4, None),
+    ):
+        trust.accept(_list(root, version, control=_naming(2, url)))
+        assert store.record.control_url == ROOT_A, url
+    assert (store.record.epoch, store.record.control_url_epoch) == (2, 1)
