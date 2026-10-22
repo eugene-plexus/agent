@@ -3326,6 +3326,69 @@ class RuntimeMode(StrEnum):
     reranking = 'reranking'
 
 
+class Source(StrEnum):
+    """
+    * `embedded` — the reported text matches the model file's
+      embedded template and no operator override selected it.
+    * `eugene` — the reported text matches the Eugene fallback
+      captured at launch, with no operator override in effect.
+    * `override` — the reported text matches the operator's
+      explicit template override captured at launch. This takes
+      precedence even when its contents match a bundled template.
+    * `engine` — the engine reports the text but its origin is
+      unknown, or it does not match the captured selection.
+      Never label an unconfirmed fallback as `eugene`.
+
+    """
+
+    embedded = 'embedded'
+    eugene = 'eugene'
+    override = 'override'
+    engine = 'engine'
+
+
+class RuntimeChatTemplate(BaseModel):
+    """
+    The chat template the running engine reports in effect, not a
+    saved setting or a Library fallback recommendation. Publish only
+    after the engine reports its effective template text; the digest
+    is SHA-256 of those exact UTF-8 bytes, without whitespace or line
+    ending normalization. The source is not inferred from argv alone.
+
+    Omit on stopped runtimes, while the effective template is
+    unconfirmed, and on engines that do not report it. Clear this
+    observation on stop and before each new start, so a changed
+    setting cannot leave a previous process's template on display.
+    Missing information does not block a launch or inference.
+
+    """
+
+    source: Source = Field(
+        ...,
+        description="* `embedded` — the reported text matches the model file's\n  embedded template and no operator override selected it.\n* `eugene` — the reported text matches the Eugene fallback\n  captured at launch, with no operator override in effect.\n* `override` — the reported text matches the operator's\n  explicit template override captured at launch. This takes\n  precedence even when its contents match a bundled template.\n* `engine` — the engine reports the text but its origin is\n  unknown, or it does not match the captured selection.\n  Never label an unconfirmed fallback as `eugene`.\n",
+    )
+    name: str = Field(
+        ...,
+        description='Human-readable name of the effective template. Use an engine\ntemplate label when the origin is unknown; never the name of\na saved override or fallback that was not confirmed.\n',
+        min_length=1,
+    )
+    sha256: str = Field(
+        ...,
+        description='Digest of the effective template text returned by the engine.',
+        pattern='^[0-9a-f]{64}$',
+    )
+    id: str | None = Field(
+        None,
+        description="The Library's `ChatTemplateFallback.id` when source is\n`eugene`; omitted for other sources. The digest identifies\nthe exact template revision in effect.\n",
+        min_length=1,
+    )
+    path: str | None = Field(
+        None,
+        description="Template file on this runtime's node, captured at launch and\nreported only when its captured contents match the engine's\neffective template. Absent for embedded and engine templates,\nand for inline overrides. A later edit to this file does not\nchange the running process's template or digest.\n",
+        min_length=1,
+    )
+
+
 class PromptCacheSource(StrEnum):
     """
     Where a runtime's prompt cache size comes from. `profile` is the
@@ -3389,7 +3452,7 @@ class RuntimeSpeculation(BaseModel):
     )
 
 
-class Source(StrEnum):
+class Source1(StrEnum):
     """
     Which counter answered. On the wire so that "this host cannot
     measure it" stays distinguishable from "this engine is not
@@ -3446,7 +3509,7 @@ class LoadProgress(BaseModel):
         None,
         description='Observed over a short window, so it tracks a share that has\njust got slower rather than averaging the whole load. Null on\nthe first pair of readings.\n',
     )
-    source: Source = Field(
+    source: Source1 = Field(
         ...,
         description='Which counter answered. On the wire so that "this host cannot\nmeasure it" stays distinguishable from "this engine is not\nreading" — both of which make the field absent, and only one\nof which is worth reporting to whoever runs the host.\n',
     )
@@ -5979,6 +6042,7 @@ class Runtime(BaseModel):
         None, description='Version reported by the binary that is actually running.'
     )
     capabilities: RuntimeCapabilities | None = None
+    chatTemplate: RuntimeChatTemplate | None = None
     lastRestart: AwareDatetime | None = None
     lastError: str | None = Field(
         None,
