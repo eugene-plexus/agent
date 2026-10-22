@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import sys
@@ -861,3 +862,57 @@ def test_an_uninstalled_app_leaves_nothing_listening_on_its_port(tmp_path: Path)
     manager.store.put(_record(_manifest()))
     asyncio.run(manager.uninstall("tiny", purge=False))
     assert closed == ["app:tiny"]
+
+
+def test_rotating_an_app_key_rewrites_its_key_file(
+    app: FastAPI, authed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row 24: the agent on the app's machine writes the new token to the app's
+    key file (mode 0600), and restarts an app that reads its key only at start."""
+    manager: apps.AppManager = app.state.apps
+    manager.supervisor = FakeAppSupervisor()  # type: ignore[assignment]
+    manifest = _manifest(environment={"API_KEY": "{clientKey}"})
+    manager.store.put(_record(manifest))
+    manager.store.put_key("tiny", apps.AppKey(key_id="k1", key_name="app:tiny@this-node"))
+    key_file = manager.store.key_file("tiny")
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.write_text("old-token")
+    restarted: list[str] = []
+
+    async def restart(record: apps.InstalledApp) -> None:
+        restarted.append(record.id)
+
+    monkeypatch.setattr(manager, "restart", restart)
+    seen: dict[str, Any] = {}
+
+    async def forward(self: Any, method: str, path: str, **kw: Any) -> Any:
+        seen[method + " " + path] = kw
+        if method == "GET":
+            return {"keys": [_created("k1", "app:tiny@this-node").key.model_dump(mode="json")]}
+        return _created("k2", "app:tiny@this-node").model_dump(mode="json")
+
+    from eugene_plexus_agent.client_key_registry import ClientKeyRegistry
+
+    monkeypatch.setattr(ClientKeyRegistry, "forward", forward)
+    monkeypatch.setattr(ClientKeyRegistry, "enrolled", property(lambda self: True))
+
+    response = authed_client.post("/v1/auth/client-keys/k1/rotate", json={"overlapSeconds": 3600})
+    assert response.status_code == 201, response.text
+    assert key_file.read_text() == "the-token-shown-once"
+    if os.name == "posix":
+        assert key_file.stat().st_mode & 0o777 == 0o600
+    key = manager.store.key("tiny")
+    assert key is not None and key.key_id == "k2"
+    assert restarted == ["tiny"]
+
+    # A key of the same app on another machine is that machine's to rotate.
+    seen.clear()
+
+    async def other_node(self: Any, method: str, path: str, **kw: Any) -> Any:
+        seen[method] = path
+        return {"keys": [_created("k9", "app:tiny@elsewhere").key.model_dump(mode="json")]}
+
+    monkeypatch.setattr(ClientKeyRegistry, "forward", other_node)
+    refused = authed_client.post("/v1/auth/client-keys/k9/rotate", json={})
+    assert refused.status_code == 409 and "elsewhere" in refused.text
+    assert "POST" not in seen

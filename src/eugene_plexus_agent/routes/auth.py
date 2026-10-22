@@ -49,6 +49,7 @@ import logging
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 import jwt
@@ -72,6 +73,7 @@ from .._generated.models import (
     ClientKeyLimits,
     ClientKeyList,
     ClientKeyPolicy,
+    ClientKeyRotateRequest,
     ClientKeyUpdateRequest,
     ServiceTokenRequest,
     ServiceTokenResponse,
@@ -739,7 +741,27 @@ def _to_model(record: client_keys.ClientKeyRecord) -> ClientKey:
         revokedAt=(
             client_keys.as_datetime(record.revoked_at) if record.revoked_at is not None else None
         ),
+        lastUsedAt=(
+            client_keys.as_datetime(record.last_used_at)
+            if record.last_used_at is not None
+            else None
+        ),
+        retiresAt=(
+            client_keys.as_datetime(record.retires_at) if record.retires_at is not None else None
+        ),
+        replaces=record.replaces,
+        replacedBy=record.replaced_by,
     )
+
+
+def _policy_entry(record: client_keys.ClientKeyRecord) -> dict[str, Any]:
+    """A replaced key's expiry, as the gateway reads it, is its retirement."""
+    entry = _to_model(record).model_dump(
+        mode="json", include={"id", "expiresAt", "revokedAt"}, exclude_none=True
+    )
+    if record.retires_at is not None and record.retires_at < record.expires_at:
+        entry["expiresAt"] = client_keys.as_datetime(record.retires_at).isoformat()
+    return entry
 
 
 @router.get(
@@ -849,6 +871,113 @@ async def mint_client_key(
     return ClientKeyCreated(key=_to_model(record), token=token)
 
 
+async def _key_name(request: Request, key_id: str) -> str:
+    """The name of key `key_id`, or the route's 404."""
+    owner = registry(request)
+    try:
+        if owner.enrolled:
+            listing = ClientKeyList.model_validate(
+                await owner.forward(
+                    "GET",
+                    "/v1/auth/client-keys",
+                    authorization=request.headers.get("authorization"),
+                )
+            )
+            names = {k.id: k.name for k in listing.keys}
+        else:
+            names = {r.id: r.name for r in _keys(request).records()}
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
+    if key_id not in names:
+        raise _problem(404, "No such key", "This key is not in the registry.")
+    return names[key_id]
+
+
+@router.post(
+    "/v1/auth/client-keys/{key_id}/rotate",
+    response_model=ClientKeyCreated,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_operator_session)],
+)
+async def rotate_client_key(
+    request: Request, key_id: str, body: ClientKeyRotateRequest | None = None
+) -> ClientKeyCreated:
+    """Make a new token for the same key; the old one stops after an overlap.
+
+    The root does the work when enrolled. For an app installed on this machine
+    this agent then writes the new token to the app's key file, so the person
+    pastes nothing. An app's key from another machine is that machine's to
+    rotate: the console sends the request to its agent.
+    """
+    from urllib.parse import quote
+
+    from .apps import finish_app_key_rotation, prepare_app_key_rotation
+
+    body = body or ClientKeyRotateRequest()
+    owner = registry(request)
+    name = await _key_name(request, key_id)
+    prepared = prepare_app_key_rotation(request, name, key_id, overlap=body.overlapSeconds)
+    if owner.enrolled:
+        created = ClientKeyCreated.model_validate(
+            await owner.forward(
+                "POST",
+                f"/v1/auth/client-keys/{quote(key_id, safe='')}/rotate",
+                authorization=request.headers.get("authorization"),
+                body=body.model_dump(mode="json", exclude_none=True),
+            )
+        )
+    else:
+        created = _rotate_standalone(request, key_id, body, owner)
+    log.info("rotated client key %r (id %s)", name, key_id)
+    if prepared is not None:
+        await finish_app_key_rotation(request, prepared, created, overlap=body.overlapSeconds)
+    return created
+
+
+def _rotate_standalone(
+    request: Request, key_id: str, body: ClientKeyRotateRequest, owner: Any
+) -> ClientKeyCreated:
+    store = _keys(request)
+    try:
+        old = next((r for r in store.records() if r.id == key_id), None)
+        if old is None:
+            raise _problem(404, "No such key", "This key is not in the registry.")
+        issued = int(time.time())
+        lifetime = (
+            body.ttlDays * 86400
+            if body.ttlDays is not None
+            else max(86400, int(old.expires_at - old.created_at))
+        )
+        new_id = client_keys.new_key_id()
+        token, expires = request.app.state.auth_state.trust.signer().mint(
+            typ=tokens.TYP_CLIENT,
+            sub=old.name,
+            aud=[tokens.RECIPIENT_GATEWAY],
+            ttl_seconds=lifetime,
+            now=issued,
+            jti=new_id,
+        )
+        record = store.rotate(
+            key_id,
+            client_keys.ClientKeyRecord(
+                id=new_id,
+                name=old.name,
+                tail=client_keys.tail_of(token),
+                created_at=float(issued),
+                expires_at=float(expires),
+            ),
+            retires_at=float(issued + body.overlapSeconds),
+        )
+    except OSError as exc:
+        raise owner.local_unavailable() from exc
+    except ValueError as exc:
+        raise _problem(409, "Key is off", str(exc)) from exc
+    if record is None:
+        raise _problem(404, "No such key", "This key is not in the registry.")
+    return ClientKeyCreated(key=_to_model(record), token=token)
+
+
 @router.get(
     "/v1/auth/client-keys/policy",
     response_model=ClientKeyPolicy,
@@ -870,12 +999,7 @@ async def client_key_policy(request: Request, response: Response) -> ClientKeyPo
                 authority="standalone",
                 revision=store.revision,
                 generatedAt=time.time(),
-                keys=[
-                    _to_model(r).model_dump(
-                        mode="json", include={"id", "expiresAt", "revokedAt"}, exclude_none=True
-                    )
-                    for r in store.records()
-                ],
+                keys=[_policy_entry(r) for r in store.records()],
             )
         )
     except OSError as exc:

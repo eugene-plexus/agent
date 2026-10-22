@@ -46,6 +46,13 @@ class ClientKeyRecord:
     expires_at: float
     revoked_at: float | None = None
     limits: dict[str, Any] | None = None
+    # Row 24. `lineage` names the bucket the key counts in; a replacement joins
+    # the key it replaced. `last_used_at` is to the minute.
+    last_used_at: float | None = None
+    retires_at: float | None = None
+    replaces: str | None = None
+    replaced_by: str | None = None
+    lineage: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -59,6 +66,15 @@ class ClientKeyRecord:
             out["limits"] = self.limits
         if self.revoked_at is not None:
             out["revokedAt"] = self.revoked_at
+        for name, value in (
+            ("lastUsedAt", self.last_used_at),
+            ("retiresAt", self.retires_at),
+            ("replaces", self.replaces),
+            ("replacedBy", self.replaced_by),
+            ("lineage", self.lineage),
+        ):
+            if value is not None:
+                out[name] = value
         return out
 
     @classmethod
@@ -85,6 +101,17 @@ class ClientKeyRecord:
             revoked is not None and not math.isfinite(revoked)
         ):
             return None
+        stamps: list[float | None] = []
+        for field in ("lastUsedAt", "retiresAt"):
+            try:
+                stamps.append(float(raw[field]) if raw.get(field) is not None else None)
+            except (TypeError, ValueError):
+                return None
+        if any(s is not None and not math.isfinite(s) for s in stamps):
+            return None
+        links = [raw.get(n) for n in ("replaces", "replacedBy", "lineage")]
+        if any(v is not None and (not isinstance(v, str) or not 0 < len(v) <= 128) for v in links):
+            return None
         if not key_id or not name or len(key_id) > 128 or len(name) > 64 or len(tail) > 6:
             return None
         try:
@@ -99,6 +126,11 @@ class ClientKeyRecord:
             expires_at=expires,
             revoked_at=revoked,
             limits=limits,
+            last_used_at=stamps[0],
+            retires_at=stamps[1],
+            replaces=links[0],
+            replaced_by=links[1],
+            lineage=links[2],
         )
 
 
@@ -200,9 +232,65 @@ class ClientKeyStore:
             self._check()
             record = self._records.get(key_id)
             if record is not None:
-                record = replace(record, limits=validate_limits(limits))
-                self._commit({**self._records, key_id: record})
+                clean = validate_limits(limits)
+                record = replace(record, limits=clean)
+                records = {**self._records, key_id: record}
+                # A rotated key's tokens share one allowance, so one policy.
+                for other_id, other in self._records.items():
+                    if (
+                        other_id != key_id
+                        and other.revoked_at is None
+                        and (other.lineage or other_id) == (record.lineage or key_id)
+                    ):
+                        records[other_id] = replace(other, limits=clean)
+                self._commit(records)
             return record
+
+    def rotate(
+        self, old_id: str, new: ClientKeyRecord, *, retires_at: float
+    ) -> ClientKeyRecord | None:
+        """Add `new` as `old_id`'s replacement. None for an unknown key.
+
+        Raises ValueError, naming the cause, for a key that is off or replaced.
+        The replacement takes the old key's name and limits, and joins its
+        allowance bucket.
+        """
+        with self._lock:
+            self._check()
+            old = self._records.get(old_id)
+            if old is None:
+                return None
+            if old.revoked_at is not None:
+                raise ValueError("This key is turned off.")
+            if old.expires_at <= time.time():
+                raise ValueError("This key has expired.")
+            if old.replaced_by is not None:
+                raise ValueError(f"This key is already replaced by ...{old.replaced_by[-6:]}.")
+            new = replace(
+                new,
+                name=old.name,
+                limits=old.limits,
+                replaces=old_id,
+                lineage=old.lineage or old_id,
+                revoked_at=None,
+                last_used_at=None,
+                retires_at=None,
+                replaced_by=None,
+            )
+            self._commit(
+                {
+                    **self._records,
+                    old_id: replace(old, retires_at=retires_at, replaced_by=new.id),
+                    new.id: new,
+                }
+            )
+            return new
+
+    def _minute_after(self, key: ClientKeyRecord | None, action: str) -> float | None:
+        if key is None or action not in ("check", "acquire"):
+            return None
+        minute = float(int(time.time() // 60) * 60)
+        return minute if key.last_used_at is None or key.last_used_at < minute else None
 
     def admit(
         self,
@@ -226,8 +314,15 @@ class ClientKeyStore:
                 now=self._admission_clock.now(self._admission["clock"]),
                 purpose=purpose,
             )
+            used = self._minute_after(key, action)
+            records = self._records
+            if used is not None and key is not None:
+                records = {**records, key_id: replace(key, last_used_at=used)}
             if candidate is not None:
-                self._commit(self._records, admission=candidate)
+                self._commit(records, admission=candidate)
+            elif used is not None:
+                # A check writes the registry at most once a minute for each key.
+                self._commit(records)
             return result
 
     def _commit(
