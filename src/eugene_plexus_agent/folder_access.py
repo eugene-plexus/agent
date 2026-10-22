@@ -97,6 +97,8 @@ def _overlaps(path: PurePath, roots: tuple[str, ...]) -> bool:
 def refusal(facts: Facts) -> str | None:
     """One pure decision, including ancestors that would expose a refused tree."""
     path = _path(facts.path)
+    if facts.path.startswith(("\\\\?\\", "\\\\.\\")):
+        return "not_a_folder"
     if facts.network or facts.path.startswith(("\\\\", "//")):
         return "network"
     if facts.link:
@@ -117,6 +119,7 @@ def refusal(facts: Facts) -> str | None:
             drive + "\\" + name
             for name in (
                 "Windows",
+                "Windows.old",
                 "Program Files",
                 "Program Files (x86)",
                 "ProgramData",
@@ -153,6 +156,11 @@ class Permissions(Protocol):
     def revoke(self, path: str, delta: dict) -> bool: ...
 
 
+def _same_identity(left: list[int], right: list[int]) -> bool:
+    # Phase 2 Linux records included device and mount ids, both transient.
+    return (left[1:4] if len(left) == 5 else left) == (right[1:4] if len(right) == 5 else right)
+
+
 class Access:
     def __init__(
         self,
@@ -177,6 +185,7 @@ class Access:
     def listing(self, app: str) -> list[FolderAccess]:
         with _LOCK:
             rows = self._read()
+            before = json.dumps(rows)
             result = []
             for row in rows.values():
                 if row["app"] != app:
@@ -184,7 +193,7 @@ class Access:
                 if row["state"] == "ready":
                     try:
                         facts, identity = self.permissions.inspect(row["path"])
-                        if facts.link or identity != row["identity"]:
+                        if facts.link or not _same_identity(identity, row["identity"]):
                             row.update(
                                 state="changed_outside",
                                 message=(
@@ -193,13 +202,16 @@ class Access:
                                 ),
                             )
                     except OSError as exc:
-                        row.update(
+                        transient = dict(row)
+                        transient.update(
                             state="changed_outside",
                             message=(
                                 f"The folder cannot be checked: {exc}. "
                                 "Its permissions were left as they are."
                             ),
                         )
+                        result.append(FolderAccess.model_validate(transient))
+                        continue
                 if row["state"] in ("applying", "removing") and row["id"] not in _RUNNING:
                     row.update(
                         state="failed",
@@ -218,7 +230,8 @@ class Access:
                         restartNeeded=False, message=f"Workbench can read and write {row['path']}."
                     )
                 result.append(FolderAccess.model_validate(row))
-            self._write(rows)
+            if json.dumps(rows) != before:
+                self._write(rows)
             return result
 
     def add(
@@ -241,7 +254,10 @@ class Access:
                     and _path(existing["path"]) == _path(facts.path)
                     and existing["state"] != "removed"
                 ):
-                    if existing["identity"] != identity and existing["id"] not in _RUNNING:
+                    if (
+                        not _same_identity(existing["identity"], identity)
+                        and existing["id"] not in _RUNNING
+                    ):
                         existing.update(
                             state="changed_outside",
                             message=(
@@ -286,7 +302,7 @@ class Access:
                 self._write(current)
 
         def save(delta: dict) -> None:
-            if "identity" in delta and delta["identity"] != identity:
+            if "identity" in delta and not _same_identity(delta["identity"], identity):
                 raise ValueError("The folder was replaced before its permission could be changed.")
             row["delta"] = delta
             persist()
@@ -341,7 +357,7 @@ class Access:
             self._write(rows)
         try:
             facts, identity = self.permissions.inspect(row["path"])
-            if facts.link or identity != row["identity"]:
+            if facts.link or (facts.is_dir and not _same_identity(identity, row["identity"])):
                 raise ValueError("The folder was replaced.")
             if row["delta"] is not None and not self.permissions.revoke(row["path"], row["delta"]):
                 raise ValueError("The recorded permissions were changed outside Eugene.")
@@ -366,16 +382,26 @@ class Access:
                     _RUNNING.discard(ident)
         return FolderAccess.model_validate(row)
 
-    def release(self, app: str, path: str) -> list[FolderAccess]:
+    def lookup(self, app: str, path: str) -> list[FolderAccess]:
+        facts, identity = self.permissions.inspect(path)
+        candidate = _path(facts.path)
         with _LOCK:
             matching = [
-                ident
-                for ident, row in self._read().items()
+                FolderAccess.model_validate(row)
+                for row in self._read().values()
                 if row["app"] == app
-                and _path(row["path"]) == _path(path)
                 and row["state"] != "removed"
+                and (
+                    candidate.is_relative_to(_path(row["path"]))
+                    or (identity and _same_identity(identity, row["identity"]))
+                )
             ]
-        return [self.remove(app, ident) for ident in matching]
+        if not matching:
+            raise KeyError("No recorded folder access covers this folder for this app.")
+        return matching
+
+    def release(self, app: str, ident: str) -> list[FolderAccess]:
+        return [self.remove(app, ident)]
 
 
 def windows_roots() -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -415,7 +441,7 @@ class WindowsPermissions:
 
     @contextlib.contextmanager
     def _open(
-        self, path: str, *, change: bool = False, _single: bool = False
+        self, path: str, *, change: bool = False, _single: bool = False, revoke: bool = False
     ) -> Iterator[tuple[int, Facts, list[int]]]:
         if sys.platform != "win32":
             raise OSError("Windows folder permissions need Windows.")
@@ -423,6 +449,8 @@ class WindowsPermissions:
         from ctypes import wintypes as w
 
         value = PureWindowsPath(path)
+        if path.startswith(("\\\\?\\", "\\\\.\\")):
+            raise Refused("not_a_folder", "Device paths are not supported. " + path)
         if path.startswith(("\\\\", "//")):
             raise Refused("network", path)
         if not value.is_absolute() or not re.fullmatch("[A-Za-z]:", value.drive):
@@ -457,21 +485,24 @@ class WindowsPermissions:
             for index, part in enumerate(components):
                 if index or _single:
                     current /= part
-                # MAXIMUM_ALLOWED deliberately suppresses SetSecurityInfo's
-                # automatic propagation. Every child is checked and changed
-                # through its own held handle instead (including hardlinks).
-                access = 0x02000000 if change and index == len(components) - 1 else 0x20080
-                handle = kernel.CreateFileW(str(current), access, 3, None, 3, 0x02200000, None)
+                access = 0x60000 if change and index == len(components) - 1 else 0x20080
+                # Files need no data access and share read, write and delete.
+                # Retained directory handles keep the traversal parents in place.
+                directory = stat.S_ISDIR(os.lstat(current).st_mode)
+                share = 3 if directory else 7
+                handle = kernel.CreateFileW(str(current), access, share, None, 3, 0x02200000, None)
                 if handle == w.HANDLE(-1).value:
-                    raise ctypes.WinError(ctypes.get_last_error())
+                    error = ctypes.WinError(ctypes.get_last_error())
+                    error.filename = str(current)
+                    raise error
                 fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
                 held.append(fd)
                 info = os.fstat(fd)
-                if info.st_file_attributes & 0x400:
+                if info.st_file_attributes & 0x400 and not revoke:
                     raise Refused("link", str(current))
                 if not stat.S_ISDIR(info.st_mode) and not _single:
                     raise Refused("not_a_folder", str(current))
-                if not stat.S_ISDIR(info.st_mode) and info.st_nlink != 1:
+                if not stat.S_ISDIR(info.st_mode) and info.st_nlink != 1 and not revoke:
                     raise Refused("link", f"{current} has more than one hard link.")
             buffer = ctypes.create_unicode_buffer(32768)
             length = kernel.GetFinalPathNameByHandleW(
@@ -486,6 +517,7 @@ class WindowsPermissions:
                 eugene=self.eugene,
                 homes=self.homes,
                 system=self.system,
+                link=bool(info.st_file_attributes & 0x400),
             )
             yield (
                 msvcrt.get_osfhandle(held[-1]),
@@ -497,6 +529,10 @@ class WindowsPermissions:
                 os.close(fd)
 
     def inspect(self, path: str) -> tuple[Facts, list[int]]:
+        # Refuse reserved trees even when they are absent on this machine.
+        lexical = Facts(path, eugene=self.eugene, homes=self.homes, system=self.system)
+        if refusal(lexical):
+            return lexical, []
         try:
             with self._open(path) as (_, facts, identity):
                 return facts, identity
@@ -522,36 +558,65 @@ class WindowsPermissions:
         path: str,
         handle: int,
         identity: list[int],
-        stack: contextlib.ExitStack,
-        reuse: dict[tuple[str, ...], tuple[int, list[int], Any, bool]] | None = None,
-    ) -> tuple[list[tuple[tuple[str, ...], int, list[int], Any, bool]], int]:
-        nodes = []
-        protected = 0
+        *,
+        revoke: bool = False,
+        selected: set[tuple[str, ...]] | None = None,
+    ) -> Iterator[tuple[tuple[str, ...], int, list[int], Any, bool, bool]]:
+        """Yield one live file handle; only traversal directories remain open."""
 
         def walk(
-            current: Path, names: tuple[str, ...], held: int, ident: list[int], directory: bool
-        ) -> None:
-            nonlocal protected
+            current: Path,
+            names: tuple[str, ...],
+            held: int,
+            ident: list[int],
+            directory: bool,
+            link: bool = False,
+        ) -> Iterator[tuple[tuple[str, ...], int, list[int], Any, bool, bool]]:
             descriptor = ws.GetSecurityInfo(held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION)
-            nodes.append((names, held, ident, descriptor.GetSecurityDescriptorDacl(), directory))
-            if names and descriptor.GetSecurityDescriptorControl()[0] & 0x1000:
-                protected += 1
-                return
-            if directory:
+            protected = bool(names and descriptor.GetSecurityDescriptorControl()[0] & 0x1000)
+            yield names, held, ident, descriptor.GetSecurityDescriptorDacl(), directory, protected
+            if directory and not protected and not link:
                 for entry in current.iterdir():
-                    child_names = (*names, entry.name)
-                    previous = reuse.get(child_names) if reuse is not None else None
-                    if previous is not None:
-                        child, child_id, _, is_dir = previous
-                    else:
-                        child, facts, child_id = stack.enter_context(
-                            self._open(str(entry), change=True, _single=True)
-                        )
-                        is_dir = facts.is_dir
-                    walk(entry, child_names, child, child_id, is_dir)
+                    if selected is not None and (*names, entry.name) not in selected:
+                        continue
+                    try:
+                        with self._open(
+                            str(entry), change=not revoke, _single=True, revoke=revoke
+                        ) as (
+                            child,
+                            facts,
+                            child_id,
+                        ):
+                            yield from walk(
+                                entry,
+                                (*names, entry.name),
+                                child,
+                                child_id,
+                                facts.is_dir,
+                                facts.link,
+                            )
+                    except FileNotFoundError:
+                        if not revoke:
+                            raise
 
-        walk(Path(path), (), handle, identity, True)
-        return nodes, protected
+        yield from walk(Path(path), (), handle, identity, True)
+
+    @staticmethod
+    def _set_acl(ws: Any, handle: int, acl: Any) -> None:
+        # The kernel API changes this object only. SetSecurityInfo propagates
+        # to unchecked descendants when opened with READ_CONTROL | WRITE_DAC.
+        descriptor = ws.GetSecurityInfo(handle, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION)
+        control = descriptor.GetSecurityDescriptorControl()[0]
+        descriptor.SetSecurityDescriptorDacl(1, acl, 0)
+        # The kernel consumes AUTO_INHERIT_REQ and sets AUTO_INHERITED. Without
+        # the request it clears that state and turns inherited ACEs explicit.
+        descriptor.SetSecurityDescriptorControl(0x100, 0x100 if control & 0x400 else 0)
+        protection = (
+            ws.PROTECTED_DACL_SECURITY_INFORMATION
+            if control & 0x1000
+            else ws.UNPROTECTED_DACL_SECURITY_INFORMATION
+        )
+        ws.SetKernelObjectSecurity(handle, ws.DACL_SECURITY_INFORMATION | protection, descriptor)
 
     @staticmethod
     def _insert(ws: Any, acl: Any, sid: Any, mask: int, flags: int) -> Any:
@@ -607,21 +672,18 @@ class WindowsPermissions:
         )
         mask = self.WRITE if mode == "write" else self.READ
         sid_text = ws.ConvertSidToStringSid(sid)
-        with (
-            self._open(path, change=True) as (handle, facts, identity),
-            contextlib.ExitStack() as stack,
-        ):
+        with self._open(path, change=True) as (handle, facts, identity):
             if cause := refusal(facts):
                 raise Refused(cause, path)
-            nodes, count = self._tree(ws, path, handle, identity, stack)
-            plans = []
-            for names, held, ident, acl, directory in nodes:
-                descriptor = ws.GetSecurityInfo(
-                    held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION
-                )
-                if names and descriptor.GetSecurityDescriptorControl()[0] & 0x1000:
+            plans: dict[tuple[str, ...], dict[str, Any]] = {}
+            count = 0
+            for names, _, ident, acl, directory, protected in self._tree(
+                ws, path, handle, identity
+            ):
+                if protected:
+                    count += 1
                     continue
-                if acl is None:  # NULL DACL already grants everything
+                if acl is None:
                     continue
                 matching = [
                     acl.GetAce(i)
@@ -641,18 +703,27 @@ class WindowsPermissions:
                 if rights & mask == mask:
                     continue
                 flags = 3 if not names else (19 if directory else 16)
-                plans.append((names, held, ident, flags, self._insert(ws, acl, sid, mask, flags)))
-            delta = dict(added=bool(plans), sid=sid_text, mask=mask, identity=identity, items=[])
-            save(delta)
-            for names, held, ident, flags, acl in plans:
-                item = dict(names=names, identity=ident, flags=flags, applied=False)
-                delta["items"].append(item)
-                save(delta)
-                ws.SetSecurityInfo(
-                    held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION, None, None, acl, None
-                )
+                plans[names] = dict(names=names, identity=ident, flags=flags, applied=False)
+            delta = dict(
+                added=bool(plans),
+                sid=sid_text,
+                mask=mask,
+                identity=identity,
+                items=list(plans.values()),
+            )
+            save(delta)  # One complete write-ahead plan, independent of tree size.
+            selected = {names[:i] for names in plans for i in range(len(names) + 1)}
+            for names, held, ident, acl, _, _ in self._tree(
+                ws, path, handle, identity, selected=selected
+            ):
+                item = plans.get(names)
+                if item is None:
+                    continue
+                if ident != item["identity"]:
+                    raise ValueError(f"The folder item was replaced: {Path(path).joinpath(*names)}")
+                self._set_acl(ws, held, self._insert(ws, acl, sid, mask, item["flags"]))
                 item["applied"] = True
-                save(delta)
+            save(delta)
             return delta, count, False
 
     def revoke(self, path: str, delta: dict) -> bool:
@@ -660,82 +731,69 @@ class WindowsPermissions:
 
         if not delta["added"]:
             return True
-        with (
-            self._open(path, change=True) as (handle, _, identity),
-            contextlib.ExitStack() as stack,
-        ):
-            if identity != delta["identity"]:
-                return False
-            nodes, _ = self._tree(ws, path, handle, identity, stack)
-            current = {
-                names: (held, ident, acl, directory) for names, held, ident, acl, directory in nodes
-            }
-            changes = []
-            owned = set()
-            recorded = {tuple(item["names"]) for item in delta["items"]}
-            for item in delta["items"]:
-                if item.get("removed"):
-                    continue
-                names = tuple(item["names"])
-                found = current.get(names)
-                if found is None or found[1] != item["identity"]:
+        try:
+            context = self._open(path, change=True)
+            with context as (handle, _, identity):
+                if identity != delta["identity"]:
                     return False
-                held, _, acl, _ = found
-                matches = self._matches(ws, acl, delta, item["flags"])
-                if not matches and not item["applied"]:
-                    continue
-                if len(matches) != 1:
-                    return False
-                owned.add(names)
-                acl.DeleteAce(matches[0])
-                changes.append((held, acl, item))
-            # A new object's inherited bit and its held parent establish its
-            # provenance on Windows. Explicit by-hand entries are never removed.
-            for names, held, _, acl, directory in nodes:
-                if not names or names in recorded or names[:-1] not in owned:
-                    continue
-                matches = self._matches(ws, acl, delta, 19 if directory else 16)
-                if len(matches) > 1:
-                    return False
-                if matches:
+                recorded = {tuple(item["names"]): item for item in delta["items"]}
+                owned = set()
+                for names, _held, ident, acl, directory, protected in self._tree(
+                    ws, path, handle, identity, revoke=True
+                ):
+                    item = recorded.get(names)
+                    if item is not None:
+                        if item.get("removed"):
+                            owned.add(names)
+                            continue
+                        if ident != item["identity"]:
+                            # A replacement never inherits the recorded explicit ACE.
+                            continue
+                        flags = item["flags"]
+                    elif names and names[:-1] in owned and not protected:
+                        flags = 19 if directory else 16
+                    else:
+                        continue
+                    matches = self._matches(ws, acl, delta, flags)
+                    if len(matches) > 1:
+                        return False
+                    if matches:
+                        # Files/links were inspected with READ_CONTROL only.
+                        # Request WRITE_DAC only for an exact owned ACE.
+                        with self._open(
+                            str(Path(path).joinpath(*names)), change=True, _single=True, revoke=True
+                        ) as (change, _, current_id):
+                            if current_id != ident:
+                                continue
+                            acl = self._acl(ws, change)
+                            matches = self._matches(ws, acl, delta, flags)
+                            if len(matches) > 1:
+                                return False
+                            if matches:
+                                acl.DeleteAce(matches[0])
+                                self._set_acl(ws, change, acl)
+                    elif item is not None and item.get("applied"):
+                        # It was already removed externally; no owned rights remain.
+                        pass
                     owned.add(names)
-                    acl.DeleteAce(matches[0])
-                    item = dict(
-                        names=names,
-                        identity=current[names][1],
-                        flags=19 if directory else 16,
-                        applied=True,
-                    )
-                    delta["items"].append(item)
-                    changes.append((held, acl, item))
-            for held, acl, item in changes:
-                ws.SetSecurityInfo(
-                    held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION, None, None, acl, None
-                )
-                item["removed"] = True
-            # A file can inherit the old ACE after the inspection and before
-            # its parent's ACE is removed. Record it for a safe GUI retry;
-            # never report that all additions are gone while it remains.
-            known = set(current)
-            try:
-                final_nodes, _ = self._tree(ws, path, handle, identity, stack, reuse=current)
-            except Refused as exc:
-                raise OSError(f"Folder contents changed during removal: {exc}") from exc
-            leftovers = False
-            for names, _, ident, acl, directory in final_nodes:
-                if not names or names in known or names[:-1] not in owned:
-                    continue
-                flags = 19 if directory else 16
-                if self._matches(ws, acl, delta, flags):
-                    delta["items"].append(
-                        dict(names=names, identity=ident, flags=flags, applied=True)
-                    )
-                    leftovers = True
-            if leftovers:
-                raise OSError(
-                    "New files inherited access during removal. "
-                    "Some additions remain; try Remove access again."
-                )
+                    if item is not None:
+                        item["removed"] = True
+                # Detect files created in the narrow interval before a parent's
+                # ACE was removed. A retry uses the same recorded plan.
+                for names, _, _, acl, directory, _ in self._tree(
+                    ws, path, handle, identity, revoke=True
+                ):
+                    if (
+                        names
+                        and names[:-1] in owned
+                        and self._matches(ws, acl, delta, 19 if directory else 16)
+                    ):
+                        raise OSError(
+                            "New files inherited access during removal. "
+                            "Some additions remain; try Remove access again."
+                        )
+                return True
+        except FileNotFoundError:
             return True
 
 
@@ -764,6 +822,7 @@ class LinuxPermissions:
         )
         if any(p.is_symlink() for p in (value, *value.parents)):
             return Facts(path, link=True), []
+        value = value.resolve()
         try:
             info = value.stat()
         except (FileNotFoundError, NotADirectoryError):
@@ -771,25 +830,21 @@ class LinuxPermissions:
         if not stat.S_ISDIR(info.st_mode):
             return Facts(path, is_dir=False), []
         # Metadata must be readable before the requested access is granted.
-        fd = os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.open(value, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             info = os.fstat(fd)
             data = ctypes.create_string_buffer(256)
             libc = ctypes.CDLL(None, use_errno=True)
             if (
-                libc.statx(fd, b"", 0x1000, 0x1800, data)
-                or struct.unpack_from("=I", data)[0] & 0x1800 != 0x1800
+                libc.statx(fd, b"", 0x1000, 0x800, data)
+                or struct.unpack_from("=I", data)[0] & 0x800 != 0x800
             ):
-                raise OSError(
-                    "The filesystem does not expose folder creation time and mount identity."
-                )
+                raise OSError("The kernel or filesystem does not expose folder creation time.")
             seconds, nanos = struct.unpack_from("=qI", data, 80)
             identity = [
-                info.st_dev,
                 info.st_ino,
                 seconds,
                 nanos,
-                struct.unpack_from("=Q", data, 144)[0],
             ]
         finally:
             os.close(fd)
@@ -807,8 +862,9 @@ class LinuxPermissions:
         request = self.ctl / f"{request_id}.req"
         result = self.ctl / f"{request_id}.res"
         write_private(request, f"{verb} {self.app} {mode} {ident}\n")
-        deadline = time.perf_counter() + 900
-        while time.perf_counter() < deadline:
+        # A root helper may still be applying a large plan after 900 seconds.
+        # Only its result can declare success or failure.
+        while True:
             if result.is_file():
                 try:
                     answer: dict = json.loads(result.read_text("utf-8"))
@@ -824,9 +880,6 @@ class LinuxPermissions:
                 result_body: dict = json.loads(answer["output"])
                 return result_body
             time.sleep(0.2)
-        raise TimeoutError(
-            "The installed folder permission helper did not answer within 900 seconds."
-        )
 
     def grant(self, path: str, mode: str, save: Callable[[dict], None]) -> tuple[dict, int, bool]:
         facts, identity = self.inspect(path)

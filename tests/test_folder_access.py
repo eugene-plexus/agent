@@ -114,9 +114,71 @@ def test_replaced_folder_is_not_reported_as_an_old_ready_grant(tmp_path: Path) -
 def test_release_only_own_app(tmp_path: Path) -> None:
     access = service(tmp_path)
     grant = access.add("workbench", "/srv/acme", "read", "operator")
-    assert access.release("other", "/srv/acme") == []
+    with pytest.raises(KeyError):
+        access.release("other", grant.id)
     assert access.listing("workbench")[0].state == "ready"
-    assert access.release("workbench", "/srv/acme")[0].id == grant.id
+    assert access.release("workbench", grant.id)[0].id == grant.id
+
+
+def test_release_unknown_id_never_reports_empty_success(tmp_path: Path) -> None:
+    access = service(tmp_path)
+    access.add("workbench", "/srv/acme", "read", "operator")
+    with pytest.raises(KeyError):
+        access.release("workbench", "unknown")
+
+
+def test_poll_error_is_transient_and_does_not_write_state(tmp_path: Path, monkeypatch) -> None:
+    backend = MemoryPermissions()
+    access = service(tmp_path, backend)
+    access.add("workbench", "/srv/acme", "read", "operator")
+    before = access.file.read_bytes()
+    original = backend.inspect
+
+    def asleep(_):
+        raise OSError("drive asleep")
+
+    monkeypatch.setattr(backend, "inspect", asleep)
+    assert "drive asleep" in access.listing("workbench")[0].message
+    assert access.file.read_bytes() == before
+    monkeypatch.setattr(backend, "inspect", original)
+    assert access.listing("workbench")[0].state == "ready"
+
+
+def test_missing_folder_still_calls_revoke(tmp_path: Path, monkeypatch) -> None:
+    backend = MemoryPermissions()
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "write", "operator")
+    monkeypatch.setattr(backend, "inspect", lambda p: (fa.Facts(p, is_dir=False), []))
+    assert access.remove("workbench", grant.id).state == "removed"
+    assert backend.rights == {"manual"}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux path resolution")
+def test_linux_resolves_parent_traversal_before_refusal(tmp_path: Path) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    facts, _ = backend.inspect("/srv/../etc")
+    assert fa.refusal(facts) == "system"
+
+
+def test_linux_waits_past_900_seconds_for_helper(tmp_path: Path, monkeypatch) -> None:
+    import json
+
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(backend, "inspect", lambda p: (fa.Facts(p), [1, 2, 3]))
+    access = fa.Access(tmp_path / "access.json", backend)
+    ticks = iter([0, 0, 901, 902, 903, 904])
+    monkeypatch.setattr(fa.time, "perf_counter", lambda: next(ticks, 905))
+    polls = []
+
+    def waiting(_):
+        polls.append(access.listing("workbench")[0].state)
+        if len(polls) == 2:
+            req = next(backend.ctl.glob("*.req"))
+            req.with_suffix(".res").write_text(json.dumps({"code": 0, "output": '{"added":true}'}))
+
+    monkeypatch.setattr(fa.time, "sleep", waiting)
+    assert access.add("workbench", "/srv/acme", "read", "operator").state == "ready"
+    assert polls == ["applying", "applying"]
 
 
 def test_applying_is_visible_while_propagation_waits(tmp_path: Path) -> None:
@@ -244,7 +306,7 @@ def test_linux_can_identify_a_folder_before_it_has_read_permission(tmp_path: Pat
         backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
         facts, identity = backend.inspect(str(folder))
         assert facts.is_dir
-        assert len(identity) == 5
+        assert len(identity) == 3
     finally:
         folder.chmod(0o700)
 
@@ -293,7 +355,7 @@ def test_release_authenticates_the_installed_apps_own_key(
 
     client = authed_client
     access = service(tmp_path)
-    access.add("workbench", "/srv/acme", "read", "operator")
+    grant = access.add("workbench", "/srv/acme", "read", "operator")
     minted = client.post("/v1/auth/client-keys", json={"name": "app:workbench@this-node"}).json()
     own_key = minted["token"]
     # Key id comes from the authority's list, never a request's claimed name.
@@ -328,7 +390,19 @@ def test_release_authenticates_the_installed_apps_own_key(
         headers={"Authorization": f"Bearer {own_key}"},
     )
     assert response.status_code == 200, response.text
+    assert response.json()["grants"][0]["state"] == "ready"
+    response = client.post(
+        "/v1/apps/workbench/folder-access/release",
+        json={"id": grant.id},
+        headers={"Authorization": f"Bearer {own_key}"},
+    )
     assert response.json()["grants"][0]["state"] == "removed"
+    response = client.post(
+        "/v1/apps/workbench/folder-access/release",
+        json={"id": "missing"},
+        headers={"Authorization": f"Bearer {own_key}"},
+    )
+    assert response.status_code == 404
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DACLs")

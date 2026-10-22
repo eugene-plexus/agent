@@ -134,7 +134,14 @@ async def release_folder_access(
         )
     try:
         access = _access(request, app)
-        return FolderAccessList(grants=await asyncio.to_thread(access.release, app, body.path))
+        if bool(body.id) == bool(body.path):
+            raise HTTPException(400, detail="Supply exactly one access id or lookup path.")
+        records = await asyncio.to_thread(
+            access.release if body.id else access.lookup, app, body.id or body.path or ""
+        )
+        return FolderAccessList(grants=records)
+    except KeyError as exc:
+        raise HTTPException(404, detail="No recorded folder access matched for this app.") from exc
     except (OSError, ValueError) as exc:
         raise HTTPException(
             500, detail={"detail": str(exc), "title": "Folder release failed"}
