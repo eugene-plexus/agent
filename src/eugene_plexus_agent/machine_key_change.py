@@ -85,9 +85,12 @@ REQUESTED, SCHEDULED = "requested", "scheduled"
 #: itself (part 3b). 0: only on request.
 KEY_DAYS_KEY = "machineKeyChangeDays"
 DEFAULT_KEY_DAYS = 365
-#: A scheduled change that could not start, or that an operator stopped or the
-#: root refused, is tried again after this long, not at every step.
+#: A scheduled change that an operator stopped, or the root refused, starts
+#: again after this long while the key is still past its age.
 SCHEDULE_RETRY = timedelta(days=1)
+#: A scheduled start that could not happen (a root older than row 3, a machine
+#: port not listening yet) is tried again after this long, and said once.
+SCHEDULE_RETRY_REFUSED = timedelta(hours=1)
 
 
 class KeyChangeRefused(Exception):
@@ -414,7 +417,7 @@ class MachineKeyChange:
             if ended is not None and now - ended < SCHEDULE_RETRY:
                 return False
         refused = self._schedule_refused
-        return refused is None or now - refused[0] >= SCHEDULE_RETRY
+        return refused is None or now - refused[0] >= SCHEDULE_RETRY_REFUSED
 
     def _start_scheduled(self) -> None:
         try:
@@ -425,7 +428,7 @@ class MachineKeyChange:
             if exc.detail != said:
                 log.warning(
                     "this machine's key is due a change, and the change cannot start: %s "
-                    "It is tried again in a day.",
+                    "It is tried again every hour.",
                     exc.detail,
                 )
             return

@@ -102,7 +102,7 @@ async def test_zero_days_means_only_on_request(tmp_path: Path, lifetime: dict[st
         assert started["reason"] == "requested"
 
 
-async def test_a_scheduled_start_the_root_refuses_is_tried_again_a_day_later(
+async def test_a_scheduled_start_that_cannot_happen_is_tried_again_an_hour_later(
     tmp_path: Path, lifetime: dict[str, int], caplog: pytest.LogCaptureFixture
 ) -> None:
     async with Node(tmp_path) as node:
@@ -119,8 +119,8 @@ async def test_a_scheduled_start_the_root_refuses_is_tried_again_a_day_later(
         assert "Update the machine that runs the root" in said[0].getMessage()
         node.trust.claims = {**claims, "keyChange": True}  # the root is updated
         await node.change.step()
-        assert node.change.status() is None, "not before a day has passed"
-        _clock(node, 1.01)
+        assert node.change.status() is None, "not before an hour has passed"
+        _clock(node, 1.05 / 24)
         await node.change.step()
         status = node.change.status()
         assert status is not None and status["reason"] == "scheduled"
