@@ -510,3 +510,133 @@ async def test_drafting_is_counted_as_measured(tmp_path: Path) -> None:
         await required(flags={"draftWith": "mtpHead"}, extraArgs=["--spec-type", "ngram-simple"])
         == base
     )
+
+
+# --- prompt caches count against system memory (row 9, PC7) -------------------
+
+
+def _cache_holder(
+    name: str, cache_gib: float, *, status: RuntimeStatus = RuntimeStatus.ready
+) -> RunningRuntime:
+    return RunningRuntime(
+        spec=_spec(f"/models/{name}.gguf", name=name),
+        status=status,
+        prompt_cache_bytes=int(cache_gib * GIB),
+    )
+
+
+@pytest.mark.anyio
+async def test_running_prompt_caches_are_counted_against_system_memory(tmp_path: Path) -> None:
+    """On a host with no card the model lives in system memory, and so do the
+    prompt caches of what already runs. 30 GiB of model beside 40 GiB free is
+    admitted alone and refused beside a 16 GiB cache: llama.cpp's cache fills as
+    conversations arrive, so the whole limit is promised to it, not what it holds today."""
+    model = _model(tmp_path, 25 * GIB)  # 25 GiB of weights, cache and allowance: 30.0 GiB
+    alone = await check_admission(
+        _spec(model, name="new"), snapshot=fake_devices(count=0), library=None, running=[]
+    )
+    assert alone.decision is AdmissionDecision.admit
+    assert alone.requiredBytes == 30 * GIB
+
+    beside = await check_admission(
+        _spec(model, name="new"),
+        snapshot=fake_devices(count=0),
+        library=None,
+        running=[_cache_holder("qwen3-8b", 16)],
+    )
+    assert beside.decision is AdmissionDecision.refuse
+    # It names whose cache holds the memory, and the way out.
+    assert "qwen3-8b" in beside.reason
+    assert "16.0 GiB" in beside.reason
+    assert "prompt cache" in beside.reason.lower()
+    assert "?force=true" in beside.reason
+    assert [b.name for b in beside.blockers] == ["qwen3-8b"]
+
+
+@pytest.mark.anyio
+async def test_only_a_runtime_that_holds_memory_counts_its_cache(tmp_path: Path) -> None:
+    model = _model(tmp_path, 25 * GIB)
+    for status in (RuntimeStatus.stopped, RuntimeStatus.crashed, RuntimeStatus.exited):
+        result = await check_admission(
+            _spec(model, name="new"),
+            snapshot=fake_devices(count=0),
+            library=None,
+            running=[_cache_holder("gone", 16, status=status)],
+        )
+        assert result.decision is AdmissionDecision.admit, status
+    # One that is still copying its file or loading it has been promised its cache too.
+    for status in (RuntimeStatus.copying, RuntimeStatus.starting, RuntimeStatus.loading):
+        result = await check_admission(
+            _spec(model, name="new"),
+            snapshot=fake_devices(count=0),
+            library=None,
+            running=[_cache_holder("coming-up", 16, status=status)],
+        )
+        assert result.decision is AdmissionDecision.refuse, status
+
+
+@pytest.mark.anyio
+async def test_a_runtimes_own_cache_is_not_counted_against_its_restart(tmp_path: Path) -> None:
+    """A restart re-measures a runtime that is already running: its old cache is gone."""
+    model = _model(tmp_path, 25 * GIB)
+    result = await check_admission(
+        _spec(model, name="same"),
+        snapshot=fake_devices(count=0),
+        library=None,
+        running=[_cache_holder("same", 16)],
+    )
+    assert result.decision is AdmissionDecision.admit
+
+
+@pytest.mark.anyio
+async def test_a_model_that_fits_on_the_card_is_not_refused_for_caches(tmp_path: Path) -> None:
+    """The card holds the model; system memory is not what it needs. A cache is
+    only counted where the launch takes system memory."""
+    result = await check_admission(
+        _spec(_model(tmp_path, 2 * GIB), name="new"),
+        snapshot=fake_devices(free=24 * GIB, total=32 * GIB),
+        library=None,
+        running=[_cache_holder("a", 20), _cache_holder("b", 20)],
+    )
+    assert result.decision is AdmissionDecision.admit
+
+
+@pytest.mark.anyio
+async def test_a_spill_into_system_memory_is_measured_after_the_caches(tmp_path: Path) -> None:
+    """30 GiB of model on a 24 GiB card spills about 4 GiB into system memory: there
+    is room for that beside 40 GiB free, and none beside two 20 GiB caches."""
+    spill = _spec(_model(tmp_path, 30 * GIB), name="new", flags={"gpuLayers": 20})
+    free = await check_admission(
+        spill, snapshot=fake_devices(free=24 * GIB, total=32 * GIB), library=None, running=[]
+    )
+    assert free.decision is AdmissionDecision.admit
+    held = await check_admission(
+        spill,
+        snapshot=fake_devices(free=24 * GIB, total=32 * GIB),
+        library=None,
+        running=[_cache_holder("alpha", 20), _cache_holder("beta", 20)],
+    )
+    assert held.decision is AdmissionDecision.refuse
+    assert "alpha" in held.reason and "beta" in held.reason
+    assert "40.0 GiB" in held.reason
+
+
+@pytest.mark.anyio
+async def test_an_admission_reports_the_cache_the_launch_would_keep(tmp_path: Path) -> None:
+    model = _model(tmp_path, 2 * GIB)
+
+    async def cache(**spec: object) -> int | None:
+        result = await check_admission(
+            _spec(model, **spec), snapshot=fake_devices(), library=None, running=[]
+        )
+        return result.promptCacheBytes
+
+    # The default the profile shows, which the command line carries.
+    assert await cache() == 8 * GIB
+    assert await cache(flags={"cacheRam": 24}) == 24 * GIB
+    assert await cache(flags={"cacheRam": 0}) == 0
+    # A typed `--cache-ram` wins, as it does on the command line (MiB).
+    assert await cache(flags={"cacheRam": 24}, extraArgs=["--cache-ram", "2048"]) == 2 * GIB
+    # A search model keeps none, and neither does an engine without one.
+    assert await cache(mode="embedding") is None
+    assert await cache(engine="mlx") is None

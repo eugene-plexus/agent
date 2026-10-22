@@ -434,7 +434,11 @@ async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[A
     snapshot = await asyncio.to_thread(detector)
     # Measured at what the engine will be started with (MR3): a search model's
     # flags, not the model's own context.
+    declared = spec
     spec = await asyncio.to_thread(launch_view, request, spec)
+    # `launch_view` hands back another spec for exactly the models that start as search
+    # models, which keep no prompt cache.
+    searching = spec is not declared
     views = [(other, _compose(other, supervisor)) for other in state.list_runtime_specs()]
     observed = [(other, view.status) for other, view in views]
     running = [
@@ -443,6 +447,9 @@ async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[A
         RunningRuntime(
             spec=other.model_copy(update={"idleUnloadSeconds": view.idleUnloadSeconds}),
             status=view.status,
+            # The prompt cache it was started with (row 9): promised to it, whole, for as
+            # long as it holds memory. A search model reports none.
+            prompt_cache_bytes=(view.promptCache.bytes or 0) if view.promptCache else 0,
         )
         for other, view in views
         if other.name != spec.name
@@ -474,6 +481,8 @@ async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[A
         copy_settings=supervisor.copy_settings() if supervisor is not None else None,
         engine_places=places,
     )
+    if searching and admission.promptCacheBytes is not None:
+        admission = admission.model_copy(update={"promptCacheBytes": None})
     if spec.engine is EngineKind.strata and admission.decision is AdmissionDecision.admit:
         rules = effective_rules_for(request)
 

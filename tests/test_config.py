@@ -43,6 +43,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "allowCustomApps",
         "updateChecks",
         "updateChannel",
+        "reportOllama",
     }
     # Checking is on by default and installs nothing; the channel is a
     # binary choice whose default is releases (Troy, 2026-09-29).

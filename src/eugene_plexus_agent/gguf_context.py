@@ -31,6 +31,26 @@ _UINT32, _INT32, _UINT64, _INT64 = 4, 5, 10, 11
 _MAX_KEYS = 100_000
 
 
+def architecture_of(path: Path) -> str | None:
+    """Architecture for an Ollama report, read only from the GGUF header."""
+    try:
+        with path.open("rb") as stream:
+            if stream.read(4) != MAGIC:
+                return None
+            version, _, count = struct.unpack("<IQQ", stream.read(20))
+            if version not in (2, 3) or count > _MAX_KEYS:
+                return None
+            for _ in range(count):
+                key = _string(stream)
+                kind = struct.unpack("<I", stream.read(4))[0]
+                if key == b"general.architecture" and kind == _STRING:
+                    return _string(stream).decode("utf-8")
+                _skip(stream, kind)
+    except (OSError, ValueError, struct.error):
+        return None
+    return None
+
+
 def _u64(stream: BinaryIO) -> int:
     return int(struct.unpack("<Q", stream.read(8))[0])
 

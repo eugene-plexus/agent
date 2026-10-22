@@ -1,4 +1,4 @@
-"""Speculative decoding for llama.cpp: the profile's settings as a command line (SD1).
+"""Speculative decoding: shared profile settings for llama.cpp (SD1) and vLLM (SD2).
 
 `docs/design/speculative-decoding.md` is the design, with Troy's calls S1-S5.
 Two settings, under the heading "Speculative decoding":
@@ -32,6 +32,7 @@ Three rules keep it from breaking a launch that worked before:
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -211,8 +212,13 @@ def metrics_argv(argv: Sequence[str]) -> list[str]:
 
 
 def in_argv(argv: Sequence[str]) -> tuple[list[str], str | None] | None:
-    """`(types, draft model)` from a command line, or None when it does not
-    speculate. Every `--spec-type` counts, because llama.cpp appends them."""
+    """`(types, draft model)` from either engine's command line, or None.
+
+    The supervisor uses this to decide whether to poll counters. Every llama.cpp
+    `--spec-type` counts, because llama.cpp appends them; vLLM takes one config.
+    """
+    if vllm_by_hand(argv):
+        return vllm_in_argv(argv)
     types: list[str] = []
     draft: str | None = None
     tokens = iter(argv)
@@ -242,6 +248,120 @@ def parse_metrics(text: str) -> tuple[int | None, int | None]:
             except ValueError:
                 continue
     return found.get(DRAFTED_METRIC), found.get(ACCEPTED_METRIC)
+
+
+# vLLM v0.30.0 (the adapter's RECIPE_VERSION), `vllm/config/speculative.py`:
+# SpeculativeMethod, MTPModelTypes, SpeculativeConfig and its model validator.
+# These three methods and keys also appear at the design's v0.32.0.
+VLLM_FLAG = "--speculative-config"
+VLLM_DEFAULT_TOKENS = 3  # Eugene's default, matching SD1; vLLM requires a count.
+VLLM_UNAVAILABLE = (
+    "This vLLM build does not list --speculative-config (or its help could not be read), "
+    "so speculative decoding is off."
+)
+VLLM_MODEL_WINS = (
+    "Reuse repeated text (ngram) is not in effect: vLLM takes one method, "
+    "and Draft with selects the model."
+)
+VLLM_BY_HAND = "Speculative decoding is set by hand in extraArgs."
+
+
+def vllm_by_hand(extra_args: Sequence[str] | None) -> bool:
+    return any(token.partition("=")[0] == VLLM_FLAG for token in extra_args or ())
+
+
+def vllm_plan(
+    flags: Mapping[str, object],
+    *,
+    extra_args: Sequence[str] | None,
+    offered: frozenset[str] | None,
+) -> Plan:
+    """One method, only if this build lists the flag; extraArgs owns its own config."""
+    if vllm_by_hand(extra_args):
+        return Plan()
+    choice = flags.get(DRAFT_WITH_KEY) or "off"
+    if choice not in DRAFT_WITH_CHOICES:
+        raise ValueError(f"draftWith must be off, mtpHead or companion, not {choice!r}")
+    reuse = flags.get(REUSE_TEXT_KEY) is not False
+    if choice == "off" and not reuse:
+        return Plan()
+    if offered is None or VLLM_FLAG not in offered:
+        return Plan(note=VLLM_UNAVAILABLE)
+
+    tokens = flags.get(DRAFT_TOKENS_KEY)
+    if tokens is None:
+        tokens = VLLM_DEFAULT_TOKENS
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 1:
+        raise ValueError("Tokens drafted per step must be a positive integer.")
+    method = {"mtpHead": "mtp", "companion": "draft_model"}.get(str(choice), "ngram")
+    config: dict[str, object] = {"method": method, "num_speculative_tokens": tokens}
+    draft = None
+    if choice == "companion":
+        draft = _str(flags.get(DRAFT_MODEL_KEY))
+        if draft is None:
+            raise ValueError(
+                "Draft with is set to a companion file, but no companion file is chosen."
+            )
+        config["model"] = draft
+    elif method == "ngram":
+        # SpeculativeConfig's validator defaults both to 5 (its field docstring
+        # still says min=1). Pass those values explicitly, including on older builds.
+        config.update(prompt_lookup_min=5, prompt_lookup_max=5)
+    return Plan(
+        argv=(VLLM_FLAG, json.dumps(config)),
+        types=(method,),
+        draft_model=draft,
+        note=VLLM_MODEL_WINS if choice != "off" and reuse else None,
+    )
+
+
+def vllm_in_argv(argv: Sequence[str]) -> tuple[list[str], str | None] | None:
+    """Read the final JSON config, including the inline spelling in extraArgs."""
+    value = ""
+    tokens = iter(argv)
+    for token in tokens:
+        name, equals, inline = token.partition("=")
+        if name == VLLM_FLAG:
+            value = inline if equals else next(tokens, "")
+    try:
+        config = json.loads(value)
+    except ValueError:
+        return None
+    if not isinstance(config, dict):
+        return None
+    method = _str(config.get("method"))
+    model = _str(config.get("model"))
+    if method is None and model:
+        method = "ngram" if model in ("ngram", "[ngram]") else "draft_model"
+    if method is None:
+        return None
+    return [method], model if method not in ("ngram", "suffix") else None
+
+
+# `vllm/v1/spec_decode/metrics.py`, SpecDecodingProm at v0.30.0. Prometheus
+# adds `_total` to the counter names. Each engine has its own labelled sample.
+VLLM_DRAFTED_METRIC = "vllm:spec_decode_num_draft_tokens_total"
+VLLM_ACCEPTED_METRIC = "vllm:spec_decode_num_accepted_tokens_total"
+_VLLM_COUNTER_RE = re.compile(
+    rf"^({VLLM_DRAFTED_METRIC}|{VLLM_ACCEPTED_METRIC})(?:\{{.*\}})?\s+(\S+)",
+    re.MULTILINE,
+)
+
+
+def vllm_parse_metrics(text: str) -> tuple[int | None, int | None]:
+    """Sum token counters over vLLM's engines; missing is unknown, never zero."""
+    found: dict[str, int] = {}
+    for match in _VLLM_COUNTER_RE.finditer(text):
+        name, raw = match.groups()
+        try:
+            number = float(raw)
+            if number < 0:
+                continue
+            value = int(number)
+        except (ValueError, OverflowError):
+            continue
+        found[name] = found.get(name, 0) + value
+    return found.get(VLLM_DRAFTED_METRIC), found.get(VLLM_ACCEPTED_METRIC)
 
 
 def declaration_problem(model_path: str, flags: Mapping[str, object] | None) -> str | None:

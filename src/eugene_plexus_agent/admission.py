@@ -403,6 +403,40 @@ class RunningRuntime:
 
     spec: RuntimeSpec
     status: RuntimeStatus
+    prompt_cache_bytes: int = 0
+    """The prompt cache it keeps in system memory (row 9, PC7): the limit it was started
+    with, from its running view. A cache fills over time, so the whole limit is counted
+    against what a later launch needs from system memory, never what it holds today."""
+
+
+def prompt_cache_claims(
+    spec: RuntimeSpec, running: Sequence[RunningRuntime]
+) -> list[tuple[str, int]]:
+    """`(name, bytes)` of every OTHER runtime that holds memory and keeps a prompt cache.
+
+    **Counted whole** (Troy, LD-C5; `docs/design/rows/row-09.md`): llama.cpp's cache fills as
+    conversations arrive, so its limit is what later launches must leave it. Counting a cache
+    that is not full yet refuses rather than admits, the direction the ledger already
+    accepts (`reservations.py`), and `?force=true` is the override. A runtime's own cache is
+    never counted against its own restart.
+    """
+    return [
+        (other.spec.name, other.prompt_cache_bytes)
+        for other in running
+        if other.spec.name != spec.name
+        and other.status in _HOLDING
+        and other.prompt_cache_bytes > 0
+    ]
+
+
+def own_prompt_cache_bytes(spec: RuntimeSpec) -> int | None:
+    """The prompt cache this launch would keep in system memory, from its adapter: the
+    profile's setting or the default it shows, `extraArgs` last. None for an engine with none."""
+    from .engines import ADAPTERS  # the adapters import the supervisor
+
+    adapter = ADAPTERS.get(spec.engine)
+    view = adapter.prompt_cache_view(spec, []) if adapter is not None else None
+    return view.bytes if view is not None else None
 
 
 # --- pure helpers -----------------------------------------------------------
@@ -1286,6 +1320,7 @@ async def check_admission(
             basis=AdmissionBasis.file_size,
             contextLength=context_length,
             blockers=[],
+            promptCacheBytes=own_prompt_cache_bytes(spec),
             reason=(
                 f"admit on faith: no compute device could be detected on this host, so "
                 f"{spec.modelPath} was not measured against anything."
@@ -1305,6 +1340,9 @@ async def check_admission(
     # the card that is not true.
     placement = place(spec, targets, reservations)
     device = placement.main
+    claims = prompt_cache_claims(spec, running)
+    cache_held = sum(size for _, size in claims)
+    own_cache = own_prompt_cache_bytes(spec)
     free = placement.free
     total = placement.total
     reserved = placement.reserved
@@ -1325,6 +1363,16 @@ async def check_admission(
     unified = device.kind is ComputeDeviceKind.metal or bool(device.sharedMemory)
     spillover_device = device.kind is not ComputeDeviceKind.cpu and not unified
     ram_available = snapshot.ram_available_bytes if spillover_device else 0
+    # The prompt caches of what already runs sit in system memory (row 9, PC7). A launch
+    # that lives in it -- on the processor, or on a device that shares it -- has that much
+    # less; one that spills into it has less to spill into. A launch whole on a card is
+    # not measured against it.
+    system_budget = not spillover_device
+    if cache_held:
+        if system_budget and budget is not None:
+            budget = max(budget - cache_held, 0)
+        if spillover_device and ram_available is not None:
+            ram_available = max(ram_available - cache_held, 0)
     blockers = _blockers(spec, targets, snapshot, running)
     full_offload = wants_full_offload(spec, engine_places=engine_places)
     engine_spills = not full_offload and (spec.flags or {}).get("gpuLayers") is None
@@ -1342,6 +1390,7 @@ async def check_admission(
             device=device,
             devices=list(placement.devices) if placement.spread else None,
             contextLength=context_length,
+            promptCacheBytes=own_cache,
             blockers=blockers,
             location=location,
             reason=(
@@ -1440,6 +1489,16 @@ async def check_admission(
         else "Nothing else of ours holds memory on it."
     )
     ctx_text = f" at {context_length} context" if context_length else ""
+    # Whose prompt cache holds system memory the launch needs: named, with the way out.
+    cache_text = (
+        " The prompt caches of "
+        + ", ".join(f"{name} ({_gib(size)})" for name, size in claims)
+        + f" hold {_gib(cache_held)} of system memory, counted whole because a cache "
+        "fills as conversations arrive. Lower Prompt cache in system memory on "
+        + ("that runtime." if len(claims) == 1 else "those runtimes.")
+        if cache_held and (system_budget or spillover_device)
+        else ""
+    )
     # Slots divide the context they do not multiply the memory --
     # measured, see `per_request_context`. Said here because the runtime
     # will read back the divided number and the contract calls that
@@ -1474,7 +1533,7 @@ async def check_admission(
     # to say why in the same sentence as the numbers.
     reserved_text = (
         f" {_gib(reserved)} of it is reserved for a launch already under way, "
-        f"leaving {_gib(budget)}."
+        f"leaving {_gib(placement.budget)}."
         if reserved
         else ""
     )
@@ -1542,7 +1601,7 @@ async def check_admission(
             f"refuse: {spec.modelPath} needs about {_gib(required)}{ctx_text} ({basis_text}) but "
             f"{where} {has} {_gib(free)} free of {_gib(total)}{between};{reserved_text} "
             f"verdict {fit.value}.{share_text}{fits_up_to} "
-            f"{held}{slot_text} {fix}"
+            f"{held}{slot_text}{cache_text} {fix}"
         )
         warning = "; ".join(warnings) or None
 
@@ -1558,6 +1617,7 @@ async def check_admission(
         devices=list(placement.devices) if placement.spread else None,
         contextLength=context_length,
         maxContextLength=max_context_length,
+        promptCacheBytes=own_cache,
         blockers=blockers,
         location=location,
         reason=reason,

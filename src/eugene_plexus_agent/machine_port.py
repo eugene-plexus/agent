@@ -426,14 +426,22 @@ class _Inner:
         self.sock.close()
 
 
-def server_context(certificate_pem: str, key_pem: str, directory: Path) -> ssl.SSLContext:
+def server_context(
+    certificate_pem: str,
+    key_pem: str,
+    directory: Path,
+    *,
+    context: ssl.SSLContext | None = None,
+) -> ssl.SSLContext:
     """The machine key, as a TLS server. Python loads a chain only from a
     file, so the key and certificate are written owner-only beside
-    `node.yaml`, from it, on every start."""
+    `node.yaml`, from it, on every start. Given `context`, the key is loaded
+    into it in place (`MachinePort.reload`)."""
     path = directory / "machine_tls.pem"
     write_private(path, key_pem.rstrip() + "\n" + certificate_pem.rstrip() + "\n")
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    if context is None:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=str(path), keyfile=str(path))
     return context
 
@@ -449,8 +457,11 @@ class MachinePort:
         bind_host: str,
         port: int,
         pin: str,
+        directory: Path | None = None,
     ) -> None:
         self.status = Status(port=port, pin=pin)
+        self._context = context
+        self._directory = directory
         self._bind_host = bind_host
         self._peers = _Peers()
         self._forward = _Forwarder()
@@ -467,6 +478,20 @@ class MachinePort:
         await self._plain.start()
         if not await self._bind():
             self._binder = asyncio.create_task(self._keep_binding(), name="machine-port-bind")
+
+    def reload(self, certificate_pem: str, key_pem: str, pin: str) -> None:
+        """Present another machine key from the next handshake on, with no
+        restart (row 3). Loaded into the live context: OpenSSL copies the
+        certificate and key into each connection when it is made, so a
+        handshake under way and every open session keep the key they began
+        with, and only new ones get this one. Runs on the event loop, where
+        every connection is made, so no handshake sees a certificate without
+        its key. Raises when the key does not load, and the old one stays."""
+        if self._directory is None:
+            raise ValueError("this machine port was started without a key directory")
+        server_context(certificate_pem, key_pem, self._directory, context=self._context)
+        previous, self.status.pin = self.status.pin, pin
+        log.info("the machine port presents key %s now (it presented %s)", pin, previous)
 
     async def _bind(self) -> bool:
         try:
@@ -725,12 +750,15 @@ def machine_url(app: Any) -> str | None:
 
 
 def announced(app: Any) -> dict[str, str] | None:
-    """`machineUrl` and `tlsPin` for an announcement or an enrolment, or None."""
+    """`machineUrl` and `tlsPin` for an announcement or an enrolment, or None.
+    While the machine key changes, `tlsNextPin` too (row 3)."""
     url = machine_url(app)
     door: MachinePort | None = getattr(app.state, "machine_port", None)
     if url is None or door is None:
         return None
-    return {"machineUrl": url, "tlsPin": door.status.pin}
+    from . import machine_key_change
+
+    return machine_key_change.machine_fields(app.state.node_identity.record, url, door.status.pin)
 
 
 def component_machine_url(app: Any, entry: Any) -> str | None:
@@ -783,6 +811,7 @@ async def start(app: Any) -> MachinePort | None:
         bind_host=bind_host_for(app),
         port=int(settings.machine_port),
         pin=node_identity.machine_pin(record.tls_certificate),
+        directory=directory,
     )
     app.state.machine_port = door
     await door.start()

@@ -31,12 +31,13 @@ from .._generated.models import (
     Os,
     RuntimeCapabilities,
     RuntimeMode,
+    RuntimePromptCache,
     RuntimeSpec,
     RuntimeSpeculation,
     Secondary,
 )
 from ..child_env import child_environment
-from . import gpu_probe, llama_architectures, run_mode, speculation
+from . import gpu_probe, llama_architectures, prompt_cache, run_mode, speculation
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -486,7 +487,11 @@ class LlamaCppAdapter(EngineAdapter):
                 # the cache and the setting: flash_attention_argv (agent#6).
                 argv += flash_attention_argv(flags)
                 continue
-            if field.key == FLASH_ATTENTION_KEY or field.key in speculation.KEYS:
+            if (
+                field.key == FLASH_ATTENTION_KEY
+                or field.key in speculation.KEYS
+                or field.key in prompt_cache.KEYS
+            ):
                 continue
             if field.key not in flags:
                 continue
@@ -505,6 +510,22 @@ class LlamaCppAdapter(EngineAdapter):
         argv += _load_mode_argv(flags, binary.path)
 
         argv += launch.argv()
+
+        # The prompt cache (row 9, PC7): all three numbers, always, so the profile's
+        # settings are the ones in effect. A search model keeps none; a flag this build
+        # does not list is left out, and the running view says so.
+        if not launch.search:
+            cache_tokens, left_out = prompt_cache.argv(
+                flags, env=spec.env, offered=_supported_long_flags(binary.path)
+            )
+            argv += cache_tokens
+            if left_out:
+                log.warning(
+                    "%s: this llama.cpp build does not list %s, so the profile's setting for "
+                    "it is not passed",
+                    spec.name,
+                    ", ".join(left_out),
+                )
 
         # Speculative decoding (SD1): "Reuse repeated text" on unless the
         # profile turns it off, and "Draft with" as chosen, both only as far
@@ -530,6 +551,10 @@ class LlamaCppAdapter(EngineAdapter):
 
     def declaration_problem(self, spec: RuntimeSpec) -> str | None:
         return speculation.declaration_problem(spec.modelPath, spec.flags)
+
+    def prompt_cache_view(self, spec: RuntimeSpec, argv: list[str]) -> RuntimePromptCache | None:
+        """The RAM prompt cache this runtime was started with, from its command line (PC7)."""
+        return prompt_cache.llama_view(spec, argv)
 
     def companion_files(self, spec: RuntimeSpec) -> tuple[str, ...]:
         found = speculation.companion(spec.flags)
@@ -937,6 +962,11 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     # is the other half, set from the same flag (`companion_overrides`).
     SLOT_PINNING_KEY: "--no-cache-idle-slots",
     "memoryMargin": "--fit-target",
+    # PC7: always passed, so the profile's numbers are the ones in effect. Written by
+    # `prompt_cache.argv`, which turns GiB into MiB and leaves out what the build lacks.
+    prompt_cache.RAM_KEY: prompt_cache.RAM_FLAG,
+    prompt_cache.REUSE_KEY: prompt_cache.REUSE_FLAG,
+    prompt_cache.CHECKPOINTS_KEY: prompt_cache.CHECKPOINTS_FLAG,
 }
 
 # The cache precision is one choice written as two CLI flags, because the
@@ -1222,6 +1252,56 @@ _FLAG_FIELDS: list[ConfigField] = [
         minimum=0,
         maximum=65536,
         unsetMeans="1024 MiB on each card, llama.cpp's own default.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=prompt_cache.RAM_KEY,
+        label="Prompt cache in system memory",
+        description=(
+            "Keeps recent conversations in system memory, so their next turn is not read "
+            "again.\n\n"
+            "The size is in GiB; 0 turns the cache off. It fills as conversations arrive and "
+            "drops the oldest when it is full. A larger one keeps more conversations warm "
+            "and uses that much more system memory: Eugene counts the whole size against "
+            "the memory a second model needs, for as long as this runtime runs. The running "
+            "model shows the size it was started with."
+        ),
+        category="memory",
+        valueType=ConfigValueType.number,
+        minimum=0,
+        default=prompt_cache.DEFAULT_RAM_GIB,
+        unsetMeans="Not set: 8 GiB, llama.cpp's own default, which Eugene passes.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=prompt_cache.REUSE_KEY,
+        label="Reuse moved text",
+        description=(
+            "Reuses repeated text found at a new place in the prompt.\n\n"
+            "Pieces of at least this many tokens are reused. 0 is off. Some models cannot "
+            "use it: llama.cpp says so in its log and turns it off."
+        ),
+        category="memory",
+        valueType=ConfigValueType.integer,
+        minimum=0,
+        default=prompt_cache.DEFAULT_REUSE_TOKENS,
+        unsetMeans="Not set: 0, off, llama.cpp's own default, which Eugene passes.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=prompt_cache.CHECKPOINTS_KEY,
+        label="Checkpoints per slot",
+        description=(
+            "How many points in each conversation a hybrid or sliding-window model can "
+            "return to. Each one uses memory."
+        ),
+        category="memory",
+        valueType=ConfigValueType.integer,
+        minimum=0,
+        default=prompt_cache.DEFAULT_CHECKPOINTS,
+        unsetMeans=(
+            "Not set: 32, the default of the llama.cpp build Eugene installs, which Eugene passes."
+        ),
         requiresRestart=True,
     ),
     ConfigField(
