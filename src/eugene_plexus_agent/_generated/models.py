@@ -4068,16 +4068,22 @@ class FolderAccessRequest(BaseModel):
 
 class FolderAccessReleaseRequest(BaseModel):
     """
-    A folder the authenticated app no longer uses; never an instruction to add access.
+    Send path to look up covering records, or id to release one record. Exactly one is required. Never adds access.
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    path: str = Field(
-        ...,
-        description="Match this path to this app's own recorded folder access on this node.",
+    path: str | None = Field(
+        None,
+        description="Look up this app's covering access records without changing permissions.",
         max_length=4096,
+        min_length=1,
+    )
+    id: str | None = Field(
+        None,
+        description="Release this app's access record by its stable id.",
+        max_length=128,
         min_length=1,
     )
 
