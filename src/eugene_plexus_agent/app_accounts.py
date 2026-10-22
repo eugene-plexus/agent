@@ -243,6 +243,9 @@ _PASSED = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy",
 
 def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
     env = {k: v for k, v in plan.env.items() if k.startswith("EUGENE_PLEXUS_APP_") or k in _PASSED}
+    # A fixed local transport for app-only release calls; never inferred from
+    # the control root's gateway or a browser's address.
+    env["EUGENE_PLEXUS_APP_AGENT_URL"] = ingress.removesuffix("/v1/logs")
     # The secrets never go in a file the account can read beside its
     # spec: on Windows they are files in its own data directory, on Linux
     # systemd hands them over as credentials.
