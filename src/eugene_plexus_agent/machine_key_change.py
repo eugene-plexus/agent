@@ -223,11 +223,13 @@ class MachineKeyChange:
 
     def schedule(self) -> dict[str, Any]:
         """`MachinePort.keyMadeAt` and `keyChangeDueAt` (part 3b)."""
-        record = self.w.store.record
-        made = machine_key_made_at(record.tls_certificate) if record.tls_certificate else None
-        days = _days(self.w.lifetime_days())
-        due = made + timedelta(days=days) if made is not None and days > 0 else None
-        return {"keyMadeAt": made, "keyChangeDueAt": due}
+        certificate = self.w.store.record.tls_certificate
+        if not certificate:
+            return {"keyMadeAt": None, "keyChangeDueAt": None}
+        return {
+            "keyMadeAt": machine_key_made_at(certificate),
+            "keyChangeDueAt": change_due_at(certificate, _days(self.w.lifetime_days())),
+        }
 
     # ---- the root's door file ------------------------------------------------
 
@@ -679,6 +681,22 @@ class MachineKeyChange:
             self.write_door()
 
 
+def change_due_at(certificate_pem: str, days: int) -> datetime | None:
+    """When a key changes by itself: `days` after it was made, plus a spread
+    of up to a twelfth of them (about a month a year), drawn from the key's
+    pin. The same key keeps its day across restarts; keys made on one day,
+    the machines of one install that joined together, fall due on different
+    days (Troy's call R3-SCHEDULE-2). None for 0 days: only on request."""
+    import hashlib
+
+    if days <= 0:
+        return None
+    made = machine_key_made_at(certificate_pem)
+    pin = machine_pin(certificate_pem)
+    fraction = int.from_bytes(hashlib.sha256(pin.encode("ascii")).digest()[:8], "big") / 2**64
+    return made + timedelta(days=days) + timedelta(days=days / 12) * fraction
+
+
 def _days(value: Any) -> int:
     """`machineKeyChangeDays` as a count of days; anything else is the default."""
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -760,6 +778,7 @@ __all__ = [
     "MachineKeyChange",
     "Wiring",
     "announced_next_pin",
+    "change_due_at",
     "door_pins",
     "from_app",
     "machine_fields",

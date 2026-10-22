@@ -181,9 +181,9 @@ def test_get_node_says_when_the_key_was_made_and_when_it_changes(
         app.state.machine_port = None
         app.state.machine_key_change = None
     assert datetime.datetime.fromisoformat(machine["keyMadeAt"]) == made
-    assert datetime.datetime.fromisoformat(machine["keyChangeDueAt"]) == made + datetime.timedelta(
-        days=30
-    )
+    due = datetime.datetime.fromisoformat(machine["keyChangeDueAt"])
+    # 30 days, plus this key's spread: up to a twelfth of them.
+    assert made + datetime.timedelta(days=30) <= due < made + datetime.timedelta(days=32.5)
 
 
 def test_the_setting_is_in_the_agent_s_config(authed_client: Any) -> None:
@@ -194,3 +194,24 @@ def test_the_setting_is_in_the_agent_s_config(authed_client: Any) -> None:
     changed = authed_client.patch("/v1/config", json={machine_key_change.KEY_DAYS_KEY: 30})
     assert changed.status_code == 200, changed.text
     assert authed_client.get("/v1/config").json()[machine_key_change.KEY_DAYS_KEY] == 30
+
+
+def test_the_machines_of_one_install_do_not_change_on_the_same_day() -> None:
+    """Troy's call: a yearly timer per machine, spread by a random offset.
+    Keys made the same day are due on different days, each within a month
+    after its year, and one key's day does not move."""
+    from eugene_plexus_agent.machine_key_change import change_due_at
+
+    made = datetime.datetime(2026, 3, 1, tzinfo=UTC)
+    dues = set()
+    for _ in range(12):
+        key, _cert = node_identity.generate_machine_key()
+        certificate = node_identity.machine_certificate(key, made=made)
+        due = change_due_at(certificate, 365)
+        assert due is not None
+        assert made + datetime.timedelta(days=365) <= due
+        assert due < made + datetime.timedelta(days=365 + 365 / 12)
+        assert change_due_at(certificate, 365) == due, "the same key keeps its day"
+        dues.add(due.date())
+    assert len(dues) >= 8, f"twelve keys made one day fall due on {len(dues)} days"
+    assert change_due_at(certificate, 0) is None

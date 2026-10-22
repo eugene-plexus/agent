@@ -4573,7 +4573,7 @@ class MachinePort(BaseModel):
     )
     keyChangeDueAt: AwareDatetime | None = Field(
         None,
-        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default).\nA key past it is changed at the next check, within a minute.\n`null` when the field is 0 (only on request).\n',
+        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default),\nplus a spread of up to a twelfth of it (about a month a year),\ndrawn from the key itself: the same for one key, different for\neach, so the machines of one install do not change on the same\nday. A key past it is changed at the next check, within a\nminute. `null` when the field is 0 (only on request).\n',
     )
 
 
