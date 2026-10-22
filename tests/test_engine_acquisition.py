@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import tarfile
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -628,6 +630,122 @@ async def test_install_verifies_extracts_and_records(
     assert (current.directory / "cudart64_13.dll").is_file()
     # The archives themselves are removed; they are hundreds of megabytes.
     assert not list(current.directory.glob("*.zip"))
+
+
+def _tar_gz_bytes(files: dict[str, bytes], links: dict[str, str]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tf:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+        for name, target in links.items():
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.SYMTYPE
+            info.linkname = target
+            tf.addfile(info)
+    return buffer.getvalue()
+
+
+async def test_install_records_each_files_sha256_and_each_links_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**The build's own record of what it unpacked** (row 8 re-review,
+    R8-ENGINES-COPY): every file's SHA-256 and every link's target, taken
+    when the verified archive is unpacked, so a copy of the build can be
+    checked file by file later -- the move to a Mac's daemon does."""
+    payloads = {
+        "llama-b7-bin-macos-arm64.tar.gz": _tar_gz_bytes(
+            {"llama-server": b"server", "libggml.0.dylib": b"lib", "sub/libmtl.dylib": b"metal"},
+            {"libggml.dylib": "libggml.0.dylib"},
+        )
+    }
+    _, store = await _run_install(tmp_path, monkeypatch, payloads, version="b7")
+    current = store.current()
+    assert current is not None
+    meta = json.loads((current.directory / "install.json").read_text(encoding="utf-8"))
+    files = {
+        p.relative_to(current.directory).as_posix(): "sha256:"
+        + hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in current.directory.rglob("*")
+        if p.is_file() and not p.is_symlink() and p.name != "install.json"
+    }
+    links = {
+        p.relative_to(current.directory).as_posix(): str(Path(os.readlink(p)).as_posix())
+        for p in current.directory.rglob("*")
+        if p.is_symlink()
+    }
+    assert {"llama-server", "libggml.0.dylib", "sub/libmtl.dylib"} <= set(files)
+    assert meta["files"] == files
+    assert meta["links"] == links
+    if os.name != "nt":  # Windows unpacks a link as a copy unless it may make links
+        assert links == {"libggml.dylib": "libggml.0.dylib"}
+
+
+async def test_a_listed_build_is_fetched_again_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A build the move to the daemon could not check against its record
+    was removed and listed in `<engine root>/refetch.json`; the agent
+    fetches that version again from upstream, verified as any install is,
+    and the list goes once it is installed (row 8, R8-ENGINES-COPY)."""
+    from eugene_plexus_agent import runtimes
+
+    root = tmp_path / "engines"
+    root.mkdir()
+    (root / "refetch.json").write_text(
+        json.dumps(
+            {"builds": [{"engine": "llama_cpp", "version": "b9", "variant": "macos-arm64"}]}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EUGENE_PLEXUS_AGENT_ENGINE_ROOT", str(root))
+    monkeypatch.setattr(runtimes, "_INSTALLERS", {})
+    payloads = {"llama-b9-bin-macos-arm64.zip": _zip_bytes({"llama-server": b"fresh"})}
+    _FakeDownloads(payloads).install(monkeypatch)
+    asked: list[tuple[str | None, str | None]] = []
+
+    def plan_for(
+        kind: EngineKind,
+        *,
+        version: str | None = None,
+        variant: str | None = None,
+        host: object = None,
+    ) -> acq.AcquisitionPlan:
+        asked.append((version, variant))
+        return acq.AcquisitionPlan(
+            version=version or "b10",
+            variant=variant or "macos-arm64",
+            assets=tuple(_asset_for(n, d) for n, d in payloads.items()),
+            binary_name="llama-server",
+        )
+
+    monkeypatch.setattr(runtimes, "plan_for", plan_for)
+    installed = await runtimes.refetch_listed_builds()
+    assert asked == [("b9", "macos-arm64")]
+    assert installed == ["llama_cpp b9"]
+    current = ManagedStore(root, EngineKind.llama_cpp).current()
+    assert current is not None and current.version == "b9"
+    assert current.binary.read_bytes() == b"fresh"
+    assert not (root / "refetch.json").exists()
+
+
+async def test_a_listed_build_that_cannot_be_fetched_stays_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from eugene_plexus_agent import runtimes
+
+    root = tmp_path / "engines"
+    root.mkdir()
+    listed = {"builds": [{"engine": "llama_cpp", "version": "b9", "variant": "macos-arm64"}]}
+    (root / "refetch.json").write_text(json.dumps(listed), encoding="utf-8")
+    monkeypatch.setenv("EUGENE_PLEXUS_AGENT_ENGINE_ROOT", str(root))
+    monkeypatch.setattr(runtimes, "_INSTALLERS", {})
+    monkeypatch.setattr(
+        runtimes, "plan_for", lambda kind, **_: Unavailable(reason="GitHub cannot be reached")
+    )
+    assert await runtimes.refetch_listed_builds() == []
+    assert json.loads((root / "refetch.json").read_text(encoding="utf-8")) == listed
 
 
 async def test_install_refuses_a_bad_digest(

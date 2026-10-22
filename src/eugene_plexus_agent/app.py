@@ -605,6 +605,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.safe_mode
         else asyncio.create_task(RunWorker(app).run_forever(), name="run-operations")
     )
+    # Engine builds a move to the Mac's daemon could not check against
+    # their record, fetched again from upstream (row 8, R8-ENGINES-COPY).
+    from .runtimes import refetch_listed_builds
+
+    refetch_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(refetch_listed_builds(), name="engine-refetch")
+    )
     from .site_host import SiteHostSupervisor
 
     # A job site on this machine is its own enrollment (J19, J23): the agent
@@ -659,7 +668,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         all_updates = getattr(app.state, "update_all", None)
         if all_updates is not None:
             await all_updates.close()
-        for task in (approval_task, sign_in_task, firewall_task, history_task, ollama_task):
+        for task in (
+            approval_task,
+            sign_in_task,
+            firewall_task,
+            history_task,
+            ollama_task,
+            refetch_task,
+        ):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)

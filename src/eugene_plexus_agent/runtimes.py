@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import shutil
 import time
@@ -43,6 +44,7 @@ from ._generated.models import (
     RuntimeSpec,
     RuntimeSpeculation,
     RuntimeStatus,
+    State,
     StopReason,
 )
 from .child_env import child_environment, reserved_override
@@ -1248,6 +1250,79 @@ async def close_installers() -> None:
     for installer in list(_INSTALLERS.values()):
         await installer.aclose()
     _INSTALLERS.clear()
+
+
+#: Builds to fetch again, beside the managed builds (row 8, R8-ENGINES-COPY).
+#: The move of a Mac's per-user install to its daemon copies the person's
+#: engine builds, keeps one only when every file matches the record made
+#: when it was downloaded, and removes and lists the rest here.
+REFETCH_NAME = "refetch.json"
+
+
+async def refetch_listed_builds() -> list[str]:
+    """Fetch again each build listed in `<engine root>/refetch.json`.
+
+    The same install as the console's: the release's own archives,
+    verified against upstream's digests. A version upstream no longer has
+    for this host is replaced by the newest that it does. An entry whose
+    fetch fails stays listed, and the next start tries again; the list goes
+    once nothing is left in it. Returns what was installed."""
+    from .engines.acquisition import engine_root
+
+    marker = engine_root() / REFETCH_NAME
+    if marker.is_symlink() or not marker.is_file():
+        return []
+    try:
+        listed = json.loads(marker.read_text(encoding="utf-8")).get("builds") or []
+    except (OSError, ValueError, AttributeError) as e:
+        log.warning("could not read %s, so no engine build was fetched again: %s", marker, e)
+        return []
+    installed: list[str] = []
+    remaining: list[dict[str, Any]] = []
+    for entry in listed:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            kind = EngineKind(str(entry.get("engine")))
+        except ValueError:
+            continue
+        installer = installer_for(kind)
+        if installer is None:
+            continue
+        version = str(entry["version"]) if entry.get("version") else None
+        variant = str(entry["variant"]) if entry.get("variant") else None
+        plan = await asyncio.to_thread(plan_for, kind, version=version, variant=variant)
+        if isinstance(plan, Unavailable) and version is not None:
+            plan = await asyncio.to_thread(plan_for, kind)
+        if isinstance(plan, Unavailable):
+            log.warning("%s %s was not fetched again: %s", kind.value, version or "", plan.reason)
+            remaining.append(entry)
+            continue
+        try:
+            installer.start(plan)
+        except AcquisitionError as e:
+            log.warning("%s %s was not fetched again: %s", kind.value, plan.version, e)
+            remaining.append(entry)
+            continue
+        done = await installer.wait()
+        if done is not None and done.state is State.done:
+            log.info(
+                "fetched %s %s again (a move could not check its copy)", kind.value, plan.version
+            )
+            installed.append(f"{kind.value} {plan.version}")
+        else:
+            log.warning(
+                "%s %s was not fetched again: %s",
+                kind.value,
+                plan.version,
+                (done.error if done is not None else None) or "the install did not finish",
+            )
+            remaining.append(entry)
+    if remaining:
+        marker.write_text(json.dumps({"builds": remaining}, indent=2), encoding="utf-8")
+    else:
+        marker.unlink(missing_ok=True)
+    return installed
 
 
 def _manual_reason(adapter: EngineAdapter, manual: ManualInstall | None) -> str:
