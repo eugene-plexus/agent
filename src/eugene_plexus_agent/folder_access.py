@@ -382,6 +382,12 @@ class Access:
             with _LOCK:
                 try:
                     current = self._read()
+                    reapplied = set((row["delta"] or {}).get("reapplied", []))
+                    for other in current.values():
+                        delta = other.get("delta")
+                        if other["app"] == app and delta and delta.get("id") in reapplied:
+                            other["preexisting"] = False
+                            delta["added"] = True
                     current[ident] = row
                     self._write(current)
                 finally:
@@ -912,6 +918,7 @@ class LinuxPermissions:
 
     def revoke(self, path: str, delta: dict) -> bool:
         result = self._ask("folder-revoke", delta["id"])
+        delta["reapplied"] = result.get("reapplied", [])
         if not result["removed"] and result.get("message"):
             raise RemovalIncomplete(
                 f"Some items were not changed: {str(result['message']).rstrip('.')}. "

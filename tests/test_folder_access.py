@@ -210,6 +210,42 @@ def test_linux_partial_revoke_is_failed_and_retryable(
     assert access.remove("workbench", grant.id).state == "removed"
 
 
+@pytest.mark.parametrize("removed", [False, True])
+def test_linux_revoke_updates_preexisting_parent_after_reapply(
+    tmp_path: Path, monkeypatch, removed: bool
+) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(backend, "inspect", lambda p: (fa.Facts(p), [1, 2, 3]))
+    record_ids = {}
+
+    def helper(verb, ident, *args):
+        if verb == "folder-grant":
+            path = (backend.ctl / f"{ident}.path").read_text("utf-8")
+            record_ids[path] = ident
+            return {"added": path == "/srv/acme/sub"}
+        return {
+            "removed": removed,
+            "message": "" if removed else "socket: A special file is inside this folder.",
+            "reapplied": [record_ids["/srv/acme"]],
+        }
+
+    monkeypatch.setattr(backend, "_ask", helper)
+    access = fa.Access(tmp_path / "access.json", backend)
+    parent = access.add("workbench", "/srv/acme", "read", "operator")
+    untouched = access.add("workbench", "/srv/other", "read", "operator")
+    child = access.add("workbench", "/srv/acme/sub", "write", "operator")
+    assert parent.preexisting
+    assert untouched.preexisting
+    assert not child.preexisting
+    assert record_ids[parent.path] != parent.id
+    assert access.remove("workbench", child.id).state == ("removed" if removed else "failed")
+    refreshed = fa.Access(access.file, backend)
+    rows = {row.id: row for row in refreshed.listing("workbench")}
+    assert rows[parent.id].preexisting is False
+    assert refreshed._read()[parent.id]["delta"]["added"] is True
+    assert rows[untouched.id].preexisting is True
+
+
 def test_applying_is_visible_while_propagation_waits(tmp_path: Path) -> None:
     backend = MemoryPermissions()
     started, finish = threading.Event(), threading.Event()
