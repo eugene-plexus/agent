@@ -146,6 +146,10 @@ class Refused(ValueError):
         super().__init__(f"{MESSAGES[cause]} {detail}".strip())
 
 
+class RemovalIncomplete(OSError):
+    """Removal changed some permissions and named the items it could not change."""
+
+
 class Permissions(Protocol):
     account: str
 
@@ -366,6 +370,8 @@ class Access:
                 restartNeeded=False,
                 message="Eugene's additions were removed. Preexisting permissions stay.",
             )
+        except RemovalIncomplete as exc:
+            row.update(state="failed", message=str(exc))
         except ValueError as exc:
             row.update(
                 state="changed_outside", message=f"{exc} Its permissions were left as they are."
@@ -907,5 +913,8 @@ class LinuxPermissions:
     def revoke(self, path: str, delta: dict) -> bool:
         result = self._ask("folder-revoke", delta["id"])
         if not result["removed"] and result.get("message"):
-            raise ValueError(result["message"])
+            raise RemovalIncomplete(
+                f"Some items were not changed: {str(result['message']).rstrip('.')}. "
+                "Try Remove access again."
+            )
         return bool(result["removed"])

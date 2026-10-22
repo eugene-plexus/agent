@@ -181,6 +181,35 @@ def test_linux_waits_past_900_seconds_for_helper(tmp_path: Path, monkeypatch) ->
     assert polls == ["applying", "applying"]
 
 
+@pytest.mark.parametrize(
+    "causes",
+    [
+        "mount: A mounted descendant is not supported.",
+        "socket: A special file is inside this folder.; outside: A file has more than one hard link.",
+    ],
+)
+def test_linux_partial_revoke_is_failed_and_retryable(
+    tmp_path: Path, monkeypatch, causes: str
+) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(backend, "inspect", lambda p: (fa.Facts(p), [1, 2, 3]))
+    outcomes = iter([{"removed": False, "message": causes}, {"removed": True}])
+
+    def helper(verb, *args):
+        return {"added": True} if verb == "folder-grant" else next(outcomes)
+
+    monkeypatch.setattr(backend, "_ask", helper)
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "read", "operator")
+    removed = access.remove("workbench", grant.id)
+    assert removed.state == "failed"
+    assert removed.message == (
+        f"Some items were not changed: {causes.rstrip('.')}. Try Remove access again."
+    )
+    assert fa.Access(access.file, backend).listing("workbench")[0] == removed
+    assert access.remove("workbench", grant.id).state == "removed"
+
+
 def test_applying_is_visible_while_propagation_waits(tmp_path: Path) -> None:
     backend = MemoryPermissions()
     started, finish = threading.Event(), threading.Event()
