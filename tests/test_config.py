@@ -26,6 +26,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "allowUnrestrictedEngineLaunch",
         "advertiseUrl",
         "machineUrl",
+        "machineKeyChangeDays",
         "clientCertificateFile",
         "clientKeyFile",
         "allowedHosts",

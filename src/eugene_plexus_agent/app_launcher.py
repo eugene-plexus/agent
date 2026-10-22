@@ -53,6 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
+from datetime import UTC, datetime
 from http.client import HTTPException, HTTPMessage
 from pathlib import Path
 from typing import IO, Any
@@ -157,6 +158,8 @@ PLACEHOLDERS = frozenset(
         "appSecret",
         "embeddingModel",
         "rerankModel",
+        "imageModel",
+        "imageModelSet",
     }
 )
 #: Read by `render_start` from files, never carried in a spec: a value for
@@ -167,9 +170,13 @@ SECRET_PLACEHOLDERS = frozenset({"clientKey", "oidcClientSecret", "appSecret"})
 #: model (it embeds) and its result sorter (it reranks). Never carried in a
 #: spec either: the model that was running when the agent wrote one may not
 #: be when the app starts.
-MODEL_SURFACES = {"embeddingModel": "embeddings", "rerankModel": "rerank"}
+MODEL_SURFACES = {"embeddingModel": "embeddings", "rerankModel": "rerank", "imageModel": "image"}
 #: What a person calls each, in the notes.
-_MODEL_WORDS = {"embeddingModel": "search model", "rerankModel": "result sorter"}
+_MODEL_WORDS = {
+    "embeddingModel": "search model",
+    "rerankModel": "result sorter",
+    "imageModel": "image model",
+}
 #: In all, how long a start waits for the gateway's list of models: the name
 #: lookup, the connection, the tries and the answer together. A start does not
 #: wait longer than this for a convenience.
@@ -539,6 +546,11 @@ def local_model(models: list[dict[str, Any]], surface: str) -> tuple[str | None,
 def _unset_model(name: str, outside: list[str]) -> str:
     """Why a model placeholder has no value, when the gateway answered."""
     word = _MODEL_WORDS[name]
+    if name == "imageModel":
+        return (
+            "{imageModel} has no value at this start: the gateway lists no eligible "
+            "image model for this app's key. Images are off."
+        )
     head = f"{{{name}}} has no value at this start: no local {word} is running"
     if not outside:
         return f"{head} (the gateway lists none for this app's key)."
@@ -575,6 +587,25 @@ def _stopped_model(name: str, model: str) -> str:
         f"given the install's {word} rather than its own default: start {model} in Eugene's "
         "console, under Backends, for it to work."
     )
+
+
+def image_model(models: list[dict[str, Any]]) -> tuple[str | None, bool]:
+    """Images may use an external model; local models always come first."""
+    local, running, _ = local_model(models, "image")
+    if local:
+        return local, running
+    external = [
+        m
+        for m in models
+        if isinstance(m.get("x_eugene_plexus"), dict)
+        and m["x_eugene_plexus"].get("locality") == "external"
+    ]
+    # Reuse the same id, surface and readiness validation as local models.
+    external = [
+        {**m, "x_eugene_plexus": {**m["x_eugene_plexus"], "locality": "local"}} for m in external
+    ]
+    chosen, running, _ = local_model(external, "image")
+    return chosen, running
 
 
 def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, str], list[str]]:
@@ -614,7 +645,7 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
         str(k): str(v)
         for k, v in (spec.get("values") or {}).items()
         if v is not None and k in PLACEHOLDERS and k not in SECRET_PLACEHOLDERS
-        if k not in MODEL_SURFACES
+        if k not in MODEL_SURFACES and k != "imageModelSet"
     }
     if data:
         values["dataDir"] = data
@@ -625,6 +656,8 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
     if "gatewayUrl" in wanted and not values.get("gatewayUrl"):
         raise GatewayUnknown(_no_gateway(spec.get("gatewayDetail")))
     models = [name for name in MODEL_SURFACES if name in wanted]
+    if "imageModelSet" in wanted and "imageModel" not in models:
+        models.append("imageModel")
 
     key = _secret(spec.get("keyFile")) if "clientKey" in wanted or reset or models else None
     if key:
@@ -647,12 +680,15 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
                 )
                 continue
             chosen, running, outside = local_model(listing, MODEL_SURFACES[name])
+            if name == "imageModel":
+                chosen, running = image_model(listing)
             if chosen is None:
                 notes.append(_unset_model(name, outside))
                 continue
             values[name] = chosen
             if not running:
                 notes.append(_stopped_model(name, chosen))
+    values["imageModelSet"] = "true" if values.get("imageModel") else "false"
     argv = [str(a) for a in spec["argv"]]
     argv.extend(_fill(text, values)[0] for text in args)
     out = dict(env)
@@ -669,6 +705,7 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
             out[name] = filled
     if reset:
         out.pop(reset, None)
+        first = data and not Path(data, CONNECTION_FILE).exists()
         if data and connection_changed(data, values.get("gatewayUrl"), key, environment):
             out[reset] = "true"
             notes.append(
@@ -677,6 +714,14 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
                 f"{reset}=true for this start: the app takes the new ones, and settings "
                 "changed inside it go back to their defaults."
             )
+        if data and (first or out.get(reset) == "true"):
+            given = {
+                "givenAt": datetime.now(UTC).isoformat(),
+                "webSearchEnabled": out.get("ENABLE_WEB_SEARCH", "false").lower() == "true",
+                **{name: values[name] for name in MODEL_SURFACES if name in values},
+            }
+            with _DATA_FILES:
+                _write_own(os.path.join(data, "given.json"), json.dumps(given))
     return argv, out, notes
 
 

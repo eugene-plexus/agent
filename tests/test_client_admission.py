@@ -166,6 +166,37 @@ def test_write_logs_must_be_a_boolean():
     assert validate_limits({"writeLogs": False}) == validate_limits({})
 
 
+def test_a_search_is_admitted_with_no_model_under_the_keys_limits(tmp_path):
+    """Row 34: a web search has no model, and still counts against the key."""
+    store = ClientKeyStore(tmp_path / "keys.json")
+    store.add(
+        replace(
+            _record(),
+            limits={
+                "maxConcurrentRequests": 1,
+                "requestsPerMinute": 2,
+                "allowedModels": ["chat"],
+            },
+        )
+    )
+    ask = lambda action, request, **kw: store.admit(  # noqa: E731
+        key_id="abc", action=action, request_id=request, model=None, purpose="search", **kw
+    )
+    assert ask("acquire", "s1")["leaseSeconds"] > 0
+    with pytest.raises(AdmissionRefusal) as caught:
+        ask("acquire", "s2")
+    assert caught.value.status == 429
+    ask("release", "s1")
+    ask("acquire", "s2")
+    ask("release", "s2")
+    with pytest.raises(AdmissionRefusal) as caught:
+        ask("acquire", "s3")
+    assert caught.value.status == 429
+    with pytest.raises(AdmissionRefusal) as caught:
+        store.admit(key_id="abc", action="acquire", request_id="s4", model="chat", purpose="search")
+    assert caught.value.status == 422
+
+
 def test_an_enrolled_agent_passes_on_the_roots_queue_band(app, client):
     """Row 70: the root answers a verified person's `queueBand`. An agent
     whose models predate it fails the whole forward (`extra='forbid'`);
