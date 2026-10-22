@@ -410,6 +410,10 @@ async def _pull_once(app: Any, client: httpx.AsyncClient) -> Heard:
         list_before = machines.taken_at
         await pull_machine_list(machines, client, record.control_url)
         list_taken = machines.taken_at is not None and machines.taken_at != list_before
+        if list_taken and standby.unmarked_root(app):
+            # Row 4: a list that names this machine the root marks the copy
+            # it runs promoted (`standby._named_root`).
+            await standby.reconcile(app)
     except BundleRollback as exc:
         log.debug("the control root's bundle is older than the one held: %s", exc)
         return Heard.UNTRUSTED

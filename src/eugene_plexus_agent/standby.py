@@ -211,6 +211,17 @@ async def _reconcile(app: Any) -> None:
         await asyncio.to_thread(_delete_copy, home)
 
 
+def unmarked_root(app: Any) -> bool:
+    """The machine list held names this machine the root, and the copy it
+    runs is not marked promoted yet: `reconcile` has something to decide."""
+    state: AgentState = app.state.agent_state
+    if state.get_topology_entry(STANDBY_COMPONENT) is None or promoted(state):
+        return False
+    machines = getattr(app.state, "machine_trust", None)
+    control = (machines.claims or {}).get("control") if machines is not None else None
+    return isinstance(control, dict) and control.get("node") == app.state.node_identity.record.name
+
+
 def _named_root(app: Any, epoch: int | None) -> bool:
     """Row 4: the root's signed machine list held here names this machine
     the root, at the epoch the copy says it is at. The list is signed by

@@ -731,6 +731,10 @@ async def take_machine_list(request: Request, body: SignedMachineList) -> Respon
             "Older than the one held",
             f"Refused machine list: {exc}.",
         ) from exc
+    # The list may name this machine the root (a promotion of the copy it
+    # runs), whether or not this node moved: the copy is this machine's root
+    # once it says so too (`standby._named_root`).
+    await standby.reconcile(request.app)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

@@ -286,3 +286,42 @@ def test_a_root_address_no_other_machine_reaches_is_not_followed(tmp_path: Path)
         trust.accept(_list(root, version, control=_naming(2, url)))
         assert store.record.control_url == ROOT_A, url
     assert (store.record.epoch, store.record.control_url_epoch) == (2, 1)
+
+
+def test_a_list_naming_this_machine_marks_its_copy_with_no_address(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A promoted copy on a machine whose list names no address (no machine
+    port, no nodes name): nothing moves, but the copy is this machine's root
+    once a list signed at its epoch names this machine and the copy says it
+    is a root. The push route brings the copy in line, as the bundle's does."""
+    from eugene_plexus_agent import standby
+    from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind, SpawnConfig
+
+    root = FakeRoot()
+    with TestClient(app) as client:
+        enroll_app(app, root, "me", control_url=ROOT_A, grants=(tokens.GRANT_STANDBY,))
+        state = app.state.agent_state
+        state.add_topology_entry(
+            ComponentEntry(
+                name=standby.STANDBY_COMPONENT,
+                kind=ComponentKind.control,
+                url="http://127.0.0.1:9",  # type: ignore[arg-type]
+                spawn=SpawnConfig(configFile=str(Path(state.path).parent / "standby.yaml")),
+            )
+        )
+
+        async def says(_entry: Any) -> tuple[str, int]:
+            return "control", 2
+
+        monkeypatch.setattr(standby, "_local_health", says)
+        root.epoch = 2
+        root.register("me", app.state.auth_state.trust.signer().key.public_key(), ())
+        took = client.post("/v1/node/trust-bundle", json={"jws": root.bundle().jws})
+        assert took.status_code == 200, took.text
+        assert not standby.promoted(state), "no list names this machine yet"
+
+        listed = _push(client, _list(root, 3, control=_naming(2, None, node="me")))
+        assert listed.status_code == 204, listed.text
+        assert standby.promoted(state)
+        assert app.state.node_identity.record.control_url == ROOT_A, "no address to move to"
