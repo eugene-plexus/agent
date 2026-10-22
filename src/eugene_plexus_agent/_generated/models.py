@@ -18,6 +18,244 @@ from pydantic import (
 )
 
 
+class ServingWorkload(StrEnum):
+    """
+    A person is one top-level session, not a stream or sub-agent.
+    `agents` uses growing histories, the published pauses and bursts,
+    and an uncounted warm start at a random turn. `chat` uses short
+    questions and reading pauses. `streams` is closed loop with no
+    pause or history growth, comparable with a concurrency sweep.
+    All use the profile builder's bundled corpus and seeded sampling.
+
+    """
+
+    agents = 'agents'
+    chat = 'chat'
+    streams = 'streams'
+
+
+class ServingRuntime(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str = Field(
+        ..., description='Node identity used by the node proxy.', min_length=1
+    )
+    runtime: str = Field(..., min_length=1)
+    model: str = Field(
+        ..., description='The model alias exposed by the gateway.', min_length=1
+    )
+
+
+class ServingMeasurementPreflight(BaseModel):
+    otherReplicas: list[ServingRuntime] = Field(
+        ...,
+        description='Other ready replicas of the same alias, including replicas on other nodes.',
+    )
+    otherRuntimes: list[ServingRuntime] = Field(
+        ...,
+        description='Other running runtimes on this node; informational, never stopped implicitly.',
+    )
+    problems: list[str] = Field(
+        ...,
+        description='Observed causes that prevent starting, one sentence each. Empty when it can start.',
+    )
+    estimateSeconds: int | None = Field(
+        ...,
+        description='Estimated total of the level windows; null when it cannot be estimated.',
+        ge=0,
+    )
+
+
+class ServingLevel(BaseModel):
+    """
+    One tested number of people, including all requests begun in its
+    window and their drain time. Excludes warm-up requests. Unknown
+    observations are null, never fabricated zeroes. Latencies are
+    client-side through the gateway; speed after the first content
+    token excludes TTFT. A level remains readable with no successful
+    requests, including a failed or cancelled partial level.
+
+    """
+
+    people: int = Field(..., ge=1, le=256)
+    streamsMean: float = Field(
+        ...,
+        description='Time-weighted mean requests in flight, including sub-agents.',
+        ge=0.0,
+    )
+    streamsPeak: int = Field(
+        ..., description='Peak requests in flight, including sub-agents.', ge=0
+    )
+    requests: int = Field(
+        ...,
+        description='Counted requests attempted, including requests that failed.',
+        ge=0,
+    )
+    errors: int = Field(..., ge=0)
+    errorCauses: dict[str, int] = Field(
+        ...,
+        description="Counts by observed cause, including the engine or gateway's error words.",
+    )
+    ttftP50Ms: float | None = Field(
+        ...,
+        description='Median time to first content token; null when no request produced content.',
+        ge=0.0,
+    )
+    ttftP90Ms: float | None = Field(..., ge=0.0)
+    itlP50Ms: float | None = Field(
+        ...,
+        description='Median inter-token latency; null when there are no measured intervals.',
+        ge=0.0,
+    )
+    itlP90Ms: float | None = Field(..., ge=0.0)
+    tokensPerSecondEachP50: float | None = Field(
+        ...,
+        description='Median per-request decode speed after the first content token, not total speed divided by people.',
+        ge=0.0,
+    )
+    tokensPerSecondEachP10: float | None = Field(..., ge=0.0)
+    tokensPerSecondTotal: float | None = Field(
+        ...,
+        description='Actual counted output tokens divided by durationSeconds; null if output usage is unavailable.',
+        ge=0.0,
+    )
+    promptTokens: int = Field(
+        ...,
+        description="Sum of reported prompt usage; missing usage is named in the job's detail.",
+        ge=0,
+    )
+    cachedTokens: int = Field(
+        ...,
+        description="Sum of reported cached prompt usage; missing usage is named in the job's detail.",
+        ge=0,
+    )
+    waitedP50Ms: float | None = Field(
+        ...,
+        description='Median X-Eugene-Plexus-Waited-Ms; null when the header was unavailable.',
+        ge=0.0,
+    )
+    foreignRequests: int | None = Field(
+        ...,
+        description="Engine request-counter delta minus this job's requests; null means others' use is unknown.",
+        ge=0,
+    )
+    watts: float | None = Field(
+        ...,
+        description='Mean GPU power from host history over the level; null when history has no power readings.',
+        ge=0.0,
+    )
+    outputTokens: int = Field(
+        ...,
+        description='Actual reported output tokens, including any output from failed requests; never max_tokens.',
+        ge=0,
+    )
+    durationSeconds: float = Field(
+        ...,
+        description='Observed duration including drain time; permits interpreting total throughput on partial levels.',
+        ge=0.0,
+    )
+    promptReuse: float | None = Field(
+        ...,
+        description='Fraction of prompt tokens reused as an unchanged prefix between turns; null when not observed.',
+        ge=0.0,
+        le=1.0,
+    )
+    loopLagMaxMs: float = Field(
+        ...,
+        description='Largest measured event-loop scheduling delay during this level.',
+        ge=0.0,
+    )
+    loopLagged: bool = Field(
+        ...,
+        description='True when loopLagMaxMs exceeds 50 ms; marks a potentially load-generator-limited level.',
+    )
+
+
+class ServingKnee(BaseModel):
+    """
+    The last level before TTFT p50 exceeds request.ttftThresholdMs
+    or per-request median speed falls below request.speedRatioThreshold
+    times level 1's. These owner-editable thresholds follow Troy's
+    MEASURE-KNEE-2 call. `found: false` means the limit was not reached;
+    `people` and speeds then describe the largest tested usable level,
+    not an extrapolation. An unfinished or unusable run has a null knee.
+
+    """
+
+    found: bool
+    people: int = Field(..., ge=1, le=256)
+    tokensPerSecondEach: float = Field(..., ge=0.0)
+    ttftP50Ms: float = Field(..., ge=0.0)
+
+
+class ServingGpu(BaseModel):
+    name: str
+    uuid: str | None = Field(..., description='Stable device identity when available.')
+    memoryBytes: int | None = Field(..., ge=0)
+
+
+class ServingProvenance(BaseModel):
+    """
+    Snapshot of the engine, effective launch, model file and hardware
+    measured. Unknown identity fields are null and remain visible as
+    unknown; their absence never makes an untested engine unsupported.
+    Model identity is its local path, size and mtime, not a model hash.
+    Does not hold prompts, answers, credentials or raw client keys.
+
+    """
+
+    engine: str = Field(..., min_length=1)
+    engineBuild: str | None
+    binaryHash: str | None = Field(
+        ...,
+        description='sha256 of the running engine binary, when readable.',
+        pattern='^[0-9a-f]{64}$',
+    )
+    launchArgv: list[str] = Field(
+        ...,
+        description='Effective engine launch argv at measurement time, with credentials redacted.',
+    )
+    modelPath: str
+    modelSizeBytes: int | None = Field(..., ge=0)
+    modelModifiedAt: AwareDatetime | None
+    gpus: list[ServingGpu] = Field(
+        ...,
+        description='GPUs used by the runtime, in stable device order; empty for CPU-only.',
+    )
+    driver: str | None = Field(
+        ..., description='GPU driver version or versions, in stable device order.'
+    )
+    cpu: str | None
+    ramBytes: int | None = Field(..., ge=0)
+    agentCommit: str | None
+    gatewayCommit: str | None
+
+
+class ServingDrafting(BaseModel):
+    """
+    Drafting in effect during this run, for comparing on and off
+    records of the same model and machine. No automatic off pass.
+    Acceptance is an observation and is not part of provenanceKey;
+    drafting configuration is captured by the effective launch argv.
+
+    """
+
+    type: str | None = Field(
+        ..., description="Engine's drafting type, off when disabled, null when unknown."
+    )
+    model: str | None = Field(
+        ...,
+        description='Draft model path or identity; null when no separate draft model is used or it is unknown.',
+    )
+    acceptance: float | None = Field(
+        ...,
+        description='Accepted draft tokens divided by proposed draft tokens; null when not observed.',
+        ge=0.0,
+        le=1.0,
+    )
+
+
 class MeasurementPreflight(BaseModel):
     """
     What starting a benchmark or a profile build with this request
@@ -4190,6 +4428,115 @@ class App(BaseModel):
         None,
         description='Something the operator should know that is not an error — the\ngateway could not be found, say — in words they can act on.\n',
     )
+
+
+class ServingMeasurementRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    runtime: str = Field(
+        ...,
+        description='The name of an existing runtime on this node; it must be ready.',
+        min_length=1,
+    )
+    workload: ServingWorkload | None = 'agents'
+    maxPeople: int | None = Field(
+        None,
+        description='Defaults to min(256, 4 * parallelSlots) of the running runtime.',
+        ge=1,
+        le=256,
+    )
+    windowSeconds: int | None = Field(
+        None,
+        description="Per level. Defaults to 300 for agents and chat, 120 for streams.\nWith `full: true` the effective window is 3,600 seconds, even\nwhen a different window was supplied. Requests still in flight\nat the window's end finish and count, adding drain time.\n",
+        ge=10,
+        le=3600,
+    )
+    full: bool | None = Field(False, description='Use a one-hour window at each level.')
+    seed: int | None = Field(
+        0,
+        description='Seed for workload sampling; does not promise identical model output.',
+    )
+    ttftThresholdMs: float | None = Field(
+        1000,
+        description="The owner's first-token ceiling, in milliseconds; editable on\nthe run page. Troy's MEASURE-KNEE-2 call sets the default to\nfirst content after more than one second.\n",
+        gt=0.0,
+    )
+    speedRatioThreshold: float | None = Field(
+        0.6666666666666666,
+        description="Minimum per-person median speed as a fraction of level 1's;\neditable on the run page. Default is two thirds (Troy's\nMEASURE-KNEE-2 call). A speed below this crosses the knee.\n",
+        gt=0.0,
+        le=1.0,
+    )
+    stopReplicas: list[ServingRuntime] | None = Field(
+        [],
+        description='The other replicas the operator agreed to stop after seeing\nthe preflight, identified by node, runtime and model alias.\nOnly replicas of the measured alias may be listed, never the\nmeasured runtime. The job calls their agents to stop them,\nthen restarts exactly those it stopped when the run ends.\nAn unlisted ready replica is a 409, including one that became\nready after the preflight. Already stopped entries are not\nrestarted by this job.\n',
+        validate_default=True,
+    )
+
+
+class ServingMeasurementRestart(BaseModel):
+    node: str
+    runtime: str
+    state: MeasurementRestartState
+    detail: str | None = Field(
+        ...,
+        description='Observed cause of a refusal or failed restart; null when no explanation is needed.',
+    )
+
+
+class ServingMeasurement(BaseModel):
+    """
+    A serving measurement kept on the runtime's node for rows 11,
+    13, 14 and 69 and the speed nudge. Agent restart marks an unfinished
+    run failed and names that cause; it keeps partial levels and never
+    resumes load silently. Final records keep their state when cancel
+    is used only to revoke a key. Does not persist prompts or answers.
+
+    """
+
+    id: str
+    node: str
+    runtime: str
+    model: str = Field(..., description='The measured gateway model alias.')
+    state: BenchmarkState
+    request: ServingMeasurementRequest = Field(
+        ...,
+        description='The effective request, including resolved workload, maxPeople,\nwindowSeconds, full, seed, both knee thresholds and stopReplicas.\nReturned settings always describe the values in effect, including\nthe one-hour window when full overrides a supplied shorter one.\n',
+    )
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str = Field(
+        ...,
+        description="One sentence of progress, or the observed cause of a failure, including the upstream's words.",
+    )
+    levels: list[ServingLevel]
+    knee: ServingKnee | None
+    provenance: ServingProvenance
+    provenanceKey: str = Field(
+        ...,
+        description="Lowercase sha256 of provenance as UTF-8 JSON with sorted object\nkeys, compact separators and unescaped Unicode. Array order is\npreserved. Includes null identity fields; excludes observations\nsuch as drafting acceptance and the request's workload seed.\n",
+        pattern='^[0-9a-f]{64}$',
+    )
+    current: bool = Field(
+        ...,
+        description="Recomputed on read; true only when the runtime's present provenance matches this record.",
+    )
+    staleBecause: list[str] = Field(
+        ...,
+        description='What changed since measurement, with old and new values; empty when current. A missing runtime is named.',
+    )
+    keyLive: bool = Field(
+        ...,
+        description='True until the control root confirms revocation or expiry; a failed revocation is named in detail.',
+    )
+    restarts: list[ServingMeasurementRestart]
+    drafting: ServingDrafting
+
+
+class ServingMeasurementList(BaseModel):
+    measurements: list[ServingMeasurement]
 
 
 class Component(BaseModel):
