@@ -242,9 +242,12 @@ class Sweep:
         self.peak = max(self.peak, self.inflight)
 
     def check_runtime(self, runtime: str | None, node: str | None) -> None:
-        if runtime and (runtime != self.runtime or (node and node != self.node)):
+        if (runtime is not None and runtime != self.runtime) or (
+            node is not None and node != self.node
+        ):
             self.fatal = (
-                f"A request was answered by {runtime} on {node or self.node}, "
+                f"A request was answered by {runtime or 'an unknown runtime'} "
+                f"on {node or 'an unknown machine'}, "
                 f"not {self.runtime} on {self.node}. The run stopped."
             )
             raise ValueError(self.fatal)
@@ -276,7 +279,8 @@ class Sweep:
                     raw = (await response.aread()).decode(errors="replace")
                     raise ValueError(f"Gateway returned {response.status_code}: {raw[:600]}")
                 runtime = response.headers.get("X-Eugene-Plexus-Runtime")
-                self.check_runtime(runtime, response.headers.get("X-Eugene-Plexus-Node"))
+                node = response.headers.get("X-Eugene-Plexus-Node")
+                self.check_runtime(runtime, node)
                 if response.headers.get("X-Eugene-Plexus-Waited-Ms"):
                     observation.waited = float(response.headers["X-Eugene-Plexus-Waited-Ms"])
                 done = False
@@ -291,9 +295,10 @@ class Sweep:
                     if frame.get("error"):
                         raise ValueError(f"Gateway stream error: {frame['error']}")
                     routing = frame.get("x_eugene_plexus") or {}
-                    if routing.get("runtime"):
-                        runtime = routing["runtime"]
-                        self.check_runtime(runtime, routing.get("node"))
+                    if "runtime" in routing or "node" in routing:
+                        runtime = routing.get("runtime", runtime)
+                        node = routing.get("node", node)
+                        self.check_runtime(runtime, node)
                     if routing.get("waited_ms") is not None and observation.waited is None:
                         observation.waited = float(routing["waited_ms"])
                     if usage := frame.get("usage"):
@@ -313,8 +318,15 @@ class Sweep:
                     raise ValueError("Gateway closed the stream before [DONE].")
                 if observation.ttft is None:
                     raise ValueError("The engine returned no content tokens.")
-                if runtime is None:
-                    self.notes.add("The gateway did not report which runtime answered.")
+                missing = [
+                    field for field, value in (("runtime", runtime), ("node", node)) if not value
+                ]
+                if missing:
+                    self.fatal = (
+                        f"The gateway did not report the {' and '.join(missing)} "
+                        "that answered. The run stopped."
+                    )
+                    raise ValueError(self.fatal)
                 if observation.output is None or observation.prompt is None:
                     self.notes.add("The engine did not report complete token usage.")
                 if observation.cached is None:

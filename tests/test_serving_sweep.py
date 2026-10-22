@@ -109,7 +109,11 @@ class Backend:
         assert request.headers["authorization"] == "Bearer measurement-secret"
         return httpx.Response(
             200,
-            headers={"X-Eugene-Plexus-Runtime": self.runtime, "X-Eugene-Plexus-Waited-Ms": "3"},
+            headers={
+                "X-Eugene-Plexus-Runtime": self.runtime,
+                "X-Eugene-Plexus-Node": "tower",
+                "X-Eugene-Plexus-Waited-Ms": "3",
+            },
             stream=Tokens(self, body),
         )
 
@@ -155,6 +159,52 @@ async def test_an_answer_from_another_runtime_stops_the_run():
         )
         with pytest.raises(ValueError, match=r"other.*tower.*r.*tower"):
             await sweep.level(1, 0.1, "streams")
+    assert sweep.partial.errors == 1
+
+
+@pytest.mark.parametrize("metadata", ["headers", "envelope", "runtime-header", "node-header"])
+@pytest.mark.parametrize("counted", [True, False])
+@pytest.mark.asyncio
+async def test_the_same_runtime_on_another_machine_stops_the_run(metadata, counted):
+    async def handle(request):
+        headers, routing = {}, {}
+        for field, value in (("runtime", "r"), ("node", "studio")):
+            if metadata == "headers" or metadata == f"{field}-header":
+                headers[f"x-eugene-plexus-{field}"] = value
+            else:
+                routing[field] = value
+        frame = {"choices": [{"delta": {"content": "word"}}], "x_eugene_plexus": routing}
+        return httpx.Response(
+            200, headers=headers, text="data: " + json.dumps(frame) + "\n\ndata: [DONE]\n\n"
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        sweep = Sweep(client, "http://fixture", "secret", "r", "tower", "m", 8192, random.Random(0))
+        with pytest.raises(ValueError, match=r"studio.*tower.*run stopped"):
+            if counted:
+                await sweep.level(1, 0.01, "streams")
+            else:
+                await sweep.turn(Session(random.Random(0), "warmup", "agents", 8192), counted=False)
+    assert sweep.fatal is not None
+    if counted:
+        assert sweep.partial.errors == 1
+
+
+@pytest.mark.parametrize("missing", ["runtime", "node", "runtime and node"])
+@pytest.mark.asyncio
+async def test_an_answer_with_missing_provenance_stops_the_run(missing):
+    async def handle(request):
+        routing = {"runtime": "r", "node": "tower"}
+        for field in missing.split(" and "):
+            del routing[field]
+        frame = {"choices": [{"delta": {"content": "word"}}], "x_eugene_plexus": routing}
+        return httpx.Response(200, text="data: " + json.dumps(frame) + "\n\ndata: [DONE]\n\n")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        sweep = Sweep(client, "http://fixture", "secret", "r", "tower", "m", 8192, random.Random(0))
+        with pytest.raises(ValueError, match=r"did not report.*run stopped"):
+            await sweep.level(1, 0.01, "streams")
+    assert sweep.fatal is not None
     assert sweep.partial.errors == 1
 
 
