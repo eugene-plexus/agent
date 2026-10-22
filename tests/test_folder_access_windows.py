@@ -190,7 +190,54 @@ def test_revoke_tolerates_junctions_and_hardlinks(tmp_path: Path) -> None:
         )
         == before
     )
+    for path in (inside, root / "junction"):
+        with backend._open(str(path), _single=True, revoke=True) as (handle, _, _):
+            acl = backend._acl(ws, handle)
+            assert all(
+                ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) != backend.account
+                for i in range(acl.GetAceCount())
+            )
     (root / "junction").rmdir()
+
+
+def test_revoke_continues_when_file_vanishes_before_write_open(tmp_path: Path, monkeypatch) -> None:
+    import contextlib
+
+    import win32security as ws
+
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    vanishing = root / "first"
+    vanishing.touch()
+    tail = root / "last"
+    tail.touch()
+    backend = fa.WindowsPermissions("S-1-5-32-545", eugene=(), homes=())
+    access = fa.Access(tmp_path / "access.json", backend)
+    grant = access.add("workbench", str(root), "read", "operator")
+    original = backend._open
+    observed = []
+
+    @contextlib.contextmanager
+    def disappearing(path, **kwargs):
+        if path == str(vanishing) and kwargs.get("change"):
+            vanishing.unlink()
+            raise FileNotFoundError(path)
+        with original(path, **kwargs) as result:
+            if kwargs.get("change"):
+                observed.append(path)
+            yield result
+
+    monkeypatch.setattr(backend, "_open", disappearing)
+    assert access.remove("workbench", grant.id).state == "removed"
+    assert not vanishing.exists()
+    assert str(tail) in observed, "Removal must finish the walk before reporting removed"
+    for path in (root, tail):
+        acl = ws.GetFileSecurity(str(path), 4).GetSecurityDescriptorDacl()
+        assert all(
+            ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) != backend.account
+            for i in range(acl.GetAceCount())
+        )
 
 
 def test_acl_open_shares_all(tmp_path: Path) -> None:

@@ -731,35 +731,38 @@ class WindowsPermissions:
 
         if not delta["added"]:
             return True
-        try:
-            context = self._open(path, change=True)
-            with context as (handle, _, identity):
-                if identity != delta["identity"]:
-                    return False
-                recorded = {tuple(item["names"]): item for item in delta["items"]}
-                owned = set()
-                for names, _held, ident, acl, directory, protected in self._tree(
-                    ws, path, handle, identity, revoke=True
-                ):
-                    item = recorded.get(names)
-                    if item is not None:
-                        if item.get("removed"):
-                            owned.add(names)
-                            continue
-                        if ident != item["identity"]:
-                            # A replacement never inherits the recorded explicit ACE.
-                            continue
-                        flags = item["flags"]
-                    elif names and names[:-1] in owned and not protected:
-                        flags = 19 if directory else 16
-                    else:
+        with contextlib.ExitStack() as opened:
+            try:
+                handle, _, identity = opened.enter_context(self._open(path, change=True))
+            except FileNotFoundError:
+                return True
+            if identity != delta["identity"]:
+                return False
+            recorded = {tuple(item["names"]): item for item in delta["items"]}
+            owned = set()
+            for names, _held, ident, acl, directory, protected in self._tree(
+                ws, path, handle, identity, revoke=True
+            ):
+                item = recorded.get(names)
+                if item is not None:
+                    if item.get("removed"):
+                        owned.add(names)
                         continue
-                    matches = self._matches(ws, acl, delta, flags)
-                    if len(matches) > 1:
-                        return False
-                    if matches:
-                        # Files/links were inspected with READ_CONTROL only.
-                        # Request WRITE_DAC only for an exact owned ACE.
+                    if ident != item["identity"]:
+                        # A replacement never inherits the recorded explicit ACE.
+                        continue
+                    flags = item["flags"]
+                elif names and names[:-1] in owned and not protected:
+                    flags = 19 if directory else 16
+                else:
+                    continue
+                matches = self._matches(ws, acl, delta, flags)
+                if len(matches) > 1:
+                    return False
+                if matches:
+                    # Files/links were inspected with READ_CONTROL only.
+                    # Request WRITE_DAC only for an exact owned ACE.
+                    try:
                         with self._open(
                             str(Path(path).joinpath(*names)), change=True, _single=True, revoke=True
                         ) as (change, _, current_id):
@@ -772,28 +775,28 @@ class WindowsPermissions:
                             if matches:
                                 acl.DeleteAce(matches[0])
                                 self._set_acl(ws, change, acl)
-                    elif item is not None and item.get("applied"):
-                        # It was already removed externally; no owned rights remain.
-                        pass
-                    owned.add(names)
-                    if item is not None:
-                        item["removed"] = True
-                # Detect files created in the narrow interval before a parent's
-                # ACE was removed. A retry uses the same recorded plan.
-                for names, _, _, acl, directory, _ in self._tree(
-                    ws, path, handle, identity, revoke=True
+                    except FileNotFoundError:
+                        continue
+                elif item is not None and item.get("applied"):
+                    # It was already removed externally; no owned rights remain.
+                    pass
+                owned.add(names)
+                if item is not None:
+                    item["removed"] = True
+            # Detect files created in the narrow interval before a parent's
+            # ACE was removed. A retry uses the same recorded plan.
+            for names, _, _, acl, directory, _ in self._tree(
+                ws, path, handle, identity, revoke=True
+            ):
+                if (
+                    names
+                    and names[:-1] in owned
+                    and self._matches(ws, acl, delta, 19 if directory else 16)
                 ):
-                    if (
-                        names
-                        and names[:-1] in owned
-                        and self._matches(ws, acl, delta, 19 if directory else 16)
-                    ):
-                        raise OSError(
-                            "New files inherited access during removal. "
-                            "Some additions remain; try Remove access again."
-                        )
-                return True
-        except FileNotFoundError:
+                    raise OSError(
+                        "New files inherited access during removal. "
+                        "Some additions remain; try Remove access again."
+                    )
             return True
 
 
