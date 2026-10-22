@@ -1999,6 +1999,13 @@ class ComponentStatus(StrEnum):
     unreachable = 'unreachable'
 
 
+class SignedMachineList(BaseModel):
+    jws: str = Field(
+        ...,
+        description='A JWS compact serialization with header\n`{"alg": "EdDSA", "typ": "ep-machines+jwt"}` whose payload is a\n`MachineList` (`control.yaml`), signed with the root identity\nthis node pinned at enrolment.\n',
+    )
+
+
 class LocalStandby(BaseModel):
     """
     The warm standby this agent runs because its node holds the
@@ -5958,6 +5965,11 @@ class NodeIdentity(BaseModel):
     )
     controlUrl: AnyUrl | None = Field(
         None, description='The control root this node answers to.'
+    )
+    controlUrlEpoch: int | None = Field(
+        None,
+        description='The epoch `controlUrl` came with (row 4): the epoch at\nenrolment, or of the promoted root this node moved to. A node\nmoves only for a signed machine list at a higher epoch. Set to\nthe epoch held when a node updated to row 4 first starts, so an\nupdate never moves a node. Absent until enrolled.\n',
+        ge=0,
     )
     standby: LocalStandby | None = None
     hostsControl: bool | None = Field(
