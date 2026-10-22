@@ -476,6 +476,8 @@ class LlamaCppAdapter(EngineAdapter):
                     spec.name,
                 )
         for field in self.flag_schema().fields:
+            if field.key == "missingCard":
+                continue
             if field.key in _LOAD_MODE_KEYS:
                 # Not a presence-only switch any more; handled together
                 # below, because the two collapse into one CLI value.
@@ -745,10 +747,12 @@ class LlamaCppAdapter(EngineAdapter):
     # --- configuring ------------------------------------------------------
 
     def flag_schema(self) -> ConfigSchema:
+        from ..card_launch import missing_card_field
+
         return ConfigSchema(
             component="engine:llama_cpp",
             categories=_CATEGORIES,
-            fields=_FLAG_FIELDS,
+            fields=[*_FLAG_FIELDS, missing_card_field()],
         )
 
 

@@ -684,7 +684,9 @@ def test_every_schema_flag_has_a_cli_mapping(adapter: VllmAdapter) -> None:
     from eugene_plexus_agent.engines import speculation
 
     # These four settings compose one JSON flag rather than individual CLI flags.
-    assert {f.key for f in adapter.flag_schema().fields} == set(_FLAG_CLI_NAMES) | speculation.KEYS
+    assert {f.key for f in adapter.flag_schema().fields} == set(
+        _FLAG_CLI_NAMES
+    ) | speculation.KEYS | {"missingCard"}
 
 
 def test_the_curated_surface_is_the_designed_twelve_and_the_cache(adapter: VllmAdapter) -> None:
@@ -694,6 +696,7 @@ def test_the_curated_surface_is_the_designed_twelve_and_the_cache(adapter: VllmA
     and are deliberately absent."""
     keys = {f.key for f in adapter.flag_schema().fields}
     assert keys == {
+        "missingCard",
         "maxModelLen",
         "gpuMemoryUtilization",
         "tensorParallelSize",

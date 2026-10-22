@@ -18,7 +18,7 @@ import contextlib
 import logging
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,6 +31,7 @@ from ._generated.models import (
     EngineInstall,
     EngineKind,
     HostAccelerator,
+    LastDevice,
     LoadProgress,
     ManagedEngine,
     ManualInstall,
@@ -45,6 +46,7 @@ from ._generated.models import (
     RuntimeStatus,
     StopReason,
 )
+from .card_launch import CardLaunch, DeviceMemory, refit_on_cards_left, select_cards
 from .child_env import child_environment, reserved_override
 from .companions import companion_name
 from .engines import (
@@ -186,6 +188,9 @@ class _RuntimePlanner:
         so the operator sees the build that is actually running rather than
         whatever is on PATH now."""
         self.opened_path: str | None = None
+        self.before_start: Callable[[RuntimeSpec], Awaitable[CardLaunch | None]] | None = None
+        self.after_start: Callable[[CardLaunch], None] | None = None
+        self.card_launch: CardLaunch | None = None
         """The model path the last plan handed the engine. Read for
         `Runtime.openedPath`, because `localPath` is recomputed on every
         read and a folder's mount can change under a running process."""
@@ -276,14 +281,31 @@ class _RuntimePlanner:
                 ", ".join(f"{k}={v}" for k, v in sorted(injected.items())),
                 self.spec.engine.value,
             )
-        if self.spec.env:
-            env.update({k: str(v) for k, v in self.spec.env.items()})
+        if launch_spec.env:
+            env.update({k: str(v) for k, v in launch_spec.env.items()})
 
         return SpawnPlan(
             argv=argv,
             env=env,
             cwd=self._adapter.working_directory(launch_spec, binary),
+            on_spawn=self._record_cards,
         )
+
+    async def plan_async(self) -> SpawnPlan:
+        """The supervisor awaits this before every spawn, crash respawns included."""
+        reason = _launch_policy(self.spec, self._adapter, self._get_config)
+        if reason is not None:
+            raise SpawnPlanError(reason)
+        if self.before_start is not None:
+            try:
+                self.card_launch = await self.before_start(self.spec)
+            except ValueError as exc:
+                raise SpawnPlanError(str(exc)) from exc
+        return await asyncio.to_thread(self.plan)
+
+    def _record_cards(self) -> None:
+        if self.card_launch is not None and self.after_start is not None:
+            self.after_start(self.card_launch)
 
     def _rules(self) -> list[PathRule]:
         return effective_rules(
@@ -310,7 +332,7 @@ class _RuntimePlanner:
         """
         rules, settings = self._rules(), self._copy_settings()
         resolved = resolve_local_path(self.spec.modelPath, rules, settings)
-        spec = self.spec
+        spec = self.card_launch.spec if self.card_launch is not None else self.spec
         if resolved.path != spec.modelPath:
             self._log.info(
                 "%s: opening %s as %s (%s)",
@@ -427,6 +449,9 @@ class RuntimeSupervisor:
         self._inherited_rules = inherited_rules
         self._processes: dict[str, SupervisedProcess] = {}
         self._planners: dict[str, _RuntimePlanner] = {}
+        self.device_memory = DeviceMemory()
+        self.launch_check: Callable[[RuntimeSpec], Awaitable[CardLaunch]] | None = None
+        self.force_launches: set[str] = set()
         # Latest readiness per runtime. Held here rather than on the
         # process because it is an *observation*, not loop state — the
         # same reason component safe-mode observations live on Supervisor.
@@ -544,12 +569,34 @@ class RuntimeSupervisor:
         planner = _RuntimePlanner(
             spec, adapter, self._log, self._get_config, inherited_rules=self._inherited_rules
         )
+        planner.before_start = self._check_cards
+        planner.after_start = lambda launch: self.device_memory.record(spec, launch)
         sp = SupervisedProcess(planner, self._log, stop_on_startup_crash=True)
         self._planners[spec.name] = planner
         self._processes[spec.name] = sp
         self._stop_reasons.pop(spec.name, None)
         self._forget_stop(spec.name)
         sp.start()
+
+    async def _check_cards(self, spec: RuntimeSpec) -> CardLaunch:
+        if self.launch_check is not None:
+            return await self.launch_check(spec)
+        from .admission import check_admission
+
+        snapshot = await asyncio.to_thread(detect_devices)
+        launch = select_cards(spec, snapshot, expected=self.device_memory.expected(spec))
+        if not launch.missing:
+            return launch
+
+        async def measure(candidate: RuntimeSpec):  # type: ignore[no-untyped-def]
+            return await check_admission(
+                candidate, snapshot=snapshot, library=None, running=[], mappings=self._rules()
+            )
+
+        launch, answer = await refit_on_cards_left(launch, measure)
+        if answer.decision.value == "refuse":
+            raise ValueError(answer.reason)
+        return launch
 
     # --- the local copy ---------------------------------------------------
 
@@ -881,6 +928,13 @@ class RuntimeSupervisor:
 
         job = self._copy_jobs.get(name)
         status = self._status_for(sp, readiness, copying=job is not None)
+        effective = (
+            planner.card_launch.spec
+            if planner is not None
+            and planner.card_launch is not None
+            and status in _PROCESS_RUNNING
+            else spec
+        )
         capabilities: RuntimeCapabilities | None = None
         engine_version: str | None = None
         adapter = adapter_for(spec.engine)
@@ -996,9 +1050,9 @@ class RuntimeSupervisor:
             # demand, whatever the declaration says (`RuntimeSpec.mode`).
             idleUnloadSeconds=None if searching else spec.idleUnloadSeconds,
             startOnDemand=None if searching else spec.startOnDemand,
-            flags=spec.flags,
+            flags=effective.flags,
             extraArgs=spec.extraArgs,
-            env=spec.env,
+            env=effective.env,
             workingDirectory=spec.workingDirectory,
             binary=spec.binary,
             # Recorded by whoever declared it, reported, never read.
@@ -1019,6 +1073,8 @@ class RuntimeSupervisor:
             loadProgress=load_progress,
             speculation=self._speculation_for(spec, adapter, argv, status),
             promptCache=self._prompt_cache_for(spec, adapter, argv, status),
+            lastDevices=[LastDevice(d) for d in self.device_memory.observed(spec)[0]] or None,
+            startedOnFewerCards=self.device_memory.observed(spec)[1],
         )
 
     def _prompt_cache_for(

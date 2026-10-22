@@ -72,6 +72,7 @@ class DeviceSnapshot:
     ram_total_bytes: int | None
     ram_available_bytes: int | None
     detected_at: datetime
+    cuda_inventory_known: bool | None = None
 
     def accelerators(self) -> list[ComputeDevice]:
         """Everything that is not the CPU."""
@@ -565,7 +566,16 @@ def detect_devices(
     lister = os_adapters or gpu_probe.adapters
 
     devices: list[ComputeDevice] = []
-    devices += _nvidia(run, warnings, ram_total, ram_available)
+    cuda_known = False
+
+    def nvidia_run(argv: list[str]) -> str | None:
+        nonlocal cuda_known
+        output = run(argv)
+        cuda_known = output is not None
+        return output
+
+    devices += _nvidia(nvidia_run, warnings, ram_total, ram_available)
+    cuda_known = cuda_known and not any("nvidia-smi row" in w for w in warnings)
     if devices:
         # **Beside NVIDIA, only what the build reaches.** `rocm-smi` and
         # `xpu-smi` used to be read here too, so a Linux machine with an
@@ -585,6 +595,9 @@ def detect_devices(
     elif not devices and sys.platform != "darwin":
         devices += _os_devices(warnings, ram_available, lister)
 
+    from ..device_health import enrich_devices
+
+    devices = enrich_devices(devices, _os_adapters_quietly(lister))
     devices.append(
         ComputeDevice(
             kind=ComputeDeviceKind.cpu,
@@ -603,6 +616,7 @@ def detect_devices(
         ram_total_bytes=ram_total,
         ram_available_bytes=ram_available,
         detected_at=datetime.now(UTC),
+        cuda_inventory_known=cuda_known,
     )
 
 
