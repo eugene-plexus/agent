@@ -89,8 +89,17 @@ DEFAULT_KEY_DAYS = 365
 #: again after this long while the key is still past its age.
 SCHEDULE_RETRY = timedelta(days=1)
 #: A scheduled start that could not happen (a root older than row 3, a machine
-#: port not listening yet) is tried again after this long, and said once.
+#: port not listening yet, a key that could not be written) is tried again
+#: after this long, and said once.
 SCHEDULE_RETRY_REFUSED = timedelta(hours=1)
+#: A key already overdue when this machine first sees it (an install updated
+#: to this version, a machine that was off) starts within this window, at a
+#: time drawn from its pin, so the machines of one install do not all change
+#: in one tick (the review of part 3b).
+CATCH_UP_WINDOW = timedelta(days=7)
+#: Seen overdue within this long of falling due is the yearly case: the
+#: machine was running when the key fell due, and it starts at once.
+CATCH_UP_GRACE = timedelta(days=1)
 
 
 class KeyChangeRefused(Exception):
@@ -207,8 +216,11 @@ class MachineKeyChange:
         self._door_written: str | None = None
         #: Why the door file could not be written, while it could not.
         self.door_error: str | None = None
-        #: A scheduled start that could not happen: when, and what was said.
+        #: A scheduled start that could not happen: when, and its cause.
         self._schedule_refused: tuple[datetime, str] | None = None
+        #: The key's pin and when this machine first saw it overdue; kept in
+        #: node.yaml too, so a restart does not move a catch-up start.
+        self._overdue_seen: tuple[str, datetime] | None = None
         #: The last step's failure when `node.yaml` could not hold it either
         #: (a full disk): reported until a step gets past it.
         self._fault: str | None = None
@@ -222,13 +234,25 @@ class MachineKeyChange:
         return held
 
     def schedule(self) -> dict[str, Any]:
-        """`MachinePort.keyMadeAt` and `keyChangeDueAt` (part 3b)."""
-        certificate = self.w.store.record.tls_certificate
+        """`MachinePort.keyMadeAt`, `keyChangeDueAt`, `keyChangeNextAttemptAt`
+        and `keyChangeBlocked` (part 3b): what the console shows, and exactly
+        what the next step acts on."""
+        record = self.w.store.record
+        certificate = record.tls_certificate
+        blocked = self._schedule_refused[1] if self._schedule_refused else None
         if not certificate:
-            return {"keyMadeAt": None, "keyChangeDueAt": None}
+            return {
+                "keyMadeAt": None,
+                "keyChangeDueAt": None,
+                "keyChangeNextAttemptAt": None,
+                "keyChangeBlocked": blocked,
+            }
+        due = change_due_at(certificate, _days(self.w.lifetime_days()))
         return {
             "keyMadeAt": machine_key_made_at(certificate),
-            "keyChangeDueAt": change_due_at(certificate, _days(self.w.lifetime_days())),
+            "keyChangeDueAt": due,
+            "keyChangeNextAttemptAt": self._next_attempt(record, due),
+            "keyChangeBlocked": blocked,
         }
 
     # ---- the root's door file ------------------------------------------------
@@ -266,6 +290,7 @@ class MachineKeyChange:
         """A change now, whatever the key's age (`reason: requested`)."""
         async with self._lock:
             self._begin(REQUESTED)
+            self._schedule_refused = None
         self._wake.set()
         return self.status() or {}
 
@@ -406,36 +431,95 @@ class MachineKeyChange:
 
     # ---- the schedule (part 3b) ------------------------------------------------
 
+    def _seen_overdue(self, record: IdentityRecord) -> datetime | None:
+        """When this machine first saw its current key overdue, if it has."""
+        pin = _current_pin(record)
+        if pin is None:
+            return None
+        if self._overdue_seen is not None and self._overdue_seen[0] == pin:
+            return self._overdue_seen[1]
+        change = record.machine_key_change or {}
+        if change.get("overduePin") == pin:
+            seen = _parse(change.get("overdueSeen"))
+            if seen is not None:
+                self._overdue_seen = (pin, seen)
+                return seen
+        return None
+
+    def _note_overdue(self, record: IdentityRecord, now: datetime) -> None:
+        """Remember the first time the current key was seen overdue, in
+        node.yaml when it can be written (memory holds it meanwhile)."""
+        pin = _current_pin(record)
+        if pin is None or self._seen_overdue(record) is not None:
+            return
+        self._overdue_seen = (pin, now)
+        try:
+            self._update(overduePin=pin, overdueSeen=now.isoformat())
+        except OSError as exc:
+            log.debug("could not keep when the key was first seen overdue: %s", exc)
+
+    def _next_attempt(self, record: IdentityRecord, due: datetime | None) -> datetime | None:
+        """When the schedule next tries to start a change: the latest of the
+        day the key falls due, its catch-up start when it was already overdue
+        when first seen, a day after a change that was stopped or refused,
+        and an hour after a start that could not happen. None while a change
+        runs, or when the key changes only on request."""
+        change = record.machine_key_change or {}
+        if due is None or change.get("state") in RUNNING:
+            return None
+        pin = _current_pin(record)
+        times = [due]
+        seen = self._seen_overdue(record)
+        if seen is None and self.w.now() >= due:
+            seen = self.w.now()  # what the next check records
+        if seen is not None and pin is not None and seen - due > CATCH_UP_GRACE:
+            times.append(seen + catch_up_offset(pin))
+        if change.get("state") in (STOPPED, FAILED):
+            ended = _parse(change.get("finishedAt"))
+            if ended is not None:
+                times.append(ended + SCHEDULE_RETRY)
+        if self._schedule_refused is not None:
+            times.append(self._schedule_refused[0] + SCHEDULE_RETRY_REFUSED)
+        return max(times)
+
     def _due(self, change: dict[str, Any]) -> bool:
-        """The key is older than `machineKeyChangeDays`, and nothing in the
-        last day says to wait: a change an operator stopped, one the root
-        refused, or a start that could not happen."""
-        due = self.schedule()["keyChangeDueAt"]
+        """The schedule's next attempt has come (`_next_attempt`)."""
+        record = self.w.store.record
+        days = _days(self.w.lifetime_days())
+        if not record.tls_certificate or days <= 0:
+            return False
+        due = change_due_at(record.tls_certificate, days)
         now = self.w.now()
         if due is None or now < due:
             return False
-        if change.get("state") in (STOPPED, FAILED):
-            ended = _parse(change.get("finishedAt"))
-            if ended is not None and now - ended < SCHEDULE_RETRY:
-                return False
-        refused = self._schedule_refused
-        return refused is None or now - refused[0] >= SCHEDULE_RETRY_REFUSED
+        self._note_overdue(self.w.store.record, now)
+        next_attempt = self._next_attempt(self.w.store.record, due)
+        return next_attempt is not None and now >= next_attempt
 
     def _start_scheduled(self) -> None:
+        """Start the scheduled change. Any failure (a refusal, a key that could
+        not be written) is kept as its cause, said once, and tried again after
+        `SCHEDULE_RETRY_REFUSED`, not at every step."""
         try:
             self._begin(SCHEDULED)
         except KeyChangeRefused as exc:
-            said = self._schedule_refused[1] if self._schedule_refused else None
-            self._schedule_refused = (self.w.now(), exc.detail)
-            if exc.detail != said:
-                log.warning(
-                    "this machine's key is due a change, and the change cannot start: %s "
-                    "It is tried again every hour.",
-                    exc.detail,
-                )
+            self._refused(exc.detail)
+            return
+        except OSError as exc:
+            self._refused(f"The new key could not be written ({exc}).")
             return
         self._schedule_refused = None
         self._wake.set()
+
+    def _refused(self, cause: str) -> None:
+        said = self._schedule_refused[1] if self._schedule_refused else None
+        self._schedule_refused = (self.w.now(), cause)
+        if cause != said:
+            log.warning(
+                "this machine's key is due a change, and the change cannot start: %s "
+                "It is tried again every hour.",
+                cause,
+            )
 
     # ---- the steps -------------------------------------------------------------
 
@@ -681,20 +765,34 @@ class MachineKeyChange:
             self.write_door()
 
 
-def change_due_at(certificate_pem: str, days: int) -> datetime | None:
-    """When a key changes by itself: `days` after it was made, plus a spread
-    of up to a twelfth of them (about a month a year), drawn from the key's
-    pin. The same key keeps its day across restarts; keys made on one day,
-    the machines of one install that joined together, fall due on different
-    days (Troy's call R3-SCHEDULE-2). None for 0 days: only on request."""
+def _fraction(pin: str, salt: str) -> float:
+    """A number in [0, 1) drawn from a key's pin: the same for one key, and
+    spread evenly across keys."""
     import hashlib
 
+    digest = hashlib.sha256(f"{salt}:{pin}".encode("ascii")).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
+def due_after(made: datetime, pin: str, days: int) -> datetime:
+    """`days` after `made`, plus a spread of up to a twelfth of them (about a
+    month a year) drawn from the pin: keys made on one day, the machines of
+    one install that joined together, fall due on different days (Troy's
+    call R3-SCHEDULE-2), and one key keeps its day across restarts."""
+    return made + timedelta(days=days) + timedelta(days=days / 12) * _fraction(pin, "due")
+
+
+def catch_up_offset(pin: str) -> timedelta:
+    """How long after this machine first sees an overdue key it starts the
+    change: within `CATCH_UP_WINDOW`, drawn from the pin."""
+    return CATCH_UP_WINDOW * _fraction(pin, "catch-up")
+
+
+def change_due_at(certificate_pem: str, days: int) -> datetime | None:
+    """When a key falls due (`due_after`), or None for 0 days: only on request."""
     if days <= 0:
         return None
-    made = machine_key_made_at(certificate_pem)
-    pin = machine_pin(certificate_pem)
-    fraction = int.from_bytes(hashlib.sha256(pin.encode("ascii")).digest()[:8], "big") / 2**64
-    return made + timedelta(days=days) + timedelta(days=days / 12) * fraction
+    return due_after(machine_key_made_at(certificate_pem), machine_pin(certificate_pem), days)
 
 
 def _days(value: Any) -> int:
@@ -763,6 +861,8 @@ def from_app(app: Any) -> MachineKeyChange:
 
 
 __all__ = [
+    "CATCH_UP_GRACE",
+    "CATCH_UP_WINDOW",
     "DEFAULT_KEY_DAYS",
     "DONE",
     "DOOR_FILE",
@@ -778,8 +878,10 @@ __all__ = [
     "MachineKeyChange",
     "Wiring",
     "announced_next_pin",
+    "catch_up_offset",
     "change_due_at",
     "door_pins",
+    "due_after",
     "from_app",
     "machine_fields",
     "status",

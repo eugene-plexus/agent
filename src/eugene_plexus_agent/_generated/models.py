@@ -4573,7 +4573,15 @@ class MachinePort(BaseModel):
     )
     keyChangeDueAt: AwareDatetime | None = Field(
         None,
-        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default),\nplus a spread of up to a twelfth of it (about a month a year),\ndrawn from the key itself: the same for one key, different for\neach, so the machines of one install do not change on the same\nday. A key past it is changed at the next check, within a\nminute. `null` when the field is 0 (only on request).\n',
+        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default),\nplus a spread of up to a twelfth of it (about a month a year),\ndrawn from the key itself: the same for one key, different for\neach, so the machines of one install do not change on the same\nday. `null` when the field is 0 (only on request).\n',
+    )
+    keyChangeNextAttemptAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine next tries to start that change: at\n`keyChangeDueAt`; for a key already overdue when first seen (an\ninstall updated to this version, a machine that was off), at a\ntime up to 7 days later drawn from the key, so the machines of an\ninstall do not all change at once; a day after a change that was\nstopped or refused; an hour after a start that could not happen\n(`keyChangeBlocked`). `null` when the key does not change by\nitself or a change is under way.\n',
+    )
+    keyChangeBlocked: str | None = Field(
+        None,
+        description='Why the last start of a scheduled change could not happen, in\nthe words of the cause (a root older than row 3, a key that\ncould not be written). `null` when the last start did not fail.\n',
     )
 
 
