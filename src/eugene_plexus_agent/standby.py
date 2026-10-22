@@ -44,15 +44,33 @@ ROLE_STANDBY = "standby"
 
 
 def is_standby(entry: ComponentEntry) -> bool:
+    """The copy this agent owns: its standby, or, once `promoted`, the
+    install's root it became."""
     return entry.name == STANDBY_COMPONENT and entry.kind == ComponentKind.control
+
+
+def promoted(state: AgentState) -> bool:
+    """Row 4: this agent's copy was promoted and is the install's root.
+
+    Marked by `_reconcile` only when the copy says it is a root and a
+    machine list signed at its epoch names this machine the root; kept in
+    `agent.yaml`, and cleared with the copy. While it holds, the copy is
+    this machine's control root (`hosts_active_control`, the machine port's
+    `/control`, the door file), with no restart."""
+    entry = state.get_topology_entry(STANDBY_COMPONENT)
+    return entry is not None and is_standby(entry) and state.standby_promoted()
+
+
+def is_root(entry: ComponentEntry, state: AgentState) -> bool:
+    """`entry` is the install's control root on this machine: a control
+    entry other than the copy, or the copy once promoted."""
+    return entry.kind == ComponentKind.control and (not is_standby(entry) or promoted(state))
 
 
 def hosts_active_control(state: AgentState) -> bool:
     """This agent supervises the install's active control root. The
-    standby it may run does not count."""
-    return any(
-        e.kind == ComponentKind.control and not is_standby(e) for e in state.list_topology_entries()
-    )
+    standby it may run does not count, until it is promoted (row 4)."""
+    return any(is_root(e, state) for e in state.list_topology_entries())
 
 
 def config_dir(state: AgentState) -> Path:
@@ -165,7 +183,7 @@ async def _reconcile(app: Any) -> None:
         # took it because this copy is the install's root now. Only the
         # control itself can say which, so it is asked, and nothing is
         # stopped or deleted until it says it is still a standby.
-        role = await _local_role(entry)
+        role, epoch = await _local_health(entry)
         if role == ROLE_ACTIVE:
             if not getattr(app.state, "standby_promoted_said", False):
                 log.warning(
@@ -173,6 +191,8 @@ async def _reconcile(app: Any) -> None:
                     "root now; it keeps running here"
                 )
                 app.state.standby_promoted_said = True
+            if not promoted(state) and _named_root(app, epoch):
+                _mark_promoted(app, state, epoch)
             return
         if role != ROLE_STANDBY:
             log.warning(
@@ -186,19 +206,64 @@ async def _reconcile(app: Any) -> None:
         state.remove_topology_entry(STANDBY_COMPONENT)
         log.warning("this node is no longer the standby: its control root is stopped")
     if not want and state.get_topology_entry(STANDBY_COMPONENT) is None:
+        if state.standby_promoted():
+            state.set_standby_promoted(False)
         await asyncio.to_thread(_delete_copy, home)
 
 
-async def _local_role(entry: ComponentEntry) -> str | None:
-    """What the local control root says it is, from its `/healthz`."""
+def _named_root(app: Any, epoch: int | None) -> bool:
+    """Row 4: the root's signed machine list held here names this machine
+    the root, at the epoch the copy says it is at. The list is signed by
+    the install's identity, so a copy that only says `control` (one started
+    without its role, say) is not taken for the root: the epoch it says
+    must be the one the list names, and no copy reaches a higher epoch
+    without a promotion entry."""
+    machines = getattr(app.state, "machine_trust", None)
+    control = (machines.claims or {}).get("control") if machines is not None else None
+    name = app.state.node_identity.record.name
+    return (
+        isinstance(control, dict)
+        and isinstance(epoch, int)
+        and control.get("node") == name
+        and control.get("epoch") == epoch
+    )
+
+
+def _mark_promoted(app: Any, state: AgentState, epoch: int | None) -> None:
+    """The copy is this machine's control root now: kept in `agent.yaml`,
+    and the door file (the machine port's keys and address, which control
+    reads) is written for it. Nothing restarts, so it does not come back
+    sealed."""
+    state.set_standby_promoted(True)
+    log.warning(
+        "this machine's copy is the install's control root at epoch %s: other machines "
+        "reach it through this machine's port",
+        epoch,
+    )
+    key_change = getattr(app.state, "machine_key_change", None)
+    if key_change is not None:
+        try:
+            key_change.write_door()
+        except Exception:  # pragma: no cover - defensive
+            log.warning("could not write the machine door file for the promoted copy")
+
+
+async def _local_health(entry: ComponentEntry) -> tuple[str | None, int | None]:
+    """What the local control root says it is, and at which epoch, from its
+    `/healthz` (`details.role`, `details.epoch`)."""
     client = shared_internal_client("standby-health", timeout=5.0)
     try:
         response = await client.get(f"{str(entry.url).rstrip('/')}/healthz")
         details = response.json().get("details") or {}
     except Exception:
-        return None
-    role = details.get("role") if isinstance(details, dict) else None
-    return role if isinstance(role, str) else None
+        return None, None
+    if not isinstance(details, dict):
+        return None, None
+    role, epoch = details.get("role"), details.get("epoch")
+    return (
+        role if isinstance(role, str) else None,
+        epoch if isinstance(epoch, int) and not isinstance(epoch, bool) else None,
+    )
 
 
 def _delete_copy(home: Path) -> None:

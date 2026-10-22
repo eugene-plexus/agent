@@ -180,6 +180,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     machine_trust.load()
     app.state.machine_trust = machine_trust
+    # Row 4: once this node follows a promoted root to its address, it
+    # announces itself there and pulls the bundle, beside whatever took the
+    # list (a push or a pull), which must not wait for it.
+    app.state.root_moved_task = None
+
+    def _root_moved() -> None:
+        from . import leaving
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        app.state.root_moved_task = loop.create_task(
+            leaving.after_root_moved(app), name="root-moved"
+        )
+
+    machine_trust.on_moved = _root_moved
 
     # The sessions signed out before this start. Outside the `hasattr`
     # above, and in safe mode too: a sign-out that was not read back is
@@ -694,6 +711,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
             await asyncio.gather(announce_task, return_exceptions=True)
+        moving = getattr(app.state, "root_moved_task", None)
+        if moving is not None and not moving.done():
+            moving.cancel()
+            await asyncio.gather(moving, return_exceptions=True)
         if key_change_task is not None:
             key_change_task.cancel()
             await asyncio.gather(key_change_task, return_exceptions=True)

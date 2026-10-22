@@ -600,6 +600,10 @@ class AgentState:
         # `autoStart` is what the person asked for at boot, and this is what
         # they did since.
         self._stopped: set[str] = set()
+        # Row 4: the standby copy this agent runs was promoted and is the
+        # install's root (`standby.promoted`). Persisted under
+        # `standbyPromoted:` beside the components it is about.
+        self._standby_promoted = False
         # v0.2 auth block. Persisted to disk under `auth:` in agent.yaml.
         # passphraseHash: Argon2id-PHC string (verifiable, not reversible)
         # masterSalt:     base64-encoded 16-byte salt used to derive the
@@ -653,6 +657,7 @@ class AgentState:
                     if isinstance(name, str) and name in self._runtimes
                 }
                 self._auth = dict(raw.get("auth") or {})
+                self._standby_promoted = raw.get("standbyPromoted") is True
                 self._drop_invalid_update_channel_locked()
             else:
                 self._config = _config_defaults()
@@ -660,6 +665,7 @@ class AgentState:
                 self._runtimes = {}
                 self._stopped = set()
                 self._auth = {}
+                self._standby_promoted = False
                 self._write_locked()
 
     def load_or_degrade(self) -> str | None:
@@ -965,6 +971,18 @@ class AgentState:
             self._write_locked()
             return updated
 
+    # Row 4: the promoted standby copy (`standby.promoted`).
+
+    def standby_promoted(self) -> bool:
+        with self._lock:
+            return self._standby_promoted
+
+    def set_standby_promoted(self, value: bool) -> None:
+        with self._lock:
+            if self._standby_promoted != value:
+                self._standby_promoted = value
+                self._write_locked()
+
     # The supervisor's `StopMemory` (agent#11).
 
     def remembered_stops(self) -> set[str]:
@@ -1140,6 +1158,8 @@ class AgentState:
         ]
         if self._stopped:
             out["stoppedRuntimes"] = sorted(self._stopped)
+        if self._standby_promoted:
+            out["standbyPromoted"] = True
         if self._auth:
             out["auth"] = dict(self._auth)
 
