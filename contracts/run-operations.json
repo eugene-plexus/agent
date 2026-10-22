@@ -2478,6 +2478,19 @@
             "type": "boolean",
             "title": "Default"
           },
+          "authorSampling": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authorsampling",
+            "description": "Whether to use the model author's sampling for omitted\nvalues, as saved (`ModelProfileSpec.authorSampling`). Absent\nmeans true for stored profiles.\n",
+            "default": true
+          },
           "maxTokens": {
             "anyOf": [
               {
@@ -2515,6 +2528,31 @@
               }
             ],
             "title": "Topp"
+          },
+          "topK": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Topk"
+          },
+          "minP": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minp"
           },
           "engine": {
             "$ref": "#/components/schemas/EngineKind"
@@ -3900,11 +3938,43 @@
               }
             ],
             "title": "Topp"
+          },
+          "minP": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Minp"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RecommendedSamplingSource"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
         "title": "RecommendedSampling",
-        "description": "Sampling parameters the model's author put in the file\n(`general.sampling.*` in GGUF). **Reported, never applied.**\n\nThe locked rule is that the gateway owns every\nLLM-output-affecting parameter and no component substitutes a\nlocal default; that rule is unchanged. But the file having an\nopinion is real information, and dropping it means the operator\nhas to go read the model card to find out. Whether anything can\nadopt these with one click is a gateway decision, not a library\none."
+        "description": "Sampling parameters the model's author put in the file\n(`general.sampling.*` in GGUF or `generation_config.json` for\nsafetensors), applied by the gateway as defaults when neither\nthe request nor the default profile sets a value. Author values\nalso apply when the model has no profile. A default profile with\n`authorSampling: false` turns them off.\n\nThe Library only reports these values. The gateway owns and\nsends every sampling value, falling back to its own defaults\nwhen no request, profile or enabled author value exists. An\ninference driver never substitutes its own defaults. The author's\nrepeat penalty is not applied."
+      },
+      "RecommendedSamplingSource": {
+        "type": "string",
+        "enum": [
+          "gguf",
+          "generation_config"
+        ],
+        "title": "RecommendedSamplingSource",
+        "description": "Where the author stated the sampling values: `general.sampling.*`\nin a GGUF file, or a safetensors model's `generation_config.json`."
       },
       "SafetensorsDetail": {
         "properties": {
@@ -3978,6 +4048,17 @@
             ],
             "title": "Configpath",
             "description": "Absolute path to `config.json`, the file that made this a model."
+          },
+          "recommendedSampling": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RecommendedSampling"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Author sampling from `generation_config.json`, reported only\nwhen `do_sample` is true. Greedy decoding contributes no\nsampling defaults.\n"
           }
         },
         "type": "object",
