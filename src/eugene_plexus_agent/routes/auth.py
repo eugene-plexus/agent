@@ -212,21 +212,33 @@ async def _keep_local_root_on_the_file(request: Request, state: AgentState, sess
     mode.
 
     Narrow on purpose: only when this agent unlocks from a file that now
-    exists, only the root this agent itself runs (never a worker's root,
-    which is another machine's), only from `os_keyring`, and only when
-    this account has no keyring, so the root's keyring could not work
-    either. A root on `prompt_on_startup` was chosen so and stays. Never
-    fails a sign-in: what it could not do, it logs.
+    exists, only the root this agent itself runs on this machine (a
+    spawned control entry on loopback, never a worker's root or an address
+    elsewhere), only from `os_keyring`, and only when this account's
+    keyring is known to be absent -- a probe that ran out of time is a
+    Keychain that might work, and never authorizes a permanent change. A
+    root on `prompt_on_startup` was chosen so and stays. Never fails a
+    sign-in: what it could not do, it logs with the root's own words.
     """
     if state.get_config("securityMode") != "passphrase_file":
         return
     path = _passphrase_path(request)
     if path is None or not path.is_file():
         return
+    from urllib.parse import urlsplit
+
     from ..machine_port import active_control_entry
+    from ..node_identity import is_loopback_host
 
     entry = active_control_entry(state)
     if entry is None:
+        return
+    root = str(entry.url).rstrip("/")
+    try:
+        host = urlsplit(root).hostname
+    except ValueError:
+        host = None
+    if not is_loopback_host(host):
         return
     try:
         available: bool | None = await asyncio.wait_for(
@@ -234,38 +246,68 @@ async def _keep_local_root_on_the_file(request: Request, state: AgentState, sess
         )
     except TimeoutError:
         available = None
-    if available:
+    if available is not False:
         return
-    root = str(entry.url).rstrip("/")
     headers = {"Authorization": f"Bearer {session}"}
     transport = getattr(request.app.state, "control_transport", None)
+    cause = (
+        "the control root on this machine still unlocks from an OS keyring this account "
+        "cannot reach"
+    )
     try:
         async with internal_client(timeout=_FORWARD_TIMEOUT_SECONDS, transport=transport) as client:
             current = await client.get(f"{root}/v1/config", headers=headers)
-            if current.status_code != 200 or current.json().get("securityMode") != "os_keyring":
+            if current.status_code != 200:
+                log.warning(
+                    "%s: it would not show its settings (%s): %s",
+                    cause,
+                    current.status_code,
+                    current.text[:300],
+                )
+                return
+            if current.json().get("securityMode") != "os_keyring":
                 return
             changed = await client.patch(
                 f"{root}/v1/config", json={"securityMode": "passphrase_file"}, headers=headers
             )
     except (httpx.HTTPError, ValueError) as exc:
         log.warning(
-            "the control root on this machine still unlocks from an OS keyring this account "
-            "cannot reach, and could not be moved to the passphrase file: %s",
+            "%s, and could not be moved to the passphrase file: %s",
+            cause,
             str(exc) or type(exc).__name__,
         )
         return
-    if changed.status_code == 200:
-        log.info(
-            "the control root on this machine now unlocks from %s, as this agent does: this "
-            "account has no OS keyring",
-            path,
-        )
-    else:
+    if changed.status_code != 200:
         log.warning(
-            "the control root on this machine refused to unlock from the passphrase file (%s): %s",
+            "%s: it refused the passphrase file (%s): %s",
+            cause,
             changed.status_code,
             changed.text[:300],
         )
+        return
+    try:
+        result = changed.json()
+    except ValueError:
+        result = {}
+    applied = result.get("applied") if isinstance(result, dict) else None
+    rejected = result.get("rejected") if isinstance(result, dict) else None
+    if not isinstance(applied, list) or "securityMode" not in applied:
+        said = "; ".join(
+            str(item.get("message"))
+            for item in (rejected if isinstance(rejected, list) else [])
+            if isinstance(item, dict) and item.get("key") == "securityMode"
+        )
+        log.warning(
+            "%s: it rejected the passphrase file: %s",
+            cause,
+            said or f"it did not apply securityMode ({changed.text[:300]})",
+        )
+        return
+    log.info(
+        "the control root on this machine now unlocks from %s, as this agent does: this "
+        "account has no OS keyring",
+        path,
+    )
 
 
 class _InitializeRequest(BaseModel):
