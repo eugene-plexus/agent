@@ -821,7 +821,7 @@ def test_the_catalogue_offers_open_webui_as_designed() -> None:
     catalogue = {m.id: m for m in apps.load_catalogue()}
     assert list(catalogue) == ["workbench", "open-webui"]
     webui = catalogue["open-webui"]
-    assert apps.pip_requirement(webui) == "open-webui==0.11.4"
+    assert apps.pip_requirement(webui) == "open-webui==0.12.3"
     assert webui.entry == "open_webui:app" and webui.healthPath == "/ready"
     assert [a.root for a in webui.args or []] == [
         "serve",
@@ -833,18 +833,25 @@ def test_the_catalogue_offers_open_webui_as_designed() -> None:
     assert webui.localActions is True and webui.signIn is True and webui.configTrio is False
     assert webui.signInCallbackPath == "/oauth/oidc/callback"
     assert webui.resetOnConnectionChange == "RESET_CONFIG_ON_START"
-    assert str(webui.licenseUrl) == "https://github.com/open-webui/open-webui/blob/v0.11.4/LICENSE"
+    assert str(webui.licenseUrl) == "https://github.com/open-webui/open-webui/blob/v0.12.3/LICENSE"
     env = webui.environment or {}
     assert env["OPENAI_API_KEY"] == "{clientKey}"
     assert env["OAUTH_CLIENT_SECRET"] == "{oidcClientSecret}"
     assert env["WEBUI_SECRET_KEY"] == "{appSecret}"
     assert env["OPENAI_API_BASE_URL"] == "{gatewayUrl}/v1"
     assert env["OPENID_PROVIDER_URL"] == "{oidcIssuer}/.well-known/openid-configuration"
-    # 33 until MR6 added the six that point its document search at Eugene, the
-    # ten that name the gateway for every address it would default to OpenAI's,
-    # and the two that batch its embeddings (`test_app_models.py` holds what
-    # each is and why).
-    assert len(env) == 51
+    assert env["ENABLE_WEB_SEARCH"] == "true"
+    assert env["WEB_SEARCH_ENGINE"] == "external"
+    assert env["EXTERNAL_WEB_SEARCH_URL"] == "{gatewayUrl}/v1/web_search"
+    assert env["EXTERNAL_WEB_SEARCH_API_KEY"] == "{clientKey}"
+    assert env["WEB_SEARCH_RESULT_COUNT"] == "5"
+    assert env["WEB_SEARCH_CONCURRENT_REQUESTS"] == "2"
+    assert env["BYPASS_WEB_SEARCH_WEB_LOADER"] == "true"
+    assert env["ENABLE_IMAGE_GENERATION"] == "{imageModelSet}"
+    assert env["IMAGE_GENERATION_ENGINE"] == "openai"
+    assert env["IMAGE_GENERATION_MODEL"] == "{imageModel}"
+    assert env["ENABLE_PLUGINS"] == "true"
+    assert [p.root for p in webui.updateBackup] == ["webui.db", "vector_db"]
 
     # Workbench needs none of it and did not change.
     workbench = catalogue["workbench"]
@@ -891,7 +898,7 @@ def test_the_listing_carries_the_licence(app: FastAPI, authed_client: TestClient
     manager.catalogue = {m.id: m for m in apps.load_catalogue()}
     listed = authed_client.get("/v1/app-catalogue").json()["apps"]
     (webui,) = [e["manifest"] for e in listed if e["manifest"]["id"] == "open-webui"]
-    assert webui["licenseUrl"] == "https://github.com/open-webui/open-webui/blob/v0.11.4/LICENSE"
+    assert webui["licenseUrl"] == "https://github.com/open-webui/open-webui/blob/v0.12.3/LICENSE"
 
 
 def test_the_app_url_is_where_the_console_opens_it(tmp_path: Path) -> None:
