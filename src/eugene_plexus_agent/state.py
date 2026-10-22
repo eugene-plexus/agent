@@ -109,6 +109,17 @@ _AUTH_MARKERS = (
 
 CONFIG_FIELDS: list[ConfigField] = [
     ConfigField(
+        key="reportOllama",
+        label="Report this machine's Ollama models",
+        description=(
+            "List this machine's Ollama models in the Library. "
+            "No file is sent until you choose Keep in the Library."
+        ),
+        category="modelStorage",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
         key="firstRunComplete",
         label="First-run setup complete",
         description=(

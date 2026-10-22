@@ -59,6 +59,7 @@ from .._generated.models import (
     HostHistoryStepChoice,
     HostMetric,
     LocalStandby,
+    MachineKeyChange,
     MachinePort,
     NodeIdentity,
     NodeReach,
@@ -167,6 +168,16 @@ def _machine(request: Request) -> MachinePort | None:
     if door is None:
         return None
     trust = getattr(request.app.state, "machine_trust", None)
+    from .. import machine_key_change
+
+    running = getattr(request.app.state, "machine_key_change", None)
+    # The running change's own view, which keeps a failure node.yaml could
+    # not hold (a full disk); the record's otherwise.
+    change = (
+        running.status()
+        if running is not None
+        else machine_key_change.status(_store(request).record)
+    )
     return MachinePort(
         url=machine_port.machine_url(request.app),  # type: ignore[arg-type]
         port=door.status.port,
@@ -175,6 +186,8 @@ def _machine(request: Request) -> MachinePort | None:
         error=door.status.error,
         required=bool(trust is not None and trust.required),
         listAgeSeconds=trust.age_seconds if trust is not None else None,
+        listVersion=trust.version if trust is not None else None,
+        keyChange=MachineKeyChange.model_validate(change) if change else None,
     )
 
 
@@ -663,6 +676,62 @@ async def take_trust_bundle(request: Request, body: SignedTrustBundle) -> NodeId
     if record.control_url:
         asyncio.get_running_loop().create_task(_refresh_machines(request.app, record.control_url))
     return _identity(request, await _devices(request))
+
+
+# --------------------------------------------------------------------------- #
+# the machine key: change it with no stop in traffic (row 3)
+# --------------------------------------------------------------------------- #
+
+
+def _key_change(request: Request) -> Any:
+    change = getattr(request.app.state, "machine_key_change", None)
+    if change is None:
+        door = getattr(request.app.state, "machine_port", None)
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "machine-port-down",
+            "Machine port not running",
+            "This machine runs no machine port"
+            + (f" ({door.status.error})" if door is not None and door.status.error else "")
+            + ", so it presents no key to change.",
+        )
+    return change
+
+
+@router.post(
+    "/v1/node/machine-key",
+    response_model=MachineKeyChange,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=_write_auth,
+)
+async def start_machine_key_change(request: Request) -> MachineKeyChange:
+    """Give this machine a new machine key, with no stop in traffic. See
+    `machine_key_change` for the order of the steps."""
+    from ..machine_key_change import KeyChangeRefused
+
+    try:
+        started = await _key_change(request).start()
+    except KeyChangeRefused as exc:
+        raise _problem(exc.status, exc.slug, exc.title, exc.detail) from exc
+    return MachineKeyChange.model_validate(started)
+
+
+@router.delete(
+    "/v1/node/machine-key",
+    response_model=MachineKeyChange,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def stop_machine_key_change(request: Request) -> MachineKeyChange:
+    """Stop a machine key change before the switch: the next key is deleted."""
+    from ..machine_key_change import KeyChangeRefused
+
+    try:
+        stopped = await _key_change(request).stop()
+    except KeyChangeRefused as exc:
+        raise _problem(exc.status, exc.slug, exc.title, exc.detail) from exc
+    return MachineKeyChange.model_validate(stopped)
 
 
 # --------------------------------------------------------------------------- #

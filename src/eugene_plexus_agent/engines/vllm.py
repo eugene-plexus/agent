@@ -56,9 +56,10 @@ from .._generated.models import (
     RuntimeCapabilities,
     RuntimePromptCache,
     RuntimeSpec,
+    RuntimeSpeculation,
 )
 from ..child_env import child_environment
-from . import prompt_cache
+from . import prompt_cache, speculation
 from .base import (
     DiscoveredBinary,
     EngineAdapter,
@@ -276,6 +277,50 @@ class VllmAdapter(EngineAdapter):
         """CPU KV offload as this runtime was started with it (PC7), from its command line."""
         return prompt_cache.vllm_view(spec, argv)
 
+    def declaration_problem(self, spec: RuntimeSpec) -> str | None:
+        return speculation.declaration_problem(spec.modelPath, spec.flags)
+
+    def companion_files(self, spec: RuntimeSpec) -> tuple[str, ...]:
+        found = speculation.companion(spec.flags)
+        return (found,) if found else ()
+
+    def speculation_view(self, spec: RuntimeSpec, argv: list[str]) -> RuntimeSpeculation | None:
+        """Read what was launched without probing an executable on the event loop."""
+        if not argv:
+            return None
+        manual = speculation.vllm_by_hand(spec.extraArgs)
+        ran = speculation.vllm_in_argv(argv)
+        if ran is not None:
+            types, draft = ran
+            note = speculation.VLLM_BY_HAND if manual else None
+            if (
+                not manual
+                and types != ["ngram"]
+                and (spec.flags or {}).get(speculation.REUSE_TEXT_KEY) is not False
+            ):
+                note = speculation.VLLM_MODEL_WINS
+            return RuntimeSpeculation(types=types, draftModelPath=draft, note=note)
+        if manual:
+            return RuntimeSpeculation(types=[], note=speculation.VLLM_BY_HAND)
+        try:
+            planned = speculation.vllm_plan(spec.flags or {}, extra_args=None, offered=None)
+        except ValueError as exc:
+            return RuntimeSpeculation(types=[], note=str(exc))
+        return RuntimeSpeculation(types=[], note=planned.note) if planned.note else None
+
+    async def read_speculation(self, base_url: str) -> tuple[int | None, int | None] | None:
+        """`(drafted, accepted)` from vLLM's default Prometheus endpoint."""
+        try:
+            response = await _probe_client().get(
+                f"{base_url.rstrip('/')}/metrics", timeout=_PROBE_TIMEOUT_SECONDS
+            )
+        except httpx.HTTPError as exc:
+            log.debug("speculation counters from %s: %s", base_url, exc)
+            return None
+        if not response.is_success:
+            return None
+        return speculation.vllm_parse_metrics(response.text)
+
     def manual_install(self, host: HostAccelerator) -> ManualInstall:
         """The install command for this host, copied from upstream's
         v0.29.0 install pages — never composed. A command that does not
@@ -320,7 +365,7 @@ class VllmAdapter(EngineAdapter):
 
         flags = spec.flags or {}
         for field in self.flag_schema().fields:
-            if field.key == prompt_cache.KV_OFFLOAD_KEY:
+            if field.key == prompt_cache.KV_OFFLOAD_KEY or field.key in speculation.KEYS:
                 continue
             if field.key not in flags:
                 continue
@@ -359,6 +404,19 @@ class VllmAdapter(EngineAdapter):
                     spec.name,
                     prompt_cache.KV_OFFLOAD_FLAG,
                 )
+
+        # SD2: one JSON config. Do not probe when off or set by hand. Use the same
+        # cached build-help probe as KV offload, and omit an unsupported flag.
+        if not speculation.vllm_by_hand(spec.extraArgs) and (
+            flags.get(speculation.DRAFT_WITH_KEY) not in (None, "off")
+            or flags.get(speculation.REUSE_TEXT_KEY) is not False
+        ):
+            planned = speculation.vllm_plan(
+                flags, extra_args=spec.extraArgs, offered=_supported_long_flags(binary.path)
+            )
+            argv += list(planned.argv)
+            if planned.note and not planned.argv:
+                log.warning("%s: %s The profile's setting is not passed", spec.name, planned.note)
 
         # Verbatim, last, so an operator can always override something the
         # curated surface generated above.
@@ -805,6 +863,7 @@ def manual_install_for(host: HostAccelerator) -> ManualInstall:
 # --------------------------------------------------------------------------- #
 
 _CATEGORIES = {
+    "speculation": "Speculative decoding",
     "memory": "Memory and context",
     "parallelism": "Parallelism",
     "performance": "Performance",
@@ -835,6 +894,63 @@ _FLAG_CLI_NAMES: dict[str, str] = {
 }
 
 _FLAG_FIELDS: list[ConfigField] = [
+    ConfigField(
+        key=speculation.REUSE_TEXT_KEY,
+        label="Reuse repeated text",
+        description=(
+            "Propose tokens from text already in the conversation.\n\n"
+            "This uses vLLM's ngram method without an extra model. It is used only "
+            "when Draft with is Off: vLLM takes one method, so a chosen model wins. "
+            "The running model shows how many proposed tokens it kept."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.boolean,
+        default=True,
+        unsetMeans="On when Draft with is Off and this vLLM build offers speculative decoding.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=speculation.DRAFT_WITH_KEY,
+        label="Draft with",
+        description=(
+            "Choose what drafts tokens ahead for the model to check.\n\n"
+            "Model's own prediction head uses its multi-token prediction (MTP) head. "
+            "Companion file uses a draft model from the model's folder, with memory "
+            "for its weights and cache. vLLM checks model support when it loads. "
+            "The settings builder currently times drafting only on llama.cpp."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.enum,
+        enumValues=list(speculation.DRAFT_WITH_CHOICES),
+        enumLabels=["Off", "Model's own prediction head (MTP)", "Companion file"],
+        unsetMeans="Off: no model drafts. Reuse repeated text is a separate setting.",
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=speculation.DRAFT_MODEL_KEY,
+        label="Companion file",
+        description=(
+            "The companion draft model path in the same Library folder as the model. "
+            "Used when Draft with is Companion file. vLLM must be able to load this path."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.string,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=speculation.DRAFT_TOKENS_KEY,
+        label="Tokens drafted per step",
+        description=(
+            "Tokens proposed before the model checks them. Used for the selected model "
+            "or for repeated text. More helps only when most proposed tokens are kept."
+        ),
+        category="speculation",
+        valueType=ConfigValueType.integer,
+        minimum=1,
+        maximum=16,
+        unsetMeans="3, Eugene's default; vLLM requires a token count.",
+        requiresRestart=True,
+    ),
     ConfigField(
         key="maxModelLen",
         label="Max model length",

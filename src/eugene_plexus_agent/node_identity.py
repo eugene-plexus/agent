@@ -11,6 +11,9 @@ One file, `node.yaml`, beside `agent.yaml`:
     tokenPrivateKey: <base64 Ed25519 seed>     signs this node's tokens
     tlsPrivateKey: <PEM P-256>          the machine port's TLS key (LT1)
     tlsCertificate: <PEM>               self-signed; other machines pin its key
+    tlsNextPrivateKey: <PEM P-256>      the next machine key, during a change (row 3)
+    tlsNextCertificate: <PEM>
+    machineKeyChange: {state: ..., ...} the last machine key change (row 3)
     controlPins: <pin>[,<pin>]          the root's machine key, from the join token
     advertiseSequence: 3               strictly increasing, mirrored at the root
     controlUrl: http://100.64.0.1:8083
@@ -59,6 +62,7 @@ checks it against the key it pinned at enrollment.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import ipaddress
 import json
@@ -395,6 +399,13 @@ class IdentityRecord:
     """Comma-separated pins of the root's machine key, from the join token
     this node enrolled with (LT1): what it checks the root against before
     the first signed machine list arrives."""
+    tls_next_private_key: str | None = None
+    tls_next_certificate: str | None = None
+    """The next machine key while it changes (row 3,
+    `machine_key_change`): made at the start, swapped in at the switch,
+    deleted when the change stops or fails."""
+    machine_key_change: dict[str, Any] | None = None
+    """The last machine key change, as `machine_key_change` keeps it."""
 
     @property
     def enrolled(self) -> bool:
@@ -418,6 +429,9 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("tlsPrivateKey", "tls_private_key"),
     ("tlsCertificate", "tls_certificate"),
     ("controlPins", "control_pins"),
+    ("tlsNextPrivateKey", "tls_next_private_key"),
+    ("tlsNextCertificate", "tls_next_certificate"),
+    ("machineKeyChange", "machine_key_change"),
 )
 
 
@@ -428,6 +442,8 @@ class NodeIdentityStore:
         self._path = path
         self._lock = threading.Lock()
         self._record = IdentityRecord()
+        #: Held while an address announcement is in flight (`enrollment`).
+        self.announcing = asyncio.Lock()
 
     @property
     def path(self) -> Path:
@@ -453,6 +469,8 @@ class NodeIdentityStore:
                 value = raw.get(wire)
                 if attr == "epoch":
                     values[attr] = int(value) if isinstance(value, int) else None
+                elif attr == "machine_key_change":
+                    values[attr] = dict(value) if isinstance(value, dict) else None
                 elif attr == "advertise_sequence":
                     values[attr] = int(value) if isinstance(value, int) else 0
                 else:
@@ -488,41 +506,40 @@ class NodeIdentityStore:
         """
         with self._lock:
             changed = False
-            if not (self._record.private_key and self._record.public_key):
+            record = self._record
+            if not (record.private_key and record.public_key):
                 private = nacl.public.PrivateKey.generate()
-                self._record = replace(
-                    self._record,
+                record = replace(
+                    record,
                     private_key=base64.b64encode(bytes(private)).decode("ascii"),
                     public_key=base64.b64encode(bytes(private.public_key)).decode("ascii"),
                 )
                 changed = True
                 log.info("generated this node's sealing keypair")
-            if not (self._record.signing_private_key and self._record.signing_public_key):
+            if not (record.signing_private_key and record.signing_public_key):
                 signing = nacl.signing.SigningKey.generate()
-                self._record = replace(
-                    self._record,
+                record = replace(
+                    record,
                     signing_private_key=base64.b64encode(bytes(signing)).decode("ascii"),
                     signing_public_key=base64.b64encode(bytes(signing.verify_key)).decode("ascii"),
                 )
                 changed = True
                 log.info("generated this node's signing keypair")
-            if not self._record.token_private_key:
+            if not record.token_private_key:
                 token = nacl.signing.SigningKey.generate()
-                self._record = replace(
-                    self._record,
+                record = replace(
+                    record,
                     token_private_key=base64.b64encode(bytes(token)).decode("ascii"),
                 )
                 changed = True
                 log.info("generated this node's token key")
-            if not (self._record.tls_private_key and self._record.tls_certificate):
+            if not (record.tls_private_key and record.tls_certificate):
                 key_pem, certificate_pem = generate_machine_key()
-                self._record = replace(
-                    self._record, tls_private_key=key_pem, tls_certificate=certificate_pem
-                )
+                record = replace(record, tls_private_key=key_pem, tls_certificate=certificate_pem)
                 changed = True
                 log.info("generated this node's machine key (pin %s)", machine_pin(certificate_pem))
             if changed:
-                self._write_locked()
+                self._write_locked(record)
             return self._record
 
     def record_enrollment(
@@ -536,22 +553,23 @@ class NodeIdentityStore:
         advertise_url: str | None,
     ) -> IdentityRecord:
         with self._lock:
-            self._record = replace(
-                self._record,
-                name=name,
-                control_url=control_url.rstrip("/"),
-                epoch=epoch,
-                control_public_key=control_public_key,
-                recovery_public_key=recovery_public_key,
-                advertise_url=advertise_url,
-                # The root's `enrollNode` replaces the node record
-                # wholesale, so its high-water mark goes to zero here
-                # too. Keeping a stale counter on either side is how a
-                # rebuilt host ends up unable to re-advertise.
-                advertise_sequence=0,
-                enrolled_at=datetime.now(UTC).isoformat(),
+            self._write_locked(
+                replace(
+                    self._record,
+                    name=name,
+                    control_url=control_url.rstrip("/"),
+                    epoch=epoch,
+                    control_public_key=control_public_key,
+                    recovery_public_key=recovery_public_key,
+                    advertise_url=advertise_url,
+                    # The root's `enrollNode` replaces the node record
+                    # wholesale, so its high-water mark goes to zero here
+                    # too. Keeping a stale counter on either side is how a
+                    # rebuilt host ends up unable to re-advertise.
+                    advertise_sequence=0,
+                    enrolled_at=datetime.now(UTC).isoformat(),
+                )
             )
-            self._write_locked()
             return self._record
 
     def record_control_pins(self, pins: list[str]) -> IdentityRecord:
@@ -559,8 +577,70 @@ class NodeIdentityStore:
         with self._lock:
             value = ",".join(pins) or None
             if value != self._record.control_pins:
-                self._record = replace(self._record, control_pins=value)
-                self._write_locked()
+                self._write_locked(replace(self._record, control_pins=value))
+            return self._record
+
+    # ----- the machine key change (row 3) -----------------------------------
+
+    def begin_machine_key_change(self, change: dict[str, Any]) -> IdentityRecord:
+        """Make the next machine key and record the change, in one write.
+
+        `change` is the change's state as `machine_key_change` keeps it;
+        `nextPin` is filled in here, from the key made."""
+        key_pem, certificate_pem = generate_machine_key()
+        with self._lock:
+            self._write_locked(
+                replace(
+                    self._record,
+                    tls_next_private_key=key_pem,
+                    tls_next_certificate=certificate_pem,
+                    machine_key_change={**change, "nextPin": machine_pin(certificate_pem)},
+                )
+            )
+            log.info("made this node's next machine key (pin %s)", machine_pin(certificate_pem))
+            return self._record
+
+    def update_machine_key_change(self, **fields: Any) -> IdentityRecord:
+        """Merge `fields` into the change's state; written only if it moved."""
+        with self._lock:
+            change = dict(self._record.machine_key_change or {})
+            merged = {**change, **fields}
+            if merged != change:
+                self._write_locked(replace(self._record, machine_key_change=merged))
+            return self._record
+
+    def switch_machine_key(self, **fields: Any) -> IdentityRecord:
+        """The switch: the next key becomes the machine key, and the old
+        private key is gone from this file, in one write. `fields` go into
+        the change's state in the same write."""
+        with self._lock:
+            record = self._record
+            if not (record.tls_next_private_key and record.tls_next_certificate):
+                raise ValueError("there is no next machine key to switch to")
+            self._write_locked(
+                replace(
+                    record,
+                    tls_private_key=record.tls_next_private_key,
+                    tls_certificate=record.tls_next_certificate,
+                    tls_next_private_key=None,
+                    tls_next_certificate=None,
+                    machine_key_change={**(record.machine_key_change or {}), **fields},
+                )
+            )
+            return self._record
+
+    def drop_next_machine_key(self, **fields: Any) -> IdentityRecord:
+        """A change that stopped or failed: the next key is deleted, the
+        machine key stays, and `fields` go into the change's state."""
+        with self._lock:
+            self._write_locked(
+                replace(
+                    self._record,
+                    tls_next_private_key=None,
+                    tls_next_certificate=None,
+                    machine_key_change={**(self._record.machine_key_change or {}), **fields},
+                )
+            )
             return self._record
 
     def record_advertise_url(self, url: str | None) -> IdentityRecord:
@@ -573,8 +653,7 @@ class NodeIdentityStore:
         with self._lock:
             if url == self._record.advertise_url:
                 return self._record
-            self._record = replace(self._record, advertise_url=url)
-            self._write_locked()
+            self._write_locked(replace(self._record, advertise_url=url))
             return self._record
 
     def next_advertise_sequence(self) -> int:
@@ -588,8 +667,7 @@ class NodeIdentityStore:
         """
         with self._lock:
             claimed = int(self._record.advertise_sequence or 0) + 1
-            self._record = replace(self._record, advertise_sequence=claimed)
-            self._write_locked()
+            self._write_locked(replace(self._record, advertise_sequence=claimed))
             return claimed
 
     def unenroll(self) -> IdentityRecord:
@@ -607,19 +685,24 @@ class NodeIdentityStore:
         `agent.yaml` and is untouched, so it keeps winning.
         """
         with self._lock:
-            self._record = replace(
-                self._record,
-                name=None,
-                control_url=None,
-                control_public_key=None,
-                recovery_public_key=None,
-                epoch=None,
-                advertise_url=None,
-                advertise_sequence=0,
-                enrolled_at=None,
-                control_pins=None,
+            self._write_locked(
+                replace(
+                    self._record,
+                    name=None,
+                    control_url=None,
+                    control_public_key=None,
+                    recovery_public_key=None,
+                    epoch=None,
+                    advertise_url=None,
+                    advertise_sequence=0,
+                    enrolled_at=None,
+                    control_pins=None,
+                    # A machine key change belongs to the install it was for.
+                    tls_next_private_key=None,
+                    tls_next_certificate=None,
+                    machine_key_change=None,
+                )
             )
-            self._write_locked()
             return self._record
 
     def accept_epoch(self, epoch: int) -> None:
@@ -637,16 +720,19 @@ class NodeIdentityStore:
                     f"root, and this node fences it without an election."
                 )
             if epoch != held_epoch:
-                self._record = replace(self._record, epoch=epoch)
-                self._write_locked()
+                self._write_locked(replace(self._record, epoch=epoch))
 
     # ----- internals --------------------------------------------------
 
-    def _write_locked(self) -> None:
+    def _write_locked(self, record: IdentityRecord | None = None) -> None:
+        """Write `record` (the one held, by default), and only then hold it
+        (row 3 review): a write that fails leaves the record in memory as
+        the file has it, so memory never claims a key the disk does not."""
+        record = self._record if record is None else record
         self._path.parent.mkdir(parents=True, exist_ok=True)
         out: dict[str, Any] = {}
         for wire, attr in _FIELDS:
-            value = getattr(self._record, attr)
+            value = getattr(record, attr)
             if value is not None:
                 out[wire] = value
         rendered = yaml.safe_dump(out, sort_keys=True, default_flow_style=False)
@@ -659,6 +745,7 @@ class NodeIdentityStore:
         # (The install's signing key is no longer here; the node's own
         # three private keys are.)
         write_private(self._path, rendered)
+        self._record = record
 
 
 __all__ = [

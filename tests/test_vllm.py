@@ -681,7 +681,10 @@ def test_flag_schema_is_a_standard_config_schema(adapter: VllmAdapter) -> None:
 
 
 def test_every_schema_flag_has_a_cli_mapping(adapter: VllmAdapter) -> None:
-    assert {f.key for f in adapter.flag_schema().fields} == set(_FLAG_CLI_NAMES)
+    from eugene_plexus_agent.engines import speculation
+
+    # These four settings compose one JSON flag rather than individual CLI flags.
+    assert {f.key for f in adapter.flag_schema().fields} == set(_FLAG_CLI_NAMES) | speculation.KEYS
 
 
 def test_the_curated_surface_is_the_designed_twelve_and_the_cache(adapter: VllmAdapter) -> None:
@@ -705,6 +708,10 @@ def test_the_curated_surface_is_the_designed_twelve_and_the_cache(adapter: VllmA
         "tokenizer",
         # Row 9: CPU KV offload, offered only where the build lists it.
         "kvOffloadGb",
+        "reuseRepeatedText",
+        "draftWith",
+        "draftModelPath",
+        "draftTokens",
     }
     assert "servedModelName" not in keys
     assert "model" not in keys

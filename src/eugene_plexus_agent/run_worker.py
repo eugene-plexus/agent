@@ -58,7 +58,7 @@ def runtime_spec(model: dict[str, Any], profile: dict[str, Any], *, start: bool)
         "" if profile.get("default") else "-" + re.sub("[^a-z0-9]+", "-", profile["name"].lower())
     )
     fields: dict[str, Any] = {}
-    if model.get("ollama"):
+    if model.get("ollama") or model.get("keptFrom"):
         # A model from an Ollama store (CX9) is a hash-named blob: the file's own name
         # would be served as the model id. It is served under the name Ollama calls it.
         fields["modelAlias"] = model["name"]

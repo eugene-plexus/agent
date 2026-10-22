@@ -2169,34 +2169,48 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
-class MachinePort(BaseModel):
+class MachineKeyChangeState(StrEnum):
     """
-    This node's machine port (LT1, `docs/design/tls-between-machines.md`):
-    the one TLS door every other machine of the install reaches it
-    through, and what this node holds about the others.
+    * `waiting`: the next key is made and announced beside the
+      current one; the machine port still presents the current key
+      until every machine holds a list that names both.
+    * `switched`: the machine port presents the new key, and the old
+      private key is deleted. The root has not yet recorded that the
+      old key is dropped; until it does, its list keeps both.
+    * `done`: the root records the new key alone.
+    * `stopped`: an operator stopped it before the switch; the next
+      key is deleted.
+    * `failed`: the root refused the next key (`error` says why); the
+      next key is deleted and nothing changed.
 
     """
 
-    url: AnyUrl | None = Field(
+    waiting = 'waiting'
+    switched = 'switched'
+    done = 'done'
+    stopped = 'stopped'
+    failed = 'failed'
+
+
+class MachineKeyChange(BaseModel):
+    """
+    A change of this node's machine key (row 3): two pins across an
+    overlap. Kept in `node.yaml`, so a restart resumes it.
+
+    """
+
+    state: MachineKeyChangeState
+    nextPin: str | None = Field(
         None,
-        description="Where other machines reach it, as announced to the root:\n`https://<advertise host>:<port>`. The port is 8083, shifted by\nthe same offset as the agent's advertised port, or the\n`machineUrl` config field. `null` while this node advertises\nno address.\n",
+        description='The pin of the key it changes to, while `waiting` or\n`switched`. `null` otherwise.\n',
     )
-    port: int | None = Field(None, description='The port it listens on here.')
-    pin: str = Field(
-        ...,
-        description="Base64url SHA-256 of this node's machine key's\nSubjectPublicKeyInfo: what it registered, and what every other\nmachine checks.\n",
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = Field(
+        None, description='When it reached `done`, `stopped` or `failed`.'
     )
-    listening: bool
     error: str | None = Field(
-        None, description='Why it is not listening, in the words of the failure.'
-    )
-    required: bool = Field(
-        ...,
-        description="The install requires encryption between machines, from the\nroot's signed list: plain HTTP from another machine is refused\nhere, and plain HTTP to another machine is refused.\n",
-    )
-    listAgeSeconds: int | None = Field(
         None,
-        description="Seconds since this node last took the root's signed machine\nlist. `null` when it holds none.\n",
+        description='Why it waits (`waiting for the root (connection refused)`),\nor why it failed, in the words of the cause.\n',
     )
 
 
@@ -3455,6 +3469,26 @@ class CopyProgress(BaseModel):
     )
 
 
+class OllamaSendRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    job: str = Field(
+        ...,
+        description="The Library's Keep job id, used to discover the authorized destination.",
+    )
+    digest: str = Field(..., pattern='^sha256:[0-9a-f]{64}$')
+
+
+class OllamaSendResult(BaseModel):
+    job: str
+    bytesSent: int = Field(
+        ...,
+        description='Bytes sent in this request, including a projector when present.',
+        ge=0,
+    )
+
+
 class ModelCopySkipped(BaseModel):
     path: str
     runtime: str | None = Field(
@@ -4457,6 +4491,45 @@ class ComponentEntry(BaseModel):
     url: AnyUrl
     spawn: SpawnConfig | None = None
     safeMode: bool | None = False
+
+
+class MachinePort(BaseModel):
+    """
+    This node's machine port (LT1, `docs/design/tls-between-machines.md`):
+    the one TLS door every other machine of the install reaches it
+    through, and what this node holds about the others.
+
+    """
+
+    url: AnyUrl | None = Field(
+        None,
+        description="Where other machines reach it, as announced to the root:\n`https://<advertise host>:<port>`. The port is 8083, shifted by\nthe same offset as the agent's advertised port, or the\n`machineUrl` config field. `null` while this node advertises\nno address.\n",
+    )
+    port: int | None = Field(None, description='The port it listens on here.')
+    pin: str = Field(
+        ...,
+        description="Base64url SHA-256 of this node's machine key's\nSubjectPublicKeyInfo: what it registered, and what every other\nmachine checks.\n",
+    )
+    listening: bool
+    error: str | None = Field(
+        None, description='Why it is not listening, in the words of the failure.'
+    )
+    required: bool = Field(
+        ...,
+        description="The install requires encryption between machines, from the\nroot's signed list: plain HTTP from another machine is refused\nhere, and plain HTTP to another machine is refused.\n",
+    )
+    listAgeSeconds: int | None = Field(
+        None,
+        description="Seconds since this node last took the root's signed machine\nlist. `null` when it holds none.\n",
+    )
+    listVersion: int | None = Field(
+        None,
+        description="The `version` of the root's signed machine list this node\nholds. The root reads it to tell when every machine holds a\nlist that names a machine's next key (`Node.machineKeyChange`).\n`null` when it holds none.\n",
+    )
+    keyChange: MachineKeyChange | None = Field(
+        None,
+        description="This node's last machine key change (`POST\n/v1/node/machine-key`), or `null` when it never had one.\n",
+    )
 
 
 class ClientTls(BaseModel):

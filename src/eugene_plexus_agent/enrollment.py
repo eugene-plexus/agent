@@ -257,10 +257,11 @@ async def perform_enrollment(
         if pin is not None:
             raise EnrollmentError(
                 "control-root-key-refused",
-                "Not the control root",
+                "Not the control root's key",
                 f"The machine at {control_url} presented a key ({pin}) that is not the one "
-                "in the join command. Something between this machine and the root answered "
-                "in its place; the join token was not sent.",
+                "in the join command: the root's machine key changed after this join command "
+                "was made, or something between this machine and the root answered in its "
+                "place. Make a new join command; the join token was not sent.",
             ) from exc
         raise EnrollmentError(
             "control-root-unreachable",
@@ -385,6 +386,32 @@ async def announce_address(
         }
 
     sent = dict(machine or {})
+    # One announcement at a time from this node (row 3: the key change
+    # announces beside the address loop), so their sequence numbers reach
+    # the root in the order they were claimed.
+    async with store.announcing:
+        return await _announce_locked(
+            store=store,
+            target=target,
+            url=url,
+            sent=sent,
+            signed=signed,
+            transport=transport,
+            old_root=old_root,
+        )
+
+
+async def _announce_locked(
+    *,
+    store: NodeIdentityStore,
+    target: str,
+    url: str,
+    sent: dict[str, str],
+    signed: Callable[[dict[str, str]], dict[str, Any]],
+    transport: Any,
+    old_root: Callable[[], bool],
+) -> AnnounceOutcome:
+    record = store.record
     try:
         async with internal_client(timeout=ANNOUNCE_TIMEOUT_SECONDS, transport=transport) as client:
             response = await client.patch(target, json=signed(sent))
@@ -569,11 +596,15 @@ def pinned_enrolment(control_url: str, pin: str) -> tuple[str, Any]:
 def _recorded_differs(
     fields: dict[str, str], recorded: tuple[str | None, tuple[str, ...]] | None
 ) -> bool:
-    """The root's signed list records another machine port or key for this
-    node than the one it has. None (no list held) is no evidence either way."""
+    """The root's signed list records another machine port or other keys for
+    this node than the ones it announces (its key, and its next key while it
+    changes keys, row 3). None (no list held) is no evidence either way."""
     if recorded is None or not fields:
         return False
-    return recorded != (fields["machineUrl"].rstrip("/"), (fields["tlsPin"],))
+    pins = tuple(
+        sorted({fields["tlsPin"], *([fields["tlsNextPin"]] if "tlsNextPin" in fields else [])})
+    )
+    return recorded != (fields["machineUrl"].rstrip("/"), pins)
 
 
 #: The control root's title for a label another machine has (`labelNode`).

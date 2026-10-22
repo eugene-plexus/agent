@@ -42,6 +42,7 @@ elsewhere in this project:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -423,7 +424,45 @@ def member_is_current(member: CopyMember, *, mtime_tolerance: float = 2.0) -> bo
         return False
     if source.size != destination.size:
         return False
-    return abs(source.mtime - destination.mtime) <= mtime_tolerance
+    if abs(source.mtime - destination.mtime) <= mtime_tolerance:
+        return True
+    blob = matching_ollama_blob(member.source)
+    return blob is not None and os.path.samefile(blob, member.destination)
+
+
+_ollama_hashes: dict[tuple[str, int, int], str] = {}
+
+
+def _file_digest(path: str) -> str:
+    stat = os.stat(path)
+    key = (path, stat.st_size, stat.st_mtime_ns)
+    if key not in _ollama_hashes:
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            while block := stream.read(CHUNK_BYTES):
+                digest.update(block)
+        if len(_ollama_hashes) > 128:
+            _ollama_hashes.clear()
+        _ollama_hashes[key] = digest.hexdigest()
+    return _ollama_hashes[key]
+
+
+def matching_ollama_blob(source: str) -> Path | None:
+    """An identical blob in this node's store, proved by SHA-256."""
+    from .ollama_store import local_models
+
+    try:
+        size = os.path.getsize(source)
+        for _, model in local_models():
+            for blob in (model.blob, model.projector):
+                if blob is None or blob.stat().st_size != size:
+                    continue
+                expected = blob.name.removeprefix("sha256-")
+                if _file_digest(source) == expected and _file_digest(str(blob)) == expected:
+                    return blob
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 # --- headroom -----------------------------------------------------------------
@@ -452,10 +491,24 @@ def headroom_shortfall(plan: CopyPlan, settings: CopySettings, size: int) -> int
     cannot measure gets to try and fail honestly rather than be refused
     on a guess.
     """
+    # A same-volume blob link uses no second allocation. A failed link still
+    # falls through to the normal copy and its live headroom checks.
+    if all(
+        (blob := matching_ollama_blob(member.source)) is not None
+        and os.stat(blob).st_dev == os.stat(_existing_parent(Path(member.destination))).st_dev
+        for member in plan.files
+    ):
+        size = 0
     free = free_bytes(os.path.dirname(plan.destination) or ".")
     if free is None:
         return 0
     return (size + settings.min_free_bytes) - free
+
+
+def _existing_parent(path: Path) -> Path:
+    while not path.exists() and path.parent != path:
+        path = path.parent
+    return path
 
 
 # --- doing it -----------------------------------------------------------------
@@ -546,6 +599,18 @@ def _copy_one(
     set's running total, returned grown by this file."""
     os.makedirs(os.path.dirname(member.destination) or ".", exist_ok=True)
     partial = member.partial
+    blob = matching_ollama_blob(member.source)
+    if blob is not None:
+        try:
+            if should_cancel is not None and should_cancel():
+                raise CopyAborted("the copy was cancelled")
+            os.link(blob, partial)
+            os.replace(partial, member.destination)
+            copied += os.path.getsize(member.source)
+            state.note(copied, time.perf_counter())
+            return copied
+        except OSError:
+            _remove_quietly(partial)
     started = time.perf_counter()
     first = copied
     try:
