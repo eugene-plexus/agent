@@ -832,7 +832,11 @@ def test_a_change_of_address_or_key_still_resets(tmp_path: Path, gateway: FakeGa
 
 def test_the_two_model_placeholders_are_placeholders() -> None:
     assert set(app_launcher.MODEL_SURFACES) <= app_launcher.PLACEHOLDERS
-    assert app_launcher.MODEL_SURFACES == {"embeddingModel": "embeddings", "rerankModel": "rerank"}
+    assert app_launcher.MODEL_SURFACES == {
+        "embeddingModel": "embeddings",
+        "rerankModel": "rerank",
+        "imageModel": "image",
+    }
     # Neither is a secret: a model's id may ride in an argument.
     assert not set(app_launcher.MODEL_SURFACES) & app_launcher.SECRET_PLACEHOLDERS
     apps.validate_manifest(
@@ -916,8 +920,11 @@ OPENAI_ADDRESSES = (
     "IMAGES_EDIT_OPENAI_API_BASE_URL",
     "AUDIO_STT_OPENAI_API_BASE_URL",
     "AUDIO_TTS_OPENAI_API_BASE_URL",
+    "AUDIO_REALTIME_OPENAI_API_BASE_URL",
 )
-OPENAI_KEYS = tuple(a.replace("BASE_URL", "KEY") for a in OPENAI_ADDRESSES)
+#: The entry is at the contract's 64-variable limit: the realtime-voice key (off by default) is
+#: the one address's key it leaves out.
+OPENAI_KEYS = tuple(a.replace("BASE_URL", "KEY") for a in OPENAI_ADDRESSES if "REALTIME" not in a)
 
 
 def test_open_webui_names_the_gateway_for_every_address_it_would_default_to_openai() -> None:

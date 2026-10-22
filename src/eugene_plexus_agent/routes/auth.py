@@ -978,6 +978,7 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
                 action=body.action.value,
                 request_id=body.requestId,
                 model=body.model,
+                purpose=getattr(body.purpose, "value", body.purpose) or "inference",
             )
         )
     except AdmissionRefusal as exc:

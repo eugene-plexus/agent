@@ -60,16 +60,18 @@ import httpx
 import yaml
 from pydantic import AnyUrl, ValidationError
 
-from . import app_accounts, app_launcher, ports
+from . import app_accounts, app_backups, app_launcher, ports
 from ._generated.models import (
     App,
     AppCatalogue,
     AppCatalogueEntry,
+    AppGivenSettings,
     AppHubSurface,
     AppInstall,
     AppIsolation,
     AppManifest,
     AppOrigin,
+    AppUpdateBackup,
     ComponentStatus,
     State1,
 )
@@ -232,6 +234,7 @@ def validate_manifest(manifest: AppManifest) -> None:
     """
     if manifest.source.strip() == PYPI:
         pip_requirement(manifest)
+    app_backups.validate_paths([p.root for p in manifest.updateBackup or []])
     args = [a.root for a in manifest.args or []]
     environment = dict(manifest.environment or {})
     if len(environment) > _MAX_ENVIRONMENT:
@@ -1295,6 +1298,7 @@ class AppManager:
             self.supervisor = AppSupervisor()
         self._gateway: dict[str, str | None] = {}
         self._detail: dict[str, str | None] = {}
+        self._image_offers: dict[str, str | None] = {}
         self._lock = asyncio.Lock()
 
     def node_name(self) -> str | None:
@@ -1355,6 +1359,11 @@ class AppManager:
                         manifest=manifest,
                         origin=origin,
                         installedVersion=record.version if record else None,
+                        resetsSettings=bool(
+                            record
+                            and manifest.resetOnConnectionChange
+                            and (manifest.environment or {}) != (record.manifest.environment or {})
+                        ),
                     )
                 )
         reason = self.installable(enrolled=enrolled)
@@ -1425,6 +1434,9 @@ class AppManager:
             name=record.manifest.name,
             version=record.version,
             previousVersion=record.previous_version,
+            updateBackup=self.backup_view(record),
+            givenSettings=self.given_settings(record),
+            availableImageModel=self._image_offers.get(record.id),
             origin=record.origin,
             node=self.node_name(),
             enabled=record.enabled,
@@ -1449,6 +1461,50 @@ class AppManager:
             lastRestart=restarted,
             lastError=error,
             detail=detail,
+        )
+
+    def given_settings(self, record: InstalledApp) -> AppGivenSettings | None:
+        if self.accounts.kind == "systemd":
+            return None
+        try:
+            path = app_backups.inside(self.store.data_dir(record.id), "given.json")
+            if path.stat().st_size > 16 * 1024:
+                return None
+            return AppGivenSettings.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def backup_view(self, record: InstalledApp) -> AppUpdateBackup | None:
+        if self.accounts.kind == "systemd":
+            return None
+        try:
+            if not record.previous_version or record.previous_version not in installed_versions(
+                self.store, record.id
+            ):
+                return None
+            backup = app_backups.read(self.store.app_dir(record.id), record.previous_version)
+            return (
+                AppUpdateBackup(version=backup["version"], createdAt=backup["createdAt"])
+                if backup
+                else None
+            )
+        except (OSError, ValueError, KeyError):
+            return None
+
+    async def refresh_image_offer(self, record: InstalledApp) -> None:
+        if not any(
+            "{imageModel" in value for value in (record.manifest.environment or {}).values()
+        ):
+            return
+        url, detail = await self._resolve_gateway()
+        self._gateway[record.id] = url
+        key = app_launcher._secret(str(self.store.key_file(record.id)))
+        listing, why = await asyncio.to_thread(app_launcher.ask_gateway_for_models, url, key)
+        self._image_offers[record.id] = (
+            app_launcher.image_model(listing)[0] if listing is not None else None
+        )
+        self._detail[record.id] = detail or (
+            f"Eugene could not check the available image models: {why}." if why else None
         )
 
     def _account(self, app_id: str) -> str:
@@ -1630,6 +1686,34 @@ class AppManager:
         manifest = normalized(manifest)
         async with self._lock:
             existing = self.store.get(manifest.id)
+            if existing and existing.version != manifest.version and manifest.updateBackup:
+                self.require_settings_access(manifest.name, "updated")
+                paths = [p.root for p in manifest.updateBackup]
+                try:
+                    await asyncio.to_thread(
+                        app_backups.check_space,
+                        self.store.app_dir(existing.id),
+                        self.store.data_dir(existing.id),
+                        paths,
+                        manifest.name,
+                    )
+                    await self.stop(existing.id)
+                    await asyncio.to_thread(
+                        app_backups.check_space,
+                        self.store.app_dir(existing.id),
+                        self.store.data_dir(existing.id),
+                        paths,
+                        manifest.name,
+                    )
+                    await asyncio.to_thread(
+                        app_backups.create,
+                        self.store.app_dir(existing.id),
+                        self.store.data_dir(existing.id),
+                        existing.manifest.model_dump(mode="json", exclude_none=True),
+                        paths,
+                    )
+                except (OSError, ValueError) as exc:
+                    raise AppInstallError(str(exc)) from exc
             if existing is None:
                 record = InstalledApp(
                     manifest=manifest,
@@ -1649,7 +1733,9 @@ class AppManager:
                     installed_at=datetime.now(UTC),
                     enabled=existing.enabled,
                     previous_version=(
-                        existing.version if existing.version != manifest.version else None
+                        existing.version
+                        if existing.version != manifest.version
+                        else existing.previous_version
                     ),
                 )
             self.store.put(record)
@@ -1659,6 +1745,66 @@ class AppManager:
             if record.enabled:
                 await self.restart(record)
             prune_versions(self.store, record.id, keep)
+
+    async def rollback(self, record: InstalledApp) -> None:
+        self.require_settings_access(record.manifest.name, "put back to its earlier version")
+        async with self._lock:
+            if self.installer.running(record.id):
+                raise AppInstallError(
+                    "An install is running. Wait for it to finish before going back."
+                )
+            if self.backup_view(record) is None:
+                raise AppInstallError(
+                    "This app has no complete update backup and previous version to go back to."
+                )
+            app_dir = self.store.app_dir(record.id)
+            try:
+                backup = app_backups.read(app_dir, record.previous_version)
+                assert backup is not None
+                manifest = normalized(AppManifest.model_validate(backup["manifest"]))
+                validate_manifest(manifest)
+                if manifest.id != record.id or manifest.version != record.previous_version:
+                    raise ValueError(
+                        "The backup manifest does not match this app's previous version"
+                    )
+                await self.stop(record.id)
+                # A failed restore must stay stopped across an agent restart.
+                record.enabled = False
+                self.store.put(record)
+                await asyncio.to_thread(
+                    app_backups.restore, app_dir, self.store.data_dir(record.id), backup
+                )
+                restored = InstalledApp(
+                    manifest=manifest,
+                    origin=record.origin,
+                    port=record.port,
+                    installed_at=datetime.now(UTC),
+                    enabled=True,
+                )
+                self.store.put(restored)
+                await asyncio.to_thread(app_backups.consume, app_dir, manifest.version)
+            except (OSError, ValueError) as exc:
+                raise AppInstallError(
+                    f"The app was not restored: {exc}. Its backup is kept for retry."
+                ) from exc
+            await self.start(restored)
+
+    def require_settings_access(self, name: str, action: str) -> None:
+        """Refuse what needs the app's data folder, where the agent cannot reach it.
+
+        On a Linux system install an app runs in a systemd account of its own, and its data
+        is in that unit's private state. The root helper (`apps-ctl`) takes only start, stop,
+        restart and clean, so it cannot copy that data for a backup or a restore, and the
+        agent cannot read it. A backup the agent cannot make is not skipped: an update
+        without one could lose chats. Nothing changed, and the app keeps running.
+        """
+        if self.accounts.kind == "systemd":
+            raise AppInstallError(
+                f"{name} was not {action}. On this install it runs in a systemd account of its "
+                "own, and Eugene cannot yet copy its data there to keep a backup. It keeps "
+                "running as it is, with its chats and settings. Update, Reset and Go back for "
+                "it need a newer install helper (eugene-plexus/specs#103)."
+            )
 
     async def uninstall(self, app_id: str, *, purge: bool) -> None:
         await self.installer.cancel(app_id)

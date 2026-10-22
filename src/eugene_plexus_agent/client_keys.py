@@ -205,7 +205,13 @@ class ClientKeyStore:
             return record
 
     def admit(
-        self, *, key_id: str, action: str, request_id: str, model: str | None
+        self,
+        *,
+        key_id: str,
+        action: str,
+        request_id: str,
+        model: str | None,
+        purpose: str = "inference",
     ) -> dict[str, Any]:
         with self._lock:
             self._check()
@@ -218,6 +224,7 @@ class ClientKeyStore:
                 request_id=request_id,
                 model=model,
                 now=self._admission_clock.now(self._admission["clock"]),
+                purpose=purpose,
             )
             if candidate is not None:
                 self._commit(self._records, admission=candidate)
