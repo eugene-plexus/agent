@@ -871,6 +871,10 @@ async def mint_client_key(
     return ClientKeyCreated(key=_to_model(record), token=token)
 
 
+def _overlap(body: ClientKeyRotateRequest) -> int:
+    return 86400 if body.overlapSeconds is None else body.overlapSeconds
+
+
 async def _key_name(request: Request, key_id: str) -> str:
     """The name of key `key_id`, or the route's 404."""
     owner = registry(request)
@@ -917,7 +921,7 @@ async def rotate_client_key(
     body = body or ClientKeyRotateRequest()
     owner = registry(request)
     name = await _key_name(request, key_id)
-    prepared = prepare_app_key_rotation(request, name, key_id, overlap=body.overlapSeconds)
+    prepared = prepare_app_key_rotation(request, name, key_id, overlap=_overlap(body))
     if owner.enrolled:
         created = ClientKeyCreated.model_validate(
             await owner.forward(
@@ -931,7 +935,7 @@ async def rotate_client_key(
         created = _rotate_standalone(request, key_id, body, owner)
     log.info("rotated client key %r (id %s)", name, key_id)
     if prepared is not None:
-        await finish_app_key_rotation(request, prepared, created, overlap=body.overlapSeconds)
+        await finish_app_key_rotation(request, prepared, created, overlap=_overlap(body))
     return created
 
 
@@ -967,7 +971,7 @@ def _rotate_standalone(
                 created_at=float(issued),
                 expires_at=float(expires),
             ),
-            retires_at=float(issued + body.overlapSeconds),
+            retires_at=float(issued + _overlap(body)),
         )
     except OSError as exc:
         raise owner.local_unavailable() from exc

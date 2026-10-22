@@ -438,7 +438,8 @@ def prepare_app_key_rotation(
     held = manager.store.key(app_id)
     if held is None or held.key_id != key_id:
         return None
-    name = manager.store.get(app_id).manifest.name if manager.store.get(app_id) else app_id
+    installed = manager.store.get(app_id)
+    name = installed.manifest.name if installed is not None else app_id
     key_file = manager.store.key_file(app_id)
     try:
         if key_file.is_file():
