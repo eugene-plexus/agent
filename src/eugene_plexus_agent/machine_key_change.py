@@ -37,7 +37,11 @@ the root's identity key, which never changes (`machine_trust.pull`,
 
 A change that is stopped before the switch, or that the root refuses,
 deletes the next key and announces the current key alone. Nothing here
-ever runs on a schedule: keys change when an operator asks (R3-SCHEDULE).
+changes by itself on a schedule: once a key is older than
+`machineKeyChangeDays` (365 by default; 0 for only on request), the machine
+starts the same change by itself (part 3b, R3-SCHEDULE and R3-SCHEDULE-2). A
+machine key is self-signed and pinned by its SPKI hash, so nothing else ever
+retires it.
 """
 
 from __future__ import annotations
@@ -49,7 +53,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -58,7 +62,7 @@ import httpx
 from . import enrollment
 from ._http import internal_client, refused_pin
 from ._private_files import write_private
-from .node_identity import IdentityRecord, NodeIdentityStore, machine_pin
+from .node_identity import IdentityRecord, NodeIdentityStore, machine_key_made_at, machine_pin
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +79,15 @@ DOOR_FILE = "machine_door.json"
 
 WAITING, SWITCHED, DONE, STOPPED, FAILED = "waiting", "switched", "done", "stopped", "failed"
 RUNNING = frozenset({WAITING, SWITCHED})
+REQUESTED, SCHEDULED = "requested", "scheduled"
+
+#: The agent config field: a key older than this many days is changed by
+#: itself (part 3b). 0: only on request.
+KEY_DAYS_KEY = "machineKeyChangeDays"
+DEFAULT_KEY_DAYS = 365
+#: A scheduled change that could not start, or that an operator stopped or the
+#: root refused, is tried again after this long, not at every step.
+SCHEDULE_RETRY = timedelta(days=1)
 
 
 class KeyChangeRefused(Exception):
@@ -145,6 +158,7 @@ def status(record: IdentityRecord) -> dict[str, Any] | None:
         return None
     return {
         "state": change["state"],
+        "reason": change.get("reason") or REQUESTED,
         "nextPin": change.get("nextPin") if change["state"] in RUNNING else None,
         "startedAt": change.get("startedAt"),
         "finishedAt": change.get("finishedAt"),
@@ -175,6 +189,9 @@ class Wiring:
     pull: Callable[[], Awaitable[None]] | None = None
     """Take the root's machine list now."""
     on_switched: Callable[[], None] | None = None
+    lifetime_days: Callable[[], int] = lambda: DEFAULT_KEY_DAYS
+    """`machineKeyChangeDays`: the age at which the key changes by itself."""
+    now: Callable[[], datetime] = lambda: datetime.now(UTC)
 
 
 class MachineKeyChange:
@@ -187,6 +204,8 @@ class MachineKeyChange:
         self._door_written: str | None = None
         #: Why the door file could not be written, while it could not.
         self.door_error: str | None = None
+        #: A scheduled start that could not happen: when, and what was said.
+        self._schedule_refused: tuple[datetime, str] | None = None
         #: The last step's failure when `node.yaml` could not hold it either
         #: (a full disk): reported until a step gets past it.
         self._fault: str | None = None
@@ -198,6 +217,14 @@ class MachineKeyChange:
         if held is not None and self._fault is not None:
             held["error"] = self._fault
         return held
+
+    def schedule(self) -> dict[str, Any]:
+        """`MachinePort.keyMadeAt` and `keyChangeDueAt` (part 3b)."""
+        record = self.w.store.record
+        made = machine_key_made_at(record.tls_certificate) if record.tls_certificate else None
+        days = _days(self.w.lifetime_days())
+        due = made + timedelta(days=days) if made is not None and days > 0 else None
+        return {"keyMadeAt": made, "keyChangeDueAt": due}
 
     # ---- the root's door file ------------------------------------------------
 
@@ -231,70 +258,77 @@ class MachineKeyChange:
     # ---- start and stop --------------------------------------------------------
 
     async def start(self) -> dict[str, Any]:
+        """A change now, whatever the key's age (`reason: requested`)."""
         async with self._lock:
-            store = self.w.store
-            record = store.record
-            if not record.enrolled:
-                raise KeyChangeRefused(
-                    409,
-                    "not-enrolled",
-                    "Not part of an install",
-                    "This machine has joined no install, so no other machine holds its key.",
-                )
-            door = self.w.door()
-            if door is None or not door.status.listening:
-                why = getattr(getattr(door, "status", None), "error", None)
-                raise KeyChangeRefused(
-                    409,
-                    "machine-port-down",
-                    "Machine port not listening",
-                    "This machine's machine port is not listening"
-                    + (f" ({why})" if why else "")
-                    + ", so it presents no key to change.",
-                )
-            if (self.w.trust.claims or {}).get("keyChange") is not True:
-                raise KeyChangeRefused(
-                    409,
-                    "root-too-old",
-                    "The root cannot change machine keys",
-                    "The root runs a version that does not take a next machine key. Update the "
-                    "machine that runs the root first.",
-                )
-            change = record.machine_key_change or {}
-            if change.get("state") in RUNNING:
-                raise KeyChangeRefused(
-                    409,
-                    "already-changing",
-                    "Machine key already changing",
-                    f"This machine's key change started at {change.get('startedAt')} is still "
-                    "running.",
-                )
-            if self.w.fields() is None:
-                raise KeyChangeRefused(
-                    409,
-                    "no-machine-url",
-                    "No machine address",
-                    "This machine advertises no address, so no other machine reaches it over its "
-                    "machine port.",
-                )
-            store.begin_machine_key_change(
-                {
-                    "state": WAITING,
-                    "startedAt": _now(),
-                    "finishedAt": None,
-                    "error": None,
-                    "previousPin": door.status.pin,
-                }
-            )
-            self.write_door()
-            log.warning(
-                "changing this machine's key: the next key is %s; the machine port presents %s "
-                "until every machine holds a list that names both",
-                store.record.machine_key_change and store.record.machine_key_change["nextPin"],
-                door.status.pin,
-            )
+            self._begin(REQUESTED)
         self._wake.set()
         return self.status() or {}
+
+    def _begin(self, reason: str) -> None:
+        """Start a change, or raise `KeyChangeRefused` with why not. The
+        lock is held."""
+        store = self.w.store
+        record = store.record
+        if not record.enrolled:
+            raise KeyChangeRefused(
+                409,
+                "not-enrolled",
+                "Not part of an install",
+                "This machine has joined no install, so no other machine holds its key.",
+            )
+        door = self.w.door()
+        if door is None or not door.status.listening:
+            why = getattr(getattr(door, "status", None), "error", None)
+            raise KeyChangeRefused(
+                409,
+                "machine-port-down",
+                "Machine port not listening",
+                "This machine's machine port is not listening"
+                + (f" ({why})" if why else "")
+                + ", so it presents no key to change.",
+            )
+        if (self.w.trust.claims or {}).get("keyChange") is not True:
+            raise KeyChangeRefused(
+                409,
+                "root-too-old",
+                "The root cannot change machine keys",
+                "The root runs a version that does not take a next machine key. Update the "
+                "machine that runs the root first.",
+            )
+        change = record.machine_key_change or {}
+        if change.get("state") in RUNNING:
+            raise KeyChangeRefused(
+                409,
+                "already-changing",
+                "Machine key already changing",
+                f"This machine's key change started at {change.get('startedAt')} is still running.",
+            )
+        if self.w.fields() is None:
+            raise KeyChangeRefused(
+                409,
+                "no-machine-url",
+                "No machine address",
+                "This machine advertises no address, so no other machine reaches it over its "
+                "machine port.",
+            )
+        store.begin_machine_key_change(
+            {
+                "state": WAITING,
+                "reason": reason,
+                "startedAt": _now(),
+                "finishedAt": None,
+                "error": None,
+                "previousPin": door.status.pin,
+            }
+        )
+        self.write_door()
+        log.warning(
+            "changing this machine's key (%s): the next key is %s; the machine port "
+            "presents %s until every machine holds a list that names both",
+            "its key is due a change" if reason == SCHEDULED else "an operator asked",
+            store.record.machine_key_change and store.record.machine_key_change["nextPin"],
+            door.status.pin,
+        )
 
     async def stop(self) -> dict[str, Any]:
         async with self._lock:
@@ -357,11 +391,46 @@ class MachineKeyChange:
                     await self._drop()
                 elif state in (STOPPED, FAILED) and not change.get("settled"):
                     await self._settle()
+                if state not in RUNNING and self._due(change):
+                    self._start_scheduled()
             except OSError as exc:
                 # node.yaml could not be written: nothing moved past what it
                 # holds, and the cause is shown until a step gets past it.
                 self._fault = f"could not write {self.w.store.path.name} ({exc})"
                 log.warning("the machine key change is held: %s", self._fault)
+
+    # ---- the schedule (part 3b) ------------------------------------------------
+
+    def _due(self, change: dict[str, Any]) -> bool:
+        """The key is older than `machineKeyChangeDays`, and nothing in the
+        last day says to wait: a change an operator stopped, one the root
+        refused, or a start that could not happen."""
+        due = self.schedule()["keyChangeDueAt"]
+        now = self.w.now()
+        if due is None or now < due:
+            return False
+        if change.get("state") in (STOPPED, FAILED):
+            ended = _parse(change.get("finishedAt"))
+            if ended is not None and now - ended < SCHEDULE_RETRY:
+                return False
+        refused = self._schedule_refused
+        return refused is None or now - refused[0] >= SCHEDULE_RETRY
+
+    def _start_scheduled(self) -> None:
+        try:
+            self._begin(SCHEDULED)
+        except KeyChangeRefused as exc:
+            said = self._schedule_refused[1] if self._schedule_refused else None
+            self._schedule_refused = (self.w.now(), exc.detail)
+            if exc.detail != said:
+                log.warning(
+                    "this machine's key is due a change, and the change cannot start: %s "
+                    "It is tried again in a day.",
+                    exc.detail,
+                )
+            return
+        self._schedule_refused = None
+        self._wake.set()
 
     # ---- the steps -------------------------------------------------------------
 
@@ -607,6 +676,23 @@ class MachineKeyChange:
             self.write_door()
 
 
+def _days(value: Any) -> int:
+    """`machineKeyChangeDays` as a count of days; anything else is the default."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return DEFAULT_KEY_DAYS
+    return max(0, int(value))
+
+
+def _parse(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def from_app(app: Any) -> MachineKeyChange:
     """The change, wired to a running agent."""
     from . import machine_port, node_identity, standby
@@ -650,15 +736,20 @@ def from_app(app: Any) -> MachineKeyChange:
             transport=lambda: getattr(app.state, "control_transport", None),
             pull=pull_now,
             on_switched=switched,
+            lifetime_days=lambda: _days(state.get_config(KEY_DAYS_KEY)),
         )
     )
 
 
 __all__ = [
+    "DEFAULT_KEY_DAYS",
     "DONE",
     "DOOR_FILE",
     "FAILED",
+    "KEY_DAYS_KEY",
+    "REQUESTED",
     "RUNNING",
+    "SCHEDULED",
     "STOPPED",
     "SWITCHED",
     "WAITING",

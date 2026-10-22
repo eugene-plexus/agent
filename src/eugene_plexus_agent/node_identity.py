@@ -320,6 +320,40 @@ def bind_host_for_advertised_node(
 _MACHINE_CERT_YEARS = 50
 
 
+#: The certificate's start is set this long before the key is made, so a
+#: clock a little behind still takes it; `machine_key_made_at` takes it back.
+_MACHINE_CERT_BACKDATE = 1
+
+
+def machine_certificate(key_pem: str, *, made: Any = None) -> str:
+    """The self-signed certificate for a machine key, PEM, dated `made`
+    (now by default). It names nothing and outlives any install: other
+    machines check its key against a pin, never its chain, name or dates."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = serialization.load_pem_private_key(key_pem.encode("ascii"), password=None)
+    if not isinstance(key, ec.EllipticCurvePrivateKey):
+        raise ValueError("a machine key is ECDSA P-256")
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "eugene-plexus-machine")])
+    now = made or datetime.datetime.now(datetime.UTC)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=_MACHINE_CERT_BACKDATE))
+        .not_valid_after(now + datetime.timedelta(days=365 * _MACHINE_CERT_YEARS))
+        .sign(key, hashes.SHA256())
+    )
+    return certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
 def generate_machine_key() -> tuple[str, str]:
     """`(key PEM, certificate PEM)`: this node's machine port key, ECDSA P-256.
 
@@ -329,32 +363,28 @@ def generate_machine_key() -> tuple[str, str]:
     other machines check its key against the pin this node registered under
     its signature, never a chain or a name (addresses move with DHCP).
     """
-    import datetime
-
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
 
     key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "eugene-plexus-machine")])
-    now = datetime.datetime.now(datetime.UTC)
-    certificate = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=365 * _MACHINE_CERT_YEARS))
-        .sign(key, hashes.SHA256())
-    )
     key_pem = key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     ).decode("ascii")
-    return key_pem, certificate.public_bytes(serialization.Encoding.PEM).decode("ascii")
+    return key_pem, machine_certificate(key_pem)
+
+
+def machine_key_made_at(certificate_pem: str) -> Any:
+    """When a machine key was made (part 3b): its certificate's start, which
+    `machine_certificate` sets a day before. A key's age is what the yearly
+    change counts; the key itself never expires."""
+    import datetime
+
+    from cryptography import x509
+
+    certificate = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+    return certificate.not_valid_before_utc + datetime.timedelta(days=_MACHINE_CERT_BACKDATE)
 
 
 def machine_pin(certificate_pem: str) -> str:
@@ -762,6 +792,8 @@ __all__ = [
     "generate_machine_key",
     "is_loopback_host",
     "local_agent_url",
+    "machine_certificate",
+    "machine_key_made_at",
     "machine_pin",
     "not_a_node_address",
     "sign_address",

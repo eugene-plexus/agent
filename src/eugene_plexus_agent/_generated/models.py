@@ -2217,6 +2217,18 @@ class MachineKeyChangeState(StrEnum):
     failed = 'failed'
 
 
+class MachineKeyChangeReason(StrEnum):
+    """
+    * `requested`: an operator asked for it (`POST /v1/node/machine-key`).
+    * `scheduled`: the key was older than `machineKeyChangeDays`, and the
+      machine started the change by itself (part 3b).
+
+    """
+
+    requested = 'requested'
+    scheduled = 'scheduled'
+
+
 class MachineKeyChange(BaseModel):
     """
     A change of this node's machine key (row 3): two pins across an
@@ -2225,6 +2237,7 @@ class MachineKeyChange(BaseModel):
     """
 
     state: MachineKeyChangeState
+    reason: MachineKeyChangeReason | None = None
     nextPin: str | None = Field(
         None,
         description='The pin of the key it changes to, while `waiting` or\n`switched`. `null` otherwise.\n',
@@ -4554,6 +4567,13 @@ class MachinePort(BaseModel):
     keyChange: MachineKeyChange | None = Field(
         None,
         description="This node's last machine key change (`POST\n/v1/node/machine-key`), or `null` when it never had one.\n",
+    )
+    keyMadeAt: AwareDatetime | None = Field(
+        None, description='When the key the machine port presents was made (part 3b).\n'
+    )
+    keyChangeDueAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default).\nA key past it is changed at the next check, within a minute.\n`null` when the field is 0 (only on request).\n',
     )
 
 
