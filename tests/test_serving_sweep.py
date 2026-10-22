@@ -370,3 +370,35 @@ async def test_a_record_write_failure_still_revokes_the_measurement_key(tmp_path
     monkeypatch.setattr(store, "save", disk_full)
     await store.run(job, FailedSweep(), cleanup, noop)
     assert not job.keyLive and "disk full" in job.detail
+
+
+@pytest.mark.asyncio
+async def test_the_job_ends_only_after_its_replicas_restart(tmp_path):
+    """A reader that sees a finished job never sees a restart still pending."""
+    from eugene_plexus_agent.measurement_node import pending
+
+    class FailedSweep:
+        partial = None
+        notes = frozenset()
+
+        async def level(self, *args):
+            raise ValueError("engine refused")
+
+    store = ServingMeasurements(tmp_path / "runs.json")
+    job = store.new(
+        effective_request(ServingMeasurementRequest(runtime="r"), 1), "tower", "m", provenance()
+    )
+    job.restarts = pending(["copy"])
+    seen = []
+
+    async def cleanup(record):
+        seen.append((record.state, record.detail, record.finishedAt))
+        record.restarts[0].state = "restarted"
+
+    async def noop(*args):
+        pass
+
+    await store.run(job, FailedSweep(), cleanup, noop)
+    assert seen == [("running", "Starting the stopped replicas again.", None)]
+    assert job.state == "failed" and job.detail == "engine refused"
+    assert job.restarts[0].state == "restarted" and job.finishedAt is not None

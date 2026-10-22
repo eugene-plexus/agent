@@ -598,6 +598,7 @@ class ServingMeasurements:
             job.levels = [old for old in job.levels if old.people != level.people] + [level]
 
         last_checkpoint = 0.0
+        final, detail = BenchmarkState.failed, "The measurement stopped unexpectedly."
         try:
             for index, people in enumerate(levels):
                 await observe(None)
@@ -638,19 +639,22 @@ class ServingMeasurements:
                     )
                 if job.knee and job.knee.found:
                     break
-            job.state = BenchmarkState.completed
+            final = BenchmarkState.completed
             job.progress = 1
-            job.detail = "Measurement completed. " + " ".join(sorted(sweep.notes))
+            detail = "Measurement completed. " + " ".join(sorted(sweep.notes))
         except asyncio.CancelledError:
-            job.state = BenchmarkState.cancelled
-            job.detail = "Measurement cancelled. Partial results were kept."
+            final = BenchmarkState.cancelled
+            detail = "Measurement cancelled. Partial results were kept."
         except Exception as exc:
-            job.state = BenchmarkState.failed
-            job.detail = str(exc) or type(exc).__name__
+            final = BenchmarkState.failed
+            detail = str(exc) or type(exc).__name__
         finally:
             if sweep.partial is not None:
                 keep(sweep.partial)
-            job.finishedAt = datetime.now(UTC)
+            # The job ends only after the stopped replicas are started again,
+            # so a finished job never shows a restart still pending.
+            if job.restarts:
+                job.detail = "Starting the stopped replicas again."
 
             def save_final() -> None:
                 try:
@@ -661,11 +665,15 @@ class ServingMeasurements:
                         job.detail += cause
 
             save_final()
+            cleanup_error = ""
             try:
                 await cleanup(job)
             except Exception as exc:
-                job.detail += f" Cleanup failed: {exc}"
+                cleanup_error = f" Cleanup failed: {exc}"
             finally:
+                job.state = final
+                job.detail = detail + cleanup_error
+                job.finishedAt = datetime.now(UTC)
                 save_final()
 
     async def close(self) -> None:
