@@ -1681,10 +1681,13 @@
         "type": "string",
         "enum": [
           "mtp",
-          "simple"
+          "simple",
+          "dflash",
+          "dspark",
+          "eagle3"
         ],
         "title": "DraftKind",
-        "description": "How llama.cpp drafts with a companion file, read from the file\nitself:\n\n* `mtp` — a separate MTP head: the `nextn` tensors of the last\n  block and no first block (`--spec-type draft-mtp`).\n* `simple` — a whole small model named as a draft (`draft-*.gguf`)\n  (`--spec-type draft-simple`)."
+        "description": "How llama.cpp drafts with a companion file, read from the file\nitself:\n\n* `mtp` — a separate MTP head: the `nextn` tensors of the last\n  block and no first block (`--spec-type draft-mtp`).\n* `simple` — a whole small model named as a draft (`draft-*.gguf`)\n  (`--spec-type draft-simple`).\n* `dflash` — a DFlash drafter (`--spec-type draft-dflash`).\n* `dspark` — a DSpark drafter (`--spec-type draft-dspark`).\n* `eagle3` — an EAGLE3 drafter (`--spec-type draft-eagle3`).\n\nDFlash, DSpark and EAGLE3 are bound to a target model by their\nheader: `general.architecture`, `<arch>.target_layers` and\n`<arch>.target_hidden_size`. DSpark uses the `dflash` architecture\nwith a `markov_w1.weight` tensor."
       },
       "EngineKind": {
         "type": "string",

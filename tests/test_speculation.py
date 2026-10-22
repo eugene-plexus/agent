@@ -39,14 +39,37 @@ HELP_NOW = (
 HELP_BEFORE = "--ctx-size N  size of the prompt context\n--metrics  enable\n"
 
 
-def _gguf(path: Path, *, blocks: int, tensors: list[str]) -> Path:
+def _gguf(
+    path: Path,
+    *,
+    blocks: int,
+    tensors: list[str],
+    architecture: str = "qwen35",
+    hidden: int = 5120,
+    layers: list[int] | None = None,
+    vocab: int = 128,
+    block_size: int | None = None,
+) -> Path:
     def string(text: str) -> bytes:
         return struct.pack("<Q", len(text.encode())) + text.encode()
 
     keys = [
-        string("general.architecture") + struct.pack("<I", 8) + string("qwen35"),
-        string("qwen35.block_count") + struct.pack("<I", 4) + struct.pack("<I", blocks),
+        string("general.architecture") + struct.pack("<I", 8) + string(architecture),
+        string(f"{architecture}.block_count") + struct.pack("<II", 4, blocks),
+        string(f"{architecture}.embedding_length") + struct.pack("<II", 4, hidden),
+        string(f"{architecture}.target_hidden_size") + struct.pack("<II", 4, hidden),
+        string("tokenizer.ggml.tokens")
+        + struct.pack("<IIQ", 9, 8, vocab)
+        + b"".join(string(str(i)) for i in range(vocab)),
     ]
+    if layers is not None:
+        keys.append(
+            string(f"{architecture}.target_layers")
+            + struct.pack("<IIQ", 9, 5, len(layers))
+            + struct.pack(f"<{len(layers)}i", *layers)
+        )
+    if block_size is not None:
+        keys.append(string(f"{architecture}.block_size") + struct.pack("<II", 4, block_size))
     body = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", len(tensors))
     body += struct.pack("<Q", len(keys)) + b"".join(keys)
     for name in tensors:
@@ -190,6 +213,154 @@ def test_tokens_drafted_per_step_only_with_a_model_drafting(tmp_path: Path) -> N
         "--spec-type",
         "ngram-mod",
     )
+
+
+def bound_draft(
+    path: Path,
+    *,
+    architecture: str = "dflash",
+    layers: list[int] | None = None,
+    markov: bool = False,
+    vocab: int = 128,
+) -> Path:
+    return _gguf(
+        path,
+        blocks=1,
+        architecture=architecture,
+        layers=layers,
+        tensors=["blk.0.attn_norm.weight", *(["markov_w1.weight"] if markov else [])],
+        vocab=vocab,
+    )
+
+
+def test_dflash_companion_launches_as_draft_dflash(
+    tmp_path: Path, binary: DiscoveredBinary
+) -> None:
+    model = plain_model(tmp_path / "model.gguf")
+    draft = bound_draft(tmp_path / "renamed.gguf", layers=[1, 20, 40, 63])
+    flags = {"draftWith": "companion", "draftModelPath": str(draft)}
+    argv = LlamaCppAdapter().build_argv(_spec(model, flags=flags), binary, 8100)
+    assert argv[argv.index("--spec-type") :] == [
+        "--spec-type",
+        "ngram-mod,draft-dflash",
+        "--spec-draft-model",
+        str(draft),
+        "--metrics",
+    ]
+    assert "--spec-draft-n-max" not in argv
+
+
+@pytest.mark.parametrize("block_size", [None, 8])
+def test_bound_drafting_facts_include_the_target_shape(
+    tmp_path: Path, block_size: int | None
+) -> None:
+    draft = _gguf(
+        tmp_path / "helper.gguf",
+        blocks=1,
+        architecture="dflash",
+        layers=[1, 20, 40, 63],
+        tensors=["markov_w1.weight"],
+        block_size=block_size,
+    )
+    facts = drafting_facts(draft)
+    assert facts is not None
+    assert facts.architecture == "dflash"
+    assert facts.embedding_length == facts.target_hidden_size == 5120
+    assert facts.target_layers == (1, 20, 40, 63)
+    assert facts.block_size == (block_size if block_size is not None else 16)
+    assert facts.markov_head is True
+    assert facts.companion_type == "draft-dspark"
+
+
+def test_companion_for_another_model_is_refused_naming_sizes(tmp_path: Path) -> None:
+    model = _gguf(
+        tmp_path / "Qwen3.5-9B-Q4_K_M.gguf",
+        blocks=32,
+        hidden=4096,
+        tensors=["blk.0.attn_norm.weight"],
+    )
+    draft = bound_draft(tmp_path / "dflash-Qwen3.6-27B-Q8_0.gguf", layers=[1, 20, 40, 63])
+    with pytest.raises(ValueError) as error:
+        _plan({"draftWith": "companion", "draftModelPath": str(draft)}, model)
+    assert (
+        str(error.value)
+        == f"{draft.name} was made for a model with hidden size 5120 and at least 64 layers. {model.name} has 4096 and 32. Choose a companion made for this model."
+    )
+
+
+def test_build_without_dflash_says_so(tmp_path: Path) -> None:
+    model = plain_model(tmp_path / "model.gguf")
+    draft = bound_draft(tmp_path / "helper.gguf", layers=[1, 20, 40, 63])
+    planned = _plan(
+        {"draftWith": "companion", "draftModelPath": str(draft), "reuseRepeatedText": False},
+        model,
+        offered=frozenset({"ngram-mod"}),
+    )
+    assert planned.argv == ()
+    assert (
+        planned.note
+        == "This llama.cpp build does not offer drafting with DFlash (draft-dflash), so it is off. Updating the engine turns it on."
+    )
+
+
+@pytest.mark.parametrize(
+    "extra,env",
+    [
+        (["--spec-default"], None),
+        (["--spec-default=true"], None),
+        (["--spec-draft-hf", "org/model"], None),
+        (None, {"LLAMA_ARG_SPEC_DEFAULT": "1"}),
+    ],
+)
+def test_spec_default_in_extra_args_is_by_hand(tmp_path: Path, extra, env) -> None:
+    assert _plan({}, plain_model(tmp_path / "model.gguf"), extra=extra, env=env).argv == ()
+
+
+@pytest.mark.parametrize(
+    "arch,layers,markov,kind",
+    [("dflash", [1, 20, 63], True, "draft-dspark"), ("eagle3", [1, 20, 64], False, "draft-eagle3")],
+)
+def test_other_bound_drafters_use_their_header(
+    tmp_path: Path, arch: str, layers: list[int], markov: bool, kind: str
+) -> None:
+    draft = bound_draft(
+        tmp_path / "dflash-helper.gguf", architecture=arch, layers=layers, markov=markov
+    )
+    planned = _plan(
+        {"draftWith": "companion", "draftModelPath": str(draft)},
+        plain_model(tmp_path / "model.gguf"),
+    )
+    assert planned.types == ("ngram-mod", kind)
+
+
+@pytest.mark.parametrize(
+    "arch,layers",
+    [
+        ("dflash", [1, 64]),
+        ("eagle3", [1, 20, 65]),
+        ("eagle3", [1, 20]),
+        ("dflash", None),
+        ("dflash", []),
+        ("dflash", [-1]),
+        ("dflash", list(range(513))),
+    ],
+)
+def test_bad_bound_target_is_refused(tmp_path: Path, arch: str, layers: list[int] | None) -> None:
+    draft = bound_draft(tmp_path / "helper.gguf", architecture=arch, layers=layers)
+    with pytest.raises(ValueError):
+        _plan(
+            {"draftWith": "companion", "draftModelPath": str(draft)},
+            plain_model(tmp_path / "model.gguf"),
+        )
+
+
+def test_bound_draft_vocab_mismatch_is_refused(tmp_path: Path) -> None:
+    draft = bound_draft(tmp_path / "helper.gguf", layers=[1, 20, 63], vocab=256)
+    with pytest.raises(ValueError, match="vocabulary"):
+        _plan(
+            {"draftWith": "companion", "draftModelPath": str(draft)},
+            plain_model(tmp_path / "model.gguf"),
+        )
 
 
 # --- the declaration ----------------------------------------------------------
@@ -352,12 +523,19 @@ def _build_plan(tmp_path: Path, model: Path, drafts=()) -> BuildPlan:  # type: i
 def test_the_build_times_every_way_this_model_can_draft(tmp_path: Path) -> None:
     model = model_with_head(tmp_path / "qwen" / "m.gguf")
     mtp = sidecar(tmp_path / "qwen" / "mtp-m.gguf")
-    ways = drafting_ways(_build_plan(tmp_path, model, [("/lib/qwen/mtp-m.gguf", mtp)]))
+    dflash = bound_draft(tmp_path / "qwen" / "helper.gguf", layers=[1, 20, 32])
+    ways = drafting_ways(
+        _build_plan(
+            tmp_path, model, [("/lib/qwen/mtp-m.gguf", mtp), ("/lib/qwen/helper.gguf", dflash)]
+        )
+    )
     assert [(w, d) for w, d, _ in ways] == [
         (DraftWith.mtpHead, None),
         (DraftWith.companion, "/lib/qwen/mtp-m.gguf"),
+        (DraftWith.companion, "/lib/qwen/helper.gguf"),
     ]
     assert ways[1][2] == ["--spec-type", "draft-mtp", "--spec-draft-model", str(mtp)]
+    assert ways[2][2] == ["--spec-type", "draft-dflash", "--spec-draft-model", str(dflash)]
     assert drafting_ways(_build_plan(tmp_path, plain_model(tmp_path / "p.gguf"))) == []
 
 

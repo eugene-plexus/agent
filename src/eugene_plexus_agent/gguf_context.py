@@ -263,8 +263,10 @@ _NEXTN_SUFFIX = b".nextn.eh_proj.weight"
 
 @dataclass(frozen=True)
 class DraftingFacts:
-    """Where a file's MTP head is, by llama.cpp's own rule (b11719,
-    `common_speculative_types_from_gguf`): `blk.<block_count-1>.nextn.eh_proj.weight`.
+    """A file's drafting kind and target shape, from its header and tensor table.
+
+    MTP follows llama.cpp's own rule (b11719, `common_speculative_types_from_gguf`):
+    `blk.<block_count-1>.nextn.eh_proj.weight`. Bound drafters use their architecture.
 
     The library reads the same tensors for the same words
     (`GgufMetadata.mtp_head`, `draft_kind`), and the two must agree.
@@ -275,6 +277,15 @@ class DraftingFacts:
     has_first_block: bool
     """The table names a `blk.0.` tensor: a whole model, not a separate head."""
 
+    architecture: str | None = None
+    embedding_length: int | None = None
+    block_count: int | None = None
+    vocab_size: int | None = None
+    target_layers: tuple[int, ...] | None = None
+    target_hidden_size: int | None = None
+    block_size: int = 16
+    markov_head: bool = False
+
     @property
     def mtp_head(self) -> bool:
         """A whole model with its own head: drafts as `draft-mtp` with no file."""
@@ -283,14 +294,33 @@ class DraftingFacts:
     @property
     def companion_type(self) -> str | None:
         """llama.cpp's `--spec-type` for drafting with this file as
-        `--spec-draft-model`, as llama.cpp would infer it: `draft-mtp` for a
-        file with an MTP head, `draft-simple` for a whole model without one,
-        None for something llama.cpp cannot draft with."""
+        `--spec-draft-model`: architecture first, then `draft-mtp` for an
+        MTP head or `draft-simple` for a whole model without one. Eugene
+        always passes the type, including EAGLE3 which llama.cpp does not infer."""
+        if self.architecture == "dflash":
+            return "draft-dspark" if self.markov_head else "draft-dflash"
+        if self.architecture == "eagle3":
+            return "draft-eagle3"
         if self.mtp_tensors:
             return "draft-mtp"
         if self.has_first_block:
             return "draft-simple"
         return None
+
+    @property
+    def target_problem(self) -> str | None:
+        if self.target_hidden_size is None or self.target_hidden_size <= 0:
+            return f"missing or invalid {self.architecture}.target_hidden_size"
+        layers = self.target_layers
+        if not layers or any(layer < 0 for layer in layers):
+            return f"missing or invalid {self.architecture}.target_layers (1 to 512 layer ids)"
+        if self.architecture == "eagle3" and len(layers) != 3:
+            return "eagle3.target_layers must name exactly 3 target layers"
+        return None
+
+    @property
+    def target_min_layers(self) -> int:
+        return max(self.target_layers or (0,)) + (self.architecture != "eagle3")
 
 
 _DRAFTING: dict[tuple[str, int, int], DraftingFacts | None] = {}
@@ -319,9 +349,13 @@ def drafting_facts(path: Path | str) -> DraftingFacts | None:
 
 def _read_drafting_facts(path: Path) -> DraftingFacts | None:
     blocks: dict[str, int] = {}
+    scalars: dict[str, int] = {}
+    layers: dict[str, tuple[int, ...] | None] = {}
+    vocab: int | None = None
     architecture: str | None = None
     nextn: set[bytes] = set()
     first_block = False
+    markov_head = False
     try:
         with path.open("rb", buffering=1 << 20) as stream:
             if stream.read(4) != MAGIC:
@@ -344,6 +378,28 @@ def _read_drafting_facts(path: Path) -> DraftingFacts | None:
                 elif name.endswith(_BLOCK_COUNT_SUFFIX) and kind in _INT_FORMATS:
                     fmt = _INT_FORMATS[kind]
                     blocks[name] = int(struct.unpack(fmt, stream.read(struct.calcsize(fmt)))[0])
+                elif (
+                    name.endswith((".embedding_length", ".target_hidden_size", ".block_size"))
+                    and kind in _INT_FORMATS
+                ):
+                    fmt = _INT_FORMATS[kind]
+                    scalars[name] = int(struct.unpack(fmt, stream.read(struct.calcsize(fmt)))[0])
+                elif name.endswith(".target_layers") and kind == _ARRAY:
+                    inner = struct.unpack("<I", stream.read(4))[0]
+                    target_count = _u64(stream)
+                    if inner in _INT_FORMATS and 1 <= target_count <= 512:
+                        fmt = _INT_FORMATS[inner]
+                        layers[name] = tuple(
+                            int(struct.unpack(fmt, stream.read(struct.calcsize(fmt)))[0])
+                            for _ in range(target_count)
+                        )
+                    elif inner in _FIXED:
+                        stream.seek(_FIXED[inner] * target_count, 1)
+                        layers[name] = None
+                    else:
+                        return None
+                elif name == "tokenizer.ggml.tokens" and kind == _ARRAY:
+                    vocab = _skip_array(stream)
                 else:
                     _skip(stream, kind)
             for _ in range(tensors):
@@ -355,6 +411,7 @@ def _read_drafting_facts(path: Path) -> DraftingFacts | None:
                 if not 1 <= dims <= 8:
                     return None
                 first_block |= name_bytes.startswith(b"blk.0.")
+                markov_head |= name_bytes == b"markov_w1.weight"
                 if name_bytes.endswith(_NEXTN_SUFFIX):
                     nextn.add(name_bytes)
                 stream.seek(dims * 8 + 4 + 8, 1)  # dimensions, type, offset; no weights
@@ -364,4 +421,15 @@ def _read_drafting_facts(path: Path) -> DraftingFacts | None:
         return None
     count = _pick(blocks, architecture, _BLOCK_COUNT_SUFFIX)
     last = f"blk.{count - 1}".encode() + _NEXTN_SUFFIX if count else None
-    return DraftingFacts(mtp_tensors=last in nextn, has_first_block=first_block)
+    return DraftingFacts(
+        mtp_tensors=last in nextn,
+        has_first_block=first_block,
+        architecture=architecture,
+        embedding_length=scalars.get(f"{architecture}.embedding_length"),
+        block_count=blocks.get(f"{architecture}.block_count"),
+        vocab_size=vocab,
+        target_layers=layers.get(f"{architecture}.target_layers"),
+        target_hidden_size=scalars.get(f"{architecture}.target_hidden_size"),
+        block_size=scalars.get(f"{architecture}.block_size", 16),
+        markov_head=markov_head,
+    )
