@@ -4037,6 +4037,184 @@ class AppInstall(BaseModel):
     finishedAt: AwareDatetime | None = None
 
 
+class Mode(StrEnum):
+    """
+    Read only by default; write adds file creation and writing. On Windows the added ACE excludes delete permission.
+    """
+
+    read = 'read'
+    write = 'write'
+
+
+class FolderAccessRequest(BaseModel):
+    """
+    A shared project folder and the rights confirmed by the operator.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    path: str = Field(
+        ...,
+        description='An existing absolute folder path on this node; links are refused.',
+        max_length=4096,
+        min_length=1,
+    )
+    mode: Mode | None = Field(
+        'read',
+        description='Read only by default; write adds file creation and writing. On Windows the added ACE excludes delete permission.',
+    )
+
+
+class FolderAccessReleaseRequest(BaseModel):
+    """
+    A folder the authenticated app no longer uses; never an instruction to add access.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    path: str = Field(
+        ...,
+        description="Match this path to this app's own recorded folder access on this node.",
+        max_length=4096,
+        min_length=1,
+    )
+
+
+class Mode1(StrEnum):
+    """
+    The recorded rights; on Windows the write ACE excludes delete permission. Workbench never deletes files.
+    """
+
+    read = 'read'
+    write = 'write'
+
+
+class State2(StrEnum):
+    """
+    The effective access state. Applying and removing are in
+    progress; ready means propagation completed, subject to
+    notInheriting and restartNeeded. Removed means Eugene's
+    additions are gone, even if preexisting rights remain.
+    Changed_outside means the folder identity or recorded rights
+    differ, so nothing was changed. Failed names its cause in
+    message; it does not imply that all additions were removed.
+
+    """
+
+    applying = 'applying'
+    ready = 'ready'
+    removing = 'removing'
+    removed = 'removed'
+    changed_outside = 'changed_outside'
+    failed = 'failed'
+
+
+class FolderAccess(BaseModel):
+    """
+    One persisted access record. Internal folder identity and the
+    exact permission delta stay in the agent's private record,
+    rather than accepting them from a caller. Every status field
+    reports the observed state, not merely the requested change.
+
+    """
+
+    id: str = Field(
+        ...,
+        description='Stable access record id, scoped to this app on this node.',
+        min_length=1,
+    )
+    app: str = Field(..., description="The installed app's AppManifest.id.")
+    path: str = Field(
+        ...,
+        description='The final absolute folder path whose identity the agent recorded.',
+        max_length=4096,
+        min_length=1,
+    )
+    mode: Mode1 = Field(
+        ...,
+        description='The recorded rights; on Windows the write ACE excludes delete permission. Workbench never deletes files.',
+    )
+    account: str = Field(
+        ..., description="The app's own OS identity that receives these rights."
+    )
+    state: State2 = Field(
+        ...,
+        description="The effective access state. Applying and removing are in\nprogress; ready means propagation completed, subject to\nnotInheriting and restartNeeded. Removed means Eugene's\nadditions are gone, even if preexisting rights remain.\nChanged_outside means the folder identity or recorded rights\ndiffer, so nothing was changed. Failed names its cause in\nmessage; it does not imply that all additions were removed.\n",
+    )
+    preexisting: bool = Field(
+        ...,
+        description='The account already had the requested rights; nothing added and nothing to take back.',
+    )
+    notInheriting: int = Field(
+        ...,
+        description='Items inside the folder that keep their own permissions; their permissions are left as they are.',
+        ge=0,
+    )
+    restartNeeded: bool = Field(
+        ...,
+        description='Linux write access awaits a Workbench restart; never show write access as effective while true.',
+    )
+    message: str = Field(
+        ...,
+        description='The current outcome in words; a failure or changed_outside names its observed cause.',
+        min_length=1,
+    )
+    addedAt: AwareDatetime = Field(
+        ..., description="When the operator's access request was recorded."
+    )
+    addedBy: str = Field(
+        ...,
+        description='The operator identity that requested access, derived from the session.',
+    )
+
+
+class FolderAccessList(BaseModel):
+    """
+    This app's recorded folder access on this node, including removal outcomes.
+    """
+
+    grants: list[FolderAccess] = Field(
+        ..., description='Empty when there is no matching recorded access.'
+    )
+
+
+class FolderAccessRefusal(StrEnum):
+    """
+    The observed reason for refusing access. not_a_folder covers
+    missing paths and files; link covers any symlink, junction or
+    reparse point in the path; drive_root includes mount roots;
+    network includes UNC paths and mapped network drives. System,
+    Eugene and home refusals also cover ancestors containing those
+    folders. Unavailable means the app shares Eugene's own account
+    and is reported with 409; path refusals use 400.
+
+    """
+
+    not_a_folder = 'not_a_folder'
+    link = 'link'
+    drive_root = 'drive_root'
+    network = 'network'
+    system = 'system'
+    eugene = 'eugene'
+    home = 'home'
+    unavailable = 'unavailable'
+
+
+class FolderAccessProblem(Problem):
+    """
+    A Problem with the observed folder-access refusal and its cause.
+    """
+
+    refusal: FolderAccessRefusal
+    detail: str = Field(
+        ...,
+        description='The observed cause, including the path where applicable, and the next action.',
+        min_length=1,
+    )
+
+
 class App(BaseModel):
     """
     One installed app: what was installed (persisted in `apps.yaml`
