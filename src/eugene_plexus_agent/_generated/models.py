@@ -323,6 +323,31 @@ class ComponentKind(StrEnum):
     tool_driver = 'tool-driver'
 
 
+class ModelRole(StrEnum):
+    """
+    An install-wide job assigned to models through the gateway's
+    `modelSlots`. A client requests `role:<ModelRole>` rather than
+    a particular model. The list is closed: a new role is a contract
+    change, and an unknown `role:` name is refused when saved.
+
+    These are routing roles, separate from a conversation's `Role`.
+    Capability checks warn; they never block role assignment.
+
+    """
+
+    chat = 'chat'
+    agentic = 'agentic'
+    vision = 'vision'
+    reads_pages = 'reads-pages'
+    image = 'image'
+    speech_to_text = 'speech-to-text'
+    text_to_speech = 'text-to-speech'
+    music = 'music'
+    embeddings = 'embeddings'
+    rerank = 'rerank'
+    decision = 'decision'
+
+
 class Role(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
@@ -3470,6 +3495,26 @@ class CopyProgress(BaseModel):
     )
     filesCopied: int | None = Field(
         None, description="How many of them are whole on this node's disk so far.", ge=0
+    )
+
+
+class OllamaSendRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    job: str = Field(
+        ...,
+        description="The Library's Keep job id, used to discover the authorized destination.",
+    )
+    digest: str = Field(..., pattern='^sha256:[0-9a-f]{64}$')
+
+
+class OllamaSendResult(BaseModel):
+    job: str
+    bytesSent: int = Field(
+        ...,
+        description='Bytes sent in this request, including a projector when present.',
+        ge=0,
     )
 
 
