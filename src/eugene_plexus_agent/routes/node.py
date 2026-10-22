@@ -190,6 +190,8 @@ def _machine(request: Request) -> MachinePort | None:
         listAgeSeconds=trust.age_seconds if trust is not None else None,
         listVersion=trust.version if trust is not None else None,
         keyChange=MachineKeyChange.model_validate(change) if change else None,
+        # Part 3b: when the key was made, and when it changes by itself.
+        **(running.schedule() if running is not None else {}),
     )
 
 

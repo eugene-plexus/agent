@@ -2224,6 +2224,18 @@ class MachineKeyChangeState(StrEnum):
     failed = 'failed'
 
 
+class MachineKeyChangeReason(StrEnum):
+    """
+    * `requested`: an operator asked for it (`POST /v1/node/machine-key`).
+    * `scheduled`: the key was older than `machineKeyChangeDays`, and the
+      machine started the change by itself (part 3b).
+
+    """
+
+    requested = 'requested'
+    scheduled = 'scheduled'
+
+
 class MachineKeyChange(BaseModel):
     """
     A change of this node's machine key (row 3): two pins across an
@@ -2232,6 +2244,7 @@ class MachineKeyChange(BaseModel):
     """
 
     state: MachineKeyChangeState
+    reason: MachineKeyChangeReason | None = None
     nextPin: str | None = Field(
         None,
         description='The pin of the key it changes to, while `waiting` or\n`switched`. `null` otherwise.\n',
@@ -2848,11 +2861,15 @@ class Action(StrEnum):
 class Purpose(StrEnum):
     """
     Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
+
+    Search is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.
+
     """
 
     inference = 'inference'
     logs = 'logs'
     catalog = 'catalog'
+    search = 'search'
 
 
 class ClientAdmissionRequest(BaseModel):
@@ -2864,7 +2881,7 @@ class ClientAdmissionRequest(BaseModel):
     requestId: str = Field(..., max_length=128, min_length=1)
     purpose: Purpose | None = Field(
         'inference',
-        description='Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.',
+        description="Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.\n",
     )
     model: str | None = Field(None, max_length=256, min_length=1)
     personToken: str | None = Field(
@@ -3912,6 +3929,10 @@ class Arg(RootModel[str]):
     root: str = Field(..., max_length=512)
 
 
+class UpdateBackupItem(RootModel[str]):
+    root: str = Field(..., max_length=512, min_length=1)
+
+
 class AppHubSurface(StrEnum):
     """
     A public hub surface an app's client key may be used on.
@@ -4044,6 +4065,53 @@ class AppInstall(BaseModel):
     finishedAt: AwareDatetime | None = None
 
 
+class AppRestartRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    resetSettings: bool | None = Field(
+        False, description="Reset stored Admin Settings to Eugene's for one start."
+    )
+
+
+class AppGivenSettings(BaseModel):
+    """
+    The non-secret filled settings written to `given.json` on the
+    first start or a reset start. This is what Eugene gave the app,
+    not a claim about subsequent changes made in its Admin Settings.
+    Model fields are absent when no eligible model was given. No
+    client key, OIDC secret or app secret is included.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    givenAt: AwareDatetime
+    webSearchEnabled: bool
+    imageModel: str | None = Field(None, min_length=1)
+    embeddingModel: str | None = Field(None, min_length=1)
+    rerankModel: str | None = Field(None, min_length=1)
+
+
+class AppUpdateBackup(BaseModel):
+    """
+    A complete retained backup, with the version and date the console
+    needs for the Go back confirmation. The version must match
+    `App.previousVersion`; a previous environment alone does not prove
+    that a usable data backup exists. Internal filesystem paths are
+    not exposed. Restoring also restores that version's given-settings
+    record, so the app page describes the settings actually seeded.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    version: str = Field(..., min_length=1)
+    createdAt: AwareDatetime
+
+
 class App(BaseModel):
     """
     One installed app: what was installed (persisted in `apps.yaml`
@@ -4061,6 +4129,19 @@ class App(BaseModel):
     version: str
     previousVersion: str | None = Field(
         None, description='The environment kept for rollback, when there is one.'
+    )
+    updateBackup: AppUpdateBackup | None = Field(
+        None,
+        description='Present only when a complete backup and its matching previous\nenvironment exist. Its absence means Go back is unavailable.\n',
+    )
+    givenSettings: AppGivenSettings | None = Field(
+        None,
+        description='Settings last given to the app on its first start or a reset\nstart. Absent before a recorded seed or on an older install.\n',
+    )
+    availableImageModel: str | None = Field(
+        None,
+        description="The image model the launcher would select now from the app's key\nlisting, using the local-first rule for `{imageModel}`. This\nis a current offer, not the app's stored setting. The console\ncompares it with `givenSettings.imageModel` to offer Reset\nwhen a model was not given. Absent when no eligible model is\nlisted or the listing fails; `detail` names the observed cause.\n",
+        min_length=1,
     )
     origin: AppOrigin
     node: str | None = Field(None, description="This node's name, when it has one.")
@@ -4108,7 +4189,10 @@ class App(BaseModel):
     installedAt: AwareDatetime | None = None
     pid: int | None = None
     lastRestart: AwareDatetime | None = None
-    lastError: str | None = None
+    lastError: str | None = Field(
+        None,
+        description="The observed cause of the app's latest failure. If the new\nversion passes the crash threshold without becoming healthy,\nthe console leads with its version and this cause, then offers\nGo back when `updateBackup` is present. Never roll back\nautomatically.\n",
+    )
     detail: str | None = Field(
         None,
         description='Something the operator should know that is not an error — the\ngateway could not be found, say — in words they can act on.\n',
@@ -4561,6 +4645,21 @@ class MachinePort(BaseModel):
     keyChange: MachineKeyChange | None = Field(
         None,
         description="This node's last machine key change (`POST\n/v1/node/machine-key`), or `null` when it never had one.\n",
+    )
+    keyMadeAt: AwareDatetime | None = Field(
+        None, description='When the key the machine port presents was made (part 3b).\n'
+    )
+    keyChangeDueAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine changes its key by itself next: `keyMadeAt`\nplus the `machineKeyChangeDays` config field (365 by default),\nplus a spread of up to a twelfth of it (about a month a year),\ndrawn from the key itself: the same for one key, different for\neach, so the machines of one install do not change on the same\nday. `null` when the field is 0 (only on request).\n',
+    )
+    keyChangeNextAttemptAt: AwareDatetime | None = Field(
+        None,
+        description='When this machine next tries to start that change: at\n`keyChangeDueAt`; for a key already overdue when first seen (an\ninstall updated to this version, a machine that was off), at a\ntime up to 7 days later drawn from the key, so the machines of an\ninstall do not all change at once; a day after a change that was\nstopped or refused; an hour after a start that could not happen\n(`keyChangeBlocked`). `null` when the key does not change by\nitself or a change is under way.\n',
+    )
+    keyChangeBlocked: str | None = Field(
+        None,
+        description='Why the last start of a scheduled change could not happen, in\nthe words of the cause (a root older than row 3, a key that\ncould not be written). `null` when the last start did not fail.\n',
     )
 
 
@@ -5226,7 +5325,7 @@ class AppManifest(BaseModel):
     environment: dict[constr(pattern=r'^[A-Za-z_][A-Za-z0-9_]{0,127}$'), str] | None = (
         Field(
             None,
-            description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{embeddingModel}`, `{rerankModel}` — the install's search\n  model and result sorter as the app's own key sees them (MR6):\n  the first model `GET /v1/models` lists, with that key, whose\n  `x_eugene_plexus.surfaces` include `embeddings` (or `rerank`)\n  and whose `x_eugene_plexus.locality` is `local`, the field\n  Workbench's own chooser reads. Never an outside model, nor\n  one whose locality is `unknown` or absent: documents would\n  leave the install unasked. (Until 2026-10-12 this said\n  `owned_by` is `local`; the gateway lists a runtime's model\n  with its driver's provider there, `openai_compat_custom`,\n  so that rule matched no local model.) A running one\n  (`x_eugene_plexus.ready_backends` above 0, or the field\n  absent) before one that is listed and stopped; a stopped one\n  is still chosen when it is all there is, and the start's\n  notes say it is not running, because an app that keeps what\n  its first start saw is better off with the install's model\n  than with its own default. Read by the launcher at every\n  start; when the gateway lists none, or does not answer\n  within a few seconds, the variable is left unset and the\n  notes say which. A change of model is not a change of\n  connection (`resetOnConnectionChange`): an app's stored\n  vectors belong to the model that made them;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**A manifest that names `{gatewayUrl}` is not started while\nthe gateway's address is unknown** (MR6, 2026-10-12). Every\nother placeholder with no value leaves its variable unset, but\nan app without the gateway's address uses its own default, and\nOpen WebUI's is `https://api.openai.com/v1`: documents and\nspeech would go there. The start is refused, naming why, and\nis tried again as any refused start is.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
+            description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{embeddingModel}`, `{rerankModel}` — the install's search\n  model and result sorter as the app's own key sees them (MR6):\n  the first model `GET /v1/models` lists, with that key, whose\n  `x_eugene_plexus.surfaces` include `embeddings` (or `rerank`)\n  and whose `x_eugene_plexus.locality` is `local`, the field\n  Workbench's own chooser reads. Never an outside model, nor\n  one whose locality is `unknown` or absent: documents would\n  leave the install unasked. (Until 2026-10-12 this said\n  `owned_by` is `local`; the gateway lists a runtime's model\n  with its driver's provider there, `openai_compat_custom`,\n  so that rule matched no local model.) A running one\n  (`x_eugene_plexus.ready_backends` above 0, or the field\n  absent) before one that is listed and stopped; a stopped one\n  is still chosen when it is all there is, and the start's\n  notes say it is not running, because an app that keeps what\n  its first start saw is better off with the install's model\n  than with its own default. Read by the launcher at every\n  start; when the gateway lists none, or does not answer\n  within a few seconds, the variable is left unset and the\n  notes say which. A change of model is not a change of\n  connection (`resetOnConnectionChange`): an app's stored\n  vectors belong to the model that made them;\n* `{imageModel}` — the first model the app's key lists with\n  the `image` surface. A local model comes before an external\n  one, and within each locality a running model comes before\n  a stopped one, using the same readiness fields as above.\n  A stopped local model therefore comes before a running\n  external model. An external, paid model is allowed when\n  there is no local image model: an image prompt goes there\n  only when a person asks for an image (OW-IMAGES,\n  2026-10-21). The key's `limits.localOnly` still applies:\n  the gateway refuses every cloud backend for such a key,\n  including fallback targets. When no eligible image model\n  is listed, or the listing fails, leave the variable unset\n  and say why in the start notes;\n* `{imageModelSet}` — `true` when `{imageModel}` has a value,\n  otherwise `false`, including when the listing fails;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**A manifest that names `{gatewayUrl}` is not started while\nthe gateway's address is unknown** (MR6, 2026-10-12). Every\nother placeholder with no value leaves its variable unset, but\nan app without the gateway's address uses its own default, and\nOpen WebUI's is `https://api.openai.com/v1`: documents and\nspeech would go there. The start is refused, naming why, and\nis tried again as any refused start is.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
         )
     )
     healthPath: str | None = Field(
@@ -5236,8 +5335,13 @@ class AppManifest(BaseModel):
     )
     resetOnConnectionChange: str | None = Field(
         None,
-        description="A variable set to `true` for one start, when the gateway's\naddress, the app's key, or the manifest's `environment` as\nwritten (its placeholders unfilled) differs from the last\nstart's. For an app that copies its settings into its own\ndatabase at its first start and ignores the environment\nafterwards (Open WebUI's `RESET_CONFIG_ON_START`), so a\nrotated key, or a setting Eugene corrects, is not silently\nignored. That start also clears what its admin set in it, and\nthe agent's log says why. A filled-in value that changes\n(`{embeddingModel}`) is not a change.\n\nThe environment joined on 2026-10-12 (MR6): Open WebUI 0.11.4\npoints every address it does not get (documents' embeddings,\nspeech, images) at `https://api.openai.com/v1`, so since C4\nan uploaded document's text was sent there (and refused, for\nwant of a key). The corrected entry names the gateway for\neach, and reaches an install that already started by this\nreset, once.\n",
+        description="A variable set to `true` for one start, when the gateway's\naddress, the app's key, or the manifest's `environment` as\nwritten (its placeholders unfilled) differs from the last\nstart's. For an app that copies its settings into its own\ndatabase at its first start and ignores the environment\nafterwards (Open WebUI's `RESET_CONFIG_ON_START`), so a\nrotated key, or a setting Eugene corrects, is not silently\nignored. That start also clears what its admin set in it, and\nthe agent's log says why. A filled-in value that changes\n(`{embeddingModel}`, `{rerankModel}`, `{imageModel}` or\n`{imageModelSet}`) is not a change. The explicit\n`restartApp` request with `resetSettings: true` also requests\nthis one-start reset without changing the manifest.\n\nOn each start that seeds settings (the first start or a reset\nstart), the launcher writes `given.json` under `{dataDir}`:\nthe time, whether search was enabled, and the filled image,\nembedding and rerank model values, with no secrets. The agent\nreturns it as `App.givenSettings`, so the app page can compare\nwhat was given with what the gateway now serves. An ordinary\nrestart does not overwrite this record: resolving another\nmodel is not evidence that the app accepted a new setting.\n\nThe environment joined on 2026-10-12 (MR6): Open WebUI 0.11.4\npoints every address it does not get (documents' embeddings,\nspeech, images) at `https://api.openai.com/v1`, so since C4\nan uploaded document's text was sent there (and refused, for\nwant of a key). The corrected entry names the gateway for\neach, and reaches an install that already started by this\nreset, once.\n",
         pattern='^[A-Za-z_][A-Za-z0-9_]{0,127}$',
+    )
+    updateBackup: list[UpdateBackupItem] | None = Field(
+        [],
+        description="File and directory paths relative to `{dataDir}` to copy\nbefore an update starts a new version. For Open WebUI:\n`[webui.db, vector_db]`. Absent or empty means no data backup\nand no data rollback is offered. Paths must stay inside the\napp's data directory; absolute paths, drive-qualified paths,\nparent traversal and a symlink or reparse point escaping that\ndirectory are refused. Apply the same containment checks when\nrestoring. A missing path is recorded as absent so a rollback\nalso removes data created there by the new version.\n",
+        validate_default=True,
     )
     licenseUrl: AnyUrl | None = Field(
         None,
@@ -5255,6 +5359,10 @@ class AppCatalogueEntry(BaseModel):
     installedVersion: str | None = Field(
         None,
         description='The version installed on this node, when one is. Differs from\n`manifest.version` when an update is available.\n',
+    )
+    resetsSettings: bool | None = Field(
+        False,
+        description='True when an installed app\'s target manifest has\n`resetOnConnectionChange` and its `environment` templates\ndiffer from the installed manifest\'s. Filled placeholder\nvalues are not compared. False for a first install or an\nentry without this reset variable. Older agents omit it.\nThe console says before the Update click: "This update\nresets Open WebUI\'s Admin Settings to Eugene\'s, once."\n',
     )
 
 
