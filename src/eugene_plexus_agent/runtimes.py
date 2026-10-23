@@ -56,6 +56,7 @@ from .engines import (
     Loading,
     Ready,
     adapter_for,
+    chat_templates,
     default_model_alias,
     interpret_readiness,
     same_answer,
@@ -197,6 +198,7 @@ class _RuntimePlanner:
         read and a folder's mount can change under a running process."""
         self.same_answer: bool | None = None
         """The effective setting from the last launch, never from a later profile edit."""
+        self.chat_template: chat_templates.CapturedTemplate | None = None
 
     @property
     def name(self) -> str:
@@ -207,6 +209,7 @@ class _RuntimePlanner:
         return f"[engine: {self.spec.name}] "
 
     def plan(self) -> SpawnPlan:
+        self.chat_template = None
         reason = _launch_policy(self.spec, self._adapter, self._get_config)
         if reason is not None:
             raise SpawnPlanError(reason)
@@ -293,6 +296,12 @@ class _RuntimePlanner:
         if launch_spec.env:
             env.update({k: str(v) for k, v in launch_spec.env.items()})
 
+        cwd = self._adapter.working_directory(launch_spec, binary)
+        try:
+            self.chat_template = chat_templates.capture(launch_spec, argv, env, cwd=cwd)
+        except ValueError as exc:
+            raise SpawnPlanError(str(exc)) from exc
+
         self.same_answer = same_answer.effective(launch_spec.engine, argv, env)
         if self.same_answer is not None:
             log.info(
@@ -309,7 +318,7 @@ class _RuntimePlanner:
         return SpawnPlan(
             argv=argv,
             env=env,
-            cwd=self._adapter.working_directory(launch_spec, binary),
+            cwd=cwd,
             on_spawn=self._record_cards,
         )
 
@@ -1096,6 +1105,18 @@ class RuntimeSupervisor:
             pid=sp.pid if sp is not None else None,
             engineVersion=engine_version,
             capabilities=capabilities,
+            chatTemplate=(
+                chat_templates.confirmed(
+                    readiness.chat_template, planner.chat_template if planner else None
+                )
+                if isinstance(readiness, Ready)
+                and readiness.chat_template
+                and status is RuntimeStatus.ready
+                and sp is not None
+                and sp.pid is not None
+                and self._proved_ready.get(name) == _run_of(sp)
+                else None
+            ),
             lastRestart=last_restart,
             lastError=last_error,
             loadProgress=load_progress,
