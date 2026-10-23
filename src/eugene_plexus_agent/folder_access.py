@@ -12,7 +12,6 @@ import json
 import os
 import re
 import stat
-import struct
 import sys
 import threading
 import time
@@ -153,6 +152,10 @@ class RemovalIncomplete(OSError):
     """Removal changed some permissions and named the items it could not change."""
 
 
+class InspectionFailed(ValueError):
+    """A folder could not be checked; its permissions must stay unchanged."""
+
+
 class Permissions(Protocol):
     account: str
 
@@ -189,6 +192,19 @@ class Access:
     def _write(self, rows: dict[str, dict]) -> None:
         write_private(self.file, json.dumps(rows, indent=2))
 
+    def _inspect(self, path: str) -> tuple[Facts, list[int]]:
+        try:
+            return self.permissions.inspect(path)
+        except OSError as exc:
+            cause = (
+                f"Eugene's account cannot open {path}"
+                if isinstance(exc, PermissionError)
+                else f"Eugene cannot check {path}"
+            )
+            raise InspectionFailed(
+                f"{cause}: {exc}. Check this folder's permissions and availability, then try again."
+            ) from exc
+
     def listing(self, app: str) -> list[FolderAccess]:
         with _LOCK:
             rows = self._read()
@@ -199,7 +215,7 @@ class Access:
                     continue
                 if row["state"] == "ready":
                     try:
-                        facts, identity = self.permissions.inspect(row["path"])
+                        facts, identity = self._inspect(row["path"])
                         if facts.link or not _same_identity(identity, row["identity"]):
                             row.update(
                                 state="changed_outside",
@@ -208,7 +224,7 @@ class Access:
                                     "its permissions were left as they are."
                                 ),
                             )
-                    except OSError as exc:
+                    except InspectionFailed as exc:
                         transient = dict(row)
                         transient.update(
                             state="changed_outside",
@@ -251,7 +267,7 @@ class Access:
         schedule: Callable[[Callable[[], None]], None] | None = None,
     ) -> FolderAccess:
         with _LOCK:
-            facts, identity = self.permissions.inspect(path)
+            facts, identity = self._inspect(path)
             if cause := refusal(facts):
                 raise Refused(cause, path)
             rows = self._read()
@@ -363,7 +379,7 @@ class Access:
             _RUNNING.add(ident)
             self._write(rows)
         try:
-            facts, identity = self.permissions.inspect(row["path"])
+            facts, identity = self._inspect(row["path"])
             if facts.link or (facts.is_dir and not _same_identity(identity, row["identity"])):
                 raise ValueError("The folder was replaced.")
             if row["delta"] is not None and not self.permissions.revoke(row["path"], row["delta"]):
@@ -373,7 +389,7 @@ class Access:
                 restartNeeded=False,
                 message="Eugene's additions were removed. Preexisting permissions stay.",
             )
-        except RemovalIncomplete as exc:
+        except (RemovalIncomplete, InspectionFailed) as exc:
             row.update(state="failed", message=str(exc))
         except ValueError as exc:
             row.update(
@@ -398,7 +414,7 @@ class Access:
         return FolderAccess.model_validate(row)
 
     def lookup(self, app: str, path: str) -> list[FolderAccess]:
-        facts, identity = self.permissions.inspect(path)
+        facts, identity = self._inspect(path)
         candidate = _path(facts.path)
         with _LOCK:
             matching = [
@@ -827,52 +843,22 @@ class LinuxPermissions:
     def inspect(self, path: str) -> tuple[Facts, list[int]]:
         if sys.platform != "linux":
             raise OSError("Linux folder permissions need Linux.")
-        import pwd
-
-        if path.startswith("//"):
-            return Facts(path, network=True), []
-
-        value = Path(path)
-        homes = tuple(
-            p.pw_dir
-            for p in pwd.getpwall()
-            if p.pw_dir.startswith("/") and p.pw_dir not in ("/", "/nonexistent")
-        )
-        if any(p.is_symlink() for p in (value, *value.parents)):
-            return Facts(path, link=True), []
-        value = value.resolve()
+        # Eugene's account need not be able to traverse a shared folder.
+        # The root broker validates the path and opens it without following links,
+        # just as it does at the mutation. Never probe the person's folder here.
+        ident = uuid.uuid4().hex
+        self.ctl.mkdir(parents=True, exist_ok=True)
+        request = self.ctl / f"{ident}.path"
+        write_private(request, path)
         try:
-            info = value.stat()
-        except (FileNotFoundError, NotADirectoryError):
-            return Facts(path, is_dir=False), []
-        if not stat.S_ISDIR(info.st_mode):
-            return Facts(path, is_dir=False), []
-        # Metadata must be readable before the requested access is granted.
-        fd = os.open(value, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            info = os.fstat(fd)
-            data = ctypes.create_string_buffer(256)
-            libc = ctypes.CDLL(None, use_errno=True)
-            if (
-                libc.statx(fd, b"", 0x1000, 0x800, data)
-                or struct.unpack_from("=I", data)[0] & 0x800 != 0x800
-            ):
-                raise OSError("The kernel or filesystem does not expose folder creation time.")
-            seconds, nanos = struct.unpack_from("=qI", data, 80)
-            identity = [
-                info.st_ino,
-                seconds,
-                nanos,
-            ]
+            result = self._ask("folder-inspect", ident)
         finally:
-            os.close(fd)
-        return Facts(
-            str(value),
-            is_dir=value.is_dir(),
-            mount_root=os.path.ismount(value),
-            eugene=self.eugene,
-            homes=homes,
-        ), identity
+            request.unlink(missing_ok=True)
+        facts = result["facts"]
+        for key in ("eugene", "homes", "system"):
+            facts[key] = tuple(facts.get(key, ()))
+        facts["eugene"] += self.eugene
+        return Facts(**facts), result["identity"]
 
     def _ask(self, verb: str, ident: str, mode: str = "read") -> dict:
         self.ctl.mkdir(parents=True, exist_ok=True)

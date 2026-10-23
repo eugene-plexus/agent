@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -171,6 +170,40 @@ def test_poll_error_is_transient_and_does_not_write_state(tmp_path: Path, monkey
     assert access.listing("workbench")[0].state == "ready"
 
 
+@pytest.mark.parametrize("operation", ["add", "lookup", "listing", "remove"])
+def test_unreadable_folder_names_cause_and_next_action(
+    tmp_path: Path, monkeypatch, operation
+) -> None:
+    backend = MemoryPermissions()
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "read", "operator")
+    before = access.file.read_bytes()
+
+    def denied(_):
+        raise PermissionError(13, "Permission denied", "/srv/acme")
+
+    monkeypatch.setattr(backend, "inspect", denied)
+    if operation in ("add", "lookup"):
+        with pytest.raises(ValueError, match="Eugene's account cannot open /srv/acme") as exc:
+            if operation == "add":
+                access.add("workbench", "/srv/acme", "read", "operator")
+            else:
+                access.lookup("workbench", "/srv/acme")
+        message = str(exc.value)
+        assert access.file.read_bytes() == before
+    else:
+        result = (
+            access.listing("workbench")[0]
+            if operation == "listing"
+            else access.remove("workbench", grant.id)
+        )
+        assert result.state == ("changed_outside" if operation == "listing" else "failed")
+        message = result.message
+        assert "Eugene's account cannot open /srv/acme" in message
+    assert "Check this folder's permissions" in message
+    assert "read" in backend.rights
+
+
 def test_missing_folder_still_calls_revoke(tmp_path: Path, monkeypatch) -> None:
     backend = MemoryPermissions()
     access = service(tmp_path, backend)
@@ -180,11 +213,84 @@ def test_missing_folder_still_calls_revoke(tmp_path: Path, monkeypatch) -> None:
     assert backend.rights == {"manual"}
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux path resolution")
-def test_linux_resolves_parent_traversal_before_refusal(tmp_path: Path) -> None:
+@pytest.mark.parametrize("probe", ["stat", "lstat", "is_symlink", "exists", "is_dir", "resolve"])
+def test_linux_unreadable_folder_uses_root_inspection(tmp_path: Path, monkeypatch, probe) -> None:
+    import json
+
+    path = "/srv/overlap/child"
     backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
-    facts, _ = backend.inspect("/srv/../etc")
-    assert fa.refusal(facts) == "system"
+    monkeypatch.setattr(fa, "sys", SimpleNamespace(platform="linux"))
+    original = getattr(Path, probe)
+
+    def unreadable(value, *args, **kwargs):
+        if value == Path(path):
+            raise PermissionError(13, "Permission denied", path)
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(Path, probe, unreadable)
+    inspected = []
+
+    def helper(verb, ident, mode="read"):
+        if verb == "folder-inspect":
+            assert (backend.ctl / f"{ident}.path").read_text() == path
+            inspected.append(ident)
+            return {"facts": {"path": path}, "identity": [10, 20, 30]}
+        if verb == "folder-grant":
+            assert json.loads((backend.ctl / f"{ident}.identity").read_text()) == [10, 20, 30]
+            return {"added": True}
+        assert verb == "folder-revoke"
+        return {"removed": True}
+
+    monkeypatch.setattr(backend, "_ask", helper)
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", path, "write", "operator")
+    assert grant.state == "ready"
+    assert access.listing("workbench")[0].state == "ready"
+    assert access.lookup("workbench", path)[0].id == grant.id
+    assert access.remove("workbench", grant.id).state == "removed"
+    assert len(inspected) == 5  # add, grant, listing, lookup and remove
+    assert not list(backend.ctl.glob("*.path"))
+
+
+@pytest.mark.parametrize(
+    ("extra", "cause"),
+    [
+        ({"link": True}, "link"),
+        ({"is_dir": False}, "not_a_folder"),
+        ({"mount_root": True}, "drive_root"),
+        ({"network": True}, "network"),
+        ({"system": ["/srv/refused"]}, "system"),
+        ({"eugene": ["/srv/refused"]}, "eugene"),
+        ({"homes": ["/srv/refused"]}, "home"),
+    ],
+)
+def test_linux_preserves_root_inspection_refusals(
+    tmp_path: Path, monkeypatch, extra, cause
+) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(fa, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(
+        backend,
+        "_ask",
+        lambda *_: {"facts": {"path": "/srv/refused", **extra}, "identity": []},
+    )
+    facts, identity = backend.inspect("/srv/refused")
+    assert fa.refusal(facts) == cause
+    assert identity == []
+    assert not list(backend.ctl.glob("*.path"))
+
+
+def test_linux_inspection_failure_cleans_request(tmp_path: Path, monkeypatch) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(fa, "sys", SimpleNamespace(platform="linux"))
+
+    def unavailable(*_):
+        raise OSError("The folder drive is unavailable")
+
+    monkeypatch.setattr(backend, "_ask", unavailable)
+    with pytest.raises(OSError, match="folder drive is unavailable"):
+        backend.inspect("/srv/project")
+    assert not list(backend.ctl.glob("*.path"))
 
 
 def test_linux_waits_past_900_seconds_for_helper(tmp_path: Path, monkeypatch) -> None:
@@ -387,20 +493,6 @@ def test_restart_completion_uses_a_fresh_service_observation(tmp_path: Path) -> 
     )
     supervisor.status = lambda _: (None, None, None, 7, None)
     assert directories._process(SimpleNamespace(supervisor=supervisor), "workbench") == 91
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="Linux metadata handles")
-def test_linux_can_identify_a_folder_before_it_has_read_permission(tmp_path: Path) -> None:
-    folder = tmp_path / "closed"
-    folder.mkdir()
-    folder.chmod(0)
-    try:
-        backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
-        facts, identity = backend.inspect(str(folder))
-        assert facts.is_dir
-        assert len(identity) == 3
-    finally:
-        folder.chmod(0o700)
 
 
 def test_add_needs_operator_session(authed_client: TestClient) -> None:
