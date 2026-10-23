@@ -3205,6 +3205,100 @@ class EngineInstall(BaseModel):
     finishedAt: AwareDatetime | None = None
 
 
+class ExecTrustKind(StrEnum):
+    """
+    Why Eugene's own account did not run a program (row 8, part 8c).
+    The check walks the program's path from `/`: every folder, every
+    link and where it points, the file, a script's interpreter and
+    the Python environment it belongs to.
+
+    - `needs_approval`: everything is owned by root, by Eugene's
+      account, or by one other account, and nothing can be changed
+      by a group or by others. It runs once an owner approves it
+      (`POST /v1/exec-approvals`).
+    - `refused`: a group or others can change something on the way
+      (mode bits, a macOS ACL entry, a volume that ignores
+      ownership), two or more other accounts own parts of it, or it
+      cannot be checked. It never runs; the error names the path and
+      who can change it.
+
+    A program owned by root and Eugene's account alone runs, and is
+    not reported.
+
+    """
+
+    needs_approval = 'needs_approval'
+    refused = 'refused'
+
+
+class ExecTrust(BaseModel):
+    """
+    A program Eugene's own account did not run, and what an owner can
+    do about it (row 8, part 8c). Present only when the agent runs as
+    an account of its own (the Mac's daemon, a Linux system install).
+
+    """
+
+    kind: ExecTrustKind
+    path: str = Field(
+        ...,
+        description='The path that would run: absolute, every folder resolved. What\n`POST /v1/exec-approvals` takes.\n',
+    )
+    account: str | None = Field(
+        None,
+        description="`needs_approval`: the one account other than root and\nEugene's that can change the program. A console says that\napproving it lets this account act as Eugene.\n",
+    )
+    sha256: str | None = Field(
+        None,
+        description="`needs_approval`: the program file's SHA-256 now, which an\napproval must name.\n",
+    )
+
+
+class ExecApprovalRequest(BaseModel):
+    path: str = Field(..., description='`ExecTrust.path`.')
+    sha256: str = Field(
+        ..., description='`ExecTrust.sha256`: the file as it was shown.'
+    )
+
+
+class ExecChainItem(BaseModel):
+    """
+    One file, folder or link the check walked, as it was approved.
+    """
+
+    path: str
+    uid: int
+    mode: int = Field(..., description='`st_mode`: the type and permission bits.')
+
+
+class ExecApproval(BaseModel):
+    """
+    An owner's approval of one program for Eugene's own account (row
+    8, part 8c). It holds while the path, the other account, the
+    file's SHA-256 and every item of the chain are what they were;
+    the first check that finds any of them different drops it, and
+    the program asks again.
+
+    """
+
+    id: str
+    path: str = Field(
+        ..., description='The program approved, as `ExecTrust.path` named it.'
+    )
+    account: str = Field(..., description='The other account that can change it.')
+    accountUid: int
+    sha256: str
+    chain: list[ExecChainItem]
+    approvedAt: AwareDatetime
+    approvedBy: str | None = Field(
+        None, description='Who approved it, as their session named them.'
+    )
+
+
+class ExecApprovalList(BaseModel):
+    approvals: list[ExecApproval]
+
+
 class Origin(StrEnum):
     """
     Where the binary came from. Discovery precedence is an
@@ -5988,6 +6082,10 @@ class Runtime(BaseModel):
         None,
         description="The program this runtime's `binary` names, when the agent runs\nin Eugene's own account and will not run it because someone\nother than root or that account could change it (row 8):\n`lastError` says who. The way out a console offers is to clear\n`binary` (`PATCH /v1/runtimes/{name}` with the spec without it),\nso the runtime runs Eugene's own build of the engine, installed\nfirst with `POST /v1/engines/{engine}/install` when there is\nnone. Absent otherwise; cleared on a successful start.\n",
     )
+    execTrust: ExecTrust | None = Field(
+        None,
+        description="Present when the last start failed because Eugene's own account\ndid not run the engine's program, whether a runtime's `binary`\nor one the agent found (row 8, part 8c). `needs_approval`: a\nconsole asks the owner, and `POST /v1/exec-approvals` lets it\nrun. Cleared on a successful start.\n",
+    )
     loadProgress: LoadProgress | None = None
     speculation: RuntimeSpeculation | None = None
     promptCache: RuntimePromptCache | None = None
@@ -6194,6 +6292,10 @@ class EngineDescriptor(BaseModel):
         description='The **curated** flag surface for this engine, as a standard\n`ConfigSchema` so the generic config editor renders it with\nno engine-specific UI code.\n\nCurated, not complete: `llama-server` has hundreds of flags\nand exposing them wholesale would produce a form nobody can\nuse. What is here is what a person actually turns —\ncontext size, GPU layers, batch size, parallel slots, flash\nattention. Anything omitted is still reachable through\n`RuntimeSpec.extraArgs`.\n',
     )
     error: str | None = Field(None, description='Populated when `available: false`.')
+    execTrust: ExecTrust | None = Field(
+        None,
+        description="Present when `error` is Eugene's own account not running the\nbinary it found (row 8, part 8c).\n",
+    )
     managed: ManagedEngine | None = None
     acquisition: EngineAcquisition | None = None
     python: PythonEngine | None = Field(

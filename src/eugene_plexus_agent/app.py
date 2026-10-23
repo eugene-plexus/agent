@@ -34,6 +34,7 @@ from . import (
     companions,
     default_topology,
     enrollment,
+    exec_approvals,
     firewall_follow,
     host_allowlist,
     install_info,
@@ -64,6 +65,7 @@ from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import directories as directories_routes
 from .routes import entrypoint as entrypoint_routes
+from .routes import exec_approvals as exec_approval_routes
 from .routes import health as health_routes
 from .routes import log_ingress as log_ingress_routes
 from .routes import logs as logs_routes
@@ -122,6 +124,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # `AgentState.load_or_degrade` for what a failure preserves.
         config_error = state.load_or_degrade()
     app.state.agent_state = state
+    # The programs an owner approved for Eugene's own account (row 8, part
+    # 8c), kept beside the agent's own state, before anything is started.
+    exec_approvals.configure(settings.config_file.parent)
     app.state.safe_mode = settings.safe_mode
     # Strata's install says when this node's copy folder is on a slow drive
     # (LS7): its installer is one per engine, so it learns the config once.
@@ -676,6 +681,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             update_all.manager(app).resume()
         yield
     finally:
+        exec_approvals.configure(None)
         all_updates = getattr(app.state, "update_all", None)
         if all_updates is not None:
             await all_updates.close()
@@ -1167,6 +1173,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # — or, from M6, the gateway's own token, because it is the one
     # component that sees demand.
     app.include_router(runtimes_routes.router)
+    # Programs an owner approved for Eugene's own account (row 8, part 8c).
+    # Operator-only on every route; declared on the router.
+    app.include_router(exec_approval_routes.router)
     app.include_router(benchmark_routes.router)
     app.include_router(profile_build_routes.router)
     # Optional apps. Operator-only on every route; declared on the router.

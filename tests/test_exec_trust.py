@@ -1,13 +1,19 @@
 """Eugene's own account runs no program anyone else can change (row 8).
 
-The disk is a stand-in (owners, modes, links, file heads, macOS ACL
-entries and mount options), so these run on every platform: the agent is
-`_eugeneplexus` (uid 400) or a person (troy, 501); alice (502) is someone
-else on the machine. The last tests walk the real disk where there is one.
+The disk is a stand-in (owners, groups, modes, links, file heads, macOS
+ACL entries and mount options), so these run on every platform: the agent
+is `_eugeneplexus` (uid 400) or a person (troy, 501); alice (502) is
+someone else on the machine. The last tests walk the real disk where there
+is one.
+
+Three kinds (part 8c, call R8-EXEC-TRUST): `ok` runs; `needs_approval`
+(one other account can change it, and nothing else can) runs once an
+owner approves it; `refused` never runs.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import sys
@@ -23,6 +29,8 @@ from eugene_plexus_agent.engines import EngineUnavailableError, LlamaCppAdapter
 from eugene_plexus_agent.engines.vllm import VllmAdapter
 
 NAMES = {0: "root", 400: "_eugeneplexus", 501: "troy", 502: "alice"}
+GROUPS = {0: "wheel", 20: "staff"}
+HOME = "/usr/local/eugene-plexus"
 
 
 def _key(path: Any) -> str:
@@ -35,6 +43,7 @@ class Disk:
     def __init__(self) -> None:
         self.nodes: dict[str, dict[str, Any]] = {}
         self.noowners: set[str] = set()
+        self.hashed: list[str] = []
         self.dir("/")
 
     def _parents(self, path: str, uid: int = 0) -> None:
@@ -43,9 +52,22 @@ class Disk:
                 str(parent), {"kind": stat.S_IFDIR, "uid": uid, "mode": 0o755, "acl": []}
             )
 
-    def dir(self, path: str, uid: int = 0, mode: int = 0o755, acl: list[str] | None = None) -> Disk:
+    def dir(
+        self,
+        path: str,
+        uid: int = 0,
+        mode: int = 0o755,
+        acl: list[str] | None = None,
+        gid: int = 0,
+    ) -> Disk:
         self._parents(path)
-        self.nodes[_key(path)] = {"kind": stat.S_IFDIR, "uid": uid, "mode": mode, "acl": acl or []}
+        self.nodes[_key(path)] = {
+            "kind": stat.S_IFDIR,
+            "uid": uid,
+            "gid": gid,
+            "mode": mode,
+            "acl": acl or [],
+        }
         return self
 
     def file(
@@ -55,11 +77,13 @@ class Disk:
         mode: int = 0o755,
         content: bytes = b"\x7fELF",
         acl: list[str] | None = None,
+        gid: int = 0,
     ) -> Disk:
         self._parents(path)
         self.nodes[_key(path)] = {
             "kind": stat.S_IFREG,
             "uid": uid,
+            "gid": gid,
             "mode": mode,
             "content": content,
             "acl": acl or [],
@@ -85,6 +109,7 @@ class Disk:
             raise FileNotFoundError(2, "No such file or directory")
         return SimpleNamespace(
             st_uid=node["uid"],
+            st_gid=node.get("gid", 0),
             st_mode=node["kind"] | node["mode"],
             st_dev=1,
             st_ino=hash(_key(path)),
@@ -109,6 +134,10 @@ class Disk:
         if node is None or node["kind"] != stat.S_IFREG:
             raise FileNotFoundError(2, "No such file")
         return bytes(node["content"])
+
+    def sha256(self, path: Any) -> str:
+        self.hashed.append(_key(path))
+        return hashlib.sha256(self.head(path)).hexdigest()
 
     def listdir(self, path: Any) -> list[str]:
         key = self.resolve(path)
@@ -141,6 +170,9 @@ def disk(monkeypatch: pytest.MonkeyPatch) -> Disk:
     monkeypatch.setattr(exec_trust, "_mount_options", d.mount)
     monkeypatch.setattr(exec_trust, "_acl_seen", {})
     monkeypatch.setattr(exec_trust, "_account_name", lambda uid: NAMES.get(uid))
+    monkeypatch.setattr(exec_trust, "_group_name", lambda gid: GROUPS.get(gid))
+    monkeypatch.setattr(exec_trust, "_account_home", lambda uid: HOME)
+    monkeypatch.setattr(exec_trust, "_sha256", d.sha256)
     monkeypatch.setattr(exec_trust, "_platform", lambda: "linux")
     monkeypatch.setattr(exec_trust, "_cwd", lambda: "/usr/local/eugene-plexus")
     as_eugene(monkeypatch)
@@ -175,25 +207,33 @@ def test_a_person_s_own_install_is_not_limited(disk: Disk, monkeypatch: pytest.M
     assert exec_trust.untrusted("/opt/shared/llama-server") is None
 
 
-def test_a_file_of_a_person_s_is_refused_naming_its_owner(disk: Disk) -> None:
+def test_a_file_of_a_person_s_is_not_run_unasked_naming_its_owner_and_what_to_do(
+    disk: Disk,
+) -> None:
     disk.dir("/Users/troy", uid=501).dir("/Users/troy/llama", uid=501)
     disk.file("/Users/troy/llama/llama-server", uid=501)
     refused(
         "/Users/troy/llama/llama-server",
-        "belongs to troy",
-        "Move it, or let Eugene fetch its own build",
+        "Eugene's own account runs /Users/troy/llama/llama-server only once an owner approves it",
+        "/Users/troy, which belongs to troy",
+        f"copy its folder into {HOME} as an administrator, or let Eugene install the engine",
     )
 
 
-def test_a_folder_of_a_person_s_above_it_is_refused(disk: Disk) -> None:
+def test_a_folder_of_a_person_s_above_it_is_not_run_unasked(disk: Disk) -> None:
     disk.dir("/Users/troy", uid=501).dir("/Users/troy/llama", uid=400)
     disk.file("/Users/troy/llama/llama-server", uid=400)
     refused("/Users/troy/llama/llama-server", "which belongs to troy")
 
 
 def test_a_folder_others_can_write_is_refused(disk: Disk) -> None:
-    disk.dir("/usr/local/shared", mode=0o775).file("/usr/local/shared/llama-server")
-    refused("/usr/local/shared/llama-server", "can be changed by others (mode 0775)")
+    disk.dir("/usr/local/shared", mode=0o777).file("/usr/local/shared/llama-server")
+    refused(
+        "/usr/local/shared/llama-server",
+        "will not run /usr/local/shared/llama-server",
+        "/usr/local/shared, which can be changed by others (mode 0777: anyone)",
+        f"Copy its folder into {HOME} as an administrator, or let Eugene install the engine",
+    )
 
 
 def test_root_s_and_its_own_folders_run_and_the_resolved_path_is_returned(disk: Disk) -> None:
@@ -206,6 +246,73 @@ def test_root_s_and_its_own_folders_run_and_the_resolved_path_is_returned(disk: 
     assert ran("/usr/local/eugene-plexus/engines/llama_cpp/b1/llama-server") == (
         "/usr/local/eugene-plexus/engines/llama_cpp/b1/llama-server"
     )
+
+
+# --- the three kinds (part 8c) -------------------------------------------------
+
+
+def test_root_s_and_eugene_s_own_program_is_ok_and_not_hashed(disk: Disk) -> None:
+    disk.dir("/usr/local/eugene-plexus", uid=400).file(
+        "/usr/local/eugene-plexus/llama-server", uid=400
+    )
+    found = exec_trust.assess("/usr/local/eugene-plexus/llama-server")
+    assert found.kind is exec_trust.Kind.ok
+    assert found.program == "/usr/local/eugene-plexus/llama-server"
+    assert (found.account, found.sha256, found.message()) == (None, None, None)
+    assert disk.hashed == []
+
+
+def test_a_program_only_one_other_account_can_change_needs_approval(disk: Disk) -> None:
+    """Every item is root's, Eugene's or troy's, and no group or other can
+    write any of them: troy's, to approve. The verdict carries what an
+    approval binds, so no caller works it out again."""
+    disk.dir("/Users/troy", uid=501).dir("/Users/troy/llama", uid=501, mode=0o700)
+    disk.file("/Users/troy/llama/llama-server", uid=501, content=b"\x7fELF troy's build")
+    found = exec_trust.assess("/Users/troy/llama/llama-server")
+    assert found.kind is exec_trust.Kind.needs_approval
+    assert (found.account, found.account_uid) == ("troy", 501)
+    assert found.program == "/Users/troy/llama/llama-server"
+    assert found.sha256 == hashlib.sha256(b"\x7fELF troy's build").hexdigest()
+    assert [(c.path, c.uid, stat.S_IMODE(c.mode)) for c in found.chain] == [
+        ("/", 0, 0o755),
+        ("/Users", 0, 0o755),
+        ("/Users/troy", 501, 0o755),
+        ("/Users/troy/llama", 501, 0o700),
+        ("/Users/troy/llama/llama-server", 501, 0o755),
+    ]
+
+
+def test_a_folder_a_group_can_change_is_refused_naming_who_can_write(disk: Disk) -> None:
+    disk.dir("/usr/local/shared", mode=0o775, gid=20).file("/usr/local/shared/llama-server")
+    found = exec_trust.assess("/usr/local/shared/llama-server")
+    assert found.kind is exec_trust.Kind.refused
+    assert found.sha256 is None and disk.hashed == []
+    refused(
+        "/usr/local/shared/llama-server",
+        "can be changed by others (mode 0775: its owner root and group staff)",
+    )
+
+
+def test_a_person_s_program_their_group_can_change_is_refused_not_offered(disk: Disk) -> None:
+    disk.dir("/Users/troy", uid=501, mode=0o775, gid=20).file("/Users/troy/llama-server", uid=501)
+    assert exec_trust.assess("/Users/troy/llama-server").kind is exec_trust.Kind.refused
+
+
+def test_a_program_two_accounts_can_change_is_refused(disk: Disk) -> None:
+    disk.dir("/Users/troy", uid=501).dir("/Users/alice", uid=502)
+    disk.file("/Users/alice/llama-server", uid=502)
+    disk.link("/Users/troy/llama-server", "/Users/alice/llama-server")
+    found = exec_trust.assess("/Users/troy/llama-server")
+    assert found.kind is exec_trust.Kind.refused and found.account is None
+    refused("/Users/troy/llama-server", "more than one account can change it (alice, troy)")
+
+
+def test_a_refusal_carries_its_verdict(disk: Disk) -> None:
+    disk.dir("/Users/troy", uid=501).file("/Users/troy/llama-server", uid=501)
+    with pytest.raises(exec_trust.Untrusted) as caught:
+        exec_trust.trusted_program("/Users/troy/llama-server")
+    assert caught.value.verdict is not None
+    assert caught.value.verdict.kind is exec_trust.Kind.needs_approval
 
 
 # --- links --------------------------------------------------------------------
@@ -274,7 +381,24 @@ def test_a_script_whose_interpreter_a_person_owns_is_refused(disk: Disk) -> None
 
 def test_a_script_that_finds_its_interpreter_on_path_is_refused(disk: Disk) -> None:
     disk.file("/usr/local/bin/vllm", content=b"#!/usr/bin/env python3\nimport vllm\n")
-    refused("/usr/local/bin/vllm", "names its interpreter through PATH")
+    assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused
+    refused(
+        "/usr/local/bin/vllm",
+        "names its interpreter through PATH",
+        "Name the interpreter by its full path on the script's first line",
+    )
+
+
+def test_a_person_s_script_is_not_read_when_it_is_not_a_plain_file(
+    disk: Disk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk goes on past a person's folder to say who else can change
+    a program, so it reads files a person controls: only the first bytes
+    of a plain file, so a pipe cannot hold the agent."""
+    disk.dir("/Users/troy", uid=501).file("/Users/troy/llama-server", uid=501)
+    disk.nodes["/Users/troy/llama-server"]["kind"] = stat.S_IFIFO
+    monkeypatch.setattr(exec_trust, "_head", lambda path: pytest.fail("read a pipe"))
+    assert exec_trust.assess("/Users/troy/llama-server").kind is exec_trust.Kind.refused
 
 
 def test_uv_s_long_path_script_names_its_python_on_the_second_line(disk: Disk) -> None:
@@ -397,7 +521,7 @@ def test_a_runtime_s_binary_is_refused_before_it_is_run_even_for_its_version(
     exe = tmp_path / "llama-server"
     exe.write_text("#!/bin/sh\n", encoding="utf-8")
 
-    def refuse(path: Any) -> Path:
+    def refuse(path: Any, **kw: Any) -> Path:
         raise exec_trust.Untrusted(
             f"{path} belongs to troy; Eugene's own account runs programs only from folders"
         )
@@ -418,7 +542,7 @@ def test_the_checked_path_is_what_runs_and_is_probed(
     exe = tmp_path / "llama-server"
     exe.write_text("#!/bin/sh\n", encoding="utf-8")
     checked = tmp_path / "checked" / "llama-server"
-    monkeypatch.setattr(exec_trust, "trusted_program", lambda path: checked)
+    monkeypatch.setattr(exec_trust, "trusted_program", lambda path, **kw: checked)
     probed: list[Path] = []
     adapter = LlamaCppAdapter()
     monkeypatch.setattr(adapter, "probe_version", lambda binary: probed.append(binary) or "1")
@@ -440,10 +564,18 @@ def test_a_refused_runtime_binary_is_named_for_the_console_and_cleared_when_it_r
     exe = tmp_path / "llama-server"
     exe.write_text("#!/bin/sh\n", encoding="utf-8")
     spec = _spec(binary=str(exe), port=8090)
+    verdict = exec_trust.Verdict(
+        kind=exec_trust.Kind.needs_approval,
+        given=str(exe),
+        program="/Users/troy/llama-server",
+        account="troy",
+        account_uid=501,
+        sha256="ab" * 32,
+    )
 
-    def refuse(path: Any) -> Path:
+    def refuse(path: Any, **kw: Any) -> Path:
         raise exec_trust.Untrusted(
-            f"{path} belongs to troy; Eugene's own account runs programs only"
+            f"{path} belongs to troy; Eugene's own account runs programs only", verdict
         )
 
     monkeypatch.setattr(exec_trust, "trusted_program", refuse)
@@ -458,12 +590,55 @@ def test_a_refused_runtime_binary_is_named_for_the_console_and_cleared_when_it_r
     assert planner.refused_binary == str(exe)
     supervisor = RuntimeSupervisor(log=logging.getLogger("test"))
     supervisor._planners[spec.name] = planner
-    assert supervisor.compose(spec).refusedBinary == str(exe)
+    shown = supervisor.compose(spec)
+    assert shown.refusedBinary == str(exe)
+    # Part 8c: what the console asks about, and what an approval names.
+    assert shown.execTrust is not None
+    assert shown.execTrust.model_dump(mode="json", exclude_none=True) == {
+        "kind": "needs_approval",
+        "path": "/Users/troy/llama-server",
+        "account": "troy",
+        "sha256": "ab" * 32,
+    }
 
-    monkeypatch.setattr(exec_trust, "trusted_program", lambda path: Path(str(path)))
+    monkeypatch.setattr(exec_trust, "trusted_program", lambda path, **kw: Path(str(path)))
     monkeypatch.setattr(LlamaCppAdapter, "probe_version", lambda self, binary: "1")
     planner.plan()
     assert planner.refused_binary is None
+    assert supervisor.compose(spec).execTrust is None
+
+
+def test_an_engine_found_but_not_run_says_why_in_the_engine_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /v1/engines`: vLLM's configured program is one only troy can
+    change, so the listing carries what to approve (part 8c)."""
+    from eugene_plexus_agent import runtimes
+    from eugene_plexus_agent.engines.base import UntrustedBinaryError
+
+    verdict = exec_trust.Verdict(
+        kind=exec_trust.Kind.needs_approval,
+        given="/Users/troy/venv/bin/vllm",
+        program="/Users/troy/venv/bin/vllm",
+        account="troy",
+        account_uid=501,
+        sha256="cd" * 32,
+    )
+
+    def discover(self: Any, configured: str | None = None) -> Any:
+        raise UntrustedBinaryError("only once an owner approves it", str(configured), verdict)
+
+    monkeypatch.setattr(VllmAdapter, "discover", discover)
+    listed = runtimes.describe_engines(
+        get_config=lambda key: "/Users/troy/venv/bin/vllm" if key == "vllmBinary" else None
+    )
+    vllm = next(e for e in listed if e.engine is EngineKind.vllm)
+    assert vllm.available is False and vllm.execTrust is not None
+    assert (vllm.execTrust.kind.value, vllm.execTrust.path, vllm.execTrust.sha256) == (
+        "needs_approval",
+        "/Users/troy/venv/bin/vllm",
+        "cd" * 32,
+    )
 
 
 def test_a_configured_engine_binary_is_refused_before_its_environment_is_read(
@@ -472,7 +647,7 @@ def test_a_configured_engine_binary_is_refused_before_its_environment_is_read(
     exe = tmp_path / "vllm"
     exe.write_text("#!/usr/bin/python3\n", encoding="utf-8")
 
-    def refuse(path: Any) -> Path:
+    def refuse(path: Any, **kw: Any) -> Path:
         raise exec_trust.Untrusted(f"{path} belongs to troy; ...")
 
     monkeypatch.setattr(exec_trust, "trusted_program", refuse)

@@ -1,32 +1,45 @@
-"""Which programs Eugene's own account runs (row 8).
+"""Which programs Eugene's own account runs (row 8, part 8c).
 
 Run as an account of its own -- the Mac's LaunchDaemon (`_eugeneplexus`)
 or a Linux system install (`eugene-plexus`) -- the agent holds the
-machine's keys out of reach of the people who use the machine. A program
-it runs must then be one nobody else can change: otherwise whatever runs as
-the person who could change it runs as Eugene's account the next time it
-starts. So a program the agent runs -- an engine binary a setting names (a
-runtime's `binary`, `vllmBinary`, `mlxBinary`, `strataServer`,
-`kevPython`), one found on PATH, a managed build, the `uv` it installs apps
-with, an app's interpreter -- runs only when:
+machine's keys out of reach of the people who use the machine. Whatever
+can change a program it runs can act as Eugene's account the next time
+that program starts. So a program the agent runs -- an engine binary a
+setting names (a runtime's `binary`, `vllmBinary`, `mlxBinary`,
+`strataServer`, `kevPython`), one found on PATH, a managed build, the `uv`
+it installs apps with, an app's interpreter -- is judged first, by
+`assess`, the one place the decision is made.
 
-- the path, walked from `/` one name at a time with every link followed by
-  hand, steps only into folders, on every hop, and ends at a file, that
-  belong to root or to Eugene's account, can be written by neither their
-  group nor others, and (on macOS) carry no ACL entry that lets anyone
-  else write, append, delete, add or change them, on a volume that does
-  not ignore ownership;
-- a script's interpreter (`#!`, and the `exec` line uv writes under
-  `#!/bin/sh` for a path too long for a shebang) passes the same walk;
-  `#!/usr/bin/env` is refused, because PATH, not the script, would choose
-  the program;
-- a Python environment the program belongs to passes too: its root, its
-  `site-packages` folders, and the interpreter it was made from (`home` in
-  `pyvenv.cfg`) with that interpreter's standard library.
+What is walked: the path, from `/`, one name at a time with every link
+followed by hand -- every folder stepped into on every hop, and the file;
+a script's interpreter (`#!`, and the `exec` line uv writes under
+`#!/bin/sh` for a path too long for a shebang) the same way; and the Python
+environment the program belongs to (its root, its `site-packages` folders,
+the interpreter it was made from, `home` in `pyvenv.cfg`, with that
+interpreter's standard library).
 
-The walk returns the resolved absolute path, with no link left in it, and
-that path is what the agent executes, a `--version` probe included: a
-relative path or a bare name means nothing else at the time it runs.
+What it decides (call R8-EXEC-TRUST, Choice 3):
+
+- `ok`: every item belongs to root or to Eugene's account and nobody else
+  can change it. It runs.
+- `needs_approval`: every item belongs to root, Eugene's account or ONE
+  other account, and no group or others can change any of them. It runs
+  once an owner approves it (`exec_approvals`): the approval binds the
+  path that runs, that account, the file's SHA-256 and every item walked
+  (path, owner, mode), and lapses when any of them differ. An approval
+  trusts that account: the hash catches a change, it is not a boundary
+  against the account that owns the file.
+- `refused`: a group or others can change an item (mode bits; on macOS an
+  ACL entry that lets someone else write, append, delete, add or change
+  it, or a volume that ignores ownership), two or more other accounts own
+  items, a script lets PATH choose its interpreter (`#!/usr/bin/env`), or
+  something cannot be checked. It never runs.
+
+The walk returns the path to execute: absolute, every folder in it
+resolved, and its last name kept when that name is a link (a venv's
+`bin/python` is one, and Python finds its environment by the name it was
+started as). That path is what the agent executes, a `--version` probe
+included: a relative path or a bare name means nothing else when it runs.
 
 Not covered, and why: the files inside a trusted folder are not each
 checked (a folder only root or Eugene's account can change holds only what
@@ -40,12 +53,15 @@ anyway.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 
 #: The accounts the installers make for Eugene: the Mac's daemon, and a
@@ -69,11 +85,99 @@ _MUTATING = frozenset(
 )
 _LINK_HOPS = 40
 _INTERPRETER_DEPTH = 4
-_ADVICE = "Move it, or let Eugene fetch its own build"
+#: The largest program hashed for an approval.
+_HASH_LIMIT = 1 << 30
+#: What a refusal offers besides copying the program: an engine's.
+INSTALL_ENGINE = "let Eugene install the engine itself"
+
+
+class Kind(StrEnum):
+    """What `assess` decided; see the module's docstring."""
+
+    ok = "ok"
+    needs_approval = "needs_approval"
+    refused = "refused"
+
+
+@dataclass(frozen=True)
+class ChainItem:
+    """One file, folder or link the walk met, as it was then."""
+
+    path: str
+    uid: int
+    mode: int
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One thing on a program's way that root and Eugene's account do not
+    control alone. `problem`: `owner` (another account owns it), `others`
+    (a group, others, an ACL entry or the volume let someone else change
+    it), or `unknown` (it cannot be judged). `text` names the item and who
+    can change it; `fix` picks the advice."""
+
+    problem: str
+    path: str
+    uid: int | None
+    text: str
+    owner: str | None = None
+    fix: str = "copy"
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """`assess`'s answer, with everything a caller acts on, so none of it is
+    worked out twice: the kind, the path to execute, the one other account
+    and the file's SHA-256 (`needs_approval`), and the items walked."""
+
+    kind: Kind
+    given: str
+    program: str | None = None
+    account: str | None = None
+    account_uid: int | None = None
+    sha256: str | None = None
+    chain: tuple[ChainItem, ...] = ()
+    findings: tuple[Finding, ...] = ()
+    home: str = "Eugene's folder"
+
+    def message(self, instead: str = INSTALL_ENGINE) -> str | None:
+        """Why it did not run, naming the path, who can change it, and what
+        to do. None for `ok`."""
+        if self.kind is Kind.ok:
+            return None
+        lead = self.why()
+        if self.kind is Kind.needs_approval:
+            return (
+                f"Eugene's own account runs {self.given} only once an owner approves it: "
+                f"{lead}. Approve it, copy its folder into {self.home} as an administrator, "
+                f"or {instead}."
+            )
+        fix = next((f.fix for f in self.findings if f.problem != "owner"), "copy")
+        advice = {
+            "shebang": "Name the interpreter by its full path on the script's first line, or "
+            f"{instead}.",
+            "check": f"Check the path, or {instead}.",
+        }.get(fix, f"Copy its folder into {self.home} as an administrator, or {instead}.")
+        return f"Eugene's own account will not run {self.given}: {lead}. {advice}"
+
+    def why(self) -> str:
+        """Who or what can change it, naming the item: the first such thing
+        found, or the accounts when more than one owns a part of it."""
+        others = [f for f in self.findings if f.problem != "owner"]
+        if others:
+            return others[0].text
+        names = sorted({f.owner or f"user {f.uid}" for f in self.findings})
+        if len(names) > 1:
+            return f"more than one account can change it ({', '.join(names)})"
+        return self.findings[0].text if self.findings else "it cannot be checked"
 
 
 class Untrusted(Exception):
     """A program Eugene's own account will not run, and why."""
+
+    def __init__(self, message: str, verdict: Verdict | None = None) -> None:
+        super().__init__(message)
+        self.verdict = verdict
 
 
 # --- what the check reads, kept apart so a test can stand in for the disk ---
@@ -81,11 +185,55 @@ class Untrusted(Exception):
 _lstat = os.lstat
 _readlink = os.readlink
 _listdir = os.listdir
+_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
 
 
 def _head(path: PurePosixPath | Path) -> bytes:
-    with open(str(path), "rb") as handle:
-        return handle.read(4096)
+    """The first bytes of a plain file. Opened without waiting, and refused
+    when it is not a plain file, so a pipe a person put in a program's
+    place cannot hold the agent."""
+    fd = os.open(str(path), _OPEN_FLAGS)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a file")
+        return os.read(fd, 4096)
+    finally:
+        os.close(fd)
+
+
+#: SHA-256 answers, by what identifies a file's bytes: a write changes its
+#: ctime, which its owner cannot set back.
+_hashes: dict[tuple[str, int, int, int, int, int], str] = {}
+
+
+def _sha256(path: PurePosixPath | Path) -> str:
+    fd = os.open(str(path), _OPEN_FLAGS)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{path} is not a file")
+        if info.st_size > _HASH_LIMIT:
+            raise OSError(f"{path} is larger than {_HASH_LIMIT >> 30} GiB")
+        key = (
+            str(path),
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+        found = _hashes.get(key)
+        if found is None:
+            digest = hashlib.sha256()
+            while chunk := os.read(fd, 1 << 20):
+                digest.update(chunk)
+            found = digest.hexdigest()
+            if len(_hashes) > 256:
+                _hashes.clear()
+            _hashes[key] = found
+        return found
+    finally:
+        os.close(fd)
 
 
 def _platform() -> str:
@@ -108,6 +256,30 @@ def _account_name(uid: int) -> str | None:
 
     try:
         return str(pwd.getpwuid(uid).pw_name)
+    except KeyError:
+        return None
+
+
+def _account_home(uid: int) -> str | None:
+    """Eugene's folder: its account's home, which the installers make the
+    install's own folder."""
+    if sys.platform == "win32":
+        return None
+    import pwd
+
+    try:
+        return str(pwd.getpwuid(uid).pw_dir)
+    except KeyError:
+        return None
+
+
+def _group_name(gid: int) -> str | None:
+    if sys.platform == "win32":
+        return None
+    import grp
+
+    try:
+        return str(grp.getgrgid(gid).gr_name)
     except KeyError:
         return None
 
@@ -183,52 +355,93 @@ def own_account() -> bool:
     return uid is not None and _account_name(uid) in SERVICE_ACCOUNTS
 
 
-def _check(path: PurePosixPath, info: os.stat_result, uid: int, given: str) -> None:
-    """One file or folder on the walk: raise Untrusted when anyone but root
-    or Eugene's account could change it."""
-    if info.st_uid not in (0, uid):
-        owner = _account_name(info.st_uid) or f"user {info.st_uid}"
-        where = f"{given} belongs" if str(path) == given else f"{given} is in {path}, which belongs"
-        raise Untrusted(
-            f"{where} to {owner}; Eugene's own account runs programs only from folders it "
-            f"or root owns. {_ADVICE}"
-        )
+def _owner_name(uid: int) -> str:
+    return _account_name(uid) or f"user {uid}"
+
+
+class _Walk:
+    """One check: every item it met, and what it found. It goes on past an
+    item another account owns, so the verdict knows whether anything else
+    could change the program too."""
+
+    def __init__(self, uid: int) -> None:
+        self.uid = uid
+        self.me = _account_name(uid)
+        self.chain: list[ChainItem] = []
+        self.findings: list[Finding] = []
+
+    def find(
+        self,
+        problem: str,
+        path: PurePosixPath | str,
+        text: str,
+        *,
+        uid: int | None = None,
+        fix: str = "copy",
+    ) -> None:
+        owner = _owner_name(uid) if uid is not None else None
+        self.findings.append(Finding(problem, str(path), uid, text, owner, fix))
+
+
+def _check(w: _Walk, path: PurePosixPath, info: os.stat_result, role: str, final: bool) -> None:
+    """One file or folder on the way."""
+    w.chain.append(ChainItem(str(path), info.st_uid, info.st_mode))
+    owner = _owner_name(info.st_uid)
+
+    def said(what: str) -> str:
+        return f"{role} {what}" if final else f"{role} is reached through {path}, which {what}"
+
+    if info.st_uid not in (0, w.uid):
+        w.find("owner", path, said(f"belongs to {owner}"), uid=info.st_uid)
     if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise Untrusted(
-            f"{path} can be changed by others (mode {stat.S_IMODE(info.st_mode):04o}); Eugene's "
-            f"own account runs {given} only from folders nobody else can change. {_ADVICE}"
+        if info.st_mode & stat.S_IWOTH:
+            who = "anyone"
+        else:
+            gid = getattr(info, "st_gid", 0)
+            who = f"its owner {owner} and group {_group_name(gid) or gid}"
+        mode = stat.S_IMODE(info.st_mode)
+        w.find(
+            "others",
+            path,
+            said(f"can be changed by others (mode {mode:04o}: {who})"),
+            uid=info.st_uid,
         )
     if _platform() != "darwin":
         return
     try:
         options = _mount_options(Path(str(path)), info.st_dev)
     except OSError as e:
-        raise Untrusted(
-            f"the volume {path} is on cannot be read ({e}), so {given} is not run"
-        ) from e
+        w.find("unknown", path, said(f"is on a volume that cannot be read ({e})"), fix="check")
+        return
     if "noowners" in options:
-        raise Untrusted(
-            f"{path} is on a volume that ignores ownership, so nobody can tell who may change "
-            f"{given}; Eugene's own account does not run it. {_ADVICE}"
+        w.find(
+            "others",
+            path,
+            said("is on a volume that ignores ownership, so anyone can change it"),
+            uid=info.st_uid,
         )
+        return
     try:
         entries = _acl_cached(path, info)
     except OSError as e:
-        raise Untrusted(f"{path}'s ACL cannot be read ({e}), so {given} is not run") from e
-    me = _account_name(uid)
+        w.find("unknown", path, said(f"has an ACL that cannot be read ({e})"), fix="check")
+        return
     for entry in entries:
         found = re.match(r"^(?:\d+:\s*)?(user|group):(\S+)\s+(?:inherited\s+)?allow\s+(\S+)", entry)
         if not found:
             continue
         kind, who, rights = found.groups()
-        if kind == "user" and who in ("root", me):
+        # Root, Eugene's account, and the item's own owner, who can change
+        # it anyway (and was found above when it is someone else).
+        if kind == "user" and who in ("root", w.me, owner):
             continue
         granted = set(rights.split(",")) & _MUTATING
         if granted:
-            raise Untrusted(
-                f"{path} carries an ACL entry that lets {kind} {who} "
-                f"{', '.join(sorted(granted))}; Eugene's own account runs {given} only from "
-                f"folders nobody else can change. {_ADVICE}"
+            w.find(
+                "others",
+                path,
+                said(f"carries an ACL entry that lets {kind} {who} {', '.join(sorted(granted))}"),
+                uid=info.st_uid,
             )
 
 
@@ -239,25 +452,11 @@ def _absolute(given: str) -> str:
     return spelled
 
 
-def trusted_path(path: Path | str) -> Path:
-    """PATH walked by hand from `/` -- every link followed, every folder
-    stepped into on every hop checked, and the file itself. Raises
-    Untrusted. Returns the path to execute: absolute, every folder in it
-    resolved, and its last name kept when that name is a link (a venv's
-    `bin/python` is one, and Python finds its environment by the name it
-    was started as). Such a link sits in a folder that was checked, and
-    where it points was walked, so nobody else can change what runs.
-
-    Outside Eugene's own account, PATH as it was given."""
-    if not own_account():
-        return Path(path)
-    return Path(str(_walk(str(path))))
-
-
-def _walk(given: str) -> PurePosixPath:
-    """`trusted_path`'s walk, on POSIX paths whatever the platform."""
-    uid = _euid()
-    assert uid is not None
+def _walk(w: _Walk, given: str, role: str) -> tuple[PurePosixPath, os.stat_result] | None:
+    """GIVEN walked by hand from `/`: every link followed, every folder
+    stepped into on every hop checked, and the last item. Returns the path
+    to execute and what the last item is, or None when the walk could not
+    finish (a finding says why)."""
     pending = list(PurePosixPath(_absolute(given)).parts[1:])
     # The names still to walk from the path as given; those a link's
     # target adds go in front of them.
@@ -265,9 +464,11 @@ def _walk(given: str) -> PurePosixPath:
     current = PurePosixPath("/")
     run_as: PurePosixPath | None = None
     try:
-        _check(current, _lstat(current), uid, given)
+        info = _lstat(current)
     except OSError as e:
-        raise Untrusted(f"{given} cannot be checked ({e.strerror or e}), so it is not run") from e
+        w.find("unknown", current, f"{role} cannot be checked ({e.strerror or e})", fix="check")
+        return None
+    _check(w, current, info, role, final=not pending)
     hops = 0
     while pending:
         last_given = len(pending) == given_left and given_left == 1
@@ -281,50 +482,64 @@ def _walk(given: str) -> PurePosixPath:
             continue
         step = current / name
         try:
-            info = _lstat(step)
+            found = _lstat(step)
         except OSError as e:
-            raise Untrusted(
-                f"{given} cannot be checked at {step} ({e.strerror or e}), so it is not run"
-            ) from e
-        if stat.S_ISLNK(info.st_mode):
+            w.find(
+                "unknown",
+                step,
+                f"{role} cannot be checked at {step} ({e.strerror or e})",
+                fix="check",
+            )
+            return None
+        if stat.S_ISLNK(found.st_mode):
             hops += 1
             if hops > _LINK_HOPS:
-                raise Untrusted(f"{given} goes through too many links, so it is not run")
+                w.find("unknown", step, f"{role} goes through too many links", fix="check")
+                return None
             if last_given:
                 run_as = step
-            # The link sits in `current`, which was checked: only root or
-            # Eugene's account can change where it points.
-            target = PurePosixPath(_readlink(step))
+            # The link sits in `current`, which was checked: whoever can
+            # change where it points was found there.
+            w.chain.append(ChainItem(str(step), found.st_uid, found.st_mode))
+            try:
+                target = PurePosixPath(_readlink(step))
+            except OSError as e:
+                w.find("unknown", step, f"{role} cannot be read at {step} ({e})", fix="check")
+                return None
             if target.is_absolute():
                 current = PurePosixPath("/")
                 pending = list(target.parts[1:]) + pending
             else:
                 pending = list(target.parts) + pending
             continue
-        _check(step, info, uid, given)
-        current = step
-    return run_as or current
+        _check(w, step, found, role, final=not pending)
+        current, info = step, found
+    return run_as or current, info
 
 
-def _interpreters(path: PurePosixPath) -> list[str] | None:
-    """What runs a script, or None for a binary: the program `#!` names
+def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
+    """What runs a script, or nothing for a binary: the program `#!` names
     (refused when it is `env`), and under `#!/bin/sh` the python uv's
     `'''exec' "<python>" "$0" "$@"` line names."""
     try:
         head = _head(path)
     except OSError:
-        return None
+        return []
     if not head.startswith(b"#!"):
-        return None
+        return []
     lines = head.decode("utf-8", errors="replace").splitlines()
     words = lines[0][2:].split()
     if not words:
-        return None
+        return []
     if PurePosixPath(words[0]).name == "env":
-        raise Untrusted(
-            f"{path} names its interpreter through PATH (#!{' '.join(words)}), so the program "
-            f"that would run is not known; Eugene's own account does not run it. {_ADVICE}"
+        w.find(
+            "unknown",
+            path,
+            f"{role} names its interpreter through PATH (#!{' '.join(words)}), so what "
+            "would run is not known",
+            fix="shebang",
         )
+        return []
     found = [words[0]]
     if len(lines) > 1:
         trampoline = re.match(r"""^'''exec' "(.+?)" "\$0" "\$@"$""", lines[1].strip())
@@ -341,60 +556,151 @@ def _exists(path: PurePosixPath) -> bool:
     return True
 
 
-def _environment(root: PurePosixPath) -> None:
+def present(path: str) -> bool:
+    """Something is at PATH, a POSIX path (a link counts), as the check
+    reads the disk."""
+    return _exists(PurePosixPath(path))
+
+
+def _environment(w: _Walk, root: PurePosixPath) -> None:
     """The Python environment at ROOT (it has a `pyvenv.cfg`): the root,
     its site-packages, and the interpreter it was made from with its
     standard library."""
-    root = _walk(str(root))
+    walked = _walk(w, str(root), f"its Python environment {root}")
+    if walked is None:
+        return
+    root = walked[0]
     for lib in ("lib", "lib64"):
         try:
-            names = _listdir(root / lib)
+            names = sorted(_listdir(root / lib))
         except OSError:
             continue
         for name in names:
             packages = root / lib / name / "site-packages"
             if name.startswith("python") and _exists(packages):
-                _walk(str(packages))
+                _walk(w, str(packages), f"its packages {packages}")
     try:
         text = _head(root / "pyvenv.cfg").decode("utf-8", errors="replace")
     except OSError:
         return
     home = re.search(r"(?m)^home\s*=\s*(.+?)\s*$", text)
     if home:
-        base = _walk(home.group(1))
-        if _exists(base.parent / "lib"):
-            _walk(str(base.parent / "lib"))
+        base = _walk(w, home.group(1), f"the Python it was made from ({home.group(1)})")
+        if base is not None and _exists(base[0].parent / "lib"):
+            lib_dir = base[0].parent / "lib"
+            _walk(w, str(lib_dir), f"that Python's standard library ({lib_dir})")
 
 
-def trusted_program(path: Path | str, *, _depth: int = 0) -> Path:
-    """`trusted_path`, then what runs a script, and the Python environment
-    the program belongs to. Returns the resolved path to execute. Raises
-    Untrusted. Outside Eugene's own account, PATH as it was given."""
-    if not own_account():
-        return Path(path)
-    return Path(str(_program(str(path), _depth)))
-
-
-def _program(given: str, depth: int) -> PurePosixPath:
-    resolved = _walk(given)
-    interpreters = _interpreters(resolved)
-    if interpreters:
+def _program(w: _Walk, given: str, depth: int, role: str) -> PurePosixPath | None:
+    walked = _walk(w, given, role)
+    if walked is None:
+        return None
+    resolved, info = walked
+    if not stat.S_ISREG(info.st_mode):
+        w.find("unknown", resolved, f"{role} is not a file", fix="check")
+        return None
+    for interpreter in _interpreters(w, resolved, role):
         if depth >= _INTERPRETER_DEPTH:
-            raise Untrusted(f"{given} goes through too many interpreters, so it is not run")
-        for interpreter in interpreters:
-            _program(interpreter, depth + 1)
+            w.find("unknown", resolved, f"{role} goes through too many interpreters", fix="check")
+            break
+        _program(w, interpreter, depth + 1, f"its interpreter {interpreter}")
     # The environment by the path as spelled (a venv's `bin/python` is a
     # link out of it) and by the path it resolves to.
     for program in (PurePosixPath(_absolute(given)), resolved):
         if _exists(program.parent.parent / "pyvenv.cfg"):
-            _environment(program.parent.parent)
+            _environment(w, program.parent.parent)
     return resolved
 
 
-def untrusted(path: Path | str) -> str | None:
-    """Why Eugene's own account must not run PATH, or None when it may."""
-    try:
-        trusted_program(path)
-    except Untrusted as e:
-        return str(e)
-    return None
+def _decide(w: _Walk, given: str, resolved: PurePosixPath | None, *, hashed: bool) -> Verdict:
+    """The kind, from what the walk found."""
+    home = _account_home(w.uid) or "Eugene's folder"
+    program = str(resolved) if resolved is not None else None
+    if resolved is not None and not w.findings:
+        return Verdict(Kind.ok, given, program, chain=tuple(w.chain), home=home)
+    owners = {f.uid for f in w.findings if f.problem == "owner"}
+    single = (
+        resolved is not None and len(owners) == 1 and all(f.problem == "owner" for f in w.findings)
+    )
+    digest: str | None = None
+    if single and hashed:
+        assert resolved is not None
+        try:
+            digest = _sha256(resolved)
+        except OSError as e:
+            w.find("unknown", resolved, f"it cannot be read to be checked ({e})", fix="check")
+            single = False
+    if not single:
+        return Verdict(
+            Kind.refused,
+            given,
+            program,
+            chain=tuple(w.chain),
+            findings=tuple(w.findings),
+            home=home,
+        )
+    (uid,) = owners
+    return Verdict(
+        Kind.needs_approval,
+        given,
+        program,
+        account=_owner_name(uid) if uid is not None else None,
+        account_uid=uid,
+        sha256=digest,
+        chain=tuple(w.chain),
+        findings=tuple(w.findings),
+        home=home,
+    )
+
+
+def assess(path: Path | str) -> Verdict:
+    """The one decision: whether Eugene's own account may run PATH, and the
+    path to execute. Outside Eugene's own account, `ok` with PATH as given."""
+    given = str(path)
+    if not own_account():
+        return Verdict(Kind.ok, given, given)
+    uid = _euid()
+    assert uid is not None
+    w = _Walk(uid)
+    return _decide(w, given, _program(w, given, 0, "it"), hashed=True)
+
+
+def assess_path(path: Path | str) -> Verdict:
+    """`assess` for a file the agent keeps rather than runs (the approvals
+    file): the walk alone, nothing hashed."""
+    given = str(path)
+    if not own_account():
+        return Verdict(Kind.ok, given, given)
+    uid = _euid()
+    assert uid is not None
+    w = _Walk(uid)
+    walked = _walk(w, given, "it")
+    return _decide(w, given, walked[0] if walked else None, hashed=False)
+
+
+def runs(verdict: Verdict) -> bool:
+    """The rule: `ok` runs; `needs_approval` runs while an owner's approval
+    of exactly this holds; `refused` never runs."""
+    if verdict.kind is Kind.ok:
+        return True
+    if verdict.kind is Kind.needs_approval:
+        from . import exec_approvals
+
+        return exec_approvals.holds(verdict)
+    return False
+
+
+def trusted_program(path: Path | str, *, instead: str = INSTALL_ENGINE) -> Path:
+    """The path to execute PATH by, when Eugene's own account may run it.
+    Raises Untrusted, carrying the verdict, otherwise. INSTEAD is what the
+    refusal offers besides copying the program."""
+    verdict = assess(path)
+    if runs(verdict) and verdict.program is not None:
+        return Path(verdict.program)
+    raise Untrusted(verdict.message(instead) or f"{path} is not run", verdict)
+
+
+def untrusted(path: Path | str, *, instead: str = INSTALL_ENGINE) -> str | None:
+    """Why Eugene's own account must not run PATH now, or None when it may."""
+    verdict = assess(path)
+    return None if runs(verdict) else verdict.message(instead)

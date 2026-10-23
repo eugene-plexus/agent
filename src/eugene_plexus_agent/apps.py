@@ -92,6 +92,8 @@ APPS_FILE = "apps.yaml"
 APPS_DIR = "apps"
 #: Apps a move left without their environment, to rebuild (row 8).
 REBUILD_FILE = "rebuild.json"
+#: What a refused `uv` offers besides copying it (row 8, `exec_trust`).
+_UV_INSTEAD = "install Eugene again, which puts its own uv back"
 UNREADABLE_SUFFIX = ".unreadable"
 CATALOGUE_RESOURCE = "apps_catalogue.yaml"
 INSTALL_METADATA = "install.json"
@@ -1061,7 +1063,7 @@ class _AppPlanner:
         # In Eugene's own account an app's interpreter and environment are
         # checked like an engine's, and the checked path is what runs (row 8).
         try:
-            python = exec_trust.trusted_program(python)
+            python = exec_trust.trusted_program(python, instead="install the app again")
         except exec_trust.Untrusted as e:
             raise SpawnPlanError(f"{record.id} {record.version} was not started: {e}") from e
         data = self._store.data_dir(record.id)
@@ -1335,7 +1337,7 @@ class AppManager:
         if found is None:
             return None
         try:
-            return exec_trust.trusted_program(found)
+            return exec_trust.trusted_program(found, instead=_UV_INSTEAD)
         except exec_trust.Untrusted:
             return None
 
@@ -1344,7 +1346,7 @@ class AppManager:
         if self.uv() is None:
             configured = self._get_config("uvBinary")
             found = find_uv(str(configured) if configured else None)
-            why = exec_trust.untrusted(found) if found is not None else None
+            why = exec_trust.untrusted(found, instead=_UV_INSTEAD) if found is not None else None
             if why is not None:
                 return why
             if configured:

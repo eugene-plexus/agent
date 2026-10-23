@@ -96,12 +96,12 @@ def test_an_app_s_interpreter_is_checked_and_the_checked_path_runs(
         record, store=store, gateway_url=lambda: None, bind_host=lambda: None
     )
     checked = Path("/usr/local/eugene-plexus/apps/tiny/versions/v1/venv/bin/python")
-    monkeypatch.setattr(exec_trust, "trusted_program", lambda path: checked)
+    monkeypatch.setattr(exec_trust, "trusted_program", lambda path, **kw: checked)
     plan = planner.base_plan()
     assert plan.argv[0] == str(checked)
     assert plan.env["PYTHONSAFEPATH"] == "1"
 
-    def refuse(path: Any) -> Path:
+    def refuse(path: Any, **kw: Any) -> Path:
         raise exec_trust.Untrusted(
             f"{path} belongs to alice; Eugene's own account runs programs only"
         )

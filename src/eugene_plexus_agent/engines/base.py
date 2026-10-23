@@ -26,6 +26,7 @@ import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -52,6 +53,9 @@ from .._http import shared_internal_client
 from ..preparation import PreparationError, Recipe
 from .acquisition import ManagedStore, engine_root
 from .devices import DevicesReader
+
+if TYPE_CHECKING:
+    from ..exec_trust import Verdict
 
 
 def probe_client() -> httpx.AsyncClient:
@@ -156,11 +160,13 @@ class EngineUnavailableError(Exception):
 class UntrustedBinaryError(EngineUnavailableError):
     """A program Eugene's own account will not run (row 8, `exec_trust`).
     `path` is the path as it was named, so a runtime can say which of its
-    settings to change."""
+    settings to change; `verdict` is the check's, which says whether an
+    owner can approve it (part 8c)."""
 
-    def __init__(self, message: str, path: str) -> None:
+    def __init__(self, message: str, path: str, verdict: Verdict | None = None) -> None:
         super().__init__(message)
         self.path = path
+        self.verdict = verdict
 
 
 @dataclass(frozen=True)
@@ -476,7 +482,7 @@ class EngineAdapter(abc.ABC):
         try:
             return exec_trust.trusted_program(path)
         except exec_trust.Untrusted as e:
-            raise UntrustedBinaryError(str(e), str(path)) from e
+            raise UntrustedBinaryError(str(e), str(path), e.verdict) from e
 
     def probe_version(self, binary: Path) -> str | None:
         """Ask the binary what it is. None when it won't say.

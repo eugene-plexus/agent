@@ -24,13 +24,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import model_copies, ports
+from . import exec_approvals, model_copies, ports
 from ._generated.models import (
     CopyProgress,
     EngineAcquisition,
     EngineDescriptor,
     EngineInstall,
     EngineKind,
+    ExecTrust,
     HostAccelerator,
     LoadProgress,
     ManagedEngine,
@@ -187,6 +188,9 @@ class _RuntimePlanner:
         self.refused_binary: str | None = None
         """This runtime's own `binary`, when the last plan refused it because
         Eugene's own account will not run it (row 8): `Runtime.refusedBinary`."""
+        self.exec_trust: ExecTrust | None = None
+        """Why the last plan did not run the engine's program, and what an
+        owner may approve (part 8c): `Runtime.execTrust`."""
         self.binary: DiscoveredBinary | None = None
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
         so the operator sees the build that is actually running rather than
@@ -224,9 +228,13 @@ class _RuntimePlanner:
                 if isinstance(e, UntrustedBinaryError) and self.spec.binary
                 else None
             )
+            self.exec_trust = (
+                exec_approvals.view(e.verdict) if isinstance(e, UntrustedBinaryError) else None
+            )
             raise SpawnPlanError(str(e)) from e
 
         self.refused_binary = None
+        self.exec_trust = None
         self.binary = binary
         port = self.spec.port
         if port is None:
@@ -1056,6 +1064,7 @@ class RuntimeSupervisor:
             lastRestart=last_restart,
             lastError=last_error,
             refusedBinary=planner.refused_binary if planner is not None else None,
+            execTrust=planner.exec_trust if planner is not None else None,
             loadProgress=load_progress,
             speculation=self._speculation_for(spec, adapter, argv, status),
             promptCache=self._prompt_cache_for(spec, adapter, argv, status),
@@ -1563,15 +1572,19 @@ def describe_engines(
         managed = _managed_for(adapter)
 
         error: str | None = None
+        exec_trust: ExecTrust | None = None
         found: DiscoveredBinary | None
         try:
             found = adapter.discover(configured=_configured_binary(adapter, get_config))
         except EngineUnavailableError as e:
             # A configured path that does not exist. Reported as
             # unavailable with the path named, never quietly replaced by
-            # whatever is on PATH.
+            # whatever is on PATH. Or one Eugene's own account did not
+            # run, and what an owner may approve (row 8, part 8c).
             found = None
             error = str(e)
+            if isinstance(e, UntrustedBinaryError):
+                exec_trust = exec_approvals.view(e.verdict)
 
         if found is None:
             if error is None:
@@ -1597,6 +1610,7 @@ def describe_engines(
                     fit=fit,
                     experimental=adapter.experimental,
                     error=error,
+                    execTrust=exec_trust,
                     flagSchema=adapter.flag_schema(),
                     managed=managed,
                     acquisition=acquisition,
