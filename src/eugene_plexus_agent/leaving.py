@@ -56,7 +56,7 @@ import httpx
 
 from . import standby, tokens
 from ._http import internal_client, refused_pin
-from .machine_trust import LIST_PATH, MachineListError
+from .machine_trust import LIST_PATH, MachineListError, _unpinned
 from .machine_trust import pull as pull_machine_list
 from .node_identity import FencedError
 from .trust import BundleRollback
@@ -271,8 +271,14 @@ async def pull_once(app: Any, client: httpx.AsyncClient) -> Heard:
     Row 4: a root that has not answered for `ASK_STANDBY_AFTER_SECONDS`
     may have been replaced while this node could not hear it, so the
     machine that held the standby grant is asked too (`ask_standby`)."""
+    app.state.root_obsolete = False
     heard = await _pull_once(app, client)
-    if heard is Heard.NO_ANSWER:
+    # Row 4 review: a root that answers only for an epoch this node has left
+    # behind is as silent as one that does not answer.
+    silent = heard is Heard.NO_ANSWER or (
+        heard is Heard.UNTRUSTED and getattr(app.state, "root_obsolete", False)
+    )
+    if silent:
         since = getattr(app.state, "root_silent_since", None)
         now = _clock()
         if since is None:
@@ -327,7 +333,22 @@ async def ask_standby(app: Any, client: httpx.AsyncClient) -> bool:
         return False
     url = machine_url.rstrip("/") + "/control" + LIST_PATH
     try:
-        response = await client.get(url)
+        try:
+            response = await client.get(url)
+        except httpx.HTTPError as exc:
+            if refused_pin(exc) is None:
+                raise
+            # Row 4 review: that machine changed its key while this node could
+            # not hear. Its root's list is public, signed by the identity this
+            # node pinned and versioned, so it is fetched once without the
+            # key and taken only if it verifies (as `machine_trust.pull` does
+            # for the root's own address).
+            log.warning(
+                "%s, which held the standby grant, presented a key this node does not hold "
+                "for it; checking its root's signed machine list",
+                holder,
+            )
+            response = await _unpinned(machine_url.replace("https://", "http://", 1) + LIST_PATH)
         if response.status_code != 200:
             log.info(
                 "asked %s, which held the standby grant, for the root: it answered %d",
@@ -335,7 +356,14 @@ async def ask_standby(app: Any, client: httpx.AsyncClient) -> bool:
                 response.status_code,
             )
             return False
-        return bool(machines.accept(str(response.json()["jws"])))
+        moved = bool(machines.accept(str(response.json()["jws"])))
+        if moved:
+            log.warning(
+                "this node could not reach its root, asked %s, which held the standby "
+                "grant, and follows the root it named",
+                holder,
+            )
+        return moved
     except MachineListError as exc:
         log.warning("refused the machine list %s sent: %s", holder, exc)
     except (httpx.HTTPError, ValueError, KeyError, TypeError, FencedError) as exc:
@@ -416,8 +444,15 @@ async def _pull_once(app: Any, client: httpx.AsyncClient) -> Heard:
             await standby.reconcile(app)
     except BundleRollback as exc:
         log.debug("the control root's bundle is older than the one held: %s", exc)
+        app.state.root_obsolete = True
+        app.state.root_silent_cause = f"it answers for an older root ({exc})"
         return Heard.UNTRUSTED
-    except (tokens.BundleError, FencedError) as exc:
+    except FencedError as exc:
+        log.warning("refused the control root's trust bundle: %s", exc)
+        app.state.root_obsolete = True
+        app.state.root_silent_cause = f"it answers for an older root ({exc})"
+        return Heard.UNTRUSTED
+    except tokens.BundleError as exc:
         log.warning("refused the control root's trust bundle: %s", exc)
         return Heard.UNTRUSTED
     except Exception as exc:

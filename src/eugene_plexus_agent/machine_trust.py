@@ -85,6 +85,60 @@ def control_of(claims: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def checked_control(claims: dict[str, Any]) -> dict[str, Any] | None:
+    """`control_of`, refusing a `control` block that is there and does not
+    hold together (row 4 review): a list that names a root must name it
+    properly, or it is not taken at all."""
+    if "control" not in claims or claims.get("control") is None:
+        return None
+    control = control_of(claims)
+    if control is None:
+        raise MachineListError("the machine list names its root in a form this node cannot read")
+    return control
+
+
+def _content(claims: dict[str, Any] | None) -> dict[str, Any]:
+    """What a list says, apart from when it was signed."""
+    return {k: v for k, v in (claims or {}).items() if k != "iat"}
+
+
+def _plain_door(url: Any) -> str | None:
+    """`http://host:port` of a machine port's `https://host:port`."""
+    origin = _origin(url) if isinstance(url, str) else None
+    if origin is None or not origin.startswith("https://"):
+        return None
+    return "http://" + origin.removeprefix("https://")
+
+
+def _not_bound(claims: dict[str, Any], control: dict[str, Any]) -> str | None:
+    """Why a list's root is not one of the machines it lists, at the door
+    and with the keys that machine registered (row 4 review); None when it
+    is. A root signs its own list, so this holds for every list a root
+    makes, and a list that names a stranger, or an address or keys its
+    machine never registered, moves no one."""
+    name = control["node"]
+    if name is None:
+        return "it names no machine as the root"
+    entry = next(
+        (n for n in claims.get("nodes") or [] if isinstance(n, dict) and n.get("name") == name),
+        None,
+    )
+    if entry is None:
+        return f"it names {name} the root but does not list {name}"
+    door = _plain_door(entry.get("machineUrl"))
+    if door is None:
+        if str(control["url"]).startswith("https://"):
+            return None  # the nodes name of a root with no machine port
+        return f"{name} registered no machine port for {control['url']}"
+    if door != control["url"]:
+        return f"{control['url']} is not the machine port {name} registered ({door})"
+    pins = {p for p in entry.get("pins") or [] if isinstance(p, str)}
+    listed = {p for p in claims.get("controlPins") or [] if isinstance(p, str)}
+    if not listed or not listed <= pins:
+        return f"the keys the list gives the root are not the keys {name} registered"
+    return None
+
+
 def _why_not_followed(url: str) -> str | None:
     """Why a root address in a signed list is not one this node moves to."""
     from .node_identity import not_a_node_address
@@ -298,7 +352,15 @@ class MachineTrust:
         try:
             kept = json.loads(self.list_path.read_text(encoding="utf-8"))
             if record.enrolled and record.control_public_key and isinstance(kept, dict):
-                self.claims = verify(str(kept["jws"]), record.control_public_key)
+                claims = verify(str(kept["jws"]), record.control_public_key)
+                control = checked_control(claims)
+                # Row 4 review: the epoch this node holds fences a kept list
+                # as it fences one offered.
+                if control is not None and control["epoch"] < (record.epoch or 0):
+                    raise MachineListFenced(
+                        f"epoch {control['epoch']} is below the {record.epoch} this node holds"
+                    )
+                self.claims = claims
                 self.taken_at = float(kept.get("takenAt") or 0) or None
         except FileNotFoundError:
             pass
@@ -320,8 +382,15 @@ class MachineTrust:
             raise MachineListError("this node is not enrolled, so it trusts no machine list")
         claims = verify(jws, record.control_public_key)
         held = int((self.claims or {}).get("version") or 0)
-        offered, had = control_of(claims), control_of(self.claims)
+        offered, had = checked_control(claims), control_of(self.claims)
         held_epoch = record.epoch or 0
+        if offered is None and had is not None:
+            # Row 4 review: once this node holds a list that names its root,
+            # a list that names none is a replay of an older root's.
+            raise MachineListFenced(
+                "it names no root epoch, and this node holds a list of a root at epoch "
+                f"{had['epoch']}"
+            )
         if offered is not None and offered["epoch"] < held_epoch:
             raise MachineListFenced(
                 f"epoch {offered['epoch']} is below the {held_epoch} this node holds"
@@ -337,12 +406,20 @@ class MachineTrust:
             raise MachineListError(
                 f"the root sent machine list {claims['version']}, older than the {held} held"
             )
+        elif claims["version"] == held and _content(claims) != _content(self.claims):
+            # Row 4 review: one version is one list. Another one under the
+            # same number is refused, and nothing of it is kept.
+            raise MachineListError(
+                f"the root sent machine list {held} again, with other content than the one held"
+            )
         else:
             same = claims["version"] == held
+        # Only now, with every check passed, is it kept (row 4 review: what
+        # memory refuses is never written, so a restart cannot take it).
         self.taken_at = time.time()
         write_private(self.list_path, json.dumps({"jws": jws, "takenAt": self.taken_at}))
         # Before the table: it is built for the root's address.
-        moved = self._follow(offered)
+        moved = self._follow(offered, claims)
         if same:
             if self._write_failed or moved:
                 # The same list again: write the table it could not, or the
@@ -366,7 +443,7 @@ class MachineTrust:
             self.on_required_changed(self.required)
         return True
 
-    def _follow(self, control: dict[str, Any] | None) -> bool:
+    def _follow(self, control: dict[str, Any] | None, claims: dict[str, Any]) -> bool:
         """Row 4 (R4-MOVE): move this node to the root a verified, newer list
         names, when it names one at an epoch above the one this node's
         `controlUrl` came with. Returns whether `controlUrl` changed.
@@ -385,6 +462,8 @@ class MachineTrust:
             return False
         url = control["url"]
         why = "it names no address" if url is None else _why_not_followed(str(url))
+        if why is None:
+            why = _not_bound(claims, control)
         if why is not None:
             if self._unfollowed != (epoch, why):
                 self._unfollowed = (epoch, why)

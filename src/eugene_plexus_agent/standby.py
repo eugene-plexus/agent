@@ -82,13 +82,22 @@ def state_dir(config_dir: Path) -> Path:
     return config_dir / STATE_DIR_NAME
 
 
-def child_env(home: Path, control_url: str, *, node: str | None, following: bool) -> dict[str, str]:
+def child_env(
+    home: Path,
+    control_url: str,
+    *,
+    node: str | None,
+    following: bool,
+    epoch: int | None = None,
+) -> dict[str, str]:
     """Suffix -> value for the standby's spawn, over everything else: its
     data directory, its node's name (so a promotion names it), loopback,
     since it pulls and is never dialled, and, **while the grant holds**,
-    the standby role and the root it follows. Without the grant it was
-    promoted (the promotion takes the grant), so it starts as the root
-    it now is."""
+    the standby role, the root it follows and the epoch this node holds.
+    Without the grant it was promoted (the promotion takes the grant), so
+    it starts as the root it now is. With the grant, a copy whose own log
+    says it was promoted above `epoch` starts as the root too (row 4
+    review): its agent had not heard of the promotion yet."""
     env = {
         "STATE_DIR": str(state_dir(home)),
         "BIND_HOST": "127.0.0.1",
@@ -98,6 +107,7 @@ def child_env(home: Path, control_url: str, *, node: str | None, following: bool
     if following:
         env["ROLE"] = "standby"
         env["ACTIVE_URL"] = control_url
+        env["FOLLOW_EPOCH"] = str(epoch or 0)
     return env
 
 
@@ -108,7 +118,11 @@ def spawn_env(app: Any) -> dict[str, str]:
         config_dir(app.state.agent_state),
         str(record.control_url or ""),
         node=record.name,
-        following=wanted(app),
+        # A signed list naming this machine the root is promotion evidence
+        # the bundle may not carry yet (row 4 review): the copy is not
+        # started to follow the root it replaced.
+        following=wanted(app) and listed_root(app) != record.name,
+        epoch=record.epoch,
     )
 
 
@@ -139,6 +153,16 @@ async def _reconcile(app: Any) -> None:
     supervisor = getattr(app.state, "supervisor", None)
     home = config_dir(state)
     entry = state.get_topology_entry(STANDBY_COMPONENT)
+    if promoted(state) and listed_root(app) != app.state.node_identity.record.name:
+        # Row 4 review: the mark holds only while a signed list names this
+        # machine the root. A mark no list backs (written by hand, or kept
+        # after another machine was promoted) is dropped, and the copy is
+        # no longer this machine's root.
+        state.set_standby_promoted(False)
+        log.warning(
+            "the machine list this node holds does not name this machine the root, so its "
+            "copy is not served as the root"
+        )
     want = wanted(app)
     if want and hosts_active_control(state):
         if entry is None:
@@ -211,15 +235,27 @@ async def _reconcile(app: Any) -> None:
         await asyncio.to_thread(_delete_copy, home)
 
 
+def listed_root(app: Any) -> str | None:
+    """The machine the signed machine list held names the root, at an epoch
+    this node still holds (row 4); None when it names none."""
+    machines = getattr(app.state, "machine_trust", None)
+    control = (machines.claims or {}).get("control") if machines is not None else None
+    if not isinstance(control, dict):
+        return None
+    epoch, node = control.get("epoch"), control.get("node")
+    held = app.state.node_identity.record.epoch or 0
+    if not isinstance(epoch, int) or epoch < held or not isinstance(node, str):
+        return None
+    return node
+
+
 def unmarked_root(app: Any) -> bool:
     """The machine list held names this machine the root, and the copy it
     runs is not marked promoted yet: `reconcile` has something to decide."""
     state: AgentState = app.state.agent_state
     if state.get_topology_entry(STANDBY_COMPONENT) is None or promoted(state):
         return False
-    machines = getattr(app.state, "machine_trust", None)
-    control = (machines.claims or {}).get("control") if machines is not None else None
-    return isinstance(control, dict) and control.get("node") == app.state.node_identity.record.name
+    return bool(listed_root(app) == app.state.node_identity.record.name)
 
 
 def _named_root(app: Any, epoch: int | None) -> bool:

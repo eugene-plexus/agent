@@ -39,6 +39,14 @@ from .conftest import FakeRoot, enroll_app, enroll_store
 ROOT_A = "http://10.0.0.5:8083"
 ROOT_B = "http://10.0.0.9:8083"
 PIN_B = "B" * 43
+#: B as a list names it: a list's root is one of the machines it lists, at
+#: the machine port and with the key it registered (row 4 review).
+B_NODE = {
+    "name": "spare",
+    "url": "http://10.0.0.9:8079",
+    "machineUrl": "https://10.0.0.9:8083",
+    "pins": [PIN_B],
+}
 
 
 @pytest.fixture(autouse=True)
@@ -124,7 +132,7 @@ def test_higher_epoch_list_moves_control_url_and_reannounces(app: FastAPI) -> No
         # B's address to B's machine port, announces to B and pulls there.
         moved = _push(
             client,
-            _list(root, 11, control=_naming(3, ROOT_B), controlPins=[PIN_B]),
+            _list(root, 11, control=_naming(3, ROOT_B), controlPins=[PIN_B], nodes=[B_NODE]),
         )
         assert moved.status_code == 204, moved.text
         record = app.state.node_identity.record
@@ -230,7 +238,9 @@ async def test_a_node_that_cannot_reach_its_root_asks_the_standby_s_machine(
             if url == "https://10.0.0.9:8083/control/v1/trust/machines":
                 if not promoted["yes"]:
                     return httpx.Response(404, json={"title": "No control root here"})
-                jws = _list(root, 9, control=_naming(2, ROOT_B), controlPins=[PIN_B])
+                jws = _list(
+                    root, 9, control=_naming(2, ROOT_B), controlPins=[PIN_B], nodes=[B_NODE]
+                )
                 return httpx.Response(200, json={"jws": jws})
             return httpx.Response(404)
 
@@ -325,3 +335,264 @@ def test_a_list_naming_this_machine_marks_its_copy_with_no_address(
         assert listed.status_code == 204, listed.text
         assert standby.promoted(state)
         assert app.state.node_identity.record.control_url == ROOT_A, "no address to move to"
+
+
+# --------------------------------------------------------------------------- the review
+
+
+def _moved_to_b(app: FastAPI, root: FakeRoot, client: TestClient) -> None:
+    """This node takes B's list at epoch 3, before B's bundle arrives."""
+    taken = _push(
+        client, _list(root, 11, control=_naming(3, ROOT_B), controlPins=[PIN_B], nodes=[B_NODE])
+    )
+    assert taken.status_code == 204, taken.text
+    assert app.state.node_identity.record.epoch == 3
+
+
+def test_a_command_from_a_root_this_machine_no_longer_follows_is_refused(
+    app: FastAPI,
+) -> None:
+    """A promotion keeps the root's token key: the old root's tokens carry
+    the epoch they were signed at, and a machine that holds a higher one
+    refuses them, its bundle not yet moved included (row 4 review,
+    blocker 1)."""
+    root = FakeRoot()
+    root.epoch = 2
+    app.state.control_transport = httpx.MockTransport(_Root(root))
+    with TestClient(app) as client:
+        enroll_app(app, root, "me", control_url=ROOT_A)
+        _moved_to_b(app, root, client)
+        assert app.state.auth_state.trust.bundle.epoch == 2, "B's bundle has not arrived"
+        old = tokens.Signer(key=root.token.key, issuer="control", epoch=2)
+        new = tokens.Signer(key=root.token.key, issuer="control", epoch=3)
+        command, _ = old.mint(
+            typ=tokens.TYP_SERVICE, sub="control", aud=["node:me"], ttl_seconds=300
+        )
+        refused = client.post(
+            "/v1/runtimes",
+            json={"name": "x", "engine": "llama_cpp", "modelPath": "/m.gguf", "autoStart": False},
+            headers={"Authorization": f"Bearer {command}"},
+        )
+        assert refused.status_code == 401, refused.text
+        assert (
+            "This command came from a root this machine no longer follows "
+            "(epoch 2; it follows epoch 3)."
+        ) in refused.text
+        session, _ = old.mint(
+            typ=tokens.TYP_SESSION, sub="operator", aud=["node:me"], ttl_seconds=600
+        )
+        stale = client.get("/v1/node", headers={"Authorization": f"Bearer {session}"})
+        assert stale.status_code == 401
+        fresh, _ = new.mint(
+            typ=tokens.TYP_SESSION, sub="operator", aud=["node:me"], ttl_seconds=600
+        )
+        took = client.get("/v1/node", headers={"Authorization": f"Bearer {fresh}"})
+        assert took.status_code == 200, took.text
+
+
+def _store_at(tmp_path: Path, root: FakeRoot, name: str = "me") -> NodeIdentityStore:
+    store = NodeIdentityStore(tmp_path / "node.yaml")
+    store.load()
+    store.ensure_keypair()
+    enroll_store(store, root, name, control_url=ROOT_A)
+    return store
+
+
+def test_a_list_that_names_no_root_epoch_is_refused_once_one_that_does_is_held(
+    tmp_path: Path,
+) -> None:
+    """A replay of an older root's list (no `control`) after the node holds
+    an epoch-aware one, and a `control` block that does not hold together,
+    are refused; nothing of them is kept (row 4 review, blocker 2)."""
+    root = FakeRoot()
+    store = _store_at(tmp_path, root)
+    trust = machine_trust.MachineTrust(tmp_path, store)
+    held = _list(root, 10, control=_naming(1, ROOT_A, node=None), controlPins=[PIN_B])
+    trust.accept(held)
+    replay = _list(root, 11, controlPins=["O" * 43])
+    with pytest.raises(machine_trust.MachineListFenced, match="names no root epoch"):
+        trust.accept(replay)
+    with pytest.raises(machine_trust.MachineListError, match="cannot read"):
+        trust.accept(_list(root, 12, control={"epoch": "three"}))
+    kept = json.loads((tmp_path / machine_trust.LIST_FILE).read_text(encoding="utf-8"))
+    assert kept["jws"] == held
+    again = machine_trust.MachineTrust(tmp_path, store)
+    again.load()
+    assert again.claims is not None and again.claims["version"] == 10
+
+
+def test_another_list_under_the_same_version_is_refused_and_not_kept(tmp_path: Path) -> None:
+    """One version is one list: another one under the same number is
+    refused in memory and on disk alike, so a restart cannot take it (row 4
+    review, blocker 2)."""
+    root = FakeRoot()
+    store = _store_at(tmp_path, root)
+    trust = machine_trust.MachineTrust(tmp_path, store)
+    held = _list(root, 10, control=_naming(1, ROOT_A, node=None), controlPins=[PIN_B])
+    assert trust.accept(held)
+    assert trust.accept(held) is False, "the same list again is fine"
+    other = _list(root, 10, control=_naming(1, ROOT_A, node=None), controlPins=["O" * 43])
+    with pytest.raises(machine_trust.MachineListError, match="other content"):
+        trust.accept(other)
+    again = machine_trust.MachineTrust(tmp_path, store)
+    again.load()
+    assert again.claims is not None and again.claims["controlPins"] == [PIN_B]
+
+
+def test_a_kept_list_of_a_root_below_the_epoch_held_is_not_loaded(tmp_path: Path) -> None:
+    root = FakeRoot()
+    store = _store_at(tmp_path, root)
+    machine_trust.MachineTrust(tmp_path, store).accept(
+        _list(root, 10, control=_naming(1, ROOT_A, node=None))
+    )
+    store.accept_epoch(3)
+    again = machine_trust.MachineTrust(tmp_path, store)
+    again.load()
+    assert again.claims is None
+
+
+def test_a_root_that_is_not_one_of_the_listed_machines_moves_no_one(tmp_path: Path) -> None:
+    """A list's root is one of the machines it lists, at the machine port
+    and with the key that machine registered (row 4 review)."""
+    root = FakeRoot()
+    store = _store_at(tmp_path, root)
+    trust = machine_trust.MachineTrust(tmp_path, store)
+    cases = [
+        {"control": _naming(2, ROOT_B, node="unknown"), "nodes": []},
+        {"control": _naming(2, "http://10.0.0.66:8083"), "nodes": [B_NODE]},
+        {"control": _naming(2, ROOT_B), "nodes": [B_NODE], "controlPins": ["O" * 43]},
+    ]
+    for version, claims in enumerate(cases, start=2):
+        trust.accept(_list(root, version, **claims))
+        assert store.record.control_url == ROOT_A, claims
+    trust.accept(_list(root, 9, control=_naming(2, ROOT_B), nodes=[B_NODE], controlPins=[PIN_B]))
+    assert store.record.control_url == ROOT_B
+
+
+async def test_a_root_that_answers_for_an_older_epoch_counts_as_silent(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An old root that comes back answers with bundles this node fences:
+    that is no root, and the 2 minutes run as if it said nothing; and when
+    the standby's machine changed its key, its root's signed list is taken
+    without that key, verified (row 4 review)."""
+    from eugene_plexus_agent import _http as http
+
+    root = FakeRoot()
+    root.epoch = 2
+    with TestClient(app):
+        enroll_app(app, root, "me", control_url=ROOT_A)
+        spare = tokens.generate_private_key().public_key()
+        root.register("spare", spare, (tokens.GRANT_STANDBY,))
+        app.state.auth_state.trust.accept(root.bundle().jws)
+        app.state.machine_trust.accept(
+            _list(root, 2, control=_naming(2, ROOT_A, node=None), nodes=[B_NODE])
+        )
+        old = FakeRoot(identity=root.identity, token=root.token, epoch=1)
+        old.members = dict(root.members)
+        stale = old.bundle().jws
+        moved = _list(root, 9, control=_naming(3, ROOT_B), controlPins=[PIN_B], nodes=[B_NODE])
+        asked: list[str] = []
+
+        def answer(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            asked.append(url)
+            if url.startswith(ROOT_A):
+                return httpx.Response(200, json={"jws": stale})
+            if url.startswith("https://10.0.0.9:8083/"):
+                raise httpx.ConnectError("refused") from http.PinRefused(
+                    "10.0.0.9:8083", "N" * 43, "spare"
+                )
+            return httpx.Response(404)
+
+        async def unpinned(url: str) -> httpx.Response:
+            asked.append("unpinned " + url)
+            return httpx.Response(200, json={"jws": moved})
+
+        clock = [1000.0]
+        monkeypatch.setattr(leaving, "_clock", lambda: clock[0])
+        monkeypatch.setattr(leaving, "_unpinned", unpinned)
+        app.state.control_transport = httpx.MockTransport(answer)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as client:
+            assert await leaving.pull_once(app, client) is leaving.Heard.UNTRUSTED
+            clock[0] += 121
+            await leaving.pull_once(app, client)
+            if app.state.root_moved_task is not None:
+                await app.state.root_moved_task
+        assert "unpinned http://10.0.0.9:8083/v1/trust/machines" in asked
+        record = app.state.node_identity.record
+        assert (record.control_url, record.control_url_epoch) == (ROOT_B, 3)
+
+
+def _spare_app(tmp_path: Path, root: FakeRoot, grants: tuple[str, ...]) -> Any:
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent.auth_state import AuthState
+    from eugene_plexus_agent.state import AgentState
+    from eugene_plexus_agent.trust import BUNDLE_FILE, NodeTrust
+
+    store = NodeIdentityStore(tmp_path / "node.yaml")
+    store.load()
+    store.ensure_keypair()
+    enroll_store(store, root, "spare", control_url=ROOT_A, grants=grants)
+    trust = NodeTrust(store, tmp_path / BUNDLE_FILE)
+    trust.load()
+    state = AgentState(tmp_path / "agent.yaml")
+    state.load()
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            agent_state=state,
+            auth_state=AuthState(trust=trust),
+            node_identity=store,
+            machine_trust=machine_trust.MachineTrust(tmp_path, store),
+            supervisor=None,
+        )
+    )
+
+
+def test_a_copy_the_list_names_the_root_is_not_started_to_follow(tmp_path: Path) -> None:
+    """The standby's spawn: while the grant holds it follows, and is told
+    the epoch this node holds; once a signed list names this machine the
+    root, it is started as the root, though the bundle still grants it
+    (row 4 review, blocker 3)."""
+    from eugene_plexus_agent import standby
+
+    root = FakeRoot()
+    app = _spare_app(tmp_path, root, (tokens.GRANT_STANDBY,))
+    env = standby.spawn_env(app)
+    assert (env["ROLE"], env["FOLLOW_EPOCH"]) == ("standby", "1")
+    app.state.machine_trust.accept(_list(root, 5, control=_naming(2, None)))
+    env = standby.spawn_env(app)
+    assert "ROLE" not in env and "FOLLOW_EPOCH" not in env
+
+
+def test_a_promoted_mark_no_list_backs_is_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`standbyPromoted` holds only while a signed list names this machine
+    the root (row 4 review)."""
+    import asyncio
+
+    from eugene_plexus_agent import standby
+    from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind, SpawnConfig
+
+    app = _spare_app(tmp_path, FakeRoot(), ())
+    state = app.state.agent_state
+    state.add_topology_entry(
+        ComponentEntry(
+            name=standby.STANDBY_COMPONENT,
+            kind=ComponentKind.control,
+            url="http://127.0.0.1:9",  # type: ignore[arg-type]
+            spawn=SpawnConfig(configFile=str(tmp_path / "standby.yaml")),
+        )
+    )
+    state.set_standby_promoted(True)
+    assert standby.promoted(state), "written by hand"
+
+    async def says(_entry: Any) -> tuple[str, int]:
+        return "control", 1
+
+    monkeypatch.setattr(standby, "_local_health", says)
+    asyncio.run(standby.reconcile(app))
+    assert not standby.promoted(state)
+    assert not standby.hosts_active_control(state)
