@@ -71,7 +71,9 @@ def test_a_moved_catalogue_app_is_installed_again_from_the_catalogue(
 def test_a_moved_app_the_person_added_is_not_installed_or_started(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    manager = _manager(tmp_path)
+    # The catalogue has an app by that id; the record says the person added
+    # theirs, so it is theirs to install again, not the catalogue's.
+    manager = _manager(tmp_path, catalogue=[_manifest()])
     manager.store.put(_record())  # origin: custom
     marker = _listed(manager, "tiny")
     monkeypatch.setattr(manager, "uv", lambda: Path("/usr/local/eugene-plexus/bin/uv"))
