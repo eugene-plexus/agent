@@ -41,6 +41,8 @@ from .._generated.models import (
     AppManifest,
     AppOrigin,
     AppRestartRequest,
+    AppSettings,
+    AppSettingsUpdate,
     ClientKeyCreateRequest,
     ClientKeyLimits,
 )
@@ -51,6 +53,7 @@ from ..apps import (
     AppInstallError,
     AppKey,
     AppManager,
+    claims_link,
     is_site_host,
     normalized,
     pip_requirement,
@@ -127,7 +130,7 @@ _CUSTOM_OFF = (
 # --------------------------------------------------------------------------- #
 
 
-@router.get("/v1/apps", response_model=AppList, response_model_exclude_none=True)
+@router.get("/v1/apps", response_model=AppList)
 async def list_apps(request: Request) -> AppList:
     return AppList(apps=_apps(request).views())
 
@@ -169,6 +172,10 @@ async def add_custom(request: Request, body: AppManifest) -> AppCatalogueEntry:
     except ValueError as exc:
         raise _problem(422, "Unusable source", str(exc)) from exc
     try:
+        if claims_link(body):
+            raise ValueError(
+                "Only shipped catalogue entries may provide or use the memory-server link"
+            )
         validate_manifest(body)
     except ValueError as exc:
         raise _problem(422, "Unusable entry", str(exc)) from exc
@@ -213,7 +220,7 @@ async def remove_custom(request: Request, app_id: str) -> Response:
 # --------------------------------------------------------------------------- #
 
 
-@router.get("/v1/apps/{app_id}", response_model=App, response_model_exclude_none=True)
+@router.get("/v1/apps/{app_id}", response_model=App)
 async def get_app(request: Request, app_id: str) -> App:
     manager = _apps(request)
     record = _record_or_404(manager, app_id)
@@ -412,14 +419,16 @@ async def install(request: Request, app_id: str) -> AppInstall:
             "lists what is.",
         )
     manifest, origin = found
-    reason = manager.installable(enrolled=_enrolled(request))
+    refusal = manager.local_actions_refusal(manifest)
+    if refusal is not None:
+        raise _problem(status.HTTP_409_CONFLICT, "Needs an account of its own", refusal)
+    reason = manager.entry_refusal(manifest, enrolled=_enrolled(request))
     if reason is not None:
         raise _problem(422, "Apps cannot be installed here", reason)
     if origin is AppOrigin.custom and not _custom_allowed(request):
         raise _problem(status.HTTP_403_FORBIDDEN, "Custom apps are off", _CUSTOM_OFF)
-    refusal = manager.local_actions_refusal(manifest)
-    if refusal is not None:
-        raise _problem(status.HTTP_409_CONFLICT, "Needs an account of its own", refusal)
+    if origin is AppOrigin.custom and claims_link(manifest):
+        raise _problem(422, "Unusable entry", "Only shipped catalogue entries may use this link.")
     if manager.installer.running(app_id):
         raise _problem(
             status.HTTP_409_CONFLICT,
@@ -478,7 +487,7 @@ async def cancel_install(request: Request, app_id: str) -> AppInstall:
     return snapshot
 
 
-@router.post("/v1/apps/{app_id}/start", response_model=App, response_model_exclude_none=True)
+@router.post("/v1/apps/{app_id}/start", response_model=App)
 async def start(request: Request, app_id: str) -> App:
     _not_node_capability(app_id)
     manager = _apps(request)
@@ -491,7 +500,35 @@ async def start(request: Request, app_id: str) -> App:
     return manager.view(record)
 
 
-@router.post("/v1/apps/{app_id}/stop", response_model=App, response_model_exclude_none=True)
+def _settings_record(manager: AppManager, app_id: str):  # type: ignore[no-untyped-def]
+    record = _record_or_404(manager, app_id)
+    if not any("{memoryModel}" in v for v in (record.manifest.environment or {}).values()):
+        raise _problem(
+            409, "No launcher settings", "This app does not use the launcher's Model setting."
+        )
+    return record
+
+
+@router.get("/v1/apps/{app_id}/settings", response_model=AppSettings)
+async def get_app_settings(request: Request, app_id: str) -> AppSettings:
+    return _settings_record(_apps(request), app_id).settings  # type: ignore[no-any-return]
+
+
+@router.patch("/v1/apps/{app_id}/settings", response_model=AppSettings)
+async def update_app_settings(
+    request: Request, app_id: str, body: AppSettingsUpdate
+) -> AppSettings:
+    manager = _apps(request)
+    record = _settings_record(manager, app_id)
+    if manager.installer.running(app_id):
+        raise _problem(409, "Install running", "Wait for this app's install before changing Model.")
+    try:
+        return await manager.update_settings(record, body)
+    except AppInstallError as exc:
+        raise _problem(503, "Model change failed", str(exc)) from exc
+
+
+@router.post("/v1/apps/{app_id}/stop", response_model=App)
 async def stop(request: Request, app_id: str) -> App:
     _not_node_capability(app_id)
     manager = _apps(request)
@@ -504,12 +541,12 @@ async def stop(request: Request, app_id: str) -> App:
         raise _problem(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Could not stop it",
-            f"{record.manifest.name} is still running: {exc}",
+            f"{record.manifest.name} could not finish stopping: {exc}",
         ) from exc
     return manager.view(record)
 
 
-@router.post("/v1/apps/{app_id}/restart", response_model=App, response_model_exclude_none=True)
+@router.post("/v1/apps/{app_id}/restart", response_model=App)
 async def restart(request: Request, app_id: str, body: AppRestartRequest | None = None) -> App:
     _not_node_capability(app_id)
     manager = _apps(request)

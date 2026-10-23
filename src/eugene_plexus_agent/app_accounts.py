@@ -261,12 +261,21 @@ def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
         "env": env,
         "ingress": ingress,
     }
+    link_url = env.pop("EUGENE_PLEXUS_APP_MEMORY_SERVER_URL", None)
+    if link_url:
+        token_path = env.pop("EUGENE_PLEXUS_APP_MEMORY_SERVER_TOKEN_FILE")
+        model_path = env.pop("EUGENE_PLEXUS_APP_MEMORY_SERVER_MODEL_FILE")
+        spec["memoryServer"] = {"url": link_url, "modelFile": model_path}
+        if kind == "windows_service":
+            spec["memoryServer"]["tokenFile"] = token_path
     if kind == "windows_service":
         spec["service"] = f"{SERVICE_PREFIX}{plan.app_id}"
         spec["dataDir"] = str(plan.data_dir)
         spec["keyFile"] = str(plan.key_file)
         spec["adminTokenFile"] = str(plan.data_dir / ADMIN_TOKEN_FILE)
         spec["oidcSecretFile"] = str(plan.data_dir / OIDC_SECRET_FILE)
+        if plan.launch.get("linkProvider"):
+            spec["linkSecretFile"] = str(plan.data_dir.parent / "memory_server_token")
     return spec
 
 
@@ -553,6 +562,11 @@ class SystemdRunner:
     def prepare(self, plan: LaunchPlan, spec: dict) -> None:
         launcher = install_launcher(self._apps)
         app_dir = self._apps / plan.app_id
+        # Every unit loads these, empty for an app with no authorised link.
+        for name in ("memory_server_token", "memory_server_model.json"):
+            path = app_dir / name
+            if not path.exists():
+                write_private(path, "")
         # Readable by the app's dynamic user, which is no owner or group of
         # anything here. Safe because the prefix itself is 0750: only the
         # unit's bind mounts reach inside it.
@@ -767,6 +781,39 @@ class OwnAccountSupervisor:
         if app_id in self._planners:
             await asyncio.to_thread(self.runner.stop, app_id)
         self._forget(app_id)
+
+    async def cleanup_pg0(self, planner: _AppPlanner, action: str) -> None:
+        """Run named cleanup inside the same service account and private state directory."""
+        app_id = planner.record.id
+        await asyncio.to_thread(self.runner.stop, app_id)
+        spawn = planner.base_plan()
+        plan = LaunchPlan(
+            app_id=app_id,
+            argv=spawn.argv,
+            env=spawn.env,
+            data_dir=self._data_dir(app_id),
+            key_file=self._key_file(app_id),
+            admin_token=planner.admin_token or "",
+            port=planner.record.port,
+            bind_host="127.0.0.1",
+            launch={**planner.launch(), "pg0Action": action},
+        )
+        spec = launch_spec(plan, kind=self.runner.kind, ingress=self._ingress())
+        await asyncio.to_thread(self.runner.prepare, plan, spec)
+        await asyncio.to_thread(self.runner.start, app_id)
+        deadline = time.perf_counter() + _STOP_TIMEOUT_SECONDS
+        while time.perf_counter() < deadline:
+            state = await asyncio.to_thread(self.runner.state, app_id)
+            if state.state == "stopped" and not state.exit_code:
+                return
+            if state.state in {"failed", "missing"}:
+                cause = state.detail or state.exit_code or state.state
+                raise OSError(f"pg0 {action} --name hindsight failed: {cause}")
+            await asyncio.sleep(0.1)
+        await asyncio.to_thread(self.runner.stop, app_id)
+        raise OSError(
+            f"pg0 {action} --name hindsight did not finish within {_STOP_TIMEOUT_SECONDS:g} seconds"
+        )
 
     async def remove(self, app_id: str, *, purge: bool) -> None:
         """Stop the app and remove its service, in one request to the

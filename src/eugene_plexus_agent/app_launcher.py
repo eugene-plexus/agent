@@ -101,6 +101,14 @@ def load_spec(path: str) -> dict:
         spec["adminTokenFile"] = os.path.join(credentials, "admin_token")
     if not spec.get("oidcSecretFile") and credentials:
         spec["oidcSecretFile"] = os.path.join(credentials, "oidc_secret")
+    if spec.get("linkProvider") and credentials:
+        spec["linkSecretFile"] = os.path.join(credentials, "memory_server_token")
+    if spec.get("memoryServer") and credentials:
+        spec["memoryServer"]["tokenFile"] = os.path.join(credentials, "memory_server_token")
+        if not spec["memoryServer"].get("modelFile"):
+            spec["memoryServer"]["modelFile"] = str(
+                Path(path).with_name("memory_server_model.json")
+            )
     return spec
 
 
@@ -108,6 +116,9 @@ def child_environment(spec: dict) -> dict[str, str]:
     """This process's environment (the service manager's, for this
     account), the spec's variables, and where things are."""
     env = dict(os.environ)
+    for name in list(env):
+        if name.startswith("EUGENE_PLEXUS_"):
+            env.pop(name)
     # Never hand the app what systemd handed the launcher about itself.
     for name in ("CREDENTIALS_DIRECTORY", "STATE_DIRECTORY", "INVOCATION_ID", "NOTIFY_SOCKET"):
         env.pop(name, None)
@@ -128,6 +139,11 @@ def child_environment(spec: dict) -> dict[str, str]:
             env["TEMP"] = env["TMP"] = temp
     if spec.get("keyFile"):
         env["EUGENE_PLEXUS_APP_KEY_FILE"] = spec["keyFile"]
+    link = spec.get("memoryServer")
+    if link:
+        env["EUGENE_PLEXUS_APP_MEMORY_SERVER_URL"] = link["url"]
+        env["EUGENE_PLEXUS_APP_MEMORY_SERVER_TOKEN_FILE"] = link["tokenFile"]
+        env["EUGENE_PLEXUS_APP_MEMORY_SERVER_MODEL_FILE"] = link["modelFile"]
     token = _secret(spec.get("adminTokenFile"))
     if token:
         env["EUGENE_PLEXUS_APP_ADMIN_TOKEN"] = token
@@ -148,6 +164,9 @@ PLACEHOLDERS = frozenset(
     {
         "bindHost",
         "port",
+        "auxPort",
+        "memoryModel",
+        "linkSecret",
         "dataDir",
         "gatewayUrl",
         "appUrl",
@@ -164,7 +183,7 @@ PLACEHOLDERS = frozenset(
 )
 #: Read by `render_start` from files, never carried in a spec: a value for
 #: one of these in the spec's `values` is ignored.
-SECRET_PLACEHOLDERS = frozenset({"clientKey", "oidcClientSecret", "appSecret"})
+SECRET_PLACEHOLDERS = frozenset({"clientKey", "oidcClientSecret", "appSecret", "linkSecret"})
 #: The placeholders answered by asking the gateway at every start (MR6), each
 #: with the surface a model must list to be the answer: the install's search
 #: model (it embeds) and its result sorter (it reranks). Never carried in a
@@ -653,6 +672,17 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
     environment = {str(k): str(v) for k, v in (spec.get("environment") or {}).items()}
     reset = spec.get("resetOnConnectionChange")
     wanted = {n for text in [*args, *environment.values()] for n in placeholders(text)}
+    if "memoryModel" in wanted and not values.get("memoryModel"):
+        raise ValueError("Choose the model Hindsight reads your chats with")
+    if "linkSecret" in wanted:
+        path = spec.get("linkSecretFile")
+        try:
+            token = Path(path).read_text(encoding="utf-8").strip() if path else ""
+        except OSError as exc:
+            raise ValueError(f"The memory-server link secret could not be read: {exc}") from exc
+        if not token:
+            raise ValueError("The memory-server link secret is missing or empty")
+        values["linkSecret"] = token
     if "gatewayUrl" in wanted and not values.get("gatewayUrl"):
         raise GatewayUnknown(_no_gateway(spec.get("gatewayDetail")))
     models = [name for name in MODEL_SURFACES if name in wanted]
@@ -689,6 +719,8 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
             if not running:
                 notes.append(_stopped_model(name, chosen))
     values["imageModelSet"] = "true" if values.get("imageModel") else "false"
+    if spec.get("linkProvider") and any(name not in values for name in models):
+        raise ValueError("Hindsight was not started. " + " ".join(notes))
     argv = [str(a) for a in spec["argv"]]
     argv.extend(_fill(text, values)[0] for text in args)
     out = dict(env)
@@ -723,6 +755,36 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
             with _DATA_FILES:
                 _write_own(os.path.join(data, "given.json"), json.dumps(given))
     return argv, out, notes
+
+
+def pg0_cleanup(python: str, action: str, env: dict[str, str]) -> None:
+    """Run the installed package's binary as its launch account, never a PATH pg0."""
+    if action not in {"stop", "drop"}:
+        raise ValueError("Unknown pg0 cleanup action")
+    code = (
+        "import pathlib,pg0,subprocess,sys; "
+        "p=next(p for p in (pathlib.Path(pg0.__file__).parent/'bin').glob('pg0*') if p.is_file()); "
+        "sys.exit(subprocess.call([str(p),*sys.argv[1:]]))"
+    )
+    args = [python, "-c", code, action, "--name", "hindsight"]
+    if action == "stop":
+        args += ["--timeout", "30"]
+    else:
+        args += ["--force"]
+    result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45, check=False)
+    if result.returncode:
+        output = (result.stdout + result.stderr).strip()
+        # pg0 reports an absent instance with a non-zero exit; it is already clean.
+        absent = (
+            "no running instance found",
+            "instance 'hindsight' does not exist",
+            "instance 'hindsight' is not running",
+        )
+        if any(text in output.lower() for text in absent) and "traceback" not in output.lower():
+            return
+        raise ValueError(
+            f"pg0 {action} --name hindsight failed ({result.returncode}): {output[-800:]}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -907,6 +969,13 @@ def _force(proc: subprocess.Popen) -> None:
 
 def run(spec: dict) -> int:
     """Start the app, forward its output, wait for it or for a stop."""
+    if spec.get("pg0Action"):
+        try:
+            pg0_cleanup(spec["argv"][0], spec["pg0Action"], child_environment(spec))
+            return 0
+        except (OSError, ValueError) as exc:
+            print(f"[launcher] {exc}", file=sys.stderr)
+            return 1
     if sys.platform == "win32":
         import ctypes
 
@@ -918,6 +987,8 @@ def run(spec: dict) -> int:
     forwarder.start()
     try:
         argv, env, notes = render_start(spec, child_environment(spec))
+        if spec.get("linkProvider"):
+            pg0_cleanup(spec["argv"][0], "stop", env)
         for note in notes:
             forwarder.add(f"[launcher] {note}")
         proc = _spawn(spec, argv, env)
@@ -940,6 +1011,13 @@ def run(spec: dict) -> int:
                 proc.wait(10)
             break
     pump.join(5)
+    if spec.get("linkProvider"):
+        try:
+            pg0_cleanup(spec["argv"][0], "stop", env)
+        except (OSError, ValueError) as exc:
+            forwarder.add(f"[launcher] {exc}")
+            forwarder.close()
+            return 1
     code = proc.returncode if proc.returncode is not None else 1
     if not _STOP.is_set() and code != 0:
         forwarder.add(f"[launcher] the app exited with code {code}")

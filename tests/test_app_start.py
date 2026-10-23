@@ -819,7 +819,7 @@ def test_the_agents_own_supervisor_asks_at_health_path(
 
 def test_the_catalogue_offers_open_webui_as_designed() -> None:
     catalogue = {m.id: m for m in apps.load_catalogue()}
-    assert list(catalogue) == ["workbench", "open-webui"]
+    assert list(catalogue) == ["workbench", "open-webui", "hindsight"]
     webui = catalogue["open-webui"]
     assert apps.pip_requirement(webui) == "open-webui==0.12.3"
     assert webui.entry == "open_webui:app" and webui.healthPath == "/ready"
