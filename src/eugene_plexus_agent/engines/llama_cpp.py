@@ -37,7 +37,7 @@ from .._generated.models import (
     Secondary,
 )
 from ..child_env import child_environment
-from . import gpu_probe, llama_architectures, prompt_cache, run_mode, speculation
+from . import gpu_probe, llama_architectures, prompt_cache, run_mode, same_answer, speculation
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -475,6 +475,8 @@ class LlamaCppAdapter(EngineAdapter):
                     "are not acted on: the embeddings door never wakes a stopped runtime",
                     spec.name,
                 )
+        if flags.get(same_answer.KEY) is True:
+            flags = {**flags, "parallelSlots": 1}
         for field in self.flag_schema().fields:
             if field.key in _LOAD_MODE_KEYS:
                 # Not a presence-only switch any more; handled together
@@ -491,6 +493,7 @@ class LlamaCppAdapter(EngineAdapter):
                 field.key == FLASH_ATTENTION_KEY
                 or field.key in speculation.KEYS
                 or field.key in prompt_cache.KEYS
+                or field.key == same_answer.KEY
             ):
                 continue
             if field.key not in flags:
@@ -1022,6 +1025,7 @@ def flash_attention_argv(flags: dict[str, object]) -> list[str]:
 
 
 _FLAG_FIELDS: list[ConfigField] = [
+    same_answer.field(EngineKind.llama_cpp),
     # Speculative decoding (SD1, docs/design/speculative-decoding.md).
     ConfigField(
         key=speculation.REUSE_TEXT_KEY,
