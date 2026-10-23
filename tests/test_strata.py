@@ -31,6 +31,11 @@ from eugene_plexus_agent.supervisor import SpawnPlanError
 
 @pytest.fixture
 def prepared(tmp_path, monkeypatch):
+    from .strata_fakes import cuda, snap
+
+    monkeypatch.setattr(
+        strata, "detect_devices", lambda: snap(cuda(24, index=0), cuda(16, index=2)), raising=False
+    )
     monkeypatch.setenv("EUGENE_PLEXUS_AGENT_ENGINE_ROOT", str(tmp_path / "owned"))
     root = tmp_path / "borrowed"
     server = root / "serve/server.py"
@@ -58,6 +63,239 @@ def prepared(tmp_path, monkeypatch):
     config = models / "qwen.json"
     config.write_text(json.dumps(cfg))
     return root, server, config, cfg
+
+
+def test_layer_split_is_accepted_and_validated(prepared):
+    root, server, config, cfg = prepared
+    cfg.update(gpu=[2, 0], layer_split=[24])
+    cfg["args"].append("--remote-expert-opt")
+    config.write_text(json.dumps(cfg))
+    spec = RuntimeSpec(
+        name="split", engine="strata", modelPath=str(_provenance(config.parent, entry=config.name))
+    )
+    saved = strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
+    assert saved["gpu"] == [2, 0]
+    assert saved["layer_split"] == "24"
+    assert "--remote-expert-opt" in saved["args"]
+    assert strata.prepared_config(config, alias="a", root=root)["layer_split"] == "24"
+
+
+@pytest.mark.parametrize(
+    "flags,cause",
+    [
+        ({"gpus": [0, 7]}, "7"),
+        ({"gpus": [0, 0]}, "duplicate"),
+        ({"gpus": [True]}, "whole"),
+        ({"gpus": []}, "nonempty"),
+        ({"gpus": [0, 2], "layerSplit": "48"}, "48"),
+        ({"gpus": [0, 2], "layerSplit": "1"}, "2"),
+        ({"gpus": [0, 2], "layerSplit": "16,32"}, "boundary"),
+        ({"gpus": [0], "layerSplit": "24"}, "several"),
+        ({"speedProjection": "yes"}, "speedProjection"),
+    ],
+)
+def test_invalid_strata_settings_name_the_cause(prepared, flags, cause):
+    _, server, config, _ = prepared
+    spec = RuntimeSpec(
+        name="s",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+        flags=flags,
+    )
+    with pytest.raises(SpawnPlanError, match=cause):
+        strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
+
+
+def test_launch_rechecks_selected_cards_each_time(prepared, monkeypatch):
+    from .strata_fakes import cuda, snap
+
+    _, server, config, _ = prepared
+    spec = RuntimeSpec(
+        name="s",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+        flags={"gpus": [2, 0]},
+    )
+    adapter, binary = strata.StrataAdapter(), DiscoveredBinary(server, Origin.configured)
+    assert adapter.prepare_config(spec, binary)["gpu"] == [2, 0]
+    monkeypatch.setattr(strata, "detect_devices", lambda: snap(cuda(24, index=0)))
+    with pytest.raises(SpawnPlanError, match=r"2.*not.*present"):
+        adapter.prepare_config(spec, binary)
+
+
+@pytest.mark.parametrize("mode", ["off", "on", None])
+def test_projection_launch_uses_local_vector_and_preserves_omitted_choice(prepared, mode):
+    root, server, config, cfg = prepared
+    vector = (
+        root
+        / "data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
+    )
+    vector.parent.mkdir(parents=True)
+    vector.touch()
+    cfg["args"] += [
+        "--control-vector-scaled",
+        "X:/other-node/Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0",
+        "--control-vector-layer-range",
+        "4",
+        "44",
+        "--cvec-mode",
+        "project",
+        "--cvec-dir",
+        "per-layer",
+    ]
+    cfg["sampling"] = {"experimental_speed_projection": True, "temperature": 0.6}
+    config.write_text(json.dumps(cfg))
+    spec = RuntimeSpec(
+        name="s",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+        flags={} if mode is None else {"speedProjection": mode},
+    )
+    saved = strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
+    args = saved["args"]
+    assert ("--control-vector-scaled" in args) is (mode != "off")
+    if mode != "off":
+        assert args[args.index("--control-vector-scaled") + 1] == f"{vector}:1.0"
+    assert saved["sampling"]["temperature"] == 0.6
+    assert saved["sampling"]["experimental_speed_projection"] is (mode != "off")
+
+
+def test_projection_missing_local_asset_names_it(prepared):
+    _, server, config, _ = prepared
+    spec = RuntimeSpec(
+        name="s",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+        flags={"speedProjection": "on"},
+    )
+    with pytest.raises(SpawnPlanError, match=r"projection.*missing"):
+        strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
+
+
+def test_strata_gui_schema_preserves_inherited_settings():
+    fields = {f.key: f for f in strata.StrataAdapter().flag_schema().fields}
+    assert set(fields) == {"speedProjection", "gpus", "layerSplit"}
+    assert all(f.default is None and "prepared" in f.unsetMeans.lower() for f in fields.values())
+    projection = fields["speedProjection"]
+    assert "changes answers" in projection.description.splitlines()[0].lower()
+    assert "experimental" in projection.description.splitlines()[0].lower()
+    assert "refusal-direction projection" in projection.description
+    assert projection.enumValues == ["off", "on"]
+
+
+def test_preparation_advertises_upstreams_projection_choices():
+    for model in strata_models.SUPPORTED_MODELS:
+        assert [str(m) for m in model.preparation.speedProjectionModes] == (
+            ["off", "on"] if model.id.startswith(("coder-", "IQ", "Q2")) else ["off"]
+        )
+
+
+def test_fit_sums_the_cards_in_the_split():
+    choice = strata_models.SETUP_CHOICES["IQ3_XXS"]
+    fit = strata_models.setup_fit(choice, 27, [16, 16])
+    assert fit.verdict.value == "split"
+    assert "cards" in fit.words and "SSD" in fit.words
+    # Each card loses 5 GiB; summing before that subtraction invents capacity.
+    assert strata_models.setup_fit(choice, 27, [14, 14]).verdict.value == "no"
+    assert strata_models.setup_fit(choice, 27, [16, None]).verdict.value == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_effective_launch_is_only_the_successfully_spawned_snapshot(prepared, monkeypatch):
+    from eugene_plexus_agent.runtimes import RuntimeSupervisor
+    from eugene_plexus_agent.supervisor import SupervisedProcess
+
+    from .test_supervisor import _FakeProcess
+
+    _, server, config, _ = prepared
+    original = config.read_bytes()
+    spec = RuntimeSpec(
+        name="s",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+        port=18234,
+        flags={"gpus": [2, 0], "layerSplit": "24"},
+    )
+    adapter = strata.StrataAdapter()
+    monkeypatch.setattr(
+        adapter, "resolve_binary", lambda *a, **kw: DiscoveredBinary(server, Origin.configured)
+    )
+    planner = _RuntimePlanner(spec, adapter, logging.getLogger("test"))
+    process = SupervisedProcess(planner=planner, log=logging.getLogger("test"))
+    runtime = RuntimeSupervisor()
+    runtime._processes[spec.name] = process
+    runtime._planners[spec.name] = planner
+    planner.plan()
+    assert runtime.compose(spec).effectiveLaunch is None
+    child = _FakeProcess()
+
+    async def spawn(*args, **kwargs):
+        child._finish(0)
+        return child
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    await process._spawn_once()
+    observed = runtime.compose(spec).effectiveLaunch.model_dump(mode="json")
+    assert observed == {"speedProjection": "off", "gpus": [2, 0], "layerSplit": "24"}
+    config.write_text("{}")
+    planner.spec = spec.model_copy(update={"flags": {"gpus": [0], "speedProjection": "on"}})
+    assert runtime.compose(planner.spec).effectiveLaunch.model_dump(mode="json") == observed
+    with pytest.raises(SpawnPlanError):
+        planner.plan()
+    assert runtime.compose(planner.spec).effectiveLaunch.model_dump(mode="json") == observed
+    config.write_bytes(original)
+    planner.spec = spec.model_copy(update={"flags": {"gpus": [0]}})
+
+    async def cannot_spawn(*args, **kwargs):
+        raise OSError("recorded process creation failure")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", cannot_spawn)
+    await process._spawn_once()
+    assert "recorded process creation failure" in process.last_error
+    assert runtime.compose(planner.spec).effectiveLaunch.model_dump(mode="json") == observed
+
+
+def test_the_gui_card_rows_resolve_to_ordered_inventory_ordinals(prepared, monkeypatch):
+    _, server, config, _ = prepared
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    spec = RuntimeSpec(
+        name="s",
+        engine="strata",
+        modelPath=str(_provenance(config.parent, entry=config.name)),
+        flags={"gpus": ["2", "0"]},
+    )
+    saved = strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
+    # Upstream child_env resets native visibility to 2,0; those cards become
+    # native devices 0,1. Report the node's 2,0, not those remapped ordinals.
+    assert saved["gpu"] == [2, 0] and saved["layer_split"] == "auto"
+
+
+@pytest.mark.parametrize("sampling,expected", [(False, "off"), (True, "on"), (None, "on")])
+def test_effective_projection_uses_the_launch_sampling_default(prepared, sampling, expected):
+    from eugene_plexus_agent.engines.strata_settings import VECTOR, effective_launch
+
+    root, server, config, cfg = prepared
+    vector = root / VECTOR
+    vector.parent.mkdir(parents=True)
+    vector.touch()
+    cfg["args"] += [
+        "--control-vector-scaled",
+        f"{vector}:1.0",
+        "--control-vector-layer-range",
+        "4",
+        "44",
+        "--cvec-mode",
+        "project",
+        "--cvec-dir",
+        "per-layer",
+    ]
+    cfg["sampling"] = {"experimental_speed_projection": sampling}
+    config.write_text(json.dumps(cfg))
+    spec = RuntimeSpec(
+        name="s", engine="strata", modelPath=str(_provenance(config.parent, entry=config.name))
+    )
+    saved = strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
+    assert effective_launch(saved).speedProjection.value == expected
 
 
 def test_private_config_preserves_assets_and_assigns_distinct_aliases(prepared):
@@ -340,7 +578,7 @@ def test_a_provenance_file_that_cannot_launch_says_why(prepared, body, said):
 def test_a_runtime_declared_on_a_bare_configuration_is_refused_with_the_reason(prepared):
     _, server, config, _ = prepared
     spec = RuntimeSpec(name="q", engine="strata", modelPath=str(config))
-    with pytest.raises(SpawnPlanError, match="runs prepared models from the Library") as refused:
+    with pytest.raises(SpawnPlanError, match=r"runs prepared models from the Library") as refused:
         strata.StrataAdapter().prepare_config(spec, DiscoveredBinary(server, Origin.configured))
     assert ".eugene-prepared.json" in str(refused.value)
 
@@ -594,7 +832,7 @@ def test_a_service_without_its_interpreter_says_which_is_missing(
 
     monkeypatch.setattr(sys, "executable", str(tmp_path / "pythonservice.exe"))
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
-    with pytest.raises(AcquisitionError, match="interpreter is missing"):
+    with pytest.raises(AcquisitionError, match=r"interpreter is missing"):
         strata_install._venv_command(tmp_path / ".venv")
 
 

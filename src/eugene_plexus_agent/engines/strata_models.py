@@ -35,6 +35,7 @@ from .._generated.models import (
     ModelPreparation,
     PreparationVisionMode,
     PreparedSource,
+    SpeedProjectionMode,
     SupportedModel,
 )
 
@@ -49,6 +50,7 @@ PREPARATION = ModelPreparation(
     note="an expert pack, a lookup table and an MTP helper",
     contexts=[Context(c) for c in SETUP_CONTEXTS],
     visionModes=list(PreparationVisionMode),
+    speedProjectionModes=list(SpeedProjectionMode),
 )
 
 _QWEN = "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"
@@ -92,6 +94,10 @@ def _entry(
     min_engine: str | None = None,
 ) -> SupportedModel:
     preparation = PREPARATION
+    if repo not in (_QWEN, _CODER):
+        preparation = preparation.model_copy(
+            update={"speedProjectionModes": [SpeedProjectionMode.off]}
+        )
     if min_engine is not None:
         preparation = preparation.model_copy(update={"minEngineVersion": min_engine})
     if id == "unsloth-UD-Q4_K_XL":
@@ -382,13 +388,45 @@ def low_ram_resident(choice: SetupChoice, ram_gib: float, vram_gib: float) -> bo
     return ram_gib >= rest + LOW_RAM_HEADROOM_GB
 
 
-def setup_fit(choice: SetupChoice, ram_gib: float, vram_gib: float | None) -> SetupFit:
+def setup_fit(
+    choice: SetupChoice, ram_gib: float, vram_gib: float | list[float | None] | None
+) -> SetupFit:
     """Setup's `--check` verdict for one choice (setup.py at the commit the
     adapter pins), mapped onto the fit words: *fits* and the RAM-budget mode
     are `fits`, the low-RAM mode `split`, *tight* `tight`, *does not fit*
     `no`. `ram_gib` is the PC's total RAM in setup's GB (2^30 bytes), as its
     `ram_gb()` reads it; `vram_gib` the card it would use, None when there is
     none it can use: then `unknown`, since setup's rule is about one."""
+    if isinstance(vram_gib, list):
+        if not vram_gib or any(v is None for v in vram_gib):
+            return SetupFit(
+                FitVerdict.unknown,
+                "selected card memory could not be read; Strata's fit is unknown",
+            )
+        if len(vram_gib) == 1:
+            return setup_fit(choice, ram_gib, vram_gib[0])
+        if choice.budget:
+            model = next(m for m in SUPPORTED_MODELS if SETUP_CHOICES[m.id] == choice)
+            split_need = (model.sizeBytes or 0) / 1e9 + UNSLOTH_RAM_LEFT_GB
+            return SetupFit(
+                FitVerdict.fits if ram_gib >= split_need else FitVerdict.no,
+                "several cards cannot use this model's RAM budget: its files plus 24 GB "
+                f"need about {split_need:.0f} GB of RAM; this machine has {ram_gib:.0f} GB",
+                "ram" if ram_gib >= split_need else None,
+            )
+        capacity = sum(max(0, v - 5) for v in vram_gib if v is not None)
+        if low_ram_needed(choice, ram_gib) and ram_gib - 6 + capacity >= choice.arena_gb:
+            fraction = min(capacity, choice.arena_gb) / choice.arena_gb
+            return SetupFit(
+                FitVerdict.split,
+                f"fits in Strata's low-RAM mode: the selected cards hold about {fraction:.0%} "
+                "of its experts after each card's allowance; the rest are read from the SSD "
+                "as needed (memory mapping; RAM can fill during long prompts)",
+                "low_ram",
+            )
+        # Preserve the single host arena. Passing a synthetic card through the
+        # existing rule gives exactly sum(max(card - 5, 0)), not sum(cards)-5.
+        return setup_fit(choice, ram_gib, capacity + 5)
     have = f"this machine has {ram_gib:.0f} GB"
     need = f"about {choice.ram_gb:g} GB of RAM"
     if vram_gib is None:

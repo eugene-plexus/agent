@@ -304,6 +304,9 @@ class EngineAdapter(abc.ABC):
         source_path: str,
         context: int | None,
         vision: PreparationVisionMode = PreparationVisionMode.off,
+        speed_projection: str | None = None,
+        gpus: list[int] | None = None,
+        layer_split: str | None = None,
     ) -> Recipe:
         """Plan preparing `model`, in the Library folder `folder` (both as
         this node reaches them), with the engine's own tools (LS5); or say,
