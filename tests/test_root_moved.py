@@ -647,6 +647,30 @@ def test_a_root_token_without_an_epoch_is_refused_once_a_promotion_is_known(
         assert client.get("/v1/node", headers=auth).status_code == 401
 
 
+def test_a_node_that_kept_no_epoch_at_joining_refuses_them_after_a_promotion() -> None:
+    """A node whose `node.yaml` held no epoch when row 4 code first ran
+    keeps no joining epoch: a list above its bundle's epoch alone ends
+    root tokens without `ep` (row 4 re-review, blocker 1a)."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent import dependencies
+
+    claims = tokens.Claims(
+        typ=tokens.TYP_SERVICE,
+        iss=tokens.ISSUER_CONTROL,
+        sub="control",
+        aud=("node:me",),
+        iat=1,
+        exp=2,
+        jti="j",
+    )
+    record = SimpleNamespace(epoch=3, legacy_token_epoch=None)
+    behind = SimpleNamespace(trust=SimpleNamespace(bundle=SimpleNamespace(epoch=2)))
+    level = SimpleNamespace(trust=SimpleNamespace(bundle=SimpleNamespace(epoch=3)))
+    assert dependencies._legacy_root_token_after_a_promotion(behind, claims, record)
+    assert not dependencies._legacy_root_token_after_a_promotion(level, claims, record)
+
+
 def test_a_restart_does_not_reopen_a_list_without_a_root_epoch(tmp_path: Path) -> None:
     """The node has taken a list that names its root; the new root's bundle
     arrives, then the node restarts before its list does, and the kept list
@@ -669,6 +693,14 @@ def test_a_restart_does_not_reopen_a_list_without_a_root_epoch(tmp_path: Path) -
         restarted.accept(replay)
     kept = json.loads((tmp_path / machine_trust.LIST_FILE).read_text(encoding="utf-8"))
     assert kept["jws"] == held
+    # A list naming no root, put on disk while the agent was down, is not
+    # loaded either.
+    (tmp_path / machine_trust.LIST_FILE).write_text(
+        json.dumps({"jws": replay, "takenAt": 1}), encoding="utf-8"
+    )
+    planted = machine_trust.MachineTrust(tmp_path, again)
+    planted.load()
+    assert planted.claims is None
 
 
 def test_a_copy_promoted_here_and_locked_is_served_and_said(
