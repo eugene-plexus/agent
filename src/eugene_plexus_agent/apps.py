@@ -1465,15 +1465,14 @@ class AppManager:
         reason = self.installable(enrolled=enrolled)
         if reason:
             return reason
-        if manifest.id == "hindsight":
-            if sys.platform not in {"linux", "win32"}:
-                return "Hindsight needs Linux for verified pg0 data cleanup."
-            if sys.platform == "win32":
-                return (
-                    "Hindsight is unavailable on Windows (MV5b-WINDOWS-PG0): pg0 uses "
-                    "the account profile instead of the app's data folder. The Windows "
-                    "agent-account launch and cleanup have no CI acceptance yet. Use Linux."
-                )
+        # MV5b-C1 allows Linux only for now: elsewhere pg0 keeps its data outside
+        # the app's folder, where uninstall cannot be shown to delete it.
+        if manifest.id == "hindsight" and sys.platform != "linux":
+            return (
+                "Hindsight runs on Linux machines only for now: elsewhere its database "
+                "would keep memories outside the app's folder, where removing the app "
+                "cannot delete them. Install it on a Linux machine."
+            )
         return self.local_actions_refusal(manifest)
 
     def local_actions_refusal(self, manifest: AppManifest) -> str | None:
