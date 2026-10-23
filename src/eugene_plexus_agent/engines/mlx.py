@@ -750,6 +750,7 @@ _FLAG_FIELDS: list[ConfigField] = [
         ),
         category="model",
         valueType=ConfigValueType.boolean,
+        default=False,
         requiresRestart=True,
     ),
     ConfigField(

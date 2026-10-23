@@ -298,6 +298,21 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.url,
     ),
     ConfigField(
+        key="machineKeyChangeDays",
+        label="Change this machine's key every (days)",
+        description=(
+            "This machine makes a new machine key by itself when its key is older than "
+            "this. The other machines take the new key first, so nothing stops.\n\n"
+            "0 changes it only when you ask (Machines, Change this machine's key now). "
+            "A change you stop starts again a day later while the key is older than this."
+        ),
+        category="node",
+        valueType=ConfigValueType.integer,
+        default=365,
+        minimum=0,
+        maximum=3650,
+    ),
+    ConfigField(
         key="clientCertificateFile",
         label="Your own certificate",
         description=(

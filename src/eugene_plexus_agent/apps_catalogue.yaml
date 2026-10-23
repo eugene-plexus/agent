@@ -20,8 +20,8 @@
     for approved file operations. Signs people in with Eugene:
     the owner with the passphrase, a small business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/9fbe04ad639bead9624845d47e27846175aa9783.tar.gz
-  version: 9fbe04ad639bead9624845d47e27846175aa9783
+  source: https://github.com/eugene-plexus/workbench/archive/68d9fc2698868284680244efed9d0247b03e71c7.tar.gz
+  version: 68d9fc2698868284680244efed9d0247b03e71c7
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
@@ -48,9 +48,9 @@
     licence. Installed unmodified. About 1.8 GB on disk and up to 2 GB of
     memory.
   homepage: https://openwebui.com
-  licenseUrl: https://github.com/open-webui/open-webui/blob/v0.11.4/LICENSE
+  licenseUrl: https://github.com/open-webui/open-webui/blob/v0.12.3/LICENSE
   source: pypi
-  version: 0.11.4
+  version: 0.12.3
   package: open-webui
   entry: open_webui:app
   args: [serve, --host, "{bindHost}", --port, "{port}"]
@@ -63,6 +63,7 @@
   healthPath: /ready
   localActions: true
   resetOnConnectionChange: RESET_CONFIG_ON_START
+  updateBackup: [webui.db, vector_db]
   environment:
     DATA_DIR: "{dataDir}"
     STATIC_DIR: "{dataDir}/static"
@@ -94,7 +95,39 @@
     AUDIO_STT_OPENAI_API_KEY: "{clientKey}"
     AUDIO_TTS_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
     AUDIO_TTS_OPENAI_API_KEY: "{clientKey}"
+    AUDIO_REALTIME_OPENAI_API_BASE_URL: "{gatewayUrl}/v1"
     ENABLE_OLLAMA_API: "false"
+    # Row 34, checked against the 0.12.3 wheel (specs scripts/open-webui-drift.py):
+    # config.py ENABLE_WEB_SEARCH 1168, WEB_SEARCH_ENGINE 1177,
+    # BYPASS_WEB_SEARCH_WEB_LOADER 1184, WEB_SEARCH_RESULT_COUNT 1186,
+    # WEB_SEARCH_CONCURRENT_REQUESTS 1203, EXTERNAL_WEB_SEARCH_URL 1330,
+    # EXTERNAL_WEB_SEARCH_API_KEY 1332, ENABLE_IMAGE_GENERATION 1360,
+    # IMAGE_GENERATION_ENGINE 1362, IMAGE_GENERATION_MODEL 1364;
+    # env.py ENABLE_PLUGINS 1194 (default true; written here so a change of
+    # default upstream changes nothing). The external engine posts
+    # {query, count} and reads {link, title, snippet} (retrieval/web/external.py).
+    # OFFLINE_MODE (env.py 1213) blocks model downloads and the version check
+    # only; it does not turn web search off.
+    # 0.12.3 added a realtime-voice section whose address falls back to
+    # api.openai.com (config.py 1656); set above with the others. Its key is not set:
+    # the entry is at the contract's 64-variable limit, and realtime is off by default.
+    ENABLE_WEB_SEARCH: "true"
+    WEB_SEARCH_ENGINE: external
+    EXTERNAL_WEB_SEARCH_URL: "{gatewayUrl}/v1/web_search"
+    EXTERNAL_WEB_SEARCH_API_KEY: "{clientKey}"
+    WEB_SEARCH_RESULT_COUNT: "5"
+    WEB_SEARCH_CONCURRENT_REQUESTS: "2"
+    # With the page loader bypassed Open WebUI still embeds the snippets into
+    # its vector store unless this is set too (config.py 1179), and with no
+    # search model running that fails the whole search ("Failed to embed and
+    # store the retrieved web pages"; found by the row's C4 run). The snippets
+    # go straight to the chat instead.
+    BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL: "true"
+    BYPASS_WEB_SEARCH_WEB_LOADER: "true"
+    ENABLE_IMAGE_GENERATION: "{imageModelSet}"
+    IMAGE_GENERATION_ENGINE: openai
+    IMAGE_GENERATION_MODEL: "{imageModel}"
+    ENABLE_PLUGINS: "true"
     # Document search through Eugene's own door (MR6, specs
     # docs/design/workbench-memory-and-documents.md). Open WebUI copies these
     # into its database at its first start and its database wins after, so what
