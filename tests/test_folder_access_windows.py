@@ -7,7 +7,10 @@ import pytest
 
 from eugene_plexus_agent import folder_access as fa
 
-pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows DACLs")
+pytestmark = [
+    pytest.mark.skipif(os.name != "nt", reason="Windows DACLs"),
+    pytest.mark.usefixtures("outside_windows_homes"),
+]
 
 
 def private_acl(root: Path) -> None:

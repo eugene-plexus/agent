@@ -43,6 +43,7 @@ MESSAGES = {
     "home": "This is inside a person's home. Use a Job Site to work in your own folders.",
     "unavailable": UNAVAILABLE,
 }
+WINDOWS_HOMES = ("Users",)
 LINUX_SYSTEM = tuple(
     "/" + p
     for p in [
@@ -95,7 +96,7 @@ def _overlaps(path: PurePath, roots: tuple[str, ...]) -> bool:
 
 
 def refusal(facts: Facts) -> str | None:
-    """One pure decision, including ancestors that would expose a refused tree."""
+    """Own prefix/data first; otherwise system, home, then other install ancestors."""
     path = _path(facts.path)
     if facts.path.startswith(("\\\\?\\", "\\\\.\\")):
         return "not_a_folder"
@@ -111,7 +112,7 @@ def refusal(facts: Facts) -> str | None:
         return "not_a_folder"
     if facts.mount_root or str(path) == path.anchor:
         return "drive_root"
-    if _overlaps(path, facts.eugene):
+    if any(path.is_relative_to(_path(root)) for root in facts.eugene):
         return "eugene"
     if isinstance(path, PureWindowsPath):
         drive = path.drive
@@ -128,15 +129,17 @@ def refusal(facts: Facts) -> str | None:
                 "$Recycle.Bin",
             )
         )
-        homes = (drive + "\\Users",)
+        homes = tuple(drive + "\\" + name for name in WINDOWS_HOMES)
     else:
         system, homes = LINUX_SYSTEM, ("/home",)
         if path.parts[1].startswith("lib"):
             return "system"
-    if _overlaps(path, facts.homes + homes):
-        return "home"
     if _overlaps(path, facts.system + system):
         return "system"
+    if _overlaps(path, facts.homes + homes):
+        return "home"
+    if _overlaps(path, facts.eugene):
+        return "eugene"
     return None
 
 

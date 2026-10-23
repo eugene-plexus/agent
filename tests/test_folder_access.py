@@ -22,13 +22,40 @@ from .conftest import local_service_token
         ("D:\\", {}, "drive_root"),
         ("/", {}, "drive_root"),
         ("C:\\Windows", {}, "system"),
+        ("C:\\Windows", {"homes": ("C:\\Windows\\System32\\config\\systemprofile",)}, "system"),
+        (
+            "C:\\Windows\\System32",
+            {
+                "eugene": ("C:\\Windows\\ep",),
+                "homes": ("C:\\Windows\\System32\\config\\systemprofile",),
+            },
+            "system",
+        ),
         ("/etc", {}, "system"),
         ("/libexec", {}, "system"),
         ("/lib-vendor", {}, "system"),
         ("D:\\ep", {"eugene": ("D:\\ep",)}, "eugene"),
         ("D:\\Projects", {"eugene": ("D:\\Projects\\ep",)}, "eugene"),
         ("C:\\Users\\person\\shared", {"homes": ("C:\\Users\\person",)}, "home"),
+        ("C:\\Users\\person", {"eugene": ("C:\\Users\\person\\ep",)}, "home"),
+        ("C:\\Users\\person\\ep", {"eugene": ("C:\\Users\\person\\ep",)}, "eugene"),
+        ("C:\\Users\\person\\ep\\apps", {"eugene": ("C:\\Users\\person\\ep",)}, "eugene"),
+        ("C:\\Users\\person\\AppData\\Local\\Temp\\shared", {}, "home"),
+        ("D:\\People\\person\\shared", {"homes": ("D:\\People\\person",)}, "home"),
         ("/home/person/shared", {}, "home"),
+        ("/home/runner", {"eugene": ("/home/runner/ep",)}, "home"),
+        ("/home", {"eugene": ("/home/runner/ep",)}, "home"),
+        ("/home/runner/shared", {"eugene": ("/home/runner/ep",)}, "home"),
+        ("/home/runner/ep", {"eugene": ("/home/runner/ep",)}, "eugene"),
+        ("/home/runner/ep/apps", {"eugene": ("/home/runner/ep",)}, "eugene"),
+        ("/opt", {"eugene": ("/opt/ep",), "homes": ("/opt/service",)}, "system"),
+        ("/opt/ep", {"eugene": ("/opt/ep",), "homes": ("/opt/service",)}, "eugene"),
+        ("/var/lib/ep/apps", {"eugene": ("/var/lib/ep",)}, "eugene"),
+        (
+            "/srv/people",
+            {"eugene": ("/srv/people/person/ep",), "homes": ("/srv/people/person",)},
+            "home",
+        ),
         ("D:\\junction", {"link": True}, "link"),
         ("\\\\server\\share\\folder", {}, "network"),
         ("D:\\mapped", {"network": True}, "network"),
@@ -471,6 +498,24 @@ def test_release_authenticates_the_installed_apps_own_key(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DACLs")
+def test_windows_detected_roots_keep_system_home_and_install_causes(tmp_path: Path) -> None:
+    own = Path.home() / "ep"
+    backend = fa.WindowsPermissions("S-1-5-32-545", eugene=(str(own),))
+    access = fa.Access(tmp_path / "access.json", backend)
+    for path, cause in [
+        (os.environ["SYSTEMROOT"], "system"),
+        (str(Path.home()), "home"),
+        (str(own), "eugene"),
+        (str(own / "apps"), "eugene"),
+    ]:
+        with pytest.raises(fa.Refused) as exc:
+            access.add("workbench", path, "read", "operator")
+        assert exc.value.cause == cause
+    assert not access.file.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACLs")
+@pytest.mark.usefixtures("outside_windows_homes")
 def test_windows_add_then_remove_touches_one_ace(tmp_path: Path) -> None:
     import win32security as ws
 
@@ -497,6 +542,7 @@ def test_windows_add_then_remove_touches_one_ace(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows DACLs")
+@pytest.mark.usefixtures("outside_windows_homes")
 def test_windows_refuses_a_hardlink_before_changing_its_target(tmp_path: Path) -> None:
     import win32security as ws
 
@@ -509,7 +555,7 @@ def test_windows_refuses_a_hardlink_before_changing_its_target(tmp_path: Path) -
     before = ws.ConvertSecurityDescriptorToStringSecurityDescriptor(
         ws.GetFileSecurity(str(target), 4), 1, 4
     )
-    with pytest.raises(fa.Refused, match="link"):
+    with pytest.raises(fa.Refused, match=r"linked\.txt"):
         backend.grant(str(folder), "read", lambda _: None)
     assert (
         ws.ConvertSecurityDescriptorToStringSecurityDescriptor(
