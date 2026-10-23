@@ -2220,6 +2220,81 @@ class HostHistory(BaseModel):
     series: list[HostSeries]
 
 
+class AgentLoginRequest(BaseModel):
+    """
+    `common.yaml`'s `AuthLoginRequest`, and (row 5) the old passphrase
+    once, for a machine that was off when the passphrase changed.
+
+    """
+
+    passphrase: str = Field(..., min_length=1)
+    previousPassphrase: str | None = Field(
+        None,
+        description='Only after a 409 of type `.../old-passphrase-needed`: the\npassphrase this machine had, which opens its master key so it\ncan wrap it under `passphrase`.\n',
+        min_length=1,
+    )
+
+
+class PassphraseChangeRequest(BaseModel):
+    """
+    The same shape as `control.yaml`'s.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    current: SecretStr = Field(..., min_length=1)
+    new: SecretStr = Field(..., min_length=12)
+
+
+class NodePassphraseRequest(BaseModel):
+    """
+    What the control root sends a machine that keeps its own passphrase.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    current: SecretStr = Field(..., min_length=1)
+    new: SecretStr = Field(..., min_length=12)
+
+
+class PassphraseMachineState(StrEnum):
+    """
+    The same values as `control.yaml`'s.
+    """
+
+    changed = 'changed'
+    pending = 'pending'
+    plain = 'plain'
+
+
+class PassphraseMachine(BaseModel):
+    node: str
+    state: PassphraseMachineState
+    detail: str | None = None
+
+
+class PassphraseFileState(StrEnum):
+    """
+    The same values as `control.yaml`'s.
+    """
+
+    matches = 'matches'
+    old = 'old'
+    none = 'none'
+
+
+class PassphraseChangeResult(BaseModel):
+    """
+    The same shape as `control.yaml`'s.
+    """
+
+    changedAt: AwareDatetime
+    machines: list[PassphraseMachine]
+    passphraseFile: PassphraseFileState
+
+
 class Os(StrEnum):
     windows = 'windows'
     linux = 'linux'
@@ -6108,6 +6183,10 @@ class NodeIdentity(BaseModel):
         None,
         description='The epoch `controlUrl` came with (row 4): the epoch at\nenrolment, or of the promoted root this node moved to. A node\nmoves only for a signed machine list at a higher epoch. Set to\nthe epoch held when a node updated to row 4 first starts, so an\nupdate never moves a node. Absent until enrolled.\n',
         ge=0,
+    )
+    ownPassphrase: bool | None = Field(
+        None,
+        description="Whether this agent keeps a passphrase of its own (row 5): the\nroot machine's agent, and a machine set up on its own before\nit joined. The control root sends a changed passphrase only to\nthese. Absent from an agent older than row 5.\n",
     )
     standby: LocalStandby | None = None
     hostsControl: bool | None = Field(
