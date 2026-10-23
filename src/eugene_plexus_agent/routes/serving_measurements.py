@@ -222,9 +222,9 @@ async def inspect(
     caps = runtime.capabilities if runtime else None
     effective = effective_request(body, caps.parallelSlots if caps and caps.parallelSlots else 1)
     replicas: dict[tuple[str, str], ServingRuntime] = {}
+    alias = (runtime.modelAlias or runtime.name) if runtime else ""
     if runtime:
         routing = await doors.routing()
-        alias = runtime.modelAlias or runtime.name
         for slot in routing.get("slots", []):
             if slot.get("model") != alias:
                 continue
@@ -242,6 +242,18 @@ async def inspect(
     others: list[ServingRuntime] = []
     for spec in request.app.state.agent_state.list_runtime_specs():
         other = _compose(spec, _supervisor(request))
+        # The gateway's view lags a restart by one refresh; this node's own
+        # ready copy of the model counts whatever the gateway shows.
+        if (
+            runtime
+            and spec.name != body.runtime
+            and other.status == "ready"
+            and (other.modelAlias or other.name) == alias
+        ):
+            replicas.setdefault(
+                (node_name(request), spec.name),
+                ServingRuntime(node=node_name(request), runtime=spec.name, model=alias),
+            )
         if spec.name != body.runtime and other.status != "stopped":
             others.append(
                 ServingRuntime(

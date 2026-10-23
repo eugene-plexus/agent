@@ -225,3 +225,26 @@ async def test_engine_counters_and_absent_observations_stay_distinct():
         transport=httpx.MockTransport(lambda r: httpx.Response(404))
     ) as client:
         assert await routes.engine_counter(client, runtime) is None
+
+
+def test_a_ready_local_copy_is_named_even_when_the_gateway_view_is_stale(
+    authed_client, app, measurement, monkeypatch
+):
+    # The gateway refreshes its view on a timer, so right after a copy
+    # restarts it can still show the copy as not ready. The agent knows its own
+    # runtimes, so it must name the copy and stop it.
+    _, replicas, _calls = measurement
+    replicas.append(
+        {"node": "tower", "runtime": "copy", "runtime_status": "starting", "eligible": False}
+    )
+    spec = SimpleNamespace(name="copy")
+    monkeypatch.setattr(app.state.agent_state, "list_runtime_specs", lambda: [spec])
+    monkeypatch.setattr(
+        routes,
+        "_compose",
+        lambda s, sup: Runtime(
+            name="copy", engine="llama_cpp", modelPath="/m.gguf", modelAlias="m", status="ready"
+        ),
+    )
+    check = authed_client.post("/v1/serving-measurements/preflight", json={"runtime": "r"}).json()
+    assert check["otherReplicas"] == [{"node": "tower", "runtime": "copy", "model": "m"}]
