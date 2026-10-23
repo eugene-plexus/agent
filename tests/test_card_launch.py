@@ -333,3 +333,26 @@ def test_damaged_observations_do_not_block_a_start(tmp_path, entry):
     memory = DeviceMemory(path)
     assert memory.expected(spec()) == []
     assert memory.observed(spec()) == ([], None)
+
+
+def test_the_installed_launch_check_runs_unstubbed(settings):
+    """The check the app installs on the real supervisor, run as a spawn runs it.
+
+    Every other test replaces it; CI's process acceptances were the first to call it,
+    and its context constructor raised a TypeError on every start.
+    """
+    from fastapi.testclient import TestClient
+
+    from eugene_plexus_agent.app import create_app
+
+    from .conftest import fake_devices
+
+    app = create_app(settings=settings)
+    app.state.device_detector = lambda: fake_devices()
+    app.state.library_fit_client = None
+    app.state.model_exists = lambda path: True
+    with TestClient(app) as client:
+        check = app.state.runtime_supervisor.launch_check
+        assert check is not None
+        launch = client.portal.call(check, spec())
+    assert launch.spec.name == "model" and launch.missing == []

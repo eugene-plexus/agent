@@ -351,7 +351,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime_supervisor.device_memory = DeviceMemory(state.path.parent / "runtime-devices.json")
 
         async def check_runtime_cards(spec: RuntimeSpec) -> CardLaunch:
-            context = NodeContext(app=app, role="agent", path="runtime-start")
+            context = NodeContext(app=app)
             try:
                 admission, _ = await _measure_launch(context, spec)
             except HTTPException as exc:
