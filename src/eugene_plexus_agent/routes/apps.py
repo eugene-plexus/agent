@@ -63,7 +63,7 @@ from ..apps import (
 )
 from ..client_key_registry import registry
 from ..dependencies import require_operator_session
-from .auth import mint_client_key, revoke_client_key_at_authority
+from .auth import key_lineage_ids, mint_client_key, revoke_client_key_at_authority
 
 log = logging.getLogger(__name__)
 
@@ -237,13 +237,14 @@ async def _revoke_key(request: Request, manager: AppManager, app_id: str) -> Non
     key = manager.store.key(app_id)
     if key is None:
         return
-    try:
-        await revoke_client_key_at_authority(
-            request, key.key_id, authorization=request.headers.get("authorization")
-        )
-    except HTTPException as exc:
-        if exc.status_code != status.HTTP_404_NOT_FOUND:
-            raise
+    authorization = request.headers.get("authorization")
+    # Every key of the app's lineage: a rotated app's old key is still in its overlap.
+    for key_id in await key_lineage_ids(request, key.key_id, authorization=authorization):
+        try:
+            await revoke_client_key_at_authority(request, key_id, authorization=authorization)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
     manager.store.drop_key(app_id)
     log.info("revoked key %r (id %s) for app %s", key.key_name, key.key_id, app_id)
 
@@ -466,10 +467,20 @@ async def finish_app_key_rotation(
         write_private(key_file, created.token)
         manager.store.put_key(app_id, AppKey(key_id=created.key.id, key_name=created.key.name))
     except OSError as exc:
+        # Nobody holds the new token, so it must not stay valid.
+        try:
+            await revoke_client_key_at_authority(
+                request, created.key.id, authorization=request.headers.get("authorization")
+            )
+            turned_off = " The new key was turned off."
+        except HTTPException:
+            turned_off = (
+                " The new key could not be turned off; turn it off under Use it from your apps."
+            )
         raise _problem(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             "Could not write the key file",
-            f"Could not write {prepared.name}'s key file ({type(exc).__name__}). "
+            f"Could not write {prepared.name}'s key file ({type(exc).__name__}).{turned_off} "
             f"The old key works until {_until(overlap)}.",
         ) from exc
     record = manager.store.get(app_id)

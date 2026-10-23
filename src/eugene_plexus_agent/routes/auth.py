@@ -871,6 +871,32 @@ async def mint_client_key(
     return ClientKeyCreated(key=_to_model(record), token=token)
 
 
+async def key_lineage_ids(request: Request, key_id: str, *, authorization: str | None) -> list[str]:
+    """`key_id` and every key it replaced or was replaced by.
+
+    Uninstalling an app turns all of them off, so an old key in its overlap does
+    not outlive the app. A registry that cannot be read gives `key_id` alone.
+    """
+    owner = registry(request)
+    try:
+        if owner.enrolled:
+            listing = ClientKeyList.model_validate(
+                await owner.forward("GET", "/v1/auth/client-keys", authorization=authorization)
+            )
+            links = {k.id: (k.replaces, k.replacedBy) for k in listing.keys}
+        else:
+            links = {r.id: (r.replaces, r.replaced_by) for r in _keys(request).records()}
+    except (OSError, HTTPException):
+        return [key_id]
+    found = [key_id]
+    for step in (0, 1):  # backwards through `replaces`, then forwards through `replacedBy`
+        current = key_id
+        while (nxt := links.get(current, (None, None))[step]) and nxt not in found:
+            found.append(nxt)
+            current = nxt
+    return found
+
+
 def _overlap(body: ClientKeyRotateRequest) -> int:
     return 86400 if body.overlapSeconds is None else body.overlapSeconds
 

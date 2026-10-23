@@ -916,3 +916,70 @@ def test_rotating_an_app_key_rewrites_its_key_file(
     refused = authed_client.post("/v1/auth/client-keys/k9/rotate", json={})
     assert refused.status_code == 409 and "elsewhere" in refused.text
     assert "POST" not in seen
+
+
+def test_a_key_file_that_cannot_be_saved_turns_off_the_new_key(
+    app: FastAPI, authed_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row 24: the root rotated but the token could not be saved, so nobody holds
+    the new key. It is revoked, the failure says so, and the old key keeps working."""
+    manager: apps.AppManager = app.state.apps
+    manager.supervisor = FakeAppSupervisor()  # type: ignore[assignment]
+    manager.store.put(_record(_manifest()))
+    manager.store.put_key("tiny", apps.AppKey(key_id="k1", key_name="app:tiny@this-node"))
+    key_file = manager.store.key_file("tiny")
+    key_file.parent.mkdir(parents=True, exist_ok=True)
+    key_file.write_text("old-token")
+    real = apps_routes.write_private
+
+    def failing(path: Any, text: str) -> None:
+        if text == "the-token-shown-once":
+            raise PermissionError("denied")
+        real(path, text)
+
+    monkeypatch.setattr(apps_routes, "write_private", failing)
+    revoked: list[str] = []
+
+    async def revoke(request: Any, key_id: str, *, authorization: str | None) -> None:
+        revoked.append(key_id)
+
+    monkeypatch.setattr(apps_routes, "revoke_client_key_at_authority", revoke)
+
+    async def forward(self: Any, method: str, path: str, **kw: Any) -> Any:
+        if method == "GET":
+            return {"keys": [_created("k1", "app:tiny@this-node").key.model_dump(mode="json")]}
+        return _created("k2", "app:tiny@this-node").model_dump(mode="json")
+
+    from eugene_plexus_agent.client_key_registry import ClientKeyRegistry
+
+    monkeypatch.setattr(ClientKeyRegistry, "forward", forward)
+    monkeypatch.setattr(ClientKeyRegistry, "enrolled", property(lambda self: True))
+    response = authed_client.post("/v1/auth/client-keys/k1/rotate", json={"overlapSeconds": 3600})
+    assert response.status_code == 500
+    assert "PermissionError" in response.text and "new key was turned off" in response.text
+    assert revoked == ["k2"]
+    assert key_file.read_text() == "old-token"
+
+
+def test_uninstalling_an_app_revokes_every_key_in_its_lineage(
+    app: FastAPI, authed_client: TestClient, tmp_path: Path
+) -> None:
+    """Row 24: an app rotated once has an old key in its overlap. Uninstalling the
+    app turns both off at once, not the old one at its retirement."""
+    import time as _time
+
+    from eugene_plexus_agent.client_keys import ClientKeyRecord, ClientKeyStore
+
+    store = ClientKeyStore(tmp_path / "client_keys.json")
+    now = _time.time()
+    common = dict(name="app:tiny@this-node", tail="abcd", created_at=now - 10, expires_at=now + 9e5)
+    store.add(ClientKeyRecord(id="k1", replaced_by="k2", retires_at=now + 3600, **common))
+    store.add(ClientKeyRecord(id="k2", replaces="k1", lineage="k1", **common))
+    app.state.client_keys = store
+    manager: apps.AppManager = app.state.apps
+    manager.supervisor = FakeAppSupervisor()  # type: ignore[assignment]
+    manager.store.put(_record())
+    manager.store.put_key("tiny", apps.AppKey(key_id="k2", key_name="app:tiny@this-node"))
+    assert authed_client.delete("/v1/apps/tiny").status_code == 204
+    revoked = {r.id: r.revoked_at for r in store.records()}
+    assert revoked["k1"] is not None and revoked["k2"] is not None
