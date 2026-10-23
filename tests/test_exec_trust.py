@@ -121,7 +121,7 @@ class Disk:
     def acl(self, path: Any) -> list[str]:
         return [f"{n}: {entry}" for n, entry in enumerate(self.nodes[_key(path)]["acl"])]
 
-    def mount(self, path: Any) -> frozenset[str]:
+    def mount(self, path: Any, dev: int = 0) -> frozenset[str]:
         key = _key(path)
         return (
             frozenset({"noowners"})

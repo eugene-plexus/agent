@@ -122,32 +122,40 @@ def _acl_entries(path: Path) -> list[str]:
     return [line.strip() for line in done.stdout.splitlines()[1:] if line.strip()]
 
 
-_mounts: tuple[float, list[tuple[str, frozenset[str]]]] | None = None
+#: macOS volume options, by device: what a file's `st_dev` names, read when
+#: a device is first seen and again after a minute.
+_volumes: dict[int, tuple[float, frozenset[str]]] = {}
 
 
-def _mount_options(path: Path) -> frozenset[str]:
-    """macOS: the options of the volume PATH is on (`mount`), read at most
-    once a minute."""
-    global _mounts
+def _mount_options(path: Path, dev: int) -> frozenset[str]:
+    """macOS: the options of the volume PATH is on. `df` names the volume's
+    own mount point (a firmlinked `/usr/local` is on the Data volume, not
+    `/`), and `mount` its options; the answer is kept by device, so a volume
+    mounted a moment ago is read the first time it is met."""
     now = time.perf_counter()
-    if _mounts is None or now - _mounts[0] > 60:
-        done = subprocess.run(
-            ["/sbin/mount"], capture_output=True, text=True, timeout=10, check=False
-        )
-        table = []
-        for line in done.stdout.splitlines():
-            found = re.match(r"^.+? on (.+) \((.*)\)$", line)
-            if found:
-                options = frozenset(o.strip() for o in found.group(2).split(","))
-                table.append((found.group(1), options))
-        _mounts = (now, table)
-    best: tuple[str, frozenset[str]] | None = None
-    text = str(path)
-    for point, options in _mounts[1]:
-        inside = point == "/" or text == point or text.startswith(point.rstrip("/") + "/")
-        if inside and (best is None or len(point) > len(best[0])):
-            best = (point, options)
-    return best[1] if best else frozenset()
+    seen = _volumes.get(dev)
+    if seen is not None and now - seen[0] <= 60:
+        return seen[1]
+    df = subprocess.run(
+        ["/bin/df", "-P", str(path)], capture_output=True, text=True, timeout=10, check=False
+    )
+    lines = df.stdout.splitlines()
+    fields = lines[1].split(None, 5) if len(lines) > 1 else []
+    if len(fields) < 6:
+        raise OSError(f"df named no volume for {path}")
+    point = fields[5]
+    table = subprocess.run(
+        ["/sbin/mount"], capture_output=True, text=True, timeout=10, check=False
+    ).stdout
+    options: frozenset[str] = frozenset()
+    for line in table.splitlines():
+        found = re.match(r"^.+? on (.+) \((.*)\)$", line)
+        if found and found.group(1) == point:
+            options = frozenset(o.strip() for o in found.group(2).split(","))
+    if len(_volumes) > 256:
+        _volumes.clear()
+    _volumes[dev] = (now, options)
+    return options
 
 
 #: macOS ACL answers, by what identifies a file's metadata: a change of
@@ -192,7 +200,13 @@ def _check(path: PurePosixPath, info: os.stat_result, uid: int, given: str) -> N
         )
     if _platform() != "darwin":
         return
-    if "noowners" in _mount_options(Path(str(path))):
+    try:
+        options = _mount_options(Path(str(path)), info.st_dev)
+    except OSError as e:
+        raise Untrusted(
+            f"the volume {path} is on cannot be read ({e}), so {given} is not run"
+        ) from e
+    if "noowners" in options:
         raise Untrusted(
             f"{path} is on a volume that ignores ownership, so nobody can tell who may change "
             f"{given}; Eugene's own account does not run it. {_ADVICE}"
