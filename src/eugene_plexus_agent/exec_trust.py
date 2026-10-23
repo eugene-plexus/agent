@@ -77,7 +77,7 @@ def untrusted(path: Path | str) -> str | None:
         except OSError as e:
             return (
                 f"{path} cannot be checked ({e.strerror or e}), so Eugene's own account "
-                "does not run it."
+                "does not run it"
             )
         if stat.S_ISLNK(info.st_mode):
             continue
@@ -86,13 +86,13 @@ def untrusted(path: Path | str) -> str | None:
             where = f"{path} belongs" if part == real else f"{path} is in {part}, which belongs"
             return (
                 f"{where} to {owner}; Eugene's own account runs programs only from folders it "
-                "or root owns. Move it, or let Eugene fetch its own build."
+                "or root owns. Move it, or let Eugene fetch its own build"
             )
         if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             what = path if part == real else part
             return (
                 f"{what} can be changed by others (mode {stat.S_IMODE(info.st_mode):04o}); "
                 f"Eugene's own account runs {path} only from folders nobody else can change. "
-                "Move it, or let Eugene fetch its own build."
+                "Move it, or let Eugene fetch its own build"
             )
     return None

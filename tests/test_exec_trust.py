@@ -83,7 +83,7 @@ def test_a_file_of_a_person_s_is_refused_naming_its_owner(monkeypatch: pytest.Mo
     reason = exec_trust.untrusted(path)
     assert reason is not None
     assert "belongs to troy" in reason
-    assert "Move it, or let Eugene fetch its own build." in reason
+    assert "Move it, or let Eugene fetch its own build" in reason
 
 
 def test_a_folder_of_a_person_s_above_it_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
