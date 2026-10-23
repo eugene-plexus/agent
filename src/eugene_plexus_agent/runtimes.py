@@ -58,6 +58,7 @@ from .engines import (
     adapter_for,
     default_model_alias,
     interpret_readiness,
+    same_answer,
     speculation,
 )
 from .engines.acquisition import (
@@ -191,6 +192,8 @@ class _RuntimePlanner:
         """The model path the last plan handed the engine. Read for
         `Runtime.openedPath`, because `localPath` is recomputed on every
         read and a folder's mount can change under a running process."""
+        self.same_answer: bool | None = None
+        """The effective setting from the last launch, never from a later profile edit."""
 
     @property
     def name(self) -> str:
@@ -278,8 +281,27 @@ class _RuntimePlanner:
                 ", ".join(f"{k}={v}" for k, v in sorted(injected.items())),
                 self.spec.engine.value,
             )
+        # DI7 is a launch field, not a host prerequisite default. An explicit profile
+        # value beats an ambient variable; the runtime's expert override still wins.
+        if launch_spec.engine is EngineKind.vllm and same_answer.KEY in (launch_spec.flags or {}):
+            env[same_answer.VLLM_ENV] = str(
+                int((launch_spec.flags or {}).get(same_answer.KEY) is True)
+            )
         if self.spec.env:
             env.update({k: str(v) for k, v in self.spec.env.items()})
+
+        self.same_answer = same_answer.effective(launch_spec.engine, argv, env)
+        if self.same_answer is not None:
+            log.info(
+                "%s: Same answer every time: %s (%s)",
+                self.spec.name,
+                "on" if self.same_answer else "off",
+                "one request at a time; others wait"
+                if launch_spec.engine is EngineKind.llama_cpp and self.same_answer
+                else f"final launch arguments and {same_answer.VLLM_ENV} environment"
+                if launch_spec.engine is EngineKind.vllm
+                else "final launch slot count",
+            )
 
         return SpawnPlan(
             argv=argv,
@@ -998,7 +1020,13 @@ class RuntimeSupervisor:
             # demand, whatever the declaration says (`RuntimeSpec.mode`).
             idleUnloadSeconds=None if searching else spec.idleUnloadSeconds,
             startOnDemand=None if searching else spec.startOnDemand,
-            flags=spec.flags,
+            flags=(
+                {**(spec.flags or {}), same_answer.KEY: planner.same_answer}
+                if planner is not None
+                and spec.engine in (EngineKind.llama_cpp, EngineKind.vllm)
+                and status in _PROCESS_RUNNING
+                else spec.flags
+            ),
             extraArgs=spec.extraArgs,
             env=spec.env,
             workingDirectory=spec.workingDirectory,

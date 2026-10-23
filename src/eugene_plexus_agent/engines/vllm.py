@@ -59,7 +59,7 @@ from .._generated.models import (
     RuntimeSpeculation,
 )
 from ..child_env import child_environment
-from . import prompt_cache, speculation
+from . import prompt_cache, same_answer, speculation
 from .base import (
     DiscoveredBinary,
     EngineAdapter,
@@ -246,6 +246,8 @@ class VllmAdapter(EngineAdapter):
         watch it fail on purpose.
         """
         env: dict[str, str] = {}
+        if same_answer.KEY in (spec.flags or {}):
+            env[same_answer.VLLM_ENV] = str(int((spec.flags or {}).get(same_answer.KEY) is True))
         if _is_wsl():
             env["VLLM_WSL2_ENABLE_PIN_MEMORY"] = "1"
         if not _cuda_toolkit_present():
@@ -366,7 +368,10 @@ class VllmAdapter(EngineAdapter):
 
         flags = spec.flags or {}
         for field in self.flag_schema().fields:
-            if field.key == prompt_cache.KV_OFFLOAD_KEY or field.key in speculation.KEYS:
+            if (
+                field.key in (prompt_cache.KV_OFFLOAD_KEY, same_answer.KEY)
+                or field.key in speculation.KEYS
+            ):
                 continue
             if field.key not in flags:
                 continue
@@ -895,6 +900,7 @@ _FLAG_CLI_NAMES: dict[str, str] = {
 }
 
 _FLAG_FIELDS: list[ConfigField] = [
+    same_answer.field(EngineKind.vllm),
     ConfigField(
         key=speculation.REUSE_TEXT_KEY,
         label="Reuse repeated text",
