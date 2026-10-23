@@ -68,7 +68,7 @@ from .engines.acquisition import (
     Release,
     Unavailable,
 )
-from .engines.base import DiscoveredBinary, with_engine_version
+from .engines.base import DiscoveredBinary, UntrustedBinaryError, with_engine_version
 from .engines.devices import DeviceSnapshot, DevicesReader, detect_devices
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
@@ -184,6 +184,9 @@ class _RuntimePlanner:
         # config (2026-09-14). This node's `pathMappings` are the
         # overrides and come first.
         self._inherited_rules = inherited_rules
+        self.refused_binary: str | None = None
+        """This runtime's own `binary`, when the last plan refused it because
+        Eugene's own account will not run it (row 8): `Runtime.refusedBinary`."""
         self.binary: DiscoveredBinary | None = None
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
         so the operator sees the build that is actually running rather than
@@ -216,8 +219,14 @@ class _RuntimePlanner:
             # A declared runtime whose engine is missing is a crash, not a
             # skipped entry: the operator asked for something that cannot
             # be delivered and needs to hear about it.
+            self.refused_binary = (
+                self.spec.binary
+                if isinstance(e, UntrustedBinaryError) and self.spec.binary
+                else None
+            )
             raise SpawnPlanError(str(e)) from e
 
+        self.refused_binary = None
         self.binary = binary
         port = self.spec.port
         if port is None:
@@ -1046,6 +1055,7 @@ class RuntimeSupervisor:
             capabilities=capabilities,
             lastRestart=last_restart,
             lastError=last_error,
+            refusedBinary=planner.refused_binary if planner is not None else None,
             loadProgress=load_progress,
             speculation=self._speculation_for(spec, adapter, argv, status),
             promptCache=self._prompt_cache_for(spec, adapter, argv, status),

@@ -153,6 +153,16 @@ class EngineUnavailableError(Exception):
     """
 
 
+class UntrustedBinaryError(EngineUnavailableError):
+    """A program Eugene's own account will not run (row 8, `exec_trust`).
+    `path` is the path as it was named, so a runtime can say which of its
+    settings to change."""
+
+    def __init__(self, message: str, path: str) -> None:
+        super().__init__(message)
+        self.path = path
+
+
 @dataclass(frozen=True)
 class NotAnswering:
     """We have no readiness information about the engine.
@@ -466,7 +476,7 @@ class EngineAdapter(abc.ABC):
         try:
             return exec_trust.trusted_program(path)
         except exec_trust.Untrusted as e:
-            raise EngineUnavailableError(str(e)) from e
+            raise UntrustedBinaryError(str(e), str(path)) from e
 
     def probe_version(self, binary: Path) -> str | None:
         """Ask the binary what it is. None when it won't say.

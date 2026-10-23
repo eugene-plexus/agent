@@ -5984,6 +5984,10 @@ class Runtime(BaseModel):
         None,
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
     )
+    refusedBinary: str | None = Field(
+        None,
+        description="The program this runtime's `binary` names, when the agent runs\nin Eugene's own account and will not run it because someone\nother than root or that account could change it (row 8):\n`lastError` says who. The way out a console offers is to clear\n`binary` (`PATCH /v1/runtimes/{name}` with the spec without it),\nso the runtime runs Eugene's own build of the engine, installed\nfirst with `POST /v1/engines/{engine}/install` when there is\nnone. Absent otherwise; cleared on a successful start.\n",
+    )
     loadProgress: LoadProgress | None = None
     speculation: RuntimeSpeculation | None = None
     promptCache: RuntimePromptCache | None = None

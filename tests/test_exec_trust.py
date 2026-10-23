@@ -427,6 +427,45 @@ def test_the_checked_path_is_what_runs_and_is_probed(
     assert probed == [checked]
 
 
+def test_a_refused_runtime_binary_is_named_for_the_console_and_cleared_when_it_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`Runtime.refusedBinary`: the runtime's own `binary`, which the
+    console offers to clear so Eugene's own build runs instead."""
+    import logging
+
+    from eugene_plexus_agent.runtimes import RuntimeSupervisor, _RuntimePlanner
+    from eugene_plexus_agent.supervisor import SpawnPlanError
+
+    exe = tmp_path / "llama-server"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = _spec(binary=str(exe), port=8090)
+
+    def refuse(path: Any) -> Path:
+        raise exec_trust.Untrusted(
+            f"{path} belongs to troy; Eugene's own account runs programs only"
+        )
+
+    monkeypatch.setattr(exec_trust, "trusted_program", refuse)
+    planner = _RuntimePlanner(
+        spec,
+        LlamaCppAdapter(),
+        logging.getLogger("test"),
+        get_config=lambda key: [str(tmp_path)] if key == "engineBinaryRoots" else None,
+    )
+    with pytest.raises(SpawnPlanError, match="belongs to troy"):
+        planner.plan()
+    assert planner.refused_binary == str(exe)
+    supervisor = RuntimeSupervisor(log=logging.getLogger("test"))
+    supervisor._planners[spec.name] = planner
+    assert supervisor.compose(spec).refusedBinary == str(exe)
+
+    monkeypatch.setattr(exec_trust, "trusted_program", lambda path: Path(str(path)))
+    monkeypatch.setattr(LlamaCppAdapter, "probe_version", lambda self, binary: "1")
+    planner.plan()
+    assert planner.refused_binary is None
+
+
 def test_a_configured_engine_binary_is_refused_before_its_environment_is_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
