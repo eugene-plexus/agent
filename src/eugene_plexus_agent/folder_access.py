@@ -40,6 +40,7 @@ MESSAGES = {
     "system": "Eugene does not give apps system folders.",
     "eugene": "This is Eugene's own folder.",
     "home": "This is inside a person's home. Use a Job Site to work in your own folders.",
+    "unsafe_parent": "can be changed by other accounts.",
     "unavailable": UNAVAILABLE,
 }
 WINDOWS_HOMES = ("Users",)
@@ -78,6 +79,7 @@ class Facts:
     eugene: tuple[str, ...] = ()
     homes: tuple[str, ...] = ()
     system: tuple[str, ...] = ()
+    unsafe_parent: str = ""
 
 
 def _path(value: str) -> PurePath:
@@ -109,6 +111,8 @@ def refusal(facts: Facts) -> str | None:
         or any(ord(c) < 32 or ord(c) == 127 for c in facts.path)
     ):
         return "not_a_folder"
+    if facts.unsafe_parent:
+        return "unsafe_parent"
     if facts.mount_root or str(path) == path.anchor:
         return "drive_root"
     if any(path.is_relative_to(_path(root)) for root in facts.eugene):
@@ -145,7 +149,13 @@ def refusal(facts: Facts) -> str | None:
 class Refused(ValueError):
     def __init__(self, cause: str, detail: str = "") -> None:
         self.cause = cause
-        super().__init__(f"{MESSAGES[cause]} {detail}".strip())
+        super().__init__(
+            (
+                f"{detail} {MESSAGES[cause]}"
+                if cause == "unsafe_parent"
+                else f"{MESSAGES[cause]} {detail}"
+            ).strip()
+        )
 
 
 class RemovalIncomplete(OSError):
@@ -216,7 +226,11 @@ class Access:
                 if row["state"] == "ready":
                     try:
                         facts, identity = self._inspect(row["path"])
-                        if facts.link or not _same_identity(identity, row["identity"]):
+                        if facts.unsafe_parent and not identity:
+                            raise InspectionFailed(
+                                f"{facts.unsafe_parent} can be changed by other accounts"
+                            )
+                        if not _same_identity(identity, row["identity"]):
                             row.update(
                                 state="changed_outside",
                                 message=(
@@ -269,7 +283,7 @@ class Access:
         with _LOCK:
             facts, identity = self._inspect(path)
             if cause := refusal(facts):
-                raise Refused(cause, path)
+                raise Refused(cause, facts.unsafe_parent or path)
             rows = self._read()
             for existing in rows.values():
                 if (
@@ -379,9 +393,12 @@ class Access:
             _RUNNING.add(ident)
             self._write(rows)
         try:
-            facts, identity = self._inspect(row["path"])
-            if facts.link or (facts.is_dir and not _same_identity(identity, row["identity"])):
-                raise ValueError("The folder was replaced.")
+            # The Linux broker opens the root-owned ledger's path and validates
+            # its saved identity. New-grant inspection must never gate revoke.
+            if not isinstance(self.permissions, LinuxPermissions):
+                facts, identity = self._inspect(row["path"])
+                if facts.link or (facts.is_dir and not _same_identity(identity, row["identity"])):
+                    raise ValueError("The folder was replaced.")
             if row["delta"] is not None and not self.permissions.revoke(row["path"], row["delta"]):
                 raise ValueError("The recorded permissions were changed outside Eugene.")
             row.update(
@@ -888,7 +905,7 @@ class LinuxPermissions:
     def grant(self, path: str, mode: str, save: Callable[[dict], None]) -> tuple[dict, int, bool]:
         facts, identity = self.inspect(path)
         if cause := refusal(facts):
-            raise Refused(cause, path)
+            raise Refused(cause, facts.unsafe_parent or path)
         ident = uuid.uuid4().hex
         delta = dict(added=True, id=ident, identity=identity)
         save(delta)

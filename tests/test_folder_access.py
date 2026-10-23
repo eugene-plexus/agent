@@ -248,7 +248,7 @@ def test_linux_unreadable_folder_uses_root_inspection(tmp_path: Path, monkeypatc
     assert access.listing("workbench")[0].state == "ready"
     assert access.lookup("workbench", path)[0].id == grant.id
     assert access.remove("workbench", grant.id).state == "removed"
-    assert len(inspected) == 5  # add, grant, listing, lookup and remove
+    assert len(inspected) == 4  # add, grant, listing and lookup; revoke uses its ledger
     assert not list(backend.ctl.glob("*.path"))
 
 
@@ -291,6 +291,91 @@ def test_linux_inspection_failure_cleans_request(tmp_path: Path, monkeypatch) ->
     with pytest.raises(OSError, match="folder drive is unavailable"):
         backend.inspect("/srv/project")
     assert not list(backend.ctl.glob("*.path"))
+
+
+@pytest.mark.parametrize(
+    ("extra", "cause"),
+    [
+        ({"homes": ["/srv/shared/person"]}, "home"),
+        ({"system": ["/srv/shared"]}, "system"),
+        ({"eugene": ["/srv/shared"]}, "eugene"),
+        ({"mount_root": True}, "drive_root"),
+        ({"unsafe_parent": "/srv"}, "unsafe_parent"),
+    ],
+)
+@pytest.mark.parametrize("identity_available", [False, True])
+def test_linux_removal_uses_saved_grant_when_new_grants_are_refused(
+    tmp_path: Path, monkeypatch, extra, cause, identity_available
+) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(fa, "sys", SimpleNamespace(platform="linux"))
+    policy = {}
+    calls = []
+    granted = []
+
+    def helper(verb, ident, mode="read"):
+        calls.append((verb, ident))
+        if verb == "folder-inspect":
+            # An older broker (or an unsafe parent) cannot return an identity.
+            return {
+                "facts": {"path": "/srv/shared", **policy},
+                "identity": (
+                    []
+                    if policy and (not identity_available or cause == "unsafe_parent")
+                    else [10, 20, 30]
+                ),
+            }
+        if verb == "folder-grant":
+            granted.append(ident)
+            return {"added": True}
+        assert verb == "folder-revoke"
+        assert ident == granted[0]  # The broker selects its root-owned ledger.
+        return {"removed": True}
+
+    monkeypatch.setattr(backend, "_ask", helper)
+    access = fa.Access(tmp_path / "access.json", backend)
+    grant = access.add("workbench", "/srv/shared", "read", "operator")
+    assert grant.state == "ready"
+    policy.update(extra)
+    with pytest.raises(fa.Refused) as exc:
+        access.add("workbench", "/srv/shared", "read", "operator")
+    assert exc.value.cause == cause
+    if cause == "unsafe_parent":
+        assert "/srv can be changed by other accounts" in str(exc.value)
+    elif identity_available:
+        assert access.listing("workbench")[0].state == "ready"
+    calls.clear()
+    assert access.remove("workbench", grant.id).state == "removed"
+    assert calls == [("folder-revoke", granted[0])]
+
+
+def test_linux_unsafe_parent_listing_can_recover_without_reporting_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(fa, "sys", SimpleNamespace(platform="linux"))
+    unsafe = False
+
+    def helper(verb, *args):
+        if verb == "folder-inspect":
+            return {
+                "facts": {"path": "/srv/shared", **({"unsafe_parent": "/srv"} if unsafe else {})},
+                "identity": [] if unsafe else [10, 20, 30],
+            }
+        return {"added": True}
+
+    monkeypatch.setattr(backend, "_ask", helper)
+    access = fa.Access(tmp_path / "access.json", backend)
+    access.add("workbench", "/srv/shared", "read", "operator")
+    before = access.file.read_bytes()
+    unsafe = True
+    row = access.listing("workbench")[0]
+    assert row.state == "changed_outside"
+    assert "/srv can be changed by other accounts" in row.message
+    assert "replaced" not in row.message
+    assert access.file.read_bytes() == before
+    unsafe = False
+    assert access.listing("workbench")[0].state == "ready"
 
 
 def test_linux_waits_past_900_seconds_for_helper(tmp_path: Path, monkeypatch) -> None:
