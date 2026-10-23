@@ -106,6 +106,18 @@ def test_the_recipe_asks_for_a_native_arm64_python() -> None:
     assert command.index("--python cpython-3.12") < command.index("~/eugene-mlx &&"), command
 
 
+def test_the_recipe_builds_on_uv_s_own_python_never_one_installed_on_the_mac() -> None:
+    """Row 8c: Eugene's own account runs an environment only when the
+    Python it was made from can be changed by root and that account alone.
+    A python.org framework (`/Library/Frameworks/Python.framework`, group
+    writable) or Homebrew's (the person's) cannot be, and uv picked the
+    framework on GitHub's macOS 14 runner (A4 30, 44). Its own managed
+    Python lands in the account's own folder."""
+    command = MlxAdapter().manual_install(APPLE).command or ""
+    venv = command.split("&&")[0]
+    assert "--python-preference only-managed" in venv, command
+
+
 def test_the_recipe_falls_back_to_uv_on_path_then_to_the_word(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr(sys, "prefix", str(tmp_path / "venv"))
     monkeypatch.setattr(mlx.shutil, "which", lambda name: "/opt/homebrew/bin/uv")
