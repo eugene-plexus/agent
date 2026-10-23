@@ -644,7 +644,10 @@ class StrataAdapter(EngineAdapter):
             gpu = config.get("gpu")
             cards = settings.selected_cards(detect_devices(), [gpu] if type(gpu) is int else gpu)
             indices = [d.index for d in cards]
-            config["gpu"] = indices if len(indices) > 1 else indices[0]
+            if indices:
+                config["gpu"] = indices if len(indices) > 1 else indices[0]
+            else:
+                config.pop("gpu", None)
             config["layer_split"] = settings.layer_split(config.get("layer_split"), len(cards))
         except ValueError as exc:
             raise SpawnPlanError(str(exc)) from exc

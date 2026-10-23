@@ -35,12 +35,11 @@ def gpu_selection(value: object) -> list[int]:
 
 
 def selected_cards(snapshot: DeviceSnapshot, value: object = None) -> list[ComputeDevice]:
-    """This recipe installs CUDA 13. No substitute for an explicitly named card."""
+    """Automatic selection may use CPU; explicit cards require discrete CUDA."""
     cards = [d for d in snapshot.devices if d.kind is ComputeDeviceKind.cuda and not d.sharedMemory]
     if value is None:
         if not cards:
-            cause = "; ".join(snapshot.warnings) or "no discrete CUDA card is present"
-            raise ValueError(f"Strata's CUDA 13 engine has no compatible card here: {cause}")
+            return []
         return [min(cards, key=lambda d: (-round((d.memoryTotalBytes or 0) / 2**30), d.index or 0))]
     indices = gpu_selection(value)
     out = []
@@ -144,10 +143,8 @@ def apply_projection(cfg: dict[str, object], mode: object, root: Path) -> None:
     cfg["sampling"] = {**sampling, "experimental_speed_projection": requested == "on"}
 
 
-def effective_launch(cfg: dict[str, object]) -> StrataEffectiveLaunch:
-    """Only the applied configuration; no profile or preparation defaults."""
-    gpu = cfg.get("gpu")
-    gpus = gpu_selection([gpu] if type(gpu) is int else gpu)
+def effective_projection(cfg: dict[str, object]) -> str:
+    """Applied vector and sampling default, independent of card selection."""
     args = cfg.get("args")
     if not isinstance(args, list):
         raise ValueError("launch has no native arguments")
@@ -158,11 +155,20 @@ def effective_launch(cfg: dict[str, object]) -> StrataEffectiveLaunch:
     if "--control-vector-scaled" in args:
         value = str(args[args.index("--control-vector-scaled") + 1])
         on = float(value.rsplit(":", 1)[1]) != 0
+    return "on" if on and sampling.get("experimental_speed_projection") is not False else "off"
+
+
+def effective_launch(cfg: dict[str, object]) -> StrataEffectiveLaunch | None:
+    """Only the applied configuration; no profile or preparation defaults."""
+    gpu = cfg.get("gpu")
+    # The GPU snapshot requires known card ordinals. An automatic CPU launch
+    # has none; keep its optional snapshot absent instead of inventing a card.
+    if gpu is None:
+        return None
+    gpus = gpu_selection([gpu] if type(gpu) is int else gpu)
     return StrataEffectiveLaunch.model_validate(
         {
-            "speedProjection": "on"
-            if on and sampling.get("experimental_speed_projection") is not False
-            else "off",
+            "speedProjection": effective_projection(cfg),
             "gpus": gpus,
             "layerSplit": layer_split(cfg.get("layer_split"), len(gpus)),
         }

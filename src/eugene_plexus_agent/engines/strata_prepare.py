@@ -459,7 +459,8 @@ class StrataPreparation:
 
     def run(self, progress: Progress) -> PreparationResult:
         try:
-            settings.selected_cards(detect_devices(), self.gpus)
+            if self.gpus:
+                settings.selected_cards(detect_devices(), self.gpus)
         except ValueError as exc:
             raise PreparationError(str(exc)) from exc
         check_tools(self.root)
@@ -657,7 +658,7 @@ class StrataPreparation:
             raise PreparationError(f"Strata's setup wrote {self.config_name} without its args")
         args = [str(a) for a in cfg["args"]]
         gpu = cfg.get("gpu")
-        actual = [gpu] if type(gpu) is int else gpu
+        actual = [gpu] if type(gpu) is int else [] if gpu is None else gpu
         if actual != self.gpus:
             raise PreparationError(
                 f"Strata's setup selected cards {actual} instead of requested cards "
@@ -674,7 +675,7 @@ class StrataPreparation:
                 f"Strata's setup selected layer split {actual_split} "
                 f"instead of requested {self.layer_split}"
             )
-        applied = settings.effective_launch(cfg).speedProjection.value
+        applied = settings.effective_projection(cfg)
         if applied != self.speed_projection:
             progress.warn(
                 f"Strata's setup left speed projection {applied} instead of requested "

@@ -65,6 +65,50 @@ def prepared(tmp_path, monkeypatch):
     return root, server, config, cfg
 
 
+@pytest.mark.parametrize("card_count", [0, 1, 2])
+@pytest.mark.parametrize("flags", [None, {}, {"speedProjection": "off", "layerSplit": "auto"}])
+def test_start_without_card_choices_keeps_automatic_launch_defaults(
+    authed_client, prepared, monkeypatch, card_count, flags
+):
+    from .conftest import fake_devices
+
+    _, server, config, _ = prepared
+    original = config.read_bytes()
+    snapshot = fake_devices(count=card_count)
+    monkeypatch.setattr(strata, "detect_devices", lambda: snapshot)
+    authed_client.app.state.device_detector = lambda: snapshot
+    authed_client.patch("/v1/config", json={"strataServer": str(server)})
+    request = {
+        "name": "automatic",
+        "engine": "strata",
+        "modelPath": str(_provenance(config.parent, entry=config.name)),
+        "port": 18234,
+        "autoStart": False,
+        "autoDriver": False,
+        "flags": flags,
+    }
+    created = authed_client.post("/v1/runtimes", json=request)
+    assert created.status_code == 201, created.text
+    started = authed_client.post("/v1/runtimes/automatic/start")
+    assert started.status_code == 202, started.text
+
+    adapter = strata.StrataAdapter()
+    monkeypatch.setattr(
+        adapter, "resolve_binary", lambda *a, **kw: DiscoveredBinary(server, Origin.configured)
+    )
+    launch = _RuntimePlanner(
+        RuntimeSpec.model_validate(request), adapter, logging.getLogger("test")
+    ).plan()
+    saved = json.loads(Path(launch.argv[launch.argv.index("--config") + 1]).read_text())
+    assert saved.get("gpu") == (0 if card_count else None)
+    assert saved.get("layer_split") is None
+    assert "--control-vector-scaled" not in saved["args"]
+    assert launch.launch_settings == (
+        {"speedProjection": "off", "gpus": [0], "layerSplit": None} if card_count else None
+    )
+    assert config.read_bytes() == original
+
+
 def test_layer_split_is_accepted_and_validated(prepared):
     root, server, config, cfg = prepared
     cfg.update(gpu=[2, 0], layer_split=[24])

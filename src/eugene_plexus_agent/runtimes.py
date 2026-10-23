@@ -314,7 +314,7 @@ class _RuntimePlanner:
         )
 
     @staticmethod
-    def _strata_launch_settings(argv: list[str]) -> dict[str, object]:
+    def _strata_launch_settings(argv: list[str]) -> dict[str, object] | None:
         from .engines.strata_settings import effective_launch
 
         # Snapshot this private configuration now. The process records it only
@@ -323,9 +323,8 @@ class _RuntimePlanner:
             import json
 
             config = Path(argv[argv.index("--config") + 1])
-            return effective_launch(json.loads(config.read_text(encoding="utf-8"))).model_dump(
-                mode="json"
-            )
+            applied = effective_launch(json.loads(config.read_text(encoding="utf-8")))
+            return applied.model_dump(mode="json") if applied is not None else None
         except (OSError, ValueError, IndexError) as exc:
             raise SpawnPlanError(
                 f"Cannot read Strata's applied launch configuration: {exc}"

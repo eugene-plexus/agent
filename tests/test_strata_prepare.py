@@ -95,6 +95,8 @@ cfg = {"exe": str(ROOT / "engine" / "strata.exe"), "args": args, "cwd": str(ROOT
        "tokenizer": str(pack / "tokenizer"), "model_name": "qwen3.8-flash-next-" + a.model.lower(),
        "log": str(ROOT / f"strata-{tag}.log"), "lib_dirs": [], "port": 8080}
 cfg["gpu"] = [int(x) for x in a.gpus.split(",")] if a.gpus else int(a.gpu or 0)
+if os.environ.get("FAKE_SETUP_NO_GPU"):
+    cfg.pop("gpu")
 if a.gpus:
     cfg["layer_split"] = a.layer_split or "auto"
     args += ["--mmap-experts", "--remote-expert-opt"]
@@ -188,6 +190,29 @@ def test_the_projection_follows_the_setting(build, mode):
     recipe = _plan(build, speed_projection=mode)
     argv = recipe.argv()
     assert argv[argv.index("--experimental-speed-projection") + 1] == mode
+
+
+def test_preparation_without_card_choices_on_a_cpu_node(build, monkeypatch):
+    from .conftest import fake_devices
+
+    monkeypatch.setattr(strata_prepare, "detect_devices", lambda: fake_devices(count=0))
+    monkeypatch.setenv("FAKE_SETUP_NO_GPU", "1")
+    recipe = _plan(build)
+    assert "--gpu" not in recipe.argv() and "--gpus" not in recipe.argv()
+    result = recipe.run(Progress())
+    cfg = json.loads(result.entry.read_text())
+    assert "gpu" not in cfg
+    assert cfg.get("layer_split") is None
+    assert "--control-vector-scaled" not in cfg["args"]
+
+
+@pytest.mark.parametrize("gpus", [[], [0], [0, 2]])
+def test_cpu_preparation_refuses_explicit_card_choices(build, monkeypatch, gpus):
+    from .conftest import fake_devices
+
+    monkeypatch.setattr(strata_prepare, "detect_devices", lambda: fake_devices(count=0))
+    with pytest.raises(PreparationError, match=r"nonempty|card 0.*cpu"):
+        _plan(build, gpus=gpus)
 
 
 def test_preparation_uses_selected_cards_and_layer_boundaries(build, monkeypatch):
