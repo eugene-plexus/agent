@@ -153,17 +153,37 @@ async def _reconcile(app: Any) -> None:
     supervisor = getattr(app.state, "supervisor", None)
     home = config_dir(state)
     entry = state.get_topology_entry(STANDBY_COMPONENT)
-    if promoted(state) and listed_root(app) != app.state.node_identity.record.name:
-        # Row 4 review: the mark holds only while a signed list names this
-        # machine the root. A mark no list backs (written by hand, or kept
-        # after another machine was promoted) is dropped, and the copy is
-        # no longer this machine's root.
-        state.set_standby_promoted(False)
-        log.warning(
-            "the machine list this node holds does not name this machine the root, so its "
-            "copy is not served as the root"
-        )
+    me = app.state.node_identity.record.name
+    if promoted(state) and entry is not None:
+        # Row 4 review: the mark holds only while signed evidence names this
+        # machine the root: a list that names it, or (re-review) while no
+        # list names any root at the epoch held, a bundle signed at the
+        # epoch the copy says it is the root at, with no standby grant here.
+        # A mark nothing backs (written by hand, or kept after another
+        # machine was promoted) is dropped.
+        root = listed_root(app)
+        keep = root == me
+        if root is None:
+            role, epoch = await _local_health(entry)
+            keep = (
+                role == ROLE_ACTIVE
+                and _bundle_names_promotion(app, epoch)
+                and (_promoted_unannounced(app, epoch) or _follows_own_copy(app, entry, epoch))
+            )
+        if not keep:
+            state.set_standby_promoted(False)
+            log.warning(
+                "no signed list or bundle this node holds says this machine is the root, so "
+                "its copy is not served as the root"
+            )
     want = wanted(app)
+    if want and entry is not None and not promoted(state):
+        # Row 4 re-review: a copy promoted here, and restarted before this
+        # agent heard (a crash before any push), runs as the root and may be
+        # locked. Its own signed bundle is the evidence: taken, it ends the
+        # grant here, and the copy is marked below.
+        await _take_promotion_from_the_copy(app, entry)
+        want = wanted(app)
     if want and hosts_active_control(state):
         if entry is None:
             log.error(
@@ -217,6 +237,10 @@ async def _reconcile(app: Any) -> None:
                 app.state.standby_promoted_said = True
             if not promoted(state) and _named_root(app, epoch):
                 _mark_promoted(app, state, epoch)
+            elif not promoted(state) and _promoted_unannounced(app, epoch):
+                _mark_promoted(app, state, epoch)
+                _follow_own_copy(app, entry, int(epoch or 0))
+            await _note_root_lock(app)
             return
         if role != ROLE_STANDBY:
             log.warning(
@@ -233,6 +257,120 @@ async def _reconcile(app: Any) -> None:
         if state.standby_promoted():
             state.set_standby_promoted(False)
         await asyncio.to_thread(_delete_copy, home)
+    await _note_root_lock(app)
+
+
+def _bundle_names_promotion(app: Any, epoch: int | None) -> bool:
+    """The bundle this node holds, signed by the install's identity, is at
+    `epoch`, at least the epoch held, and grants this node no standby: the
+    signed side of a promotion of the copy that says it is the root at
+    `epoch` (row 4 re-review)."""
+    bundle = app.state.auth_state.trust.bundle
+    held = app.state.node_identity.record.epoch or 0
+    return (
+        isinstance(epoch, int)
+        and bundle is not None
+        and bundle.epoch == epoch
+        and epoch >= held
+        and not wanted(app)
+    )
+
+
+def _promoted_unannounced(app: Any, epoch: int | None) -> bool:
+    """`_bundle_names_promotion`, at an epoch above the one this node's root
+    address came with: the copy was promoted, and no list has moved this
+    node yet. A copy that only says `control` at the epoch this node already
+    follows (one started without its role) is not this."""
+    record = app.state.node_identity.record
+    return (
+        _bundle_names_promotion(app, epoch)
+        and isinstance(epoch, int)
+        and epoch > int(record.control_url_epoch or 0)
+        and listed_root(app) in (None, record.name)
+    )
+
+
+def _own_address(app: Any, entry: ComponentEntry) -> str:
+    """Where this node reaches its own copy: this machine's port in its
+    plain form, or the copy's own loopback address without one."""
+    from . import machine_port
+
+    door = machine_port.machine_url(app)
+    return door.replace("https://", "http://", 1) if door else str(entry.url).rstrip("/")
+
+
+def _follows_own_copy(app: Any, entry: ComponentEntry, epoch: int | None) -> bool:
+    """This node already follows its own copy at `epoch` (`_follow_own_copy`)."""
+    record = app.state.node_identity.record
+    return (
+        isinstance(epoch, int)
+        and record.control_url_epoch == epoch
+        and (record.control_url or "").rstrip("/") == _own_address(app, entry)
+    )
+
+
+async def _take_promotion_from_the_copy(app: Any, entry: ComponentEntry) -> None:
+    """When the local copy says it is the root at an epoch above any this
+    node holds, take the bundle it signed at its promotion (it serves it
+    locked too), verified against the install's identity. Nothing else
+    changes here; the bundle ends the grant, and `_reconcile` goes on."""
+    role, epoch = await _local_health(entry)
+    record = app.state.node_identity.record
+    if role != ROLE_ACTIVE or not isinstance(epoch, int):
+        return
+    if epoch <= max(int(record.epoch or 0), int(record.control_url_epoch or 0)):
+        return
+    client = shared_internal_client("standby-health", timeout=5.0)
+    try:
+        response = await client.get(f"{str(entry.url).rstrip('/')}/v1/trust/bundle")
+        jws = str(response.json()["jws"])
+        taken = app.state.auth_state.trust.accept(jws)
+    except Exception as exc:
+        log.warning(
+            "this machine's copy says it is the root at epoch %d, but its bundle could not "
+            "be taken: %s",
+            epoch,
+            exc,
+        )
+        return
+    log.warning(
+        "this machine's copy was promoted to the root at epoch %d before this agent heard: "
+        "took the bundle it signed",
+        taken.epoch,
+    )
+
+
+def _follow_own_copy(app: Any, entry: ComponentEntry, epoch: int) -> None:
+    """This node follows the root its own copy now is: the other machines
+    learn its address from the list it signs once it is unlocked, and this
+    one, from its own copy. Through this machine's port when it has one."""
+    url = _own_address(app, entry)
+    app.state.node_identity.follow_root(url, epoch)
+    machines = getattr(app.state, "machine_trust", None)
+    if machines is not None:
+        machines.rebuild()
+    log.warning("this node follows its own copy, the install's root at epoch %d, at %s", epoch, url)
+
+
+async def _note_root_lock(app: Any) -> None:
+    """`NodeIdentity.rootLocked`: whether the root this machine runs is
+    locked, from its `/healthz` (row 4 re-review). Home says so."""
+    from . import machine_port
+
+    state: AgentState = app.state.agent_state
+    entry = machine_port.active_control_entry(state)
+    if entry is None:
+        app.state.root_locked = None
+        return
+    details = await _local_details(entry)
+    locked = details.get("locked") if details is not None else None
+    was = getattr(app.state, "root_locked", None)
+    app.state.root_locked = locked if isinstance(locked, bool) else None
+    if app.state.root_locked and not was:
+        log.warning(
+            "the install's root on this machine is locked: sign in on this machine's console "
+            "to unlock it"
+        )
 
 
 def listed_root(app: Any) -> str | None:
@@ -295,16 +433,23 @@ def _mark_promoted(app: Any, state: AgentState, epoch: int | None) -> None:
             log.warning("could not write the machine door file for the promoted copy")
 
 
-async def _local_health(entry: ComponentEntry) -> tuple[str | None, int | None]:
-    """What the local control root says it is, and at which epoch, from its
-    `/healthz` (`details.role`, `details.epoch`)."""
+async def _local_details(entry: ComponentEntry) -> dict[str, Any] | None:
+    """The local control root's `/healthz` details, or None without an
+    answer."""
     client = shared_internal_client("standby-health", timeout=5.0)
     try:
         response = await client.get(f"{str(entry.url).rstrip('/')}/healthz")
         details = response.json().get("details") or {}
     except Exception:
-        return None, None
-    if not isinstance(details, dict):
+        return None
+    return details if isinstance(details, dict) else None
+
+
+async def _local_health(entry: ComponentEntry) -> tuple[str | None, int | None]:
+    """What the local control root says it is, and at which epoch, from its
+    `/healthz` (`details.role`, `details.epoch`)."""
+    details = await _local_details(entry)
+    if details is None:
         return None, None
     role, epoch = details.get("role"), details.get("epoch")
     return (

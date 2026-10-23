@@ -293,6 +293,11 @@ async def pull_once(app: Any, client: httpx.AsyncClient) -> Heard:
             await ask_standby(app, client)
     else:
         app.state.root_silent_since = None
+    if heard is not Heard.LISTED:
+        # Row 4 re-review: a copy promoted here, and restarted before any
+        # push, is found on the minute even while the root this node names
+        # does not answer; and whether the root here is locked stays known.
+        await standby.reconcile(app)
     return heard
 
 

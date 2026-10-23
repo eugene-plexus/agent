@@ -163,8 +163,14 @@ def test_higher_epoch_list_moves_control_url_and_reannounces(app: FastAPI) -> No
 
 
 def _operator(app: FastAPI, root: FakeRoot) -> dict[str, str]:
+    """A session the root signed at the epoch it is at: one without `ep` is
+    refused once this node knows of a promotion (row 4 re-review)."""
     name = app.state.node_identity.record.name
-    return {"Authorization": f"Bearer {root.session(f'node:{name}', 'control')}"}
+    signer = tokens.Signer(key=root.token.key, issuer="control", epoch=root.epoch)
+    token, _ = signer.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=[f"node:{name}", "control"], ttl_seconds=600
+    )
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_a_node_updated_to_this_row_keeps_its_root(tmp_path: Path) -> None:
@@ -329,12 +335,14 @@ def test_a_list_naming_this_machine_marks_its_copy_with_no_address(
         root.register("me", app.state.auth_state.trust.signer().key.public_key(), ())
         took = client.post("/v1/node/trust-bundle", json={"jws": root.bundle().jws})
         assert took.status_code == 200, took.text
-        assert not standby.promoted(state), "no list names this machine yet"
+        # The bundle signed at the copy's epoch, with no grant here, is the
+        # evidence (row 4 re-review): this node follows its own copy.
+        assert standby.promoted(state)
+        assert app.state.node_identity.record.control_url == "http://127.0.0.1:9"
 
         listed = _push(client, _list(root, 3, control=_naming(2, None, node="me")))
         assert listed.status_code == 204, listed.text
-        assert standby.promoted(state)
-        assert app.state.node_identity.record.control_url == ROOT_A, "no address to move to"
+        assert standby.promoted(state), "the list naming this machine keeps it"
 
 
 # --------------------------------------------------------------------------- the review
@@ -596,3 +604,124 @@ def test_a_promoted_mark_no_list_backs_is_dropped(
     asyncio.run(standby.reconcile(app))
     assert not standby.promoted(state)
     assert not standby.hosts_active_control(state)
+
+
+# --------------------------------------------------------------------------- the re-review
+
+
+def test_a_root_token_without_an_epoch_is_refused_once_a_promotion_is_known(
+    app: FastAPI,
+) -> None:
+    """A root older than row 4 signs no `ep`, and neither did the root a
+    promotion replaced: once this node knows of a promotion, such a token
+    commands nothing. It knows from a list at an epoch above its bundle's,
+    or from holding an epoch above the one it had when it joined (row 4
+    re-review, blocker 1a)."""
+    root = FakeRoot()
+    root.epoch = 2
+    app.state.control_transport = httpx.MockTransport(_Root(root))
+    legacy = tokens.Signer(key=root.token.key, issuer="control")
+    spec = {"name": "x", "engine": "llama_cpp", "modelPath": "/m.gguf", "autoStart": False}
+    with TestClient(app) as client:
+        enroll_app(app, root, "me", control_url=ROOT_A)
+        assert app.state.node_identity.record.legacy_token_epoch == 2
+        command, _ = legacy.mint(
+            typ=tokens.TYP_SESSION, sub="operator", aud=["node:me"], ttl_seconds=600
+        )
+        auth = {"Authorization": f"Bearer {command}"}
+        assert client.get("/v1/node", headers=auth).status_code == 200, "no promotion known"
+
+        _moved_to_b(app, root, client)  # the list at epoch 3, the bundle still at 2
+        service, _ = legacy.mint(
+            typ=tokens.TYP_SERVICE, sub="control", aud=["node:me"], ttl_seconds=300
+        )
+        refused = client.post(
+            "/v1/runtimes", json=spec, headers={"Authorization": f"Bearer {service}"}
+        )
+        assert refused.status_code == 401
+        assert "no longer follows" in refused.text
+        # The bundle at epoch 3 arrives: the epoch held is above the one held
+        # at joining, and a token without `ep` still commands nothing.
+        root.epoch = 3
+        app.state.auth_state.trust.accept(root.bundle().jws)
+        assert client.get("/v1/node", headers=auth).status_code == 401
+
+
+def test_a_restart_does_not_reopen_a_list_without_a_root_epoch(tmp_path: Path) -> None:
+    """The node has taken a list that names its root; the new root's bundle
+    arrives, then the node restarts before its list does, and the kept list
+    (now below the epoch held) is not loaded. A list naming no root is still
+    a replay: refused, and not kept (row 4 re-review, blocker 2)."""
+    root = FakeRoot()
+    store = _store_at(tmp_path, root)
+    trust = machine_trust.MachineTrust(tmp_path, store)
+    held = _list(root, 10, control=_naming(1, ROOT_A, node=None))
+    trust.accept(held)
+    store.accept_epoch(2)
+    again = NodeIdentityStore(tmp_path / "node.yaml")
+    again.load()
+    assert again.record.list_epoch == 1, "kept in node.yaml"
+    restarted = machine_trust.MachineTrust(tmp_path, again)
+    restarted.load()
+    assert restarted.claims is None
+    replay = _list(root, 99, controlPins=["O" * 43])
+    with pytest.raises(machine_trust.MachineListFenced, match="names no root epoch"):
+        restarted.accept(replay)
+    kept = json.loads((tmp_path / machine_trust.LIST_FILE).read_text(encoding="utf-8"))
+    assert kept["jws"] == held
+
+
+def test_a_copy_promoted_here_and_locked_is_served_and_said(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy was promoted and restarted before anything was pushed: this
+    agent still holds the standby grant, and the copy, locked, signs
+    nothing new. Its own signed bundle is the evidence: taken, the copy is
+    this machine's root, this node follows it, and Home is told it waits
+    to be unlocked (row 4 re-review, blocker 3)."""
+    from eugene_plexus_agent import machine_port, standby
+    from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind, SpawnConfig
+
+    root = FakeRoot()
+    copy_url = "http://127.0.0.1:9"
+    with TestClient(app) as client:
+        enroll_app(app, root, "me", control_url=ROOT_A, grants=(tokens.GRANT_STANDBY,))
+        state = app.state.agent_state
+        state.add_topology_entry(
+            ComponentEntry(
+                name=standby.STANDBY_COMPONENT,
+                kind=ComponentKind.control,
+                url=copy_url,  # type: ignore[arg-type]
+                spawn=SpawnConfig(configFile=str(Path(state.path).parent / "standby.yaml")),
+            )
+        )
+        # What the copy signed at its promotion: epoch 2, no grant here.
+        root.epoch = 2
+        root.register("me", app.state.auth_state.trust.signer().key.public_key(), ())
+        promoted = root.bundle().jws
+
+        def copy(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/healthz":
+                details = {"role": "control", "epoch": 2, "locked": True}
+                return httpx.Response(200, json={"status": "ok", "details": details})
+            if request.url.path == "/v1/trust/bundle":
+                return httpx.Response(200, json={"jws": promoted})
+            return httpx.Response(404)
+
+        local = httpx.AsyncClient(transport=httpx.MockTransport(copy))
+        monkeypatch.setattr(standby, "shared_internal_client", lambda *a, **k: local)
+        assert standby.wanted(app), "the grant is still held here"
+        client.portal.call(standby.reconcile, app)
+
+        assert standby.promoted(state)
+        assert machine_port.active_control_entry(state).name == "standby"
+        record = app.state.node_identity.record
+        assert (record.epoch, record.control_url, record.control_url_epoch) == (2, copy_url, 2)
+        signer = tokens.Signer(key=root.token.key, issuer="control", epoch=2)
+        session, _ = signer.mint(
+            typ=tokens.TYP_SESSION, sub="operator", aud=["node:me"], ttl_seconds=600
+        )
+        app.state.supervisor.is_supervised = lambda _name: False
+        node = client.get("/v1/node", headers={"Authorization": f"Bearer {session}"}).json()
+        assert node["rootLocked"] is True
+        assert node["hostsControl"] is True

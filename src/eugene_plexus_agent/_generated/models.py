@@ -6110,6 +6110,10 @@ class NodeIdentity(BaseModel):
         ge=0,
     )
     standby: LocalStandby | None = None
+    rootLocked: bool | None = Field(
+        None,
+        description="This machine runs the install's control root, and it is locked:\nnothing can be signed until the owner signs in with the\npassphrase (row 4). Home says so. Common after a restart under\n`prompt_on_startup`, and after a promoted copy restarts before\nany other machine heard of the promotion. Absent when this\nmachine runs no root, or its state is not known yet.\n",
+    )
     hostsControl: bool | None = Field(
         None,
         description="This agent supervises the install's active control root. The\nroot reads it from its probe of each node to know its own\nmachine, which can never be its standby\n(`docs/design/warm-standby.md`). A standby this agent runs does\nnot count.\n",

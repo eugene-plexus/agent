@@ -345,15 +345,12 @@ def test_promoted_copy_is_the_active_control_entry(
     assert machine_port.active_control_entry(state) is None, "a standby has no route"
 
     root.epoch = 2
+    machines.accept(_signed_list(root, 4, {"epoch": 2, "node": "other", "url": ROOT_URL}))
     _set_grants(trust, root, ())  # the promotion took the grant
     _says(monkeypatch, "control", 2)
     asyncio.run(standby.reconcile(app))
-    assert machine_port.active_control_entry(state) is None, "no list names this machine yet"
-    assert not standby.hosts_active_control(state)
-
-    machines.accept(_signed_list(root, 4, {"epoch": 2, "node": "other", "url": ROOT_URL}))
-    asyncio.run(standby.reconcile(app))
     assert machine_port.active_control_entry(state) is None, "the list names another machine"
+    assert not standby.hosts_active_control(state)
 
     machines.accept(_signed_list(root, 5, {"epoch": 2, "node": "spare", "url": ROOT_URL}))
     _says(monkeypatch, "control", 1)

@@ -354,6 +354,10 @@ class MachineTrust:
             if record.enrolled and record.control_public_key and isinstance(kept, dict):
                 claims = verify(str(kept["jws"]), record.control_public_key)
                 control = checked_control(claims)
+                if control is None and record.list_epoch is not None:
+                    raise MachineListFenced(
+                        "it names no root epoch, and this node has taken lists that do"
+                    )
                 # Row 4 review: the epoch this node holds fences a kept list
                 # as it fences one offered.
                 if control is not None and control["epoch"] < (record.epoch or 0):
@@ -384,12 +388,14 @@ class MachineTrust:
         held = int((self.claims or {}).get("version") or 0)
         offered, had = checked_control(claims), control_of(self.claims)
         held_epoch = record.epoch or 0
-        if offered is None and had is not None:
-            # Row 4 review: once this node holds a list that names its root,
-            # a list that names none is a replay of an older root's.
+        seen = had["epoch"] if had is not None else record.list_epoch
+        if offered is None and seen is not None:
+            # Row 4 review: once this node has taken a list that names its
+            # root, a list that names none is a replay of an older root's.
+            # Kept in `node.yaml` (re-review), so a restart that dropped the
+            # kept list does not open the door again.
             raise MachineListFenced(
-                "it names no root epoch, and this node holds a list of a root at epoch "
-                f"{had['epoch']}"
+                f"it names no root epoch, and this node has taken lists of a root at epoch {seen}"
             )
         if offered is not None and offered["epoch"] < held_epoch:
             raise MachineListFenced(
@@ -418,6 +424,8 @@ class MachineTrust:
         # memory refuses is never written, so a restart cannot take it).
         self.taken_at = time.time()
         write_private(self.list_path, json.dumps({"jws": jws, "takenAt": self.taken_at}))
+        if offered is not None:
+            self._identity.record_list_epoch(int(offered["epoch"]))
         # Before the table: it is built for the root's address.
         moved = self._follow(offered, claims)
         if same:
