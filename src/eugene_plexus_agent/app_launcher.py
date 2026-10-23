@@ -45,6 +45,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -175,6 +176,7 @@ PLACEHOLDERS = frozenset(
         "clientKey",
         "oidcClientSecret",
         "appSecret",
+        "databaseSecret",
         "embeddingModel",
         "rerankModel",
         "imageModel",
@@ -183,7 +185,9 @@ PLACEHOLDERS = frozenset(
 )
 #: Read by `render_start` from files, never carried in a spec: a value for
 #: one of these in the spec's `values` is ignored.
-SECRET_PLACEHOLDERS = frozenset({"clientKey", "oidcClientSecret", "appSecret", "linkSecret"})
+SECRET_PLACEHOLDERS = frozenset(
+    {"clientKey", "oidcClientSecret", "appSecret", "linkSecret", "databaseSecret"}
+)
 #: The placeholders answered by asking the gateway at every start (MR6), each
 #: with the surface a model must list to be the answer: the install's search
 #: model (it embeds) and its result sorter (it reranks). Never carried in a
@@ -211,6 +215,9 @@ _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 #: `{appSecret}`: made at the app's first start, the same at every start after.
 APP_SECRET_FILE = "app_secret"
+DATABASE_SECRET_FILE = "database_secret"
+PG0_INSTANCE = "eugene-plexus-hindsight"
+PG0_REQUIREMENT = "pg0-embedded==0.15.2"
 #: A hash of the gateway's address, the app's key and the manifest's
 #: `environment` as written at the last start, for `resetOnConnectionChange`.
 #: A hash, so the file holds no key.
@@ -265,9 +272,9 @@ def app_secret(data_dir: str) -> str:
         return _kept_app_secret(data_dir)
 
 
-def _kept_app_secret(data_dir: str) -> str:
+def _kept_app_secret(data_dir: str, filename: str = APP_SECRET_FILE) -> str:
     """`app_secret`, with `_DATA_FILES` held: read it, or make it and keep it."""
-    path = os.path.join(data_dir, APP_SECRET_FILE)
+    path = os.path.join(data_dir, filename)
     existing = _secret(path)
     if existing:
         return existing
@@ -275,6 +282,61 @@ def _kept_app_secret(data_dir: str) -> str:
     value = secrets.token_urlsafe(32)
     _write_own(path, value)
     return value
+
+
+def database_secret(data_dir: str) -> str:
+    with _DATA_FILES:
+        return _kept_app_secret(data_dir, DATABASE_SECRET_FILE)
+
+
+_DATABASE_URI = re.compile(r"(?i)\b((?:pg0|postgres(?:ql)?)://)[^\s\"'<>]*@")
+_PORT_MOVE = re.compile(r"Port (\d+) is in use, using port (\d+) instead", re.IGNORECASE)
+
+
+def redact_database(text: str) -> str:
+    """Mask userinfo before output can enter a journal, log, tail or response."""
+    return _DATABASE_URI.sub(r"\1[redacted]@", text)
+
+
+def database_port_error(text: str) -> str | None:
+    moved = _PORT_MOVE.search(text)
+    if moved:
+        return (
+            f"Hindsight was not started: database port {moved[1]} is in use; "
+            f"pg0 selected port {moved[2]} instead."
+        )
+    return None
+
+
+def prepare_database(data: str, port: str | None) -> None:
+    if port:
+        with socket.socket() as probe:
+            if not WINDOWS:
+                # PostgreSQL reuses its listener after closing old connections.
+                # TIME_WAIT must not turn a valid restart into a port conflict.
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                probe.bind(("127.0.0.1", int(port)))
+            except OSError as exc:
+                raise ValueError(
+                    f"Hindsight was not started: database port {port} is in use "
+                    f"or cannot be bound: {exc}"
+                ) from exc
+    if not data:
+        return
+    root = Path(data) / ".pg0"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not WINDOWS:
+        root.chmod(0o700)
+    # pg0 0.15.2 initializes both TCP and local auth as password. Harden an
+    # existing cluster too, before it starts, so a retained trust rule cannot win.
+    hba = root / "instances" / PG0_INSTANCE / "data" / "pg_hba.conf"
+    if hba.exists():
+        _write_own(
+            str(hba),
+            "local all all password\nhost all all 127.0.0.1/32 password\n"
+            "host all all ::1/128 password\n",
+        )
 
 
 def connection_changed(
@@ -698,6 +760,12 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
             values["oidcClientSecret"] = oidc
     if "appSecret" in wanted and data:
         values["appSecret"] = app_secret(data)
+    if "databaseSecret" in wanted:
+        if not data:
+            raise ValueError("The database password needs the app's data folder")
+        values["databaseSecret"] = database_secret(data)
+    if spec.get("linkProvider"):
+        prepare_database(data, values.get("auxPort"))
 
     notes: list[str] = []
     if models:
@@ -754,6 +822,12 @@ def render_start(spec: dict, env: dict[str, str]) -> tuple[list[str], dict[str, 
             }
             with _DATA_FILES:
                 _write_own(os.path.join(data, "given.json"), json.dumps(given))
+    if spec.get("linkProvider"):
+        # The same stdlib guard runs in both launch accounts. It filters the
+        # child's output before the journal or agent can see it, and rejects a
+        # port fallback, including a bind race after the check above.
+        python = str(spec.get("providerPython") or spec["argv"][0])
+        argv = [python, str(Path(__file__).resolve()), "--memory-provider", *argv]
     return argv, out, notes
 
 
@@ -766,24 +840,24 @@ def pg0_cleanup(python: str, action: str, env: dict[str, str]) -> None:
         "p=next(p for p in (pathlib.Path(pg0.__file__).parent/'bin').glob('pg0*') if p.is_file()); "
         "sys.exit(subprocess.call([str(p),*sys.argv[1:]]))"
     )
-    args = [python, "-c", code, action, "--name", "hindsight"]
+    args = [python, "-c", code, action, "--name", PG0_INSTANCE]
     if action == "stop":
         args += ["--timeout", "30"]
     else:
         args += ["--force"]
     result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=45, check=False)
     if result.returncode:
-        output = (result.stdout + result.stderr).strip()
+        output = redact_database((result.stdout + result.stderr).strip())
         # pg0 reports an absent instance with a non-zero exit; it is already clean.
         absent = (
             "no running instance found",
-            "instance 'hindsight' does not exist",
-            "instance 'hindsight' is not running",
+            f"instance '{PG0_INSTANCE}' does not exist",
+            f"instance '{PG0_INSTANCE}' is not running",
         )
         if any(text in output.lower() for text in absent) and "traceback" not in output.lower():
             return
         raise ValueError(
-            f"pg0 {action} --name hindsight failed ({result.returncode}): {output[-800:]}"
+            f"pg0 {action} --name {PG0_INSTANCE} failed ({result.returncode}): {output[-800:]}"
         )
 
 
@@ -813,6 +887,7 @@ class Forwarder:
         self._thread.start()
 
     def add(self, line: str) -> None:
+        line = redact_database(line)
         with self._lock:
             self._lines.append(line)
             while len(self._lines) > BUFFER_LINES:
@@ -967,6 +1042,69 @@ def _force(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
+def watch_memory_provider(argv: list[str]) -> int:
+    """Keep secrets and pg0's port fallback inside the launch boundary."""
+    env = dict(os.environ)
+    data = env.get("HOME", "")
+    password = _secret(os.path.join(data, DATABASE_SECRET_FILE)) if data else None
+    previous_umask = os.umask(0o077) if not WINDOWS else None
+    try:
+        # The child inherits the private mask: pg0's instance.json also holds
+        # the password. Restore ours even if spawning the child fails.
+        proc = _spawn({"dataDir": data}, argv, env)
+    finally:
+        if previous_umask is not None:
+            os.umask(previous_umask)
+    failure: list[str] = []
+    database_url = env.get("HINDSIGHT_API_DATABASE_URL", "")
+    expected_port = urllib.parse.urlsplit(database_url).port if database_url else None
+    instance = Path(data) / ".pg0" / "instances" / PG0_INSTANCE / "instance.json"
+
+    def output() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:
+            line = redact_database(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+            if password:
+                line = line.replace(password, "[redacted]")
+            cause = database_port_error(line)
+            if cause and not failure:
+                failure.append(cause)
+            print(cause or line, flush=True)
+
+    reader = threading.Thread(target=output, daemon=True)
+    reader.start()
+    try:
+        while proc.poll() is None:
+            if expected_port and instance.is_file() and not failure:
+                try:
+                    actual_port = json.loads(instance.read_text(encoding="utf-8"))["port"]
+                except (OSError, ValueError, KeyError):
+                    actual_port = expected_port
+                if actual_port != expected_port:
+                    cause = (
+                        f"Hindsight was not started: database port {expected_port} was reserved; "
+                        f"pg0 selected port {actual_port} instead. The reserved port may be in use."
+                    )
+                    failure.append(cause)
+                    print(cause, flush=True)
+            if failure or _STOP.wait(0.1):
+                _ask_to_stop(proc)
+                try:
+                    proc.wait(STOP_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    _force(proc)
+                    proc.wait(10)
+                break
+        reader.join(5)
+    finally:
+        try:
+            pg0_cleanup(argv[0], "stop", env)
+        except (OSError, ValueError) as exc:
+            failure.append(redact_database(str(exc)))
+            print(f"[launcher] {failure[-1]}", flush=True)
+    return 1 if failure else (0 if _STOP.is_set() else (proc.returncode or 0))
+
+
 def run(spec: dict) -> int:
     """Start the app, forward its output, wait for it or for a stop."""
     if spec.get("pg0Action"):
@@ -1110,6 +1248,10 @@ def _windows_service(spec: dict) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
+    if args[:1] == ["--memory-provider"]:
+        signal.signal(signal.SIGTERM, lambda *_: _STOP.set())
+        signal.signal(signal.SIGINT, lambda *_: _STOP.set())
+        return watch_memory_provider(args[1:])
     if len(args) != 1:
         print("usage: app_launcher.py <launch.json>", file=sys.stderr)
         return 2

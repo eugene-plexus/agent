@@ -758,8 +758,11 @@ class OwnAccountSupervisor:
             self._started_at[app_id] = datetime.now(UTC)
             log.info("app %s started in its own account (%s)", app_id, self.account(app_id))
         except Exception as exc:
-            self._errors[app_id] = f"could not start in an account of its own: {exc}"
-            log.error("app %s could not start in its own account: %s", app_id, exc)
+            from .app_launcher import redact_database
+
+            cause = redact_database(str(exc))
+            self._errors[app_id] = f"could not start in an account of its own: {cause}"
+            log.error("app %s could not start in its own account: %s", app_id, cause)
 
     async def _settle_start(self, app_id: str) -> None:
         task = self._starting.pop(app_id, None)
@@ -808,11 +811,16 @@ class OwnAccountSupervisor:
                 return
             if state.state in {"failed", "missing"}:
                 cause = state.detail or state.exit_code or state.state
-                raise OSError(f"pg0 {action} --name hindsight failed: {cause}")
+                from .app_launcher import PG0_INSTANCE, redact_database
+
+                raise OSError(
+                    redact_database(f"pg0 {action} --name {PG0_INSTANCE} failed: {cause}")
+                )
             await asyncio.sleep(0.1)
         await asyncio.to_thread(self.runner.stop, app_id)
         raise OSError(
-            f"pg0 {action} --name hindsight did not finish within {_STOP_TIMEOUT_SECONDS:g} seconds"
+            f"pg0 {action} --name eugene-plexus-hindsight did not finish within "
+            f"{_STOP_TIMEOUT_SECONDS:g} seconds"
         )
 
     async def remove(self, app_id: str, *, purge: bool) -> None:

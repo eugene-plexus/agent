@@ -210,7 +210,7 @@
   environment:
     HINDSIGHT_API_HOST: "{bindHost}"
     HINDSIGHT_API_PORT: "{port}"
-    HINDSIGHT_API_DATABASE_URL: "pg0://hindsight:{auxPort}"
+    HINDSIGHT_API_DATABASE_URL: "pg0://hindsight:{databaseSecret}@eugene-plexus-hindsight:{auxPort}"
     HINDSIGHT_API_LLM_PROVIDER: openai
     HINDSIGHT_API_LLM_BASE_URL: "{gatewayUrl}/v1"
     HINDSIGHT_API_LLM_API_KEY: "{clientKey}"

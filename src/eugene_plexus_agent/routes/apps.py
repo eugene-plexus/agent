@@ -491,13 +491,14 @@ async def cancel_install(request: Request, app_id: str) -> AppInstall:
 async def start(request: Request, app_id: str) -> App:
     _not_node_capability(app_id)
     manager = _apps(request)
-    record = _record_or_404(manager, app_id)
-    record.enabled = True
-    manager.store.put(record)
-    if not manager.supervisor.is_running(app_id):
-        await _ensure_sign_in(request, manager, record.manifest)
-        await manager.start(record)
-    return manager.view(record)
+    async with manager._lock:
+        record = _record_or_404(manager, app_id)
+        record.enabled = True
+        manager.store.put(record)
+        if not manager.supervisor.is_running(app_id):
+            await _ensure_sign_in(request, manager, record.manifest)
+            await manager.start(record)
+        return manager.view(record)
 
 
 def _settings_record(manager: AppManager, app_id: str):  # type: ignore[no-untyped-def]
@@ -550,6 +551,13 @@ async def stop(request: Request, app_id: str) -> App:
 async def restart(request: Request, app_id: str, body: AppRestartRequest | None = None) -> App:
     _not_node_capability(app_id)
     manager = _apps(request)
+    async with manager._lock:
+        return await _restart(request, manager, app_id, body)
+
+
+async def _restart(
+    request: Request, manager: AppManager, app_id: str, body: AppRestartRequest | None
+) -> App:
     record = _record_or_404(manager, app_id)
     if body and body.resetSettings and not record.manifest.resetOnConnectionChange:
         raise _problem(409, "No settings to reset", "This app has no settings for Eugene to reset.")

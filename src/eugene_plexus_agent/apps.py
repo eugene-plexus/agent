@@ -673,7 +673,9 @@ async def _run_tool(argv: list[str], *, env: dict[str, str]) -> tuple[int, str]:
             line = await proc.stdout.readline()
             if not line:
                 break
-            tail.append(line.decode("utf-8", errors="replace").rstrip())
+            tail.append(
+                app_launcher.redact_database(line.decode("utf-8", errors="replace").rstrip())
+            )
         code = await proc.wait()
     except asyncio.CancelledError:
         with contextlib.suppress(ProcessLookupError):
@@ -864,8 +866,11 @@ class AppInstaller:
         python = venv_python(venv)
         progress.state = State1.installing
         progress.message = f"installing {manifest.package}"
+        requirements = [requirement]
+        if manifest.id == "hindsight" and manifest.package == "hindsight-api-slim[embedded-db]":
+            requirements.append(app_launcher.PG0_REQUIREMENT)
         code, out = await _run_tool(
-            [str(uv), "pip", "install", "--python", str(python), requirement], env=env
+            [str(uv), "pip", "install", "--python", str(python), *requirements], env=env
         )
         if code != 0:
             raise AppInstallError(f"installing {manifest.package} failed:\n{out}")
@@ -955,6 +960,10 @@ class _AppPlanner:
         return None
 
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        if memory_provider(self.record):
+            for line in output_tail.splitlines():
+                if "Hindsight was not started: database port" in line:
+                    return app_launcher.redact_database(line)
         return None
 
     def on_crash_threshold(self) -> bool:
@@ -1042,14 +1051,19 @@ class _AppPlanner:
             "keyFile": str(self._store.key_file(record.id)),
             "oidcSecretFile": str(self._store.oidc_secret_file(record.id)),
             "linkSecretFile": str(self._store.link_secret_file(record.id)),
+            "providerPython": str(
+                venv_python(self._store.version_dir(record.id, record.version) / "venv")
+            ),
         }
 
     def _unfillable(self, exc: Exception) -> SpawnPlanError:
         if isinstance(exc, app_launcher.GatewayUnknown):
             # The launcher's own words, whichever way the app runs. They say "this
             # app", and they are shown on the app's own card: no name before them.
-            return SpawnPlanError(str(exc))
-        return SpawnPlanError(f"could not fill in how {self.record.id} starts: {exc}")
+            return SpawnPlanError(app_launcher.redact_database(str(exc)))
+        return SpawnPlanError(
+            app_launcher.redact_database(f"could not fill in how {self.record.id} starts: {exc}")
+        )
 
     def _planned(
         self, base: SpawnPlan, argv: list[str], env: dict[str, str], notes: list[str]
@@ -1453,14 +1467,12 @@ class AppManager:
             return reason
         if manifest.id == "hindsight":
             if sys.platform not in {"linux", "win32"}:
+                return "Hindsight needs Linux for verified pg0 data cleanup."
+            if sys.platform == "win32":
                 return (
-                    "Hindsight needs Linux or an agent-account install on Windows "
-                    "for pg0 data cleanup."
-                )
-            if sys.platform == "win32" and self.accounts.available:
-                return (
-                    "Hindsight cannot install in its own Windows account: pg0 cannot keep "
-                    "data in the app's data folder there."
+                    "Hindsight is unavailable on Windows (MV5b-WINDOWS-PG0): pg0 uses "
+                    "the account profile instead of the app's data folder. The Windows "
+                    "agent-account launch and cleanup have no CI acceptance yet. Use Linux."
                 )
         return self.local_actions_refusal(manifest)
 
@@ -1548,8 +1560,9 @@ class AppManager:
             installedAt=record.installed_at,
             pid=pid,
             lastRestart=restarted,
-            lastError=self._errors.get(record.id, error),
-            detail=detail,
+            lastError=app_launcher.redact_database(self._errors.get(record.id, error) or "")
+            or None,
+            detail=app_launcher.redact_database(detail) if detail else detail,
             experimental=bool(record.manifest.experimental),
             provides=Provides1(record.manifest.provides.value)
             if record.manifest.provides
@@ -1704,6 +1717,8 @@ class AppManager:
         operator expects an app to notice."""
         if record.origin is AppOrigin.custom and claims_link(record.manifest):
             raise AppInstallError("Only shipped catalogue entries may use the memory-server link")
+        if memory_provider(record):
+            self.ensure_memory_secret(record)
         if memory_provider(record) and record.settings.memoryModel is None:
             self._detail[record.id] = CHOOSE_MEMORY_MODEL
             return
@@ -1865,9 +1880,7 @@ class AppManager:
                 if record.aux_port is None:
                     record.aux_port = self.allocate_port()
                     self.store.put(record)
-                secret = self.store.link_secret_file(record.id)
-                if not secret.exists():
-                    write_private(secret, secrets.token_urlsafe(32))
+                self.ensure_memory_secret(record)
                 self.publish_memory_model(record)
             keep = {record.version}
             if record.previous_version:
@@ -1980,9 +1993,16 @@ class AppManager:
     async def aclose(self) -> None:
         await self.installer.aclose()
         try:
-            for record in self.store.installed():
-                if memory_provider(record):
-                    await self.stop(record.id)
+            if isinstance(self.supervisor, AppSupervisor):
+                for record in self.store.installed():
+                    if memory_provider(record):
+                        try:
+                            await self.stop(record.id)
+                        except Exception as exc:
+                            log.warning(
+                                "Hindsight shutdown cleanup failed: %s",
+                                app_launcher.redact_database(str(exc)),
+                            )
         finally:
             await self.supervisor.stop_all()
 
@@ -2002,6 +2022,11 @@ class AppManager:
             f"{ENV_PREFIX}_MEMORY_SERVER_MODEL_FILE": str(self.store.link_model_file(provider.id)),
         }
 
+    def ensure_memory_secret(self, record: InstalledApp) -> None:
+        secret = self.store.link_secret_file(record.id)
+        if not secret.exists() or not secret.read_text(encoding="utf-8").strip():
+            write_private(secret, secrets.token_urlsafe(32))
+
     def publish_memory_model(self, record: InstalledApp) -> None:
         write_private(self.store.link_model_file(record.id), record.settings.model_dump_json())
         if self.accounts.kind == "systemd":
@@ -2018,6 +2043,8 @@ class AppManager:
                     os.chmod(path, 0o644)
 
     def prepare_memory_link(self, consumer: InstalledApp) -> dict[str, str]:
+        if memory_provider(consumer):
+            return {}
         link = self.memory_link(consumer)
         if not self.accounts.available:
             return link

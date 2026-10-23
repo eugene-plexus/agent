@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import socket
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_agent import app_accounts, app_launcher, apps
+from eugene_plexus_agent import app_accounts, app_launcher, apps, logs
 from eugene_plexus_agent._generated.models import AppOrigin, AppSettingsUpdate
 from eugene_plexus_agent.dependencies import require_operator_session
 from eugene_plexus_agent.routes import apps as routes
@@ -34,7 +37,7 @@ def hindsight() -> Any:
         environment={
             "MODEL": "{memoryModel}",
             "MCP_TOKEN": "{linkSecret}",
-            "DATABASE": "pg0://hindsight:{auxPort}",
+            "DATABASE": "pg0://hindsight:{databaseSecret}@eugene-plexus-hindsight:{auxPort}",
         },
     )
 
@@ -44,7 +47,9 @@ def test_catalogue_has_slim_hindsight_and_linked_workbench() -> None:
     hs = catalogue["hindsight"]
     assert apps.pip_requirement(hs) == "hindsight-api-slim[embedded-db]==1.0.0"
     assert hs.experimental and not hs.ui and not hs.localActions
-    assert hs.environment["HINDSIGHT_API_DATABASE_URL"] == "pg0://hindsight:{auxPort}"
+    assert hs.environment["HINDSIGHT_API_DATABASE_URL"] == (
+        "pg0://hindsight:{databaseSecret}@eugene-plexus-hindsight:{auxPort}"
+    )
     assert hs.environment["HINDSIGHT_API_TENANT_API_KEY"] == "{appSecret}"
     assert hs.environment["HINDSIGHT_API_MCP_AUTH_TOKEN"] == "{linkSecret}"
     assert "memory-server" in catalogue["workbench"].uses
@@ -55,7 +60,7 @@ def test_catalogue_has_slim_hindsight_and_linked_workbench() -> None:
     [
         ("linux", None, True),
         ("linux", "systemd", True),
-        ("win32", None, True),
+        ("win32", None, False),
         ("win32", "windows_service", False),
         ("darwin", None, False),
     ],
@@ -160,6 +165,7 @@ async def test_shutdown_stop_and_purge_use_named_pg0_before_delete(
 ) -> None:
     manager = _manager(tmp_path, catalogue=[hindsight()])
     await manager.installed_callback(hindsight(), AppOrigin.catalogue)
+    manager.supervisor = apps.AppSupervisor()
     events = []
 
     async def pg0(record: Any, action: str) -> None:
@@ -264,7 +270,7 @@ def test_pg0_command_is_named_and_drop_is_noninteractive(
     monkeypatch.setattr(app_launcher.subprocess, "run", run)
     app_launcher.pg0_cleanup("app-python", action, {"HOME": str(tmp_path)})
     argv, kwargs = calls[0]
-    assert argv[0] == "app-python" and argv[3:6] == [action, "--name", "hindsight"]
+    assert argv[0] == "app-python" and argv[3:6] == [action, "--name", "eugene-plexus-hindsight"]
     assert kwargs["env"]["HOME"] == str(tmp_path)
     if action == "drop":
         assert "--force" in argv
@@ -528,3 +534,358 @@ async def test_systemd_model_metadata_changes_before_the_provider_can_restart(
     assert json.loads(manager.store.link_model_file(record.id).read_text()) == {
         "memoryModel": "new-outside-model"
     }
+
+
+def test_database_password_is_private_kept_and_never_taken_from_spec(tmp_path: Path) -> None:
+    spec = {
+        "argv": ["python"],
+        "dataDir": str(tmp_path),
+        "values": {"auxPort": "8499", "databaseSecret": "forged"},
+        "environment": {"DATABASE": hindsight().environment["DATABASE"]},
+    }
+    _, first, notes = app_launcher.render_start(spec, {})
+    _, second, _ = app_launcher.render_start(spec, {})
+    password = (tmp_path / "database_secret").read_text()
+    assert len(password) >= 32 and password != "forged"
+    assert first == second
+    assert first["DATABASE"] == f"pg0://hindsight:{password}@eugene-plexus-hindsight:8499"
+    assert password not in json.dumps(spec) + json.dumps(notes)
+    assert app_launcher.app_secret(str(tmp_path)) != password
+    assert "databaseSecret" in app_launcher.SECRET_PLACEHOLDERS
+    with pytest.raises(ValueError, match=r"database.*data folder"):
+        app_launcher.render_start({**spec, "dataDir": ""}, {})
+
+
+@pytest.mark.asyncio
+async def test_systemd_provider_start_preserves_credentials_and_repairs_empty_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path, catalogue=[hindsight()])
+    manager.accounts = app_accounts.AccountSupport("systemd")
+    await manager.installed_callback(hindsight(), AppOrigin.catalogue)
+    record = manager.store.get("hindsight")
+    secret = manager.store.link_secret_file(record.id)
+    secret.write_text("")
+    await manager.installed_callback(hindsight(), AppOrigin.catalogue)
+    token = secret.read_text()
+    assert token
+    record = manager.store.get("hindsight")
+    _fake_python(manager.store, record)
+    record.settings.memoryModel = "chosen"
+    manager.publish_memory_model(record)
+    monkeypatch.setattr(manager, "pg0", lambda *a: asyncio.sleep(0))
+    await manager.start(record)
+    assert secret.read_text() == token
+    assert json.loads(manager.store.link_model_file(record.id).read_text()) == {
+        "memoryModel": "chosen"
+    }
+    planner = manager.supervisor.planners[record.id]
+    _, env, _ = app_launcher.render_start(planner._render_spec(planner.base_plan()), {})
+    assert env["MCP_TOKEN"] == token
+
+
+@pytest.mark.asyncio
+async def test_start_repairs_empty_provider_token_after_agent_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path, catalogue=[hindsight()])
+    manager.accounts = app_accounts.AccountSupport("systemd")
+    await manager.installed_callback(hindsight(), AppOrigin.catalogue)
+    record = manager.store.get("hindsight")
+    record.settings.memoryModel = "chosen"
+    _fake_python(manager.store, record)
+    secret = manager.store.link_secret_file(record.id)
+    secret.write_text("")
+    monkeypatch.setattr(manager, "pg0", lambda *a: asyncio.sleep(0))
+    await manager.start(record)
+    assert secret.read_text(), "An already installed provider must repair its empty token"
+
+
+@pytest.mark.asyncio
+async def test_own_account_start_failure_redacts_log_and_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    runner = app_accounts.SystemdRunner(tmp_path / "apps")
+    supervisor = app_accounts.OwnAccountSupervisor(
+        runner,
+        ingress=lambda: "",
+        data_dir=lambda ident: tmp_path / ident,
+        key_file=lambda ident: tmp_path / ident / "key",
+    )
+    manager = _manager(tmp_path)
+    record = _record(hindsight())
+    _fake_python(manager.store, record)
+    planner = apps._AppPlanner(
+        record, store=manager.store, gateway_url=lambda: None, bind_host=lambda: None
+    )
+
+    def state(ident: str) -> Any:
+        raise OSError("database failed: postgresql://hindsight:must-hide@127.0.0.1:8499/hindsight")
+
+    monkeypatch.setattr(runner, "state", state)
+    with caplog.at_level(logging.ERROR):
+        await supervisor._start(planner)
+    assert "must-hide" not in caplog.text
+    assert "must-hide" not in supervisor._errors[record.id]
+
+
+@pytest.mark.parametrize("action", ["start", "restart"])
+@pytest.mark.asyncio
+async def test_start_routes_wait_for_model_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    from starlette.requests import Request
+
+    manager = _manager(tmp_path, catalogue=[hindsight()])
+    await manager.installed_callback(hindsight(), AppOrigin.catalogue)
+    record = manager.store.get("hindsight")
+    entered, release = asyncio.Event(), asyncio.Event()
+    observed = []
+    stops = []
+
+    async def stop(ident: str) -> None:
+        stops.append(ident)
+        entered.set()
+        await release.wait()
+
+    async def start(record: Any) -> None:
+        observed.append(record.settings.memoryModel)
+
+    monkeypatch.setattr(manager, "stop", stop)
+    monkeypatch.setattr(manager, "start", start)
+    monkeypatch.setattr(routes, "_ensure_sign_in", lambda *a: asyncio.sleep(0))
+    app = FastAPI()
+    app.state.apps = manager
+    request = Request({"type": "http", "app": app})
+    changing = asyncio.create_task(
+        manager.update_settings(record, AppSettingsUpdate(memoryModel="B"))
+    )
+    await entered.wait()
+    starting = asyncio.create_task(getattr(routes, action)(request, record.id))
+    await asyncio.sleep(0.03)
+    try:
+        assert observed == [], "A route launched the old model while PATCH held the lock"
+        assert stops == ["hindsight"], "Restart stopped the app during the model change"
+    finally:
+        release.set()
+        await changing
+        await starting
+    assert all(model == "B" for model in observed)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_keeps_own_account_apps_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _manager(tmp_path, catalogue=[hindsight()])
+    await manager.installed_callback(hindsight(), AppOrigin.catalogue)
+    manager.accounts = app_accounts.AccountSupport("systemd")
+    stops = []
+    monkeypatch.setattr(manager, "stop", lambda ident: stops.append(ident))
+    await manager.aclose()
+    assert stops == []
+
+
+@pytest.mark.asyncio
+async def test_shutdown_continues_after_each_pg0_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    manager = _manager(tmp_path, catalogue=[hindsight()])
+    await manager.installed_callback(hindsight(), AppOrigin.catalogue)
+    second = _record(hindsight())
+    second.manifest = second.manifest.model_copy(update={"id": "second"})
+    manager.store.put(second)
+    monkeypatch.setattr(apps, "memory_provider", lambda record: True)
+    manager.supervisor = apps.AppSupervisor()
+    stopped = []
+
+    async def fail(ident: str) -> None:
+        stopped.append(ident)
+        raise OSError("pg0 permission denied")
+
+    monkeypatch.setattr(manager, "stop", fail)
+    with caplog.at_level(logging.WARNING):
+        await manager.aclose()
+    assert stopped == ["hindsight", "second"]
+    assert "pg0 permission denied" in caplog.text
+
+
+@pytest.mark.parametrize("scheme", ["pg0", "postgres", "postgresql"])
+def test_database_urls_redacted_in_forwarding_logs_and_cleanup_errors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], scheme: str
+) -> None:
+    raw = f"failed: {scheme}://hindsight:secret%21@127.0.0.1:8499/hindsight"
+    assert "secret%21" not in logs.redact(raw)
+    forwarder = app_launcher.Forwarder(None, None, "hindsight")
+    monkeypatch.setattr(app_launcher, "WINDOWS", False)
+    forwarder.add(raw)
+    assert "secret%21" not in capsys.readouterr().out
+    assert "secret%21" not in "".join(forwarder._take())
+    monkeypatch.setattr(
+        app_launcher.subprocess,
+        "run",
+        lambda *a, **kw: type("Result", (), {"returncode": 1, "stdout": raw, "stderr": ""})(),
+    )
+    with pytest.raises(ValueError) as error:
+        app_launcher.pg0_cleanup("python", "stop", {})
+    assert "secret%21" not in str(error.value)
+
+
+def test_provider_refuses_an_occupied_database_port(tmp_path: Path) -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        with pytest.raises(ValueError, match=rf"database port {port}.*in use"):
+            app_launcher.render_start(
+                {
+                    "argv": [sys.executable],
+                    "linkProvider": True,
+                    "dataDir": str(tmp_path),
+                    "values": {"auxPort": str(port)},
+                },
+                {},
+            )
+
+
+def test_provider_replaces_existing_trust_rules_before_spawn(tmp_path: Path) -> None:
+    root = tmp_path / ".pg0"
+    hba = root / "instances/eugene-plexus-hindsight/data/pg_hba.conf"
+    hba.parent.mkdir(parents=True)
+    hba.write_text("local all all trust\nhost all all 127.0.0.1/32 trust\n")
+    app_launcher.prepare_database(str(tmp_path), None)
+    assert hba.read_text().splitlines() == [
+        "local all all password",
+        "host all all 127.0.0.1/32 password",
+        "host all all ::1/128 password",
+    ]
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="PostgreSQL's POSIX port reuse; Windows Hindsight is refused"
+)
+def test_provider_can_restart_with_closed_connections_in_time_wait(tmp_path: Path) -> None:
+    with socket.socket() as listener, socket.socket() as client:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        listener.listen()
+        client.connect(("127.0.0.1", port))
+        connection, _ = listener.accept()
+        connection.close()  # The server actively closes and owns TIME_WAIT.
+        assert client.recv(1) == b""
+    app_launcher.prepare_database(str(tmp_path), str(port))
+
+
+def test_provider_restores_the_callers_umask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(app_launcher, "WINDOWS", False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(app_launcher, "pg0_cleanup", lambda *a: None)
+    current = [0o022]
+
+    def umask(mask: int) -> int:
+        previous, current[0] = current[0], mask
+        return previous
+
+    monkeypatch.setattr(app_launcher.os, "umask", umask)
+    assert app_launcher.watch_memory_provider([sys.executable, "-c", "pass"]) == 0
+    assert current == [0o022]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_and_file_logs_remove_database_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from eugene_plexus_agent.supervisor import SupervisedProcess
+
+    raw = "postgresql://hindsight:password-to-hide@127.0.0.1:8499/hindsight\n"
+    planner = apps._AppPlanner(
+        _record(hindsight()),
+        store=apps.AppStore(tmp_path / "apps.yaml"),
+        gateway_url=lambda: None,
+        bind_host=lambda: None,
+    )
+    process = SupervisedProcess(planner, logging.getLogger("test"))
+    reader = asyncio.StreamReader()
+    reader.feed_data(raw.encode())
+    reader.feed_eof()
+    await process._pipe_child_output(reader)
+    assert "password-to-hide" not in capsys.readouterr().out
+    assert "password-to-hide" not in "".join(process._output_tail)
+    assert "password-to-hide" not in logs.stamp(raw)
+
+
+def test_app_reports_redact_database_credentials(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    record = _record(hindsight())
+    manager.store.put(record)
+    manager._errors[record.id] = (
+        "failed: pg0://hindsight:password-to-hide@eugene-plexus-hindsight:8499"
+    )
+    assert "password-to-hide" not in manager.view(record).model_dump_json()
+
+
+def test_provider_port_move_stops_child_and_reports_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(app_launcher, "pg0_cleanup", lambda *a: calls.append(a))
+    command = [
+        sys.executable,
+        "-u",
+        "-c",
+        (
+            "import time;print('postgresql://hindsight:secret@127.0.0.1:8499/hindsight');"
+            "print('Port 8499 is in use, using port 8500 instead.');time.sleep(30)"
+        ),
+    ]
+    assert app_launcher.watch_memory_provider(command) != 0
+    output = capsys.readouterr().out
+    assert "8499" in output and "in use" in output and "not started" in output
+    assert "secret@" not in output
+    assert calls and calls[-1][1] == "stop"
+
+
+def test_provider_detects_a_silent_port_move_in_pg0_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "HINDSIGHT_API_DATABASE_URL", "pg0://hindsight:secret@eugene-plexus-hindsight:8499"
+    )
+    instance = tmp_path / ".pg0/instances/eugene-plexus-hindsight/instance.json"
+    instance.parent.mkdir(parents=True)
+    instance.write_text(json.dumps({"port": 8500}))
+    (tmp_path / "database_secret").write_text("a-raw-password")
+    monkeypatch.setattr(app_launcher, "pg0_cleanup", lambda *a: None)
+    code = app_launcher.watch_memory_provider(
+        [sys.executable, "-u", "-c", "import time;print('Password: a-raw-password');time.sleep(30)"]
+    )
+    output = capsys.readouterr().out
+    assert code != 0 and "pg0 selected port 8500" in output
+    assert "a-raw-password" not in output
+
+
+@pytest.mark.asyncio
+async def test_catalogue_install_pins_pg0_in_the_same_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    async def tool(argv: list[str], **kw: Any) -> tuple[int, str]:
+        calls.append(argv)
+        return 0, ""
+
+    monkeypatch.setattr(apps, "_run_tool", tool)
+    manifest = next(m for m in apps.load_catalogue() if m.id == "hindsight")
+    await apps.AppInstaller()._install(
+        manifest,
+        apps._Progress(app=manifest.id, version=manifest.version),
+        target=tmp_path / "version",
+        uv=Path("uv"),
+    )
+    install = next(argv for argv in calls if "install" in argv)
+    assert "pg0-embedded==0.15.2" in install
