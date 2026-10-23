@@ -446,3 +446,54 @@ def test_another_components_service_token_may_not(
         "/v1/auth/client-keys/policy", headers={"Authorization": f"Bearer {other}"}
     )
     assert resp.status_code == 401
+
+
+def test_standalone_rotation_and_last_use(authed_client: TestClient) -> None:
+    """Row 24: a check stamps `lastUsedAt` to the minute; a rotation makes a
+    replacement that shares the old token's allowance, and a retired token is
+    refused as replaced on check and acquire but may still renew."""
+    made = _mint(authed_client, "Continue")
+    old_id = made["key"]["id"]
+    admission = "/v1/auth/client-keys/admission"
+
+    def call(key: str, action: str, request_id: str = "r1"):
+        return authed_client.post(
+            admission, json={"keyId": key, "action": action, "requestId": request_id, "model": "m"}
+        )
+
+    assert "lastUsedAt" not in authed_client.get("/v1/auth/client-keys").json()["keys"][0]
+    assert call(old_id, "check").status_code == 200
+    used = authed_client.get("/v1/auth/client-keys").json()["keys"][0]["lastUsedAt"]
+    assert used.endswith("Z") or "+00:00" in used
+    assert used[17:19] == "00"  # to the minute
+
+    limited = authed_client.put(
+        f"/v1/auth/client-keys/{old_id}/limits",
+        json={"limits": {"maxConcurrentRequests": 1, "requestsPerMinute": 60}},
+    )
+    assert limited.status_code == 200
+    rotated = authed_client.post(
+        f"/v1/auth/client-keys/{old_id}/rotate", json={"overlapSeconds": 60}
+    )
+    assert rotated.status_code == 201, rotated.text
+    new = rotated.json()
+    assert new["token"] != made["token"] and new["key"]["replaces"] == old_id
+    assert new["key"]["name"] == "Continue" and new["key"]["limits"]["maxConcurrentRequests"] == 1
+    listed = {k["id"]: k for k in authed_client.get("/v1/auth/client-keys").json()["keys"]}
+    assert listed[old_id]["replacedBy"] == new["key"]["id"]
+    policy = {k["id"]: k for k in authed_client.get("/v1/auth/client-keys/policy").json()["keys"]}
+    assert policy[old_id]["expiresAt"] == listed[old_id]["retiresAt"]
+
+    new_id = new["key"]["id"]
+    assert call(old_id, "acquire", "stream").status_code == 200
+    assert call(new_id, "acquire", "other").status_code == 429  # one shared allowance
+    again = authed_client.post(f"/v1/auth/client-keys/{old_id}/rotate", json={})
+    assert again.status_code == 409 and "already replaced" in again.text
+    assert authed_client.post("/v1/auth/client-keys/nope/rotate", json={}).status_code == 404
+
+    other = _mint(authed_client, "phone")["key"]["id"]
+    stopped = authed_client.post(f"/v1/auth/client-keys/{other}/rotate", json={"overlapSeconds": 0})
+    assert stopped.status_code == 201
+    refused = call(other, "acquire")
+    assert refused.status_code == 401 and "replaced" in refused.text
+    assert call(other, "check").status_code == 401
