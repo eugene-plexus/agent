@@ -37,7 +37,15 @@ from .._generated.models import (
     Secondary,
 )
 from ..child_env import child_environment
-from . import gpu_probe, llama_architectures, prompt_cache, run_mode, same_answer, speculation
+from . import (
+    chat_templates,
+    gpu_probe,
+    llama_architectures,
+    prompt_cache,
+    run_mode,
+    same_answer,
+    speculation,
+)
 from .acquisition import (
     AcquisitionPlan,
     GitHubReleases,
@@ -510,6 +518,7 @@ class LlamaCppAdapter(EngineAdapter):
             else:
                 argv += [cli, str(value)]
 
+        argv += chat_templates.llama_argv(spec)
         argv += _load_mode_argv(flags, binary.path)
 
         argv += launch.argv()
@@ -649,9 +658,14 @@ class LlamaCppAdapter(EngineAdapter):
             # asserting readiness we can't vouch for.
             return Loading(detail=status)
 
-        return Ready(capabilities=await self._read_capabilities(url))
+        props = await self._read_props(url)
+        template = props.get("chat_template") if props is not None else None
+        return Ready(
+            capabilities=self._capabilities(props) if props is not None else None,
+            chat_template=template if isinstance(template, str) else None,
+        )
 
-    async def _read_capabilities(self, url: str) -> RuntimeCapabilities | None:
+    async def _read_props(self, url: str) -> dict | None:
         """Read back what the engine actually resolved, from `/props`.
 
         Deliberately read rather than inferred from the spec: a requested
@@ -670,6 +684,11 @@ class LlamaCppAdapter(EngineAdapter):
             return None
         if not isinstance(props, dict):
             return None
+
+        return props
+
+    @staticmethod
+    def _capabilities(props: dict) -> RuntimeCapabilities:
 
         default_generation = props.get("default_generation_settings")
         context_length = None
@@ -947,6 +966,7 @@ SLOT_PINNING_KEY = "slotPinning"
 # the schema so the UI-facing key never has to look like a CLI flag, and
 # so an upstream rename touches one line.
 _FLAG_CLI_NAMES: dict[str, str] = {
+    chat_templates.KEY: "--chat-template-file",
     "projectorPath": "--mmproj",
     "projectorOnCpu": "--no-mmproj-offload",
     "contextSize": "--ctx-size",
@@ -1025,6 +1045,15 @@ def flash_attention_argv(flags: dict[str, object]) -> list[str]:
 
 
 _FLAG_FIELDS: list[ConfigField] = [
+    ConfigField(
+        key=chat_templates.KEY,
+        label="Chat template file",
+        description="Use this file instead of the model's embedded template or Eugene's fallback.",
+        category="sampling",
+        valueType=ConfigValueType.string,
+        unsetMeans="Use the model's template, or Eugene's reviewed fallback when available.",
+        requiresRestart=True,
+    ),
     same_answer.field(EngineKind.llama_cpp),
     # Speculative decoding (SD1, docs/design/speculative-decoding.md).
     ConfigField(
