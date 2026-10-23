@@ -24,6 +24,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, FastAPI
 
@@ -80,6 +81,16 @@ from .supervisor import Supervisor
 from .trust import BUNDLE_FILE, NodeTrust
 
 log = logging.getLogger(__name__)
+
+
+async def _apps_boot(manager: Any) -> None:
+    """Rebuild what a move left without an environment, then start the
+    apps the operator left running (row 8)."""
+    try:
+        await manager.rebuild_moved()
+    except Exception:  # pragma: no cover - defensive: boot goes on
+        log.exception("could not rebuild the apps a move left")
+    await manager.start_enabled()
 
 
 @asynccontextmanager
@@ -555,7 +566,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # is down must not hold up supervision of the hub itself.
     apps_task: asyncio.Task[None] | None = None
     if app_manager is not None:
-        apps_task = asyncio.create_task(app_manager.start_enabled(), name="apps-boot")
+        apps_task = asyncio.create_task(_apps_boot(app_manager), name="apps-boot")
 
     # **Where this host is, said out loud on every boot.** Before M9 the
     # address was announced once, at enrollment, so a host that rebooted

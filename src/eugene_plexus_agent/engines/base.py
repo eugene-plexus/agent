@@ -429,9 +429,9 @@ class EngineAdapter(abc.ABC):
 
         managed = self.managed_store().current()
         if managed is not None:
-            self.refuse_untrusted(managed.binary)
+            binary = self.trusted(managed.binary)
             return DiscoveredBinary(
-                path=managed.binary,
+                path=binary,
                 origin=Origin.managed,
                 # The recorded build number, not a re-probe: it came off
                 # the release we installed, and spawning the binary on
@@ -450,19 +450,23 @@ class EngineAdapter(abc.ABC):
         The one place a found executable gets inspected, so an adapter
         that learns more than a version from it (a Python engine reads
         its whole environment) overrides this rather than every caller.
-        Every override starts with `refuse_untrusted`.
+        Every override starts with `path = self.trusted(path)`.
         """
-        self.refuse_untrusted(path)
+        path = self.trusted(path)
         return DiscoveredBinary(path=path, origin=origin, version=self.probe_version(path))
 
-    def refuse_untrusted(self, path: Path) -> None:
-        """In Eugene's own account, a program anyone else can change is
-        never run, not even for its version (row 8, `exec_trust`)."""
+    def trusted(self, path: Path) -> Path:
+        """In Eugene's own account, the path to execute: resolved, every
+        folder on the way and the interpreter of a script checked, so a
+        program anyone else can change is never run, not even for its
+        version, and nothing but the checked file runs (row 8,
+        `exec_trust`). Outside it, PATH as given."""
         from .. import exec_trust
 
-        reason = exec_trust.untrusted(path)
-        if reason is not None:
-            raise EngineUnavailableError(reason)
+        try:
+            return exec_trust.trusted_program(path)
+        except exec_trust.Untrusted as e:
+            raise EngineUnavailableError(str(e)) from e
 
     def probe_version(self, binary: Path) -> str | None:
         """Ask the binary what it is. None when it won't say.

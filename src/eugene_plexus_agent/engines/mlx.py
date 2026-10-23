@@ -232,7 +232,7 @@ class MlxAdapter(EngineAdapter):
         `mlx` rather than about vLLM and torch. Nothing of either engine
         is imported here: the probe runs the *other* interpreter.
         """
-        self.refuse_untrusted(path)
+        path = self.trusted(path)
         python = inspect_python_environment(path)
         version: str | None = None
         if python is not None:

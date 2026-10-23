@@ -90,6 +90,8 @@ log = logging.getLogger(__name__)
 
 APPS_FILE = "apps.yaml"
 APPS_DIR = "apps"
+#: Apps a move left without their environment, to rebuild (row 8).
+REBUILD_FILE = "rebuild.json"
 UNREADABLE_SUFFIX = ".unreadable"
 CATALOGUE_RESOURCE = "apps_catalogue.yaml"
 INSTALL_METADATA = "install.json"
@@ -1056,6 +1058,12 @@ class _AppPlanner:
                 f"the environment for {record.id} {record.version} is missing ({python}); "
                 "install the app again"
             )
+        # In Eugene's own account an app's interpreter and environment are
+        # checked like an engine's, and the checked path is what runs (row 8).
+        try:
+            python = exec_trust.trusted_program(python)
+        except exec_trust.Untrusted as e:
+            raise SpawnPlanError(f"{record.id} {record.version} was not started: {e}") from e
         data = self._store.data_dir(record.id)
         data.mkdir(parents=True, exist_ok=True)
         # A fresh admin token per spawn: the only holder is this agent, and
@@ -1097,6 +1105,8 @@ class _AppPlanner:
             env[f"{ENV_PREFIX}_OIDC_CLIENT_ID"] = client_id
             env[f"{ENV_PREFIX}_OIDC_SECRET_FILE"] = str(self._store.oidc_secret_file(record.id))
         env["PYTHONUNBUFFERED"] = "1"
+        # Nothing in the folder it starts in is imported (row 8).
+        env["PYTHONSAFEPATH"] = "1"
         return SpawnPlan(
             argv=entry_argv(python, record.manifest),
             env=env,
@@ -1322,9 +1332,12 @@ class AppManager:
         `exec_trust`)."""
         configured = self._get_config("uvBinary")
         found = find_uv(str(configured) if configured else None)
-        if found is not None and exec_trust.untrusted(found) is not None:
+        if found is None:
             return None
-        return found
+        try:
+            return exec_trust.trusted_program(found)
+        except exec_trust.Untrusted:
+            return None
 
     def installable(self, *, enrolled: bool) -> str | None:
         """None when this node can install apps, otherwise why not."""
@@ -1679,11 +1692,97 @@ class AppManager:
         await self.stop(record.id)
         await self.start(record)
 
+    async def rebuild_moved(self) -> list[str]:
+        """Boot: rebuild the environments of the apps a move left without one.
+
+        Moving a Mac's per-user install to its daemon (row 8) carries an
+        app's data and keys, never its environment: that is code, from the
+        person's account. The move lists those apps in
+        `apps/rebuild.json`; each catalogue app is installed again from
+        this agent's own catalogue, as its first install was. An app the
+        person added (custom) stays listed and is not started: its source
+        came from the person's account, so it is installed again by hand.
+        Returns what was rebuilt; an entry whose install fails stays
+        listed for the next start. Never raises."""
+        marker = self.store.root / REBUILD_FILE
+        if marker.is_symlink() or not marker.is_file():
+            return []
+        try:
+            listed = [
+                str(a) for a in (json.loads(marker.read_text(encoding="utf-8")).get("apps") or [])
+            ]
+        except (OSError, ValueError, AttributeError) as e:
+            log.warning("could not read %s, so no app was rebuilt: %s", marker, e)
+            return []
+        rebuilt: list[str] = []
+        remaining: list[str] = []
+        uv = self.uv()
+        for app_id in listed:
+            record = self.store.get(app_id)
+            if record is None:
+                continue
+            if venv_python(self.store.version_dir(app_id, record.version) / "venv").is_file():
+                continue
+            if (
+                record.origin is not AppOrigin.catalogue
+                or app_id not in self.catalogue
+                or uv is None
+            ):
+                log.warning(
+                    "%s was not rebuilt after the move: %s",
+                    app_id,
+                    "install it again from its source"
+                    if record.origin is not AppOrigin.catalogue
+                    else "it is not in this agent's catalogue"
+                    if uv is not None
+                    else "uv was not found",
+                )
+                remaining.append(app_id)
+                continue
+            manifest = self.catalogue[app_id]
+
+            async def installed(m: AppManifest) -> None:
+                await self.installed_callback(m, AppOrigin.catalogue)
+
+            try:
+                self.installer.start(manifest, store=self.store, uv=uv, on_installed=installed)
+            except AppInstallError as e:
+                log.warning("%s was not rebuilt after the move: %s", app_id, e)
+                remaining.append(app_id)
+                continue
+            done = await self.installer.wait(app_id)
+            if done is not None and done.state is State1.done:
+                log.info("rebuilt %s after the move", app_id)
+                rebuilt.append(app_id)
+            else:
+                log.warning(
+                    "%s was not rebuilt after the move: %s",
+                    app_id,
+                    (done.error if done is not None else None) or "the install did not finish",
+                )
+                remaining.append(app_id)
+        if remaining:
+            marker.write_text(json.dumps({"apps": remaining}, indent=2), encoding="utf-8")
+        else:
+            marker.unlink(missing_ok=True)
+        return rebuilt
+
+    def held_for_rebuild(self, app_id: str) -> bool:
+        """A move left this app without its environment, and it is listed
+        to be rebuilt: it is not started until it is."""
+        marker = self.store.root / REBUILD_FILE
+        if marker.is_symlink() or not marker.is_file():
+            return False
+        try:
+            return app_id in (json.loads(marker.read_text(encoding="utf-8")).get("apps") or [])
+        except (OSError, ValueError, AttributeError):
+            return False
+
     async def start_enabled(self) -> None:
         """Boot: bring up every app the operator left running. Never
         raises -- one app that will not start is that app's `lastError`."""
         for record in self.store.installed():
-            if not record.enabled:
+            if not record.enabled or self.held_for_rebuild(record.id):
                 continue
             try:
                 await self.start(record)
