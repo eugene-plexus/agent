@@ -334,6 +334,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             log=log,
             get_config=state.get_config,
             inherited_rules=folders_cache.inherited_rules,
+            library_roots=lambda: [folder.path for folder in folders_cache.folders or []],
             stop_memory=state,
         )
         owns_runtimes = True

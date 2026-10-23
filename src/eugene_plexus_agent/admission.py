@@ -227,6 +227,7 @@ class LibraryFitClient:
         self._transport = transport
         self._own_client: httpx.AsyncClient | None = None
         self.last_error: str | None = None
+        self.folders_safe_mode = False
         """Why the last folder read returned None, for the node's copy to
         keep and the Folders page to show."""
 
@@ -285,6 +286,7 @@ class LibraryFitClient:
         inherits its path rules from (2026-09-14). None when it could not
         answer, and the node keeps its last copy."""
         self.last_error = None
+        self.folders_safe_mode = False
         try:
             client = self._client()
             response = await client.get(f"{self._base}/v1/folders", headers=self._headers)
@@ -295,7 +297,9 @@ class LibraryFitClient:
                 )
                 log.warning("library folder list: %s", self.last_error)
                 return None
-            folders = response.json().get("folders")
+            body = response.json()
+            self.folders_safe_mode = body.get("safeMode") is True
+            folders = body.get("folders")
             if isinstance(folders, list):
                 return folders
             self.last_error = f"The Library at {self._base} answered without a folder list."
@@ -1321,6 +1325,12 @@ async def check_admission(
     # as long as the OS takes to give up.
     location = await asyncio.to_thread(_locate, spec, mappings, is_there, sizer, copy_settings)
     if not location.exists:
+        copy_refusal = None
+        if copy_settings is not None:
+            resolved = await asyncio.to_thread(
+                model_copies.resolve_local_path, spec.modelPath, mappings, copy_settings
+            )
+            copy_refusal = resolved.refusal
         return _refuse_missing(
             spec,
             location,
@@ -1328,6 +1338,7 @@ async def check_admission(
             context_length=context_length,
             warnings=warnings,
             folders_unread=folders_unread,
+            copy_refusal=copy_refusal,
         )
 
     # Each engine by its own fit model (LS6, Troy's L11): never another
@@ -1731,8 +1742,11 @@ def _locate(
     resolution = resolve_model_path(spec.modelPath, mappings)
     local = resolution.local_path
     if copy_settings is not None:
-        local = model_copies.resolve_local_path(spec.modelPath, mappings, copy_settings).path
-    present = bool(is_there(local))
+        resolved = model_copies.resolve_local_path(spec.modelPath, mappings, copy_settings)
+        local = resolved.path
+        present = not resolved.refusal and bool(is_there(local))
+    else:
+        present = bool(is_there(local))
     return ModelLocation(
         path=spec.modelPath,
         localPath=local,
@@ -1775,11 +1789,14 @@ def _refuse_missing(
     context_length: int | None,
     warnings: list[str],
     folders_unread: str | None = None,
+    copy_refusal: str | None = None,
 ) -> Admission:
     """The one launch failure the dry run can predict with certainty."""
     where = f"on {node_name}" if node_name else "on this host"
     tab = f"Library -> {node_name or 'this machine'} -> Folders"
-    if location.mapping is None and folders_unread:
+    if copy_refusal:
+        fix = f"The copy of {spec.modelPath} {where} {copy_refusal}"
+    elif location.mapping is None and folders_unread:
         # Not "set a mount": the operator may well have set one. This node
         # could not read the folders, so none of their mounts applied and
         # the Library's own spelling was tried (2026-09-27, the live
