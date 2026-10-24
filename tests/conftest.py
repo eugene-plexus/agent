@@ -425,6 +425,14 @@ def _no_gpus_from_the_operating_system(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _pin_spawn_card_inventory(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each spawn now reads cards too; a unit test never reads the live rig."""
+    from eugene_plexus_agent import runtimes
+
+    monkeypatch.setattr(runtimes, "detect_devices", fake_devices)
+
+
+@pytest.fixture(autouse=True)
 def _no_llama_server_places_models_by_itself(monkeypatch: pytest.MonkeyPatch) -> None:
     """Admission reads no real llama-server's help unless a test says otherwise.
 

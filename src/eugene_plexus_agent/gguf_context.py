@@ -18,7 +18,7 @@ Duplicated rather than shared, by the polyrepo rule: the library's
 from __future__ import annotations
 
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import BinaryIO
 
@@ -109,6 +109,53 @@ _INT_FORMATS = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 10: "<Q", 
 # that is not what it says, and reading it would mean allocating whatever the
 # length claims.
 _MAX_KEY_BYTES = 1 << 16
+
+
+@dataclass(frozen=True)
+class ChatTemplateFacts:
+    """A complete header's template facts, captured independently of filenames."""
+
+    architecture: str | None
+    name: str | None
+    embedded: str | None
+
+
+def chat_template_facts(path: Path | str) -> ChatTemplateFacts | None:
+    found: dict[str, str] = {}
+    wanted = {"general.architecture", "general.name", "tokenizer.chat_template"}
+    try:
+        with Path(path).open("rb") as stream:
+            if stream.read(4) != MAGIC:
+                return None
+            version, _, keys = struct.unpack("<IQQ", stream.read(20))
+            if version not in (2, 3) or keys > _MAX_KEYS:
+                return None
+            for _ in range(keys):
+                size = _u64(stream)
+                if size > _MAX_KEY_BYTES:
+                    return None
+                key = stream.read(size).decode("utf-8")
+                kind = struct.unpack("<I", stream.read(4))[0]
+                if key in wanted and kind == _STRING:
+                    size = _u64(stream)
+                    if size > 16 * 1024 * 1024:
+                        return None
+                    raw = stream.read(size)
+                    if len(raw) != size:
+                        return None
+                    found[key] = raw.decode("utf-8")
+                else:
+                    _skip(stream, kind)
+            if stream.tell() > Path(path).stat().st_size:
+                return None
+    except (OSError, ValueError, struct.error, OverflowError):
+        return None
+    return ChatTemplateFacts(
+        found.get("general.architecture"),
+        found.get("general.name"),
+        found.get("tokenizer.chat_template") or None,
+    )
+
 
 #: `<arch>.pooling_type` values (llama.cpp's `llama_pooling_type`). Only the one
 #: that matters is named: 4 is `rank`, a reranker's.
@@ -323,7 +370,7 @@ class DraftingFacts:
         return max(self.target_layers or (0,)) + (self.architecture != "eagle3")
 
 
-_DRAFTING: dict[tuple[str, int, int], DraftingFacts | None] = {}
+_DRAFTING: dict[tuple[tuple[str, int, int], ...], DraftingFacts | None] = {}
 
 
 def drafting_facts(path: Path | str) -> DraftingFacts | None:
@@ -332,15 +379,33 @@ def drafting_facts(path: Path | str) -> DraftingFacts | None:
     Reads the key block (stepping over the vocabulary) and the tensor table,
     never a weight. Cached per file as it stands, like `run_facts`.
     """
-    target = Path(path)
+    from .model_copies import shards_of
+
+    targets = tuple(Path(p) for p in shards_of(str(path)))
     try:
-        stat = target.stat()
+        stamps = [(target, target.stat()) for target in targets]
     except OSError:
         return None
-    key = (str(target), stat.st_mtime_ns, stat.st_size)
+    key = tuple((str(target), stat.st_mtime_ns, stat.st_size) for target, stat in stamps)
     if key in _DRAFTING:
         return _DRAFTING[key]
-    facts = _read_drafting_facts(target)
+    facts = _read_drafting_facts(targets[0])
+    if facts is not None and facts.architecture == "deepseek4" and len(targets) > 1:
+        parts = [facts]
+        for target in targets[1:]:
+            part = _read_drafting_facts(target)
+            if part is None or (part.architecture, part.block_count, part.vocab_size) != (
+                facts.architecture,
+                facts.block_count,
+                facts.vocab_size,
+            ):
+                return None
+            parts.append(part)
+        facts = replace(
+            facts,
+            mtp_tensors=any(part.mtp_tensors for part in parts),
+            has_first_block=any(part.has_first_block for part in parts),
+        )
     if len(_DRAFTING) >= _FACTS_KEPT:
         _DRAFTING.pop(next(iter(_DRAFTING)))
     _DRAFTING[key] = facts

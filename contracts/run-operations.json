@@ -887,6 +887,47 @@
         ],
         "title": "Answer"
       },
+      "ChatTemplateFallback": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Id",
+            "description": "Eugene's template identifier; distinct variants have distinct ids."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Name",
+            "description": "Human-readable template name for the model page."
+          },
+          "engines": {
+            "items": {
+              "$ref": "#/components/schemas/EngineKind"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Engines",
+            "description": "Engines whose Eugene adapters can apply this fallback. This\nis not a list of engines proved to load the model; consult\neligibility for that. No engine is rejected because it is\nabsent from this list.\n"
+          },
+          "sourceUrl": {
+            "type": "string",
+            "minLength": 1,
+            "format": "uri",
+            "title": "Sourceurl",
+            "description": "Published upstream format or template used for the review."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "engines",
+          "sourceUrl"
+        ],
+        "title": "ChatTemplateFallback",
+        "description": "A reviewed template Eugene can supply for this model family when\nits header confirms both the architecture and that it has no\nembedded chat template. Absent when that evidence is unknown,\nwhen the file embeds a template, or when Eugene has no reviewed\nfallback for this variant. A filename or a catalogue name alone\nis not evidence.\n\nThis is availability, not the template in effect. The model page\ncan say \"This model ships no chat template; Eugene supplies\nDeepSeek V4's\" and name the engines below, while keeping\n`ModelCapabilities.chatTemplate` false. The running agent reports\nthe effective template separately as `Runtime.chatTemplate`.\n\nDefault precedence is an explicit operator override, then the\nfile's embedded template, then this fallback on an engine listed\nbelow, then the engine's own behaviour. The override is exposed\nthrough the engine's GUI flag schema. Missing fallback information\ndoes not block a launch: engine eligibility is still decided by\nthe existing eligibility API, and untested engines remain eligible\nunder that API's rules."
+      },
       "Checkpoint": {
         "properties": {
           "lease": {
@@ -1812,6 +1853,16 @@
               }
             ]
           },
+          "chatTemplateFallback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatTemplateFallback"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "recommendedSampling": {
             "anyOf": [
               {
@@ -2390,7 +2441,7 @@
               }
             ],
             "title": "Chattemplate",
-            "description": "The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n"
+            "description": "The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n\nAn available Eugene fallback (`GgufDetail.chatTemplateFallback`\nor `CataloguePreflight.chatTemplateFallback`) never changes\nthis to true. Unknown metadata leaves this field absent.\n"
           },
           "decision": {
             "anyOf": [

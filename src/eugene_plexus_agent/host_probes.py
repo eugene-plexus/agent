@@ -129,6 +129,18 @@ class _NvmlUtilization(ctypes.Structure):
     _fields_ = (("gpu", ctypes.c_uint), ("memory", ctypes.c_uint))
 
 
+class _NvmlPciInfo(ctypes.Structure):
+    _fields_ = (
+        ("busIdLegacy", ctypes.c_char * 16),
+        ("domain", ctypes.c_uint),
+        ("bus", ctypes.c_uint),
+        ("device", ctypes.c_uint),
+        ("pciDeviceId", ctypes.c_uint),
+        ("pciSubSystemId", ctypes.c_uint),
+        ("busId", ctypes.c_char * 32),
+    )
+
+
 class _NvmlProcess(ctypes.Structure):
     _fields_ = (
         ("pid", ctypes.c_uint),
@@ -277,6 +289,95 @@ class Nvml:
             out.power = milliwatts.value / 1000.0
         else:
             out.errors["power"] = f"NVML: {self._describe(lib, status)}"
+        return out
+
+    def health(self, index: int, indices: list[int]) -> dict[str, Any]:
+        """Independent optional reads: one unsupported field never hides another.
+
+        Resolve handles afresh for each inventory: a dropped card can renumber
+        the indices since the previous 600-second inventory.
+        """
+        lib = self._lib
+        if lib is None:
+            return {}
+        self._handles.clear()
+        handle = self._handle(index)
+        if isinstance(handle, str):
+            return {}
+
+        def call(name: str, *args: Any) -> bool:
+            try:
+                return bool(getattr(lib, name)(handle, *args) == 0)
+            except (AttributeError, OSError):
+                return False
+
+        def number(name: str, *, wide: bool = False) -> int | None:
+            value = ctypes.c_ulonglong() if wide else ctypes.c_uint()
+            return int(value.value) if call(name, ctypes.byref(value)) else None
+
+        uuid = ctypes.create_string_buffer(96)
+        out: dict[str, Any] = {}
+        if call("nvmlDeviceGetUUID", uuid, ctypes.c_uint(len(uuid))):
+            out["uuid"] = uuid.value.decode(errors="replace") or None
+        pci = _NvmlPciInfo()
+        if call("nvmlDeviceGetPciInfo_v3", ctypes.byref(pci)):
+            out["pciBusId"] = pci.busId.decode(errors="replace") or None
+        link = {
+            key: number(name)
+            for key, name in (
+                ("generation", "nvmlDeviceGetCurrPcieLinkGeneration"),
+                ("width", "nvmlDeviceGetCurrPcieLinkWidth"),
+                ("maxGeneration", "nvmlDeviceGetMaxPcieLinkGeneration"),
+                ("maxWidth", "nvmlDeviceGetMaxPcieLinkWidth"),
+            )
+        }
+        out["pcieLink"] = link if any(v is not None for v in link.values()) else None
+        for key, name in (
+            ("powerLimitWatts", "nvmlDeviceGetEnforcedPowerLimit"),
+            ("powerDefaultLimitWatts", "nvmlDeviceGetPowerManagementDefaultLimit"),
+        ):
+            value = number(name)
+            out[key] = value / 1000 if value is not None else None
+        reasons = number("nvmlDeviceGetCurrentClocksThrottleReasons", wide=True)
+        if reasons is not None:
+            out["throttleReasons"] = []
+            for mask, reason in (
+                (0x60, "thermal"),
+                (0x04, "power-cap"),
+                (0x88, "hardware-slowdown"),
+            ):
+                if reasons & mask:
+                    out["throttleReasons"].append(reason)
+            if reasons & ~0xED:  # idle (0x1) is normal, not throttling
+                out["throttleReasons"].append("other")
+        current, pending = ctypes.c_uint(), ctypes.c_uint()
+        if (
+            call("nvmlDeviceGetEccMode", ctypes.byref(current), ctypes.byref(pending))
+            and current.value
+        ):
+            errors = ctypes.c_ulonglong()
+            if call("nvmlDeviceGetTotalEccErrors", 1, 0, ctypes.byref(errors)):
+                out["uncorrectedMemoryErrors"] = int(errors.value)
+        peers = []
+        peer_getter = getattr(lib, "nvmlDeviceGetP2PStatus", None)
+        readable = peer_getter is not None
+        for other in indices:
+            if other == index or not readable:
+                continue
+            peer = self._handle(other)
+            status = ctypes.c_uint()
+            if isinstance(peer, str) or not call(
+                "nvmlDeviceGetP2PStatus", peer, 0, ctypes.byref(status)
+            ):
+                readable = False
+                break
+            if status.value == 0:
+                other_uuid = ctypes.create_string_buffer(96)
+                if lib.nvmlDeviceGetUUID(peer, other_uuid, ctypes.c_uint(len(other_uuid))) == 0:
+                    peers.append(other_uuid.value.decode(errors="replace"))
+                else:
+                    readable = False
+        out["peers"] = peers if readable else None
         return out
 
     def process_memory(self, index: int) -> dict[int, int] | str:
@@ -731,7 +832,13 @@ class HostProbe:
             log.debug("host history: adapters unreadable: %s", exc)
             adapters = []
         self._gpus = match_adapters(snapshot.devices, adapters)
-        if any(g.device.kind is ComputeDeviceKind.cuda for g in self._gpus) and self._nvml is None:
+        # Handles are tied to the preceding bus inventory. Reopen after every
+        # refresh so a survivor that became card 0 is never read through card 0's
+        # old handle (or reported as a card that has already disappeared).
+        if self._nvml is not None:
+            self._nvml.close()
+            self._nvml = None
+        if any(g.device.kind is ComputeDeviceKind.cuda for g in self._gpus):
             self._nvml = self._nvml_factory()
         if self._platform == "win32" and self._gpus and self._pdh is None:
             self._pdh = self._windows_factory()
