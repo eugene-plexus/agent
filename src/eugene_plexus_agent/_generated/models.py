@@ -4295,6 +4295,9 @@ class State2(StrEnum):
     Changed_outside means the folder identity or recorded rights
     differ, so nothing was changed. Failed names its cause in
     message; it does not imply that all additions were removed.
+    Incomplete means removal found access for the app's account
+    that Eugene did not add; each such entry waits in unknown
+    for the owner's decision, and the app may still use it.
 
     """
 
@@ -4304,75 +4307,41 @@ class State2(StrEnum):
     removed = 'removed'
     changed_outside = 'changed_outside'
     failed = 'failed'
+    incomplete = 'incomplete'
 
 
-class FolderAccess(BaseModel):
+class FolderAccessUnknownKind(StrEnum):
     """
-    One persisted access record. Internal folder identity and the
-    exact permission delta stay in the agent's private record,
-    rather than accepting them from a caller. Every status field
-    reports the observed state, not merely the requested change.
+    entry is a permission entry for the app's account. null_dacl is
+    a Windows item with no permission list, which lets everyone
+    in. owner means the app's account owns the item, so it can
+    change the item's permissions. unreadable means Eugene cannot
+    read the item's permissions.
 
-    """
-
-    id: str = Field(
-        ...,
-        description='Stable access record id, scoped to this app on this node.',
-        min_length=1,
-    )
-    app: str = Field(..., description="The installed app's AppManifest.id.")
-    path: str = Field(
-        ...,
-        description='The final absolute folder path whose identity the agent recorded.',
-        max_length=4096,
-        min_length=1,
-    )
-    mode: Mode1 = Field(
-        ...,
-        description='The recorded rights; on Windows the write ACE excludes delete permission. Workbench never deletes files.',
-    )
-    account: str = Field(
-        ..., description="The app's own OS identity that receives these rights."
-    )
-    state: State2 = Field(
-        ...,
-        description="The effective access state. Applying and removing are in\nprogress; ready means propagation completed, subject to\nnotInheriting and restartNeeded. Removed means Eugene's\nadditions are gone, even if preexisting rights remain.\nChanged_outside means the folder identity or recorded rights\ndiffer, so nothing was changed. Failed names its cause in\nmessage; it does not imply that all additions were removed.\n",
-    )
-    preexisting: bool = Field(
-        ...,
-        description='The account already had the requested rights; nothing added and nothing to take back.',
-    )
-    notInheriting: int = Field(
-        ...,
-        description='Items inside the folder that keep their own permissions; their permissions are left as they are.',
-        ge=0,
-    )
-    restartNeeded: bool = Field(
-        ...,
-        description='Linux write access awaits a Workbench restart; never show write access as effective while true.',
-    )
-    message: str = Field(
-        ...,
-        description='The current outcome in words; a failure or changed_outside names its observed cause.',
-        min_length=1,
-    )
-    addedAt: AwareDatetime = Field(
-        ..., description="When the operator's access request was recorded."
-    )
-    addedBy: str = Field(
-        ...,
-        description='The operator identity that requested access, derived from the session.',
-    )
-
-
-class FolderAccessList(BaseModel):
-    """
-    This app's recorded folder access on this node, including removal outcomes.
     """
 
-    grants: list[FolderAccess] = Field(
-        ..., description='Empty when there is no matching recorded access.'
-    )
+    entry = 'entry'
+    null_dacl = 'null_dacl'
+    owner = 'owner'
+    unreadable = 'unreadable'
+
+
+class FolderAccessUnknownDecision(StrEnum):
+    """
+    Pending waits for the owner; kept means the owner chose to keep it.
+    """
+
+    pending = 'pending'
+    kept = 'kept'
+
+
+class FolderAccessDecisionAction(StrEnum):
+    """
+    Remove deletes only this entry after checking it again; keep leaves it.
+    """
+
+    remove = 'remove'
+    keep = 'keep'
 
 
 class FolderAccessRefusal(StrEnum):
@@ -4382,8 +4351,10 @@ class FolderAccessRefusal(StrEnum):
     reparse point in the path; drive_root includes mount roots;
     network includes UNC paths and mapped network drives. System,
     Eugene and home refusals also cover ancestors containing those
-    folders. Unavailable means the app shares Eugene's own account
-    and is reported with 409; path refusals use 400.
+    folders. unsafe_parent means a parent folder can be changed by
+    accounts other than root (Linux), and applies only when no other
+    refusal does. Unavailable means the app shares Eugene's own
+    account and is reported with 409; path refusals use 400.
 
     """
 
@@ -4394,6 +4365,7 @@ class FolderAccessRefusal(StrEnum):
     system = 'system'
     eugene = 'eugene'
     home = 'home'
+    unsafe_parent = 'unsafe_parent'
     unavailable = 'unavailable'
 
 
@@ -5787,6 +5759,32 @@ class AppCatalogue(BaseModel):
     )
 
 
+class FolderAccessUnknown(BaseModel):
+    """
+    One entry that lets the app's account in and that Eugene did not add.
+    """
+
+    id: str = Field(
+        ..., description='Stable id of this entry within its record.', min_length=1
+    )
+    path: str = Field(
+        ..., description='The file or folder that holds the entry.', min_length=1
+    )
+    kind: FolderAccessUnknownKind
+    entry: str = Field(
+        ..., description='The entry in words, as the console shows it.', min_length=1
+    )
+    decision: FolderAccessUnknownDecision
+
+
+class FolderAccessDecision(BaseModel):
+    """
+    The owner's decision about one unknown entry.
+    """
+
+    action: FolderAccessDecisionAction
+
+
 class AppList(BaseModel):
     apps: list[App]
 
@@ -6432,6 +6430,79 @@ class LibraryFolderReach(BaseModel):
         description='Why the library could not be read on this call, when\n`libraryConsulted` is false, in the words of what failed: the\ninstall lookup (for instance a control host registered at a\nloopback address), the library\'s own refusal, or the\nconnection. Absent when the library answered.\n\nOn the wire because the failure is otherwise silent where it\nmatters: a worker that cannot read the folders applies no\nfolder\'s mount, and its launch is refused as "nothing exists\nat" the Library\'s own path — the mount the operator already\nset is never mentioned (2026-09-27, the live install).\n',
     )
     folders: list[LibraryFolderStatus]
+
+
+class FolderAccess(BaseModel):
+    """
+    One persisted access record. Internal folder identity and the
+    exact permission delta stay in the agent's private record,
+    rather than accepting them from a caller. Every status field
+    reports the observed state, not merely the requested change.
+
+    """
+
+    id: str = Field(
+        ...,
+        description='Stable access record id, scoped to this app on this node.',
+        min_length=1,
+    )
+    app: str = Field(..., description="The installed app's AppManifest.id.")
+    path: str = Field(
+        ...,
+        description='The final absolute folder path whose identity the agent recorded.',
+        max_length=4096,
+        min_length=1,
+    )
+    mode: Mode1 = Field(
+        ...,
+        description='The recorded rights; on Windows the write ACE excludes delete permission. Workbench never deletes files.',
+    )
+    account: str = Field(
+        ..., description="The app's own OS identity that receives these rights."
+    )
+    state: State2 = Field(
+        ...,
+        description="The effective access state. Applying and removing are in\nprogress; ready means propagation completed, subject to\nnotInheriting and restartNeeded. Removed means Eugene's\nadditions are gone, even if preexisting rights remain.\nChanged_outside means the folder identity or recorded rights\ndiffer, so nothing was changed. Failed names its cause in\nmessage; it does not imply that all additions were removed.\nIncomplete means removal found access for the app's account\nthat Eugene did not add; each such entry waits in unknown\nfor the owner's decision, and the app may still use it.\n",
+    )
+    preexisting: bool = Field(
+        ...,
+        description='The account already had the requested rights; nothing added and nothing to take back.',
+    )
+    notInheriting: int = Field(
+        ...,
+        description='Items inside the folder that keep their own permissions; their permissions are left as they are.',
+        ge=0,
+    )
+    restartNeeded: bool = Field(
+        ...,
+        description='Linux write access awaits a Workbench restart; never show write access as effective while true.',
+    )
+    message: str = Field(
+        ...,
+        description='The current outcome in words; a failure or changed_outside names its observed cause.',
+        min_length=1,
+    )
+    addedAt: AwareDatetime = Field(
+        ..., description="When the operator's access request was recorded."
+    )
+    addedBy: str = Field(
+        ...,
+        description='The operator identity that requested access, derived from the session.',
+    )
+    unknown: list[FolderAccessUnknown] | None = Field(
+        None,
+        description="Access for the app's account that removal found and Eugene did\nnot add. A pending entry waits for the owner's decision; a kept\nentry stays, and the app still has that access through it.\nAbsent or empty when there is none.\n",
+    )
+
+
+class FolderAccessList(BaseModel):
+    """
+    This app's recorded folder access on this node, including removal outcomes.
+    """
+
+    grants: list[FolderAccess] = Field(
+        ..., description='Empty when there is no matching recorded access.'
+    )
 
 
 class EngineFitModel(BaseModel):

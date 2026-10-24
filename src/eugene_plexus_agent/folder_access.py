@@ -43,6 +43,10 @@ MESSAGES = {
     "unsafe_parent": "can be changed by other accounts.",
     "unavailable": UNAVAILABLE,
 }
+# What an unknown entry is, in words (R23-UNKNOWN).
+NULL_DACL = "it has no permission list (a null DACL), so every account can open it"
+OWNED = "{account} owns it, so it can change its permissions"
+UNREADABLE = "Eugene cannot read its permissions"
 WINDOWS_HOMES = ("Users",)
 LINUX_SYSTEM = tuple(
     "/" + p
@@ -200,6 +204,35 @@ class RemovalIncomplete(OSError):
     """Removal changed some permissions and named the items it could not change."""
 
 
+class UnknownAccess(RemovalIncomplete):
+    """Removal found access for the app's account that Eugene did not add.
+
+    The owner decides each entry (R23-UNKNOWN). An entry is a dict: kind,
+    path, entry (in words) and fingerprint, which the backend uses to check
+    the entry again; the fingerprint stays in the agent's private record.
+    """
+
+    def __init__(self, entries: list[dict[str, Any]]) -> None:
+        self.entries = entries
+        paths = list(dict.fromkeys(str(e["path"]) for e in entries))
+        shown = ", ".join(paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
+        super().__init__(
+            f"Workbench's account can still open {shown} through "
+            f"{'an entry' if len(entries) == 1 else 'entries'} Eugene did not add. "
+            "Choose Remove this entry too or Keep it."
+        )
+
+
+class NotWaiting(ValueError):
+    """The entry is not waiting for the owner's decision."""
+
+
+def _entry_id(fingerprint: dict[str, Any]) -> str:
+    import hashlib
+
+    return hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()[:16]
+
+
 class InspectionFailed(ValueError):
     """A folder could not be checked; its permissions must stay unchanged."""
 
@@ -212,6 +245,7 @@ class Permissions(Protocol):
         self, path: str, mode: str, save: Callable[[dict], None]
     ) -> tuple[dict, int, bool]: ...
     def revoke(self, path: str, delta: dict) -> bool: ...
+    def decide(self, path: str, delta: dict, fingerprint: dict, action: str) -> None: ...
 
 
 def _same_identity(left: list[int], right: list[int]) -> bool:
@@ -467,11 +501,39 @@ class Access:
                     raise ValueError("The folder was replaced.")
             if row["delta"] is not None and not self.permissions.revoke(row["path"], row["delta"]):
                 raise ValueError("The recorded permissions were changed outside Eugene.")
+            kept = [u for u in row.get("unknown") or [] if u["decision"] == "kept"]
+            paths = ", ".join(dict.fromkeys(u["path"] for u in kept))
             row.update(
                 state="removed",
                 restartNeeded=False,
-                message="Eugene's additions were removed. Preexisting permissions stay.",
+                unknown=kept,
+                message=(
+                    "Eugene's additions were removed. "
+                    + (
+                        f"Workbench can still open {paths} through "
+                        f"{'an entry' if len(kept) == 1 else 'entries'} Eugene did not add."
+                        if kept
+                        else "Preexisting permissions stay."
+                    )
+                ),
             )
+        except UnknownAccess as exc:
+            # R23-UNKNOWN: the owner decides each entry. Kept ones stay listed.
+            keys = dict(row.get("unknownKeys") or {})
+            listed = [u for u in row.get("unknown") or [] if u["decision"] == "kept"]
+            for found in exc.entries:
+                entry = _entry_id(found["fingerprint"])
+                keys[entry] = found["fingerprint"]
+                listed.append(
+                    dict(
+                        id=entry,
+                        path=str(found["path"]),
+                        kind=found["kind"],
+                        entry=found["entry"],
+                        decision="pending",
+                    )
+                )
+            row.update(state="incomplete", unknown=listed, unknownKeys=keys, message=str(exc))
         except (RemovalIncomplete, InspectionFailed) as exc:
             row.update(state="failed", message=str(exc))
         except ValueError as exc:
@@ -495,6 +557,40 @@ class Access:
                 finally:
                     _RUNNING.discard(ident)
         return FolderAccess.model_validate(row)
+
+    def decide(self, app: str, ident: str, entry: str, action: str) -> FolderAccess:
+        """The owner's decision about one entry Eugene did not add, then the removal again."""
+        with _LOCK:
+            rows = self._read()
+            row = rows.get(ident)
+            if row is None or row["app"] != app:
+                raise KeyError(ident)
+            found = next((u for u in row.get("unknown") or [] if u["id"] == entry), None)
+            if found is None:
+                raise KeyError(entry)
+            if row["state"] != "incomplete" or found["decision"] != "pending" or ident in _RUNNING:
+                raise NotWaiting(
+                    "This entry is not waiting for a decision. "
+                    "Choose Remove access again to check the folder."
+                )
+            fingerprint = (row.get("unknownKeys") or {})[entry]
+            _RUNNING.add(ident)
+        try:
+            # Checks the entry again, and removes only it (or records Keep).
+            self.permissions.decide(row["path"], row["delta"], fingerprint, action)
+            if action == "keep":
+                found["decision"] = "kept"
+            else:
+                row["unknown"] = [u for u in row["unknown"] if u["id"] != entry]
+                row["unknownKeys"].pop(entry, None)
+            with _LOCK:
+                current = self._read()
+                current[ident] = row
+                self._write(current)
+        finally:
+            with _LOCK:
+                _RUNNING.discard(ident)
+        return self.remove(app, ident)
 
     def lookup(self, app: str, path: str) -> list[FolderAccess]:
         facts, identity = self._inspect(path)
@@ -1006,21 +1102,67 @@ class WindowsPermissions:
                 return closed is not None and names not in closed
 
             owned: set[tuple[str, ...]] = set()
+            # Eugene's own entries it could not remove: a failure, retried.
             kept: list[tuple[str, ...]] = []
             unreadable: list[tuple[str, ...]] = []
+            # Access Eugene did not add: the owner decides (R23-UNKNOWN). An
+            # entry the owner chose to keep no longer holds the removal.
+            accepted = {json.dumps(fp, sort_keys=True) for fp in delta.get("accepted", [])}
+            asked: dict[str, dict[str, Any]] = {}
+
+            def ask(
+                kind: str, names: tuple[str, ...], ident: list[int], words: str, **extra: int
+            ) -> bool:
+                """List one entry for the owner; False when the owner already kept it."""
+                fingerprint = dict(kind=kind, names=list(names), identity=list(ident), **extra)
+                key = json.dumps(fingerprint, sort_keys=True)
+                if key in accepted:
+                    return False
+                asked.setdefault(
+                    key,
+                    dict(
+                        kind=kind,
+                        path=str(Path(path).joinpath(*names)),
+                        entry=words,
+                        fingerprint=fingerprint,
+                    ),
+                )
+                return True
+
             for names, held, ident, acl, directory, protected in self._tree(
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
-                try:
-                    if acl is None and names not in open_before:
+                null = acl is None and names not in open_before
+                if (
+                    null
+                    and json.dumps(
+                        dict(kind="null_dacl", names=list(names), identity=list(ident)),
+                        sort_keys=True,
+                    )
+                    not in accepted
+                ):
+                    try:
                         # A null DACL lets everyone do everything; it inherits again.
                         acl = self._inherit(ws, path, names, ident)
-                    if names not in owners_before and self._owner(ws, held) == delta["sid"]:
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, ValueError, pywintypes.error):
+                        ask("null_dacl", names, ident, NULL_DACL)
+                if (
+                    names not in owners_before
+                    and self._owner(ws, held) == delta["sid"]
+                    and json.dumps(
+                        dict(kind="owner", names=list(names), identity=list(ident)),
+                        sort_keys=True,
+                    )
+                    not in accepted
+                ):
+                    try:
                         self._give(ws, path, names, ident, person)
-                except FileNotFoundError:
-                    continue
-                except (OSError, ValueError, pywintypes.error):
-                    kept.append(names)
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, ValueError, pywintypes.error):
+                        ask("owner", names, ident, OWNED.format(account=self.account))
                 item = recorded.get(names)
                 # Protected since the grant: its inherited copy of Eugene's ACE
                 # became an explicit one with the same rights.
@@ -1076,14 +1218,13 @@ class WindowsPermissions:
             # Detect files created in the narrow interval before a parent's
             # ACE was removed, and any entry for the account that was not
             # there before the grant. A retry uses the same recorded plan.
-            for names, held, _, acl, directory, _ in self._tree(
+            for names, held, ident, acl, directory, _ in self._tree(
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
-                if names not in kept and (
-                    (acl is None and names not in open_before)
-                    or (names not in owners_before and self._owner(ws, held) == delta["sid"])
-                ):
-                    kept.append(names)
+                if acl is None and names not in open_before:
+                    ask("null_dacl", names, ident, NULL_DACL)
+                if names not in owners_before and self._owner(ws, held) == delta["sid"]:
+                    ask("owner", names, ident, OWNED.format(account=self.account))
                 if (
                     names
                     and names[:-1] in owned
@@ -1093,22 +1234,121 @@ class WindowsPermissions:
                         "New files inherited access during removal. "
                         "Some additions remain; try Remove access again."
                     )
-                if names not in kept and any(
-                    ace not in manual.get(names, [])
-                    for ace in self._explicit(ws, acl, delta["sid"])
-                ):
-                    kept.append(names)
-            remaining = list(dict.fromkeys(kept + unreadable))
-            if remaining:
-                shown = [str(Path(path).joinpath(*names)) for names in remaining[:3]]
-                more = f" and {len(remaining) - 3} more" if len(remaining) > 3 else ""
+                if names in kept:
+                    continue
+                left = [list(ace) for ace in manual.get(names, [])]
+                for ace_flags, ace_mask in self._explicit(ws, acl, delta["sid"]):
+                    if [ace_flags, ace_mask] in left:
+                        left.remove([ace_flags, ace_mask])
+                        continue
+                    ask(
+                        "entry",
+                        names,
+                        ident,
+                        self._words(ace_mask, ace_flags),
+                        flags=ace_flags,
+                        mask=ace_mask,
+                    )
+            for names in dict.fromkeys(unreadable):
+                ask("unreadable", names, [], UNREADABLE)
+            if kept:
+                shown = [str(Path(path).joinpath(*names)) for names in kept[:3]]
+                more = f" and {len(kept) - 3} more" if len(kept) > 3 else ""
                 raise RemovalIncomplete(
-                    f"Workbench's account can still open {', '.join(shown)}{more}: "
-                    f"{'its' if len(remaining) == 1 else 'their'} permissions were changed "
-                    "outside Eugene. Remove that access in the folder's Security settings, "
-                    "then try Remove access again."
+                    f"Eugene could not remove its own permission from {', '.join(shown)}{more}: "
+                    "the item's permissions were changed outside Eugene. Remove that access "
+                    "in the folder's Security settings, then try Remove access again."
                 )
+            if asked:
+                raise UnknownAccess(list(asked.values()))
             return True
+
+    def _words(self, mask: int, flags: int) -> str:
+        rights = {
+            self.READ: "read",
+            self.WRITE: "read and write",
+            0x1301BF: "modify",
+            0x1F01FF: "full control",
+        }.get(mask, f"the rights 0x{mask:X}")
+        reach = " on this item and everything in it" if flags & 3 == 3 else " on this item"
+        return f"{self.account} has {rights}{reach}, set outside Eugene"
+
+    def decide(self, path: str, delta: dict, fingerprint: dict, action: str) -> None:
+        """Keep one unknown entry, or check it again and remove only it."""
+        import pywintypes
+        import win32security as ws
+
+        if action == "keep":
+            delta.setdefault("accepted", []).append(fingerprint)
+            return
+        kind, names = fingerprint["kind"], tuple(fingerprint["names"])
+        ident = fingerprint["identity"]
+        if kind == "unreadable":
+            raise ValueError(
+                "Eugene cannot read this item's permissions. Change them in the folder's "
+                "Security settings, then choose Remove access again."
+            )
+        try:
+            with self._open(path, change=True) as (handle, _, identity):
+                if identity != delta["identity"]:
+                    raise ValueError("The folder was replaced, so the entry was left as it is.")
+                if kind == "null_dacl":
+                    self._inherit(ws, path, names, ident)
+                    return
+                if kind == "owner":
+                    person: str | None = self._owner(ws, handle)
+                    self._give(ws, path, names, ident, None if person == delta["sid"] else person)
+                    return
+                with self._open(
+                    str(Path(path).joinpath(*names)), change=True, _single=True, revoke=True
+                ) as (held, _, current):
+                    if current != ident:
+                        raise ValueError(
+                            "The item changed since Eugene found it, "
+                            "so the entry was left as it is."
+                        )
+                    descriptor = ws.GetSecurityInfo(
+                        held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION
+                    )
+                    acl = descriptor.GetSecurityDescriptorDacl()
+                    index = next(
+                        (
+                            i
+                            for i in range(acl.GetAceCount() if acl is not None else 0)
+                            if acl.GetAce(i)[0][0] in (0, 5)
+                            and acl.GetAce(i)[0][1] == fingerprint["flags"]
+                            and acl.GetAce(i)[1] == fingerprint["mask"]
+                            and ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) == delta["sid"]
+                        ),
+                        None,
+                    )
+                    if index is None:
+                        raise ValueError(
+                            "The entry changed since Eugene found it, so it was left as it is. "
+                            "Choose Remove access again to check the folder."
+                        )
+                    acl.DeleteAce(index)
+                    protected = descriptor.GetSecurityDescriptorControl()[0] & 0x1000
+                    # SetSecurityInfo also takes the entry's inherited copies
+                    # off the items below this one.
+                    ws.SetSecurityInfo(
+                        held,
+                        ws.SE_FILE_OBJECT,
+                        ws.DACL_SECURITY_INFORMATION
+                        | (
+                            ws.PROTECTED_DACL_SECURITY_INFORMATION
+                            if protected
+                            else ws.UNPROTECTED_DACL_SECURITY_INFORMATION
+                        ),
+                        None,
+                        None,
+                        acl,
+                        None,
+                    )
+        except FileNotFoundError:
+            return  # Gone: nothing left to remove.
+        except pywintypes.error as exc:
+            raise OSError(f"The entry could not be removed: {exc.strerror}.") from exc
 
 
 class LinuxPermissions:
@@ -1208,9 +1448,34 @@ class LinuxPermissions:
     def revoke(self, path: str, delta: dict) -> bool:
         result = self._ask("folder-revoke", delta["id"])
         delta["reapplied"] = result.get("reapplied", [])
+        if result.get("unknown"):
+            # The helper left these as they are; the owner decides (R23-UNKNOWN).
+            raise UnknownAccess(
+                [
+                    dict(
+                        kind="entry",
+                        path=found["path"],
+                        entry=found["entry"],
+                        fingerprint=found["fingerprint"],
+                    )
+                    for found in result["unknown"]
+                ]
+            )
         if not result["removed"] and result.get("message"):
             raise RemovalIncomplete(
                 f"Some items were not changed: {str(result['message']).rstrip('.')}. "
                 "Try Remove access again."
             )
         return bool(result["removed"])
+
+    def decide(self, path: str, delta: dict, fingerprint: dict, action: str) -> None:
+        """The root helper checks the entry against its own ledger, then acts."""
+        self.ctl.mkdir(parents=True, exist_ok=True)
+        request = self.ctl / f"{delta['id']}.entry"
+        write_private(request, json.dumps(fingerprint))
+        try:
+            self._ask("folder-decide", delta["id"], action)
+        except OSError as exc:
+            raise ValueError(str(exc).rstrip(".") + ".") from exc
+        finally:
+            request.unlink(missing_ok=True)

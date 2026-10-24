@@ -375,11 +375,53 @@ def test_revoke_names_access_it_cannot_attribute_and_never_reports_success(
         f"*{owner(locked)}:(OI)(CI)(F)",
         f"*{USERS}:(OI)(CI)(F)",
     )
-    with pytest.raises(fa.RemovalIncomplete, match=r"locked.*changed outside Eugene"):
+    with pytest.raises(fa.UnknownAccess) as asked:
         backend.revoke(str(root), delta)
-    # Its origin is unknown, so it stays; the record says what is left.
+    (found,) = asked.value.entries
+    assert found["kind"] == "entry" and found["path"].endswith("locked")
+    assert "full control" in found["entry"]
+    # Its origin is unknown, so it stays until the owner decides (R23-UNKNOWN).
     assert sid_aces(locked) == [(3, 0x1F01FF)]
     assert sid_aces(root) == []
+    backend.decide(str(root), delta, found["fingerprint"], "remove")
+    assert sid_aces(locked) == []
+    assert backend.revoke(str(root), delta)
+
+
+def test_a_kept_entry_stays_and_no_longer_holds_the_removal(tmp_path: Path) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    extra = root / "extra"
+    extra.mkdir()
+    icacls(extra, "/grant", f"*{USERS}:(OI)(CI)(F)")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    backend.decide(str(root), delta, found["fingerprint"], "keep")
+    assert backend.revoke(str(root), delta)
+    assert (3, 0x1F01FF) in sid_aces(extra)
+
+
+def test_remove_this_entry_too_checks_it_again_first(tmp_path: Path) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    extra = root / "extra"
+    extra.mkdir()
+    icacls(extra, "/grant", f"*{USERS}:(OI)(CI)(F)")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    icacls(extra, "/remove:g", f"*{USERS}")
+    icacls(extra, "/grant", f"*{USERS}:(OI)(CI)(M)")  # changed since it was found
+    with pytest.raises(ValueError, match="changed since"):
+        backend.decide(str(root), delta, found["fingerprint"], "remove")
+    assert sid_aces(extra) == [(3, 0x1301BF)]
 
 
 def test_revoke_keeps_a_by_hand_entry_in_a_folder_protected_before_the_grant(
@@ -477,12 +519,21 @@ def test_revoke_reports_an_app_owned_item_it_cannot_give_back(
 
     monkeypatch.setattr(fa.WindowsPermissions, "_owner", staticmethod(owned_by_app))
     monkeypatch.setattr(backend, "_give", cannot)
-    with pytest.raises(fa.RemovalIncomplete, match=r"made\.txt.*changed outside Eugene"):
+    with pytest.raises(fa.UnknownAccess) as asked:
         backend.revoke(str(root), delta)
+    assert [(e["kind"], Path(e["path"]).name) for e in asked.value.entries] == [
+        ("owner", "made.txt")
+    ]
+
+
+def elevated() -> bool:
+    import ctypes
+
+    return os.name == "nt" and bool(ctypes.windll.shell32.IsUserAnAdmin())
 
 
 @pytest.mark.skipif(
-    not __import__("ctypes").windll.shell32.IsUserAnAdmin(),
+    not elevated(),
     reason="Giving an item to another owner needs SeRestorePrivilege (CI runs as admin)",
 )
 def test_revoke_gives_app_owned_items_to_the_folders_owner(tmp_path: Path) -> None:

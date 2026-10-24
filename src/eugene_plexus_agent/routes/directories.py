@@ -11,6 +11,7 @@ from .. import app_accounts, folder_access, tokens
 from .._generated.common_models import DirectoryListing, Problem
 from .._generated.models import (
     FolderAccess,
+    FolderAccessDecision,
     FolderAccessList,
     FolderAccessReleaseRequest,
     FolderAccessRequest,
@@ -111,6 +112,34 @@ def remove_folder_access(request: Request, app: str, ident: str) -> FolderAccess
         return _access(request, app).remove(app, ident)
     except KeyError as exc:
         raise HTTPException(404, detail="No folder access with that id for this app.") from exc
+    except (OSError, ValueError) as exc:
+        raise _failure(exc) from exc
+
+
+@router.post(
+    "/v1/apps/{app}/folder-access/{ident}/unknown/{entry}",
+    response_model=FolderAccess,
+    dependencies=[Depends(require_operator_session)],
+)
+def decide_folder_access_entry(
+    request: Request, app: str, ident: str, entry: str, body: FolderAccessDecision
+) -> FolderAccess:
+    """R23-UNKNOWN: the owner removes or keeps one entry Eugene did not add."""
+    try:
+        return _access(request, app).decide(app, ident, entry, str(body.action))
+    except KeyError as exc:
+        raise HTTPException(404, detail="No such folder access entry for this app.") from exc
+    except folder_access.NotWaiting as exc:
+        raise HTTPException(
+            409,
+            detail=dict(
+                type="about:blank",
+                title="Not waiting for a decision",
+                status=409,
+                detail=str(exc),
+                component="agent",
+            ),
+        ) from exc
     except (OSError, ValueError) as exc:
         raise _failure(exc) from exc
 

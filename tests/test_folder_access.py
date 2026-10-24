@@ -6,6 +6,7 @@ import os
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -670,6 +671,102 @@ def test_restart_completion_uses_a_fresh_service_observation(tmp_path: Path) -> 
     )
     supervisor.status = lambda _: (None, None, None, 7, None)
     assert directories._process(SimpleNamespace(supervisor=supervisor), "workbench") == 91
+
+
+class AskingPermissions(MemoryPermissions):
+    """Removal finds one entry Eugene did not add, until the owner decides it."""
+
+    FOUND: ClassVar[dict] = {
+        "kind": "entry",
+        "path": "/srv/acme/sub",
+        "entry": "group eapp-0123456789ab-files: rwx (set by hand)",
+        "fingerprint": {"kind": "entry", "names": ["sub"], "key": "group:9", "value": "rwx"},
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.present = True
+        self.decisions: list[tuple[dict, str]] = []
+
+    def revoke(self, path: str, delta: dict) -> bool:
+        if self.present and self.FOUND["fingerprint"] not in delta.get("accepted", []):
+            raise fa.UnknownAccess([dict(self.FOUND)])
+        return super().revoke(path, delta)
+
+    def decide(self, path: str, delta: dict, fingerprint: dict, action: str) -> None:
+        self.decisions.append((fingerprint, action))
+        if action == "remove":
+            self.present = False
+        else:
+            delta.setdefault("accepted", []).append(fingerprint)
+
+
+def test_removal_asks_the_owner_about_an_entry_eugene_did_not_add(tmp_path: Path) -> None:
+    """R23-UNKNOWN (Troy, 2026-10-24): prompt; Keep leaves it and says so."""
+    backend = AskingPermissions()
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "write", "operator")
+    asked = access.remove("workbench", grant.id)
+    assert asked.state == "incomplete"
+    assert asked.unknown is not None and len(asked.unknown) == 1
+    entry = asked.unknown[0]
+    assert (entry.path, entry.kind, entry.decision) == ("/srv/acme/sub", "entry", "pending")
+    assert "/srv/acme/sub" in asked.message
+    # The private fingerprint never reaches the API.
+    assert "fingerprint" not in asked.model_dump_json()
+    kept = access.decide("workbench", grant.id, entry.id, "keep")
+    assert backend.decisions == [(AskingPermissions.FOUND["fingerprint"], "keep")]
+    assert kept.state == "removed"
+    assert kept.unknown is not None and [u.decision for u in kept.unknown] == ["kept"]
+    assert kept.message == (
+        "Eugene's additions were removed. Workbench can still open /srv/acme/sub "
+        "through an entry Eugene did not add."
+    )
+    with pytest.raises(ValueError, match="not waiting for a decision"):
+        access.decide("workbench", grant.id, entry.id, "remove")
+
+
+def test_remove_this_entry_too_deletes_it_and_finishes_the_removal(tmp_path: Path) -> None:
+    backend = AskingPermissions()
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "write", "operator")
+    entry = access.remove("workbench", grant.id).unknown[0]  # type: ignore[index]
+    with pytest.raises(KeyError):
+        access.decide("workbench", grant.id, "no-such-entry", "remove")
+    with pytest.raises(KeyError):
+        access.decide("other", grant.id, entry.id, "remove")
+    done = access.decide("workbench", grant.id, entry.id, "remove")
+    assert backend.decisions == [(AskingPermissions.FOUND["fingerprint"], "remove")]
+    assert done.state == "removed" and not done.unknown
+    assert done.message == "Eugene's additions were removed. Preexisting permissions stay."
+
+
+def test_decide_route_needs_an_operator_session(
+    authed_client: TestClient, monkeypatch, tmp_path: Path
+) -> None:
+    from eugene_plexus_agent.routes import directories
+
+    access = service(tmp_path, AskingPermissions())
+    monkeypatch.setattr(directories, "_access", lambda *_: access)
+    grant = access.add("workbench", "/srv/acme", "write", "operator")
+    entry = access.remove("workbench", grant.id).unknown[0]  # type: ignore[index]
+    route = f"/v1/apps/workbench/folder-access/{grant.id}/unknown/{entry.id}"
+    key = authed_client.post("/v1/auth/client-keys", json={"name": "app:workbench@local"}).json()[
+        "token"
+    ]
+    for token in (key, local_service_token(authed_client.app, "gateway")):
+        refused = authed_client.post(
+            route, json={"action": "remove"}, headers={"Authorization": f"Bearer {token}"}
+        )
+        assert refused.status_code in (401, 403), refused.text
+    assert access.listing("workbench")[0].state == "incomplete"
+    assert authed_client.post(route + "x", json={"action": "keep"}).status_code == 404
+    decided = authed_client.post(route, json={"action": "keep"})
+    assert decided.status_code == 200, decided.text
+    assert decided.json()["state"] == "removed"
+    assert decided.json()["unknown"][0]["decision"] == "kept"
+    again = authed_client.post(route, json={"action": "remove"})
+    assert again.status_code == 409, again.text
 
 
 def test_add_needs_operator_session(authed_client: TestClient) -> None:
