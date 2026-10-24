@@ -52,6 +52,7 @@ from ..admission import (
     check_admission,
     reservation_bytes,
 )
+from ..card_launch import refit_on_cards_left, select_cards
 from ..companions import (
     CompanionConflict,
     companion_name,
@@ -392,6 +393,9 @@ def _reserve(
         return
     # What admission measured, which for a search model is what it will take.
     spec = launch_view(request, spec)
+    launch = getattr(request.state, "card_launch", None)
+    if launch is not None:
+        spec = launch.spec
     size = reservation_bytes(spec, admission, engine_places=engine_places)
     _ledger(request).reserve(
         spec.name,
@@ -465,22 +469,39 @@ async def _measure_launch(request: RuntimeContext, spec: RuntimeSpec) -> tuple[A
     identity = getattr(request.app.state, "node_identity", None)
     node_name = identity.record.name if identity is not None and identity.record.enrolled else None
     places = await asyncio.to_thread(engine_places, spec, state.get_config)
-    admission = await check_admission(
-        spec,
-        snapshot=snapshot,
-        library=await library_client_for(request),
-        running=running,
-        reservations=ledger.entries(),
-        size_of=getattr(request.app.state, "model_size_of", None),
-        mappings=effective_rules_for(request),
-        node_name=node_name,
-        folders_unread=folders_unread,
-        exists=getattr(request.app.state, "model_exists", None),
-        # So admission asks about the file a launch would actually open,
-        # including this node's own copy when it holds one.
-        copy_settings=supervisor.copy_settings() if supervisor is not None else None,
-        engine_places=places,
-    )
+
+    async def measure(candidate: RuntimeSpec) -> Admission:
+        return await check_admission(
+            candidate,
+            snapshot=snapshot,
+            library=await library_client_for(request),
+            running=running,
+            reservations=ledger.entries(),
+            size_of=getattr(request.app.state, "model_size_of", None),
+            mappings=effective_rules_for(request),
+            node_name=node_name,
+            folders_unread=folders_unread,
+            exists=getattr(request.app.state, "model_exists", None),
+            # So admission asks about the file a launch would actually open,
+            # including this node's own copy when it holds one.
+            copy_settings=supervisor.copy_settings() if supervisor is not None else None,
+            engine_places=places,
+        )
+
+    try:
+        launch = select_cards(
+            spec,
+            snapshot,
+            expected=supervisor.device_memory.expected(declared)
+            if isinstance(supervisor, RuntimeSupervisor)
+            else None,
+        )
+        launch, admission = await refit_on_cards_left(launch, measure)
+    except ValueError as exc:
+        raise _problem(
+            code=422, slug="cards-missing", title="Cannot start on the cards left", detail=str(exc)
+        ) from exc
+    request.state.card_launch = launch
     if searching and admission.promptCacheBytes is not None:
         admission = admission.model_copy(update={"promptCacheBytes": None})
     if spec.engine is EngineKind.strata and admission.decision is AdmissionDecision.admit:
@@ -887,6 +908,11 @@ async def declare_runtime(
             log.error("companion for %s: %s", spec.name, e)
 
     if supervisor is not None:
+        if isinstance(supervisor, RuntimeSupervisor):
+            if force:
+                supervisor.force_launches.add(spec.name)
+            else:
+                supervisor.force_launches.discard(spec.name)
         supervisor.add_and_start(spec)
         # Last, and only once the start is actually scheduled: a
         # declaration that 409'd or 400'd above never promised anything,
@@ -1106,6 +1132,11 @@ async def start_declared_runtime(
         if admission.decision is AdmissionDecision.refuse and not force:
             raise _refused(admission)
     if supervisor is not None and not already:
+        if isinstance(supervisor, RuntimeSupervisor):
+            if force:
+                supervisor.force_launches.add(name)
+            else:
+                supervisor.force_launches.discard(name)
         # `autoStart: false` means "don't start at boot", not "never
         # start" — an explicit start overrides it for this session.
         supervisor.add_and_start(spec.model_copy(update={"autoStart": True}))

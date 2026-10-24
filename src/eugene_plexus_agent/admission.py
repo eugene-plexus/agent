@@ -517,13 +517,17 @@ def explicit_devices(
         match = _DEVICE_NAME_RE.match(name)
         backend = match.group("backend").lower() if match else ""
         kind = {"cuda": ComputeDeviceKind.cuda, "rocm": ComputeDeviceKind.rocm}.get(backend)
+        selector = match.group("index") if match else ""
+        raw = (
+            (spec.env or {}).get("CUDA_VISIBLE_DEVICES") if kind is ComputeDeviceKind.cuda else None
+        )
+        if raw is not None and match is not None:
+            visible = raw.split(",")
+            ordinal = int(match.group("index"))
+            selector = visible[ordinal].strip() if ordinal < len(visible) else ""
         device = (
             next(
-                (
-                    d
-                    for d in accelerators
-                    if d.kind is kind and d.index == int(match.group("index"))
-                ),
+                (d for d in accelerators if d.kind is kind and selector_matches(d, selector)),
                 None,
             )
             if match and kind is not None
@@ -534,6 +538,26 @@ def explicit_devices(
         elif device not in mapped:
             mapped.append(device)
     return mapped, unmapped
+
+
+def selector_matches(device: ComputeDevice, selector: str) -> bool:
+    """One vendor selector against a host device; never an empty UUID prefix."""
+    return bool(selector) and (
+        str(device.index) == selector or bool(device.uuid and device.uuid.startswith(selector))
+    )
+
+
+def main_device(spec: RuntimeSpec, devices: Sequence[ComputeDevice]) -> ComputeDevice | None:
+    index = (spec.flags or {}).get("mainGpu")
+    if index is None:
+        return None
+    selector = str(index)
+    raw = (spec.env or {}).get("CUDA_VISIBLE_DEVICES")
+    if raw is not None:
+        visible = raw.split(",")
+        ordinal = _int_flag(index, -1)
+        selector = visible[ordinal].strip() if 0 <= ordinal < len(visible) else ""
+    return next((d for d in devices if selector_matches(d, selector)), None)
 
 
 def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeDevice]:
@@ -557,14 +581,29 @@ def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeD
             cpu = snapshot.cpu()
             return [cpu] if cpu is not None else accelerators
         return accelerators
+    for var, selected_kind in _PIN_KINDS.items():
+        raw = (spec.env or {}).get(var)
+        if raw is not None and any(part.strip().startswith("GPU-") for part in raw.split(",")):
+            selected = []
+            for token in raw.split(","):
+                matches = [
+                    d
+                    for d in accelerators
+                    if d.kind is selected_kind and d.uuid and d.uuid.startswith(token.strip())
+                ]
+                if len(matches) == 1:
+                    selected.append(matches[0])
+            return selected or accelerators
     pinned = pinned_indices(spec.env)
     if pinned is None:
         return accelerators
     kind = pin_kind(spec.env)
+    raw = next((str((spec.env or {})[v]) for v in _PIN_ENV_VARS if v in (spec.env or {})), "")
     chosen = [
         d
+        for token in raw.split(",")
         for d in accelerators
-        if d.index is not None and d.index in pinned and (kind is None or d.kind is kind)
+        if selector_matches(d, token.strip()) and (kind is None or d.kind is kind)
     ]
     # A pin to a device this host does not have is an engine error at
     # spawn; admission measures against everything rather than nothing.
@@ -723,6 +762,8 @@ def place(
         device = max(
             targets, key=lambda d: (s if (s := spare(d)) is not None else -1, -(d.index or 0))
         )
+        if str((spec.flags or {}).get("splitMode", "")).lower() == "none":
+            device = main_device(spec, targets) or device
         reserved = held(device)
         free = device.memoryFreeBytes
         return Placement(
@@ -750,11 +791,7 @@ def place(
         budget = int(min((s or 0) / p for s, p in zip(spares, fractions, strict=True)))
     frees = [d.memoryFreeBytes for d in devices]
     totals = [d.memoryTotalBytes for d in devices]
-    main_index = (spec.flags or {}).get("mainGpu")
-    main = next(
-        (d for d in devices if main_index is not None and d.index == _int_flag(main_index, -1)),
-        devices[0],
-    )
+    main = main_device(spec, devices) or devices[0]
     return Placement(
         main=main,
         devices=devices,

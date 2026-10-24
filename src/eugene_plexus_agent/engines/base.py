@@ -227,6 +227,7 @@ class Ready:
 
     capabilities: RuntimeCapabilities | None = None
     version: str | None = None
+    chat_template: str | None = None
 
 
 # A sum type, not a hierarchy: there are exactly three answers to "is it

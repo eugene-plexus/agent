@@ -102,6 +102,7 @@ def supervisor_for(
             binary=None,
             opened_path=None,
             same_answer=None,
+            card_launch=None,
             refused_binary=None,
             exec_trust=None,
         )
