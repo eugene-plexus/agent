@@ -186,6 +186,15 @@ def test_revoke_tolerates_junctions_and_hardlinks(tmp_path: Path) -> None:
     before = ws.ConvertSecurityDescriptorToStringSecurityDescriptor(
         ws.GetFileSecurity(str(file), 4), 1, 4
     )
+    # A file with another name is never changed by removal: the owner decides.
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    assert sorted((e["kind"], Path(e["path"]).name) for e in asked.value.entries) == [
+        ("hardlink", "also-private"),
+        ("hardlink", "inside"),
+    ]
+    for found in asked.value.entries:
+        backend.decide(str(root), delta, found["fingerprint"], "keep")
     assert backend.revoke(str(root), delta)
     assert (
         ws.ConvertSecurityDescriptorToStringSecurityDescriptor(
@@ -193,13 +202,13 @@ def test_revoke_tolerates_junctions_and_hardlinks(tmp_path: Path) -> None:
         )
         == before
     )
-    for path in (inside, root / "junction"):
-        with backend._open(str(path), _single=True, revoke=True) as (handle, _, _):
-            acl = backend._acl(ws, handle)
-            assert all(
-                ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) != backend.account
-                for i in range(acl.GetAceCount())
-            )
+    # The junction is an item of its own: its ACL is checked, and never followed.
+    with backend._open(str(root), names=("junction",), revoke=True) as (handle, _, _):
+        acl = backend._acl(ws, handle)
+        assert all(
+            ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) != backend.account
+            for i in range(acl.GetAceCount())
+        )
     (root / "junction").rmdir()
 
 
@@ -223,12 +232,13 @@ def test_revoke_continues_when_file_vanishes_before_write_open(tmp_path: Path, m
 
     @contextlib.contextmanager
     def disappearing(path, **kwargs):
-        if path == str(vanishing) and kwargs.get("change"):
+        item = str(Path(path).joinpath(*kwargs.get("names", ())))
+        if item == str(vanishing) and kwargs.get("change"):
             vanishing.unlink()
-            raise FileNotFoundError(path)
+            raise FileNotFoundError(item)
         with original(path, **kwargs) as result:
             if kwargs.get("change"):
-                observed.append(path)
+                observed.append(item)
             yield result
 
     monkeypatch.setattr(backend, "_open", disappearing)
@@ -593,3 +603,289 @@ def test_windows_refuses_a_grant_inside_or_around_another(tmp_path: Path) -> Non
         access.add("workbench", str(root / "sub"), "write", "operator")
     assert access.remove("workbench", parent.id).state == "removed"
     assert access.add("workbench", str(root / "sub"), "write", "operator").state == "ready"
+
+
+# --- Re-review 2: exemptions follow the file, never its name or a link ------------
+
+
+@pytest.fixture
+def app_owns(monkeypatch: pytest.MonkeyPatch):
+    """Make chosen files look owned by the app's account.
+
+    A real transfer of ownership needs privileges the test account lacks, so the
+    owner of a file is read from a set of file identities, the way Windows
+    names a file: volume serial and file ID, which a rename keeps."""
+    import win32file
+
+    owned: set[tuple[int, int]] = set()
+    real = fa.WindowsPermissions._owner
+
+    def owner_of(ws, handle):
+        path = win32file.GetFinalPathNameByHandle(handle, 0).removeprefix("\\\\?\\")
+        info = os.stat(path)
+        return USERS if (info.st_dev, info.st_ino) in owned else real(ws, handle)
+
+    monkeypatch.setattr(fa.WindowsPermissions, "_owner", staticmethod(owner_of))
+
+    def own(path: Path) -> None:
+        info = os.stat(path)
+        owned.add((info.st_dev, info.st_ino))
+
+    return own
+
+
+def cannot_give(*_args, **_kwargs):
+    raise PermissionError(1307, "This security ID may not be assigned as the owner")
+
+
+def junction(link: Path, target: Path) -> None:
+    import subprocess
+
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+    )
+
+
+def shared_root(tmp_path: Path) -> Path:
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    return root
+
+
+def test_ownership_exemption_follows_the_file_after_a_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, app_owns
+) -> None:
+    """Re-review 2: the app owned `seed` before the grant. After a rename and a new
+    app-owned `seed`, removal exempted the new file by its name."""
+    root = shared_root(tmp_path)
+    (root / "seed").write_text("old")
+    app_owns(root / "seed")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    monkeypatch.setattr(backend, "_give", cannot_give)
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    (root / "seed").rename(root / "moved")
+    (root / "seed").write_text("replacement")
+    app_owns(root / "seed")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    assert [(e["kind"], Path(e["path"]).name) for e in asked.value.entries] == [("owner", "seed")]
+
+
+def test_a_by_hand_entry_stays_with_its_file_after_a_rename(tmp_path: Path) -> None:
+    root = shared_root(tmp_path)
+    (root / "seed").write_text("x")
+    icacls(root / "seed", "/grant", f"*{USERS}:(RX)")
+    by_hand = sid_aces(root / "seed")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    (root / "seed").rename(root / "moved")
+    assert backend.revoke(str(root), delta)
+    assert sid_aces(root / "moved") == by_hand
+
+
+def test_a_null_dacl_from_before_the_grant_stays_after_a_rename(tmp_path: Path) -> None:
+    root = shared_root(tmp_path)
+    (root / "open").write_text("x")
+    null_dacl(root / "open")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    (root / "open").rename(root / "moved")
+    assert backend.revoke(str(root), delta)
+    assert dacl(root / "moved") is None
+
+
+def test_keep_is_about_the_file_not_its_name(tmp_path: Path) -> None:
+    root = shared_root(tmp_path)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    extra = root / "extra"
+    extra.mkdir()
+    icacls(extra, "/grant", f"*{USERS}:(OI)(CI)(F)")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    backend.decide(str(root), delta, asked.value.entries[0]["fingerprint"], "keep")
+    extra.rename(root / "renamed")
+    assert backend.revoke(str(root), delta)
+    assert [e["path"] for e in delta["retained"]] == [str(root / "renamed")]
+
+
+def test_removal_never_changes_a_file_with_another_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, app_owns
+) -> None:
+    """Re-review 2 (blocker): an app-owned file with a hard link outside the folder
+    had its owner and ACE changed through both names."""
+    root = shared_root(tmp_path)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    made = root / "made.txt"
+    made.write_text("app data")
+    app_owns(made)
+    alias = tmp_path / "alias.txt"
+    os.link(made, alias)
+    granted = sid_aces(made)
+    assert granted  # inherited from the folder
+    monkeypatch.setattr(
+        backend, "_give", lambda *a, **k: pytest.fail("ownership changed on a shared file")
+    )
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    assert (found["kind"], Path(found["path"]).name) == ("hardlink", "made.txt")
+    assert found["entry"] == fa.HARDLINK
+    assert sid_aces(made) == granted and sid_aces(alias) == granted
+    # Keep leaves both names as they are; the removal then finishes.
+    backend.decide(str(root), delta, found["fingerprint"], "keep")
+    assert backend.revoke(str(root), delta)
+    assert sid_aces(made) == granted and [e["kind"] for e in delta["retained"]] == ["hardlink"]
+
+
+def test_remove_on_a_file_with_another_name_lets_the_removal_change_it(
+    tmp_path: Path,
+) -> None:
+    root = shared_root(tmp_path)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    made = root / "made.txt"
+    made.write_text("app data")
+    os.link(made, tmp_path / "alias.txt")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    backend.decide(str(root), delta, asked.value.entries[0]["fingerprint"], "remove")
+    assert sid_aces(made) == [(16, backend.WRITE)]  # the decision allows; it changes nothing yet
+    assert backend.revoke(str(root), delta)
+    assert sid_aces(made) == []
+
+
+def test_a_decision_never_follows_a_junction_put_in_place_of_a_folder(tmp_path: Path) -> None:
+    """Re-review 2 (blocker): after the prompt about shared/sub/f, `sub` moved away and
+    a junction took its name. The decision followed it and changed an ACE outside."""
+    root = shared_root(tmp_path)
+    (root / "sub").mkdir()
+    made = root / "sub" / "f"
+    made.write_text("x")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    icacls(made, "/inheritance:r", "/grant:r", f"*{owner(made)}:(F)", f"*{USERS}:(F)")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    outside = tmp_path / "outside"
+    (root / "sub").rename(outside)
+    junction(root / "sub", outside)
+    with pytest.raises((ValueError, OSError)):
+        backend.decide(str(root), delta, found["fingerprint"], "remove")
+    assert sid_aces(outside / "f") == [(0, 0x1F01FF)]
+
+
+def test_an_ownership_decision_never_follows_a_junction_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = shared_root(tmp_path)
+    (root / "sub").mkdir()
+    (root / "sub" / "f").write_text("x")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    info = os.stat(root / "sub" / "f")
+    fingerprint = {
+        "kind": "owner",
+        "names": ["sub", "f"],
+        "identity": [info.st_dev, info.st_ino, info.st_birthtime_ns],
+        "state": "",
+    }
+    outside = tmp_path / "outside"
+    (root / "sub").rename(outside)
+    junction(root / "sub", outside)
+    import win32security
+
+    gave: list[str] = []
+    real_set = win32security.SetSecurityInfo
+    monkeypatch.setattr(
+        win32security, "SetSecurityInfo", lambda *a, **k: gave.append("set") or real_set(*a, **k)
+    )
+    with pytest.raises((ValueError, OSError)):
+        backend.decide(str(root), delta, fingerprint, "remove")
+    assert gave == []
+
+
+def test_reopening_below_a_grant_refuses_a_link_in_any_component(tmp_path: Path) -> None:
+    root = shared_root(tmp_path)
+    (root / "a" / "b").mkdir(parents=True)
+    (root / "a" / "b" / "f").write_text("x")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    with backend._open(str(root), names=("a", "b", "f"), change=True, revoke=True) as (_, facts, _):
+        assert not facts.is_dir
+    outside = tmp_path / "outside"
+    (root / "a" / "b").rename(outside)
+    junction(root / "a" / "b", outside)
+    with (
+        pytest.raises(fa.Refused) as refused,
+        backend._open(str(root), names=("a", "b", "f"), change=True, revoke=True),
+    ):
+        pass
+    assert refused.value.cause == "link"
+
+
+def test_a_stale_null_dacl_decision_is_not_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review 2: a failed null-DACL repair waited for the owner; a valid manual
+    DACL went in; Remove replaced all of it."""
+    root = shared_root(tmp_path)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    keep = root / "keep"
+    keep.mkdir()
+    null_dacl(keep)
+    real_inherit = backend._inherit
+
+    def refuses(*_args, **_kwargs):
+        raise PermissionError("its DACL is still null")
+
+    monkeypatch.setattr(backend, "_inherit", refuses)
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    assert found["kind"] == "null_dacl"
+    icacls(keep, "/grant", f"*{USERS}:(OI)(CI)(RX)", f"*{owner(root)}:(OI)(CI)(F)")
+
+    def aces() -> list:
+        acl = dacl(keep)
+        return [(acl.GetAce(i)[0], acl.GetAce(i)[1]) for i in range(acl.GetAceCount())]
+
+    manual = aces()
+    monkeypatch.setattr(backend, "_inherit", real_inherit)
+    with pytest.raises(fa.StaleEntry, match="changed since"):
+        backend.decide(str(root), delta, found["fingerprint"], "remove")
+    assert aces() == manual
+
+
+def test_a_stale_owner_decision_is_not_applied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, app_owns
+) -> None:
+    root = shared_root(tmp_path)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    made = root / "made.txt"
+    made.write_text("app data")
+    app_owns(made)
+    monkeypatch.setattr(backend, "_give", cannot_give)
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    assert found["kind"] == "owner"
+    import win32security
+
+    monkeypatch.delattr(backend, "_give")  # the real one decides, with the real check
+    changed: list[str] = []
+    real_set = win32security.SetSecurityInfo
+    monkeypatch.setattr(
+        win32security, "SetSecurityInfo", lambda *a, **k: changed.append("set") or real_set(*a, **k)
+    )
+    # The owner is somebody else by the time the owner decides.
+    monkeypatch.setattr(
+        fa.WindowsPermissions, "_owner", staticmethod(lambda ws, handle: "S-1-5-32-544")
+    )
+    with pytest.raises(fa.StaleEntry, match="changed since"):
+        backend.decide(str(root), delta, found["fingerprint"], "remove")
+    assert changed == []

@@ -47,6 +47,7 @@ MESSAGES = {
 NULL_DACL = "it has no permission list (a null DACL), so every account can open it"
 OWNED = "{account} owns it, so it can change its permissions"
 UNREADABLE = "Eugene cannot read its permissions"
+HARDLINK = "it has another name outside the folder, so changing it here changes it there too"
 WINDOWS_HOMES = ("Users",)
 LINUX_SYSTEM = tuple(
     "/" + p
@@ -84,6 +85,8 @@ class Facts:
     homes: tuple[str, ...] = ()
     system: tuple[str, ...] = ()
     unsafe_parent: str = ""
+    #: Names a file has. Above one, a change here reaches every other name.
+    links: int = 1
 
 
 def _path(value: str) -> PurePath:
@@ -216,15 +219,64 @@ class UnknownAccess(RemovalIncomplete):
         self.entries = entries
         paths = list(dict.fromkeys(str(e["path"]) for e in entries))
         shown = ", ".join(paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
+        what = (
+            "a file with another name outside the folder"
+            if all(e["kind"] == "hardlink" for e in entries)
+            else f"{'an entry' if len(entries) == 1 else 'entries'} Eugene did not add"
+        )
         super().__init__(
-            f"Workbench's account can still open {shown} through "
-            f"{'an entry' if len(entries) == 1 else 'entries'} Eugene did not add. "
+            f"Workbench's account can still open {shown} through {what}. "
             "Choose Remove this entry too or Keep it."
         )
 
 
 class NotWaiting(ValueError):
     """The entry is not waiting for the owner's decision."""
+
+
+class StaleEntry(ValueError):
+    """What the owner decided about has changed since Eugene asked.
+
+    Nothing is applied on an old answer: the removal runs again and asks about
+    what is there now."""
+
+
+def _file_key(identity: list[int]) -> str:
+    """A file by what Windows calls it: volume serial and file ID.
+
+    A rename keeps both and a replacement has neither, so exemptions and
+    inventories keyed by this follow the file, never its name or a link."""
+    return f"{identity[0]}:{identity[1]}"
+
+
+def _answer_key(fingerprint: dict[str, Any]) -> str:
+    """What an owner's answer is about: the item and the entry, not its name or state."""
+    return json.dumps(
+        {k: v for k, v in fingerprint.items() if k not in ("names", "state")}, sort_keys=True
+    )
+
+
+def _kept(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """The entries the owner kept, as the backend's own record reports them.
+
+    A backend that holds the owner's answers (the Linux helper's ledger) is the
+    truth: an answer it committed shows even when this record never heard of it.
+    The report is a one-time message from the last removal, never saved.
+    """
+    delta = row.get("delta") or {}
+    retained = delta.pop("retained", None)
+    if retained is None:
+        return [u for u in row.get("unknown") or [] if u["decision"] == "kept"]
+    return [
+        dict(
+            id=_entry_id(found["fingerprint"]),
+            path=str(found["path"]),
+            kind=found["kind"],
+            entry=found["entry"],
+            decision="kept",
+        )
+        for found in retained
+    ]
 
 
 def _entry_id(fingerprint: dict[str, Any]) -> str:
@@ -501,7 +553,7 @@ class Access:
                     raise ValueError("The folder was replaced.")
             if row["delta"] is not None and not self.permissions.revoke(row["path"], row["delta"]):
                 raise ValueError("The recorded permissions were changed outside Eugene.")
-            kept = [u for u in row.get("unknown") or [] if u["decision"] == "kept"]
+            kept = _kept(row)
             paths = ", ".join(dict.fromkeys(u["path"] for u in kept))
             row.update(
                 state="removed",
@@ -520,7 +572,7 @@ class Access:
         except UnknownAccess as exc:
             # R23-UNKNOWN: the owner decides each entry. Kept ones stay listed.
             keys = dict(row.get("unknownKeys") or {})
-            listed = [u for u in row.get("unknown") or [] if u["decision"] == "kept"]
+            listed = _kept(row)
             for found in exc.entries:
                 entry = _entry_id(found["fingerprint"])
                 keys[entry] = found["fingerprint"]
@@ -543,6 +595,7 @@ class Access:
         except Exception as exc:
             row.update(state="failed", message=f"Access could not be removed: {exc}.")
         finally:
+            (row["delta"] or {}).pop("retained", None)
             with _LOCK:
                 try:
                     current = self._read()
@@ -577,7 +630,12 @@ class Access:
             _RUNNING.add(ident)
         try:
             # Checks the entry again, and removes only it (or records Keep).
-            self.permissions.decide(row["path"], row["delta"], fingerprint, action)
+            try:
+                self.permissions.decide(row["path"], row["delta"], fingerprint, action)
+            except StaleEntry:
+                # What the owner saw is gone: apply nothing, drop the old question
+                # and let the removal below ask about what is there now.
+                action = "stale"
             if action == "keep":
                 found["decision"] = "kept"
             else:
@@ -660,7 +718,17 @@ class WindowsPermissions:
         _single: bool = False,
         revoke: bool = False,
         owner: bool = False,
+        names: tuple[str, ...] = (),
+        root_identity: list[int] | None = None,
     ) -> Iterator[tuple[int, Facts, list[int]]]:
+        """Open `path`, or the item `names` below it, one component at a time.
+
+        Every component is opened from the one before, which stays held: no
+        component may be a link (only the last item below the grant, when
+        `revoke` asks for links), and `root_identity` must be the grant's own
+        folder. Never reopen an item by its full path: a folder swapped for a
+        junction would be followed.
+        """
         if sys.platform != "win32":
             raise OSError("Windows folder permissions need Windows.")
         import msvcrt
@@ -674,8 +742,13 @@ class WindowsPermissions:
         if not value.is_absolute() or not re.fullmatch("[A-Za-z]:", value.drive):
             raise Refused("not_a_folder", path)
         if any(
-            p in (".", "..") or p.endswith((".", " ")) or ":" in p or any(ord(c) < 32 for c in p)
-            for p in value.parts[1:]
+            p in (".", "..")
+            or p.endswith((".", " "))
+            or ":" in p
+            or "/" in p
+            or "\\" in p
+            or any(ord(c) < 32 for c in p)
+            for p in (*value.parts[1:], *names)
         ):
             raise Refused("not_a_folder", path)
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -699,12 +772,13 @@ class WindowsPermissions:
         held = []
         try:
             current = PureWindowsPath(value.anchor)
-            components = (str(value),) if _single else (value.anchor, *value.parts[1:])
+            components = (str(value),) if _single else (value.anchor, *value.parts[1:], *names)
             for index, part in enumerate(components):
+                last = index == len(components) - 1
                 if index or _single:
                     current /= part
-                access = 0x60000 if change and index == len(components) - 1 else 0x20080
-                if owner and index == len(components) - 1:
+                access = 0x60000 if change and last else 0x20080
+                if owner and last:
                     access |= 0x80000  # WRITE_OWNER
                 # Files need no data access and share read, write and delete.
                 # Retained directory handles keep the traversal parents in place.
@@ -718,12 +792,19 @@ class WindowsPermissions:
                 fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
                 held.append(fd)
                 info = os.fstat(fd)
-                if info.st_file_attributes & 0x400 and not revoke:
+                if info.st_file_attributes & 0x400 and not (revoke and last and (_single or names)):
                     raise Refused("link", str(current))
-                if not stat.S_ISDIR(info.st_mode) and not _single:
+                if not stat.S_ISDIR(info.st_mode) and not _single and not (names and last):
                     raise Refused("not_a_folder", str(current))
                 if not stat.S_ISDIR(info.st_mode) and info.st_nlink != 1 and not revoke:
                     raise Refused("link", f"{current} has more than one hard link.")
+                if (
+                    root_identity is not None
+                    and not _single
+                    and index == len(value.parts) - 1
+                    and [info.st_dev, info.st_ino, info.st_birthtime_ns] != root_identity
+                ):
+                    raise ValueError("The folder was replaced.")
             buffer = ctypes.create_unicode_buffer(32768)
             length = kernel.GetFinalPathNameByHandleW(
                 msvcrt.get_osfhandle(held[-1]), buffer, len(buffer), 0
@@ -738,6 +819,7 @@ class WindowsPermissions:
                 homes=self.homes,
                 system=self.system,
                 link=bool(info.st_file_attributes & 0x400),
+                links=info.st_nlink,
             )
             yield (
                 msvcrt.get_osfhandle(held[-1]),
@@ -781,9 +863,9 @@ class WindowsPermissions:
         *,
         revoke: bool = False,
         selected: set[tuple[str, ...]] | None = None,
-        descend: Callable[[tuple[str, ...]], bool] | None = None,
+        descend: Callable[[tuple[str, ...], list[int]], bool] | None = None,
         unreadable: list[tuple[str, ...]] | None = None,
-    ) -> Iterator[tuple[tuple[str, ...], int, list[int], Any, bool, bool]]:
+    ) -> Iterator[tuple[tuple[str, ...], int, list[int], Any, bool, bool, int]]:
         """Yield one live file handle; only traversal directories remain open.
 
         A protected folder is entered only when `descend` says so. An item that
@@ -797,14 +879,23 @@ class WindowsPermissions:
             ident: list[int],
             directory: bool,
             link: bool = False,
-        ) -> Iterator[tuple[tuple[str, ...], int, list[int], Any, bool, bool]]:
+            links: int = 1,
+        ) -> Iterator[tuple[tuple[str, ...], int, list[int], Any, bool, bool, int]]:
             descriptor = ws.GetSecurityInfo(held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION)
             protected = bool(names and descriptor.GetSecurityDescriptorControl()[0] & 0x1000)
-            yield names, held, ident, descriptor.GetSecurityDescriptorDacl(), directory, protected
+            yield (
+                names,
+                held,
+                ident,
+                descriptor.GetSecurityDescriptorDacl(),
+                directory,
+                protected,
+                links,
+            )
             if (
                 directory
                 and not link
-                and (not protected or (descend is not None and descend(names)))
+                and (not protected or (descend is not None and descend(names, ident)))
             ):
                 for entry in current.iterdir():
                     if selected is not None and (*names, entry.name) not in selected:
@@ -824,6 +915,7 @@ class WindowsPermissions:
                                 child_id,
                                 facts.is_dir,
                                 facts.link,
+                                facts.links,
                             )
                     except FileNotFoundError:
                         if not revoke:
@@ -928,8 +1020,39 @@ class WindowsPermissions:
         descriptor = ws.GetSecurityInfo(handle, ws.SE_FILE_OBJECT, ws.OWNER_SECURITY_INFORMATION)
         return str(ws.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner()))
 
+    @staticmethod
+    def _state(ws: Any, handle: int) -> str:
+        """The item's owner and DACL as one fingerprint.
+
+        An owner's answer is about this state; if either changed since Eugene
+        asked, the answer is not applied (StaleEntry) and Eugene asks again."""
+        import hashlib
+
+        descriptor = ws.GetSecurityInfo(handle, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION)
+        dacl_text = ws.ConvertSecurityDescriptorToStringSecurityDescriptor(
+            descriptor, ws.SDDL_REVISION_1, ws.DACL_SECURITY_INFORMATION
+        )
+        owner = WindowsPermissions._owner(ws, handle)
+        return hashlib.sha256(f"{owner}|{dacl_text}".encode()).hexdigest()
+
+    @staticmethod
+    def _unchanged(ws: Any, handle: int, state: str | None) -> None:
+        if state is not None and WindowsPermissions._state(ws, handle) != state:
+            raise StaleEntry(
+                "The item's permissions or owner changed since Eugene found it, so the "
+                "answer was not applied. Eugene asks again about what is there now."
+            )
+
     def _give(
-        self, ws: Any, path: str, names: tuple[str, ...], ident: list[int], owner: str | None
+        self,
+        ws: Any,
+        path: str,
+        names: tuple[str, ...],
+        ident: list[int],
+        owner: str | None,
+        *,
+        root: list[int] | None = None,
+        state: str | None = None,
     ) -> None:
         """Make the granted folder's owner the owner of an item the app owns.
 
@@ -941,15 +1064,12 @@ class WindowsPermissions:
         with (
             _privileges(ws, "SeRestorePrivilege", "SeTakeOwnershipPrivilege"),
             self._open(
-                str(Path(path).joinpath(*names)),
-                change=True,
-                owner=True,
-                _single=True,
-                revoke=True,
+                path, change=True, owner=True, revoke=True, names=names, root_identity=root
             ) as (held, _, current),
         ):
             if current != ident:
                 raise ValueError("The folder item was replaced.")
+            self._unchanged(ws, held, state)
             ws.SetSecurityInfo(
                 held,
                 ws.SE_FILE_OBJECT,
@@ -960,17 +1080,30 @@ class WindowsPermissions:
                 None,
             )
 
-    def _inherit(self, ws: Any, path: str, names: tuple[str, ...], ident: list[int]) -> Any:
+    def _inherit(
+        self,
+        ws: Any,
+        path: str,
+        names: tuple[str, ...],
+        ident: list[int],
+        *,
+        root: list[int] | None = None,
+        state: str | None = None,
+    ) -> Any:
         """Replace a null DACL with what the item inherits from its parent.
 
-        Done through the item's own handle; the parents are held open, so the
-        item cannot be swapped and its parent cannot move meanwhile.
+        Done through the item's own handle, reopened component by component from
+        the grant's folder; the parents are held open, so the item cannot be
+        swapped and its parent cannot move meanwhile.
         """
-        with self._open(
-            str(Path(path).joinpath(*names)), change=True, _single=True, revoke=True
-        ) as (held, _, current):
+        with self._open(path, change=True, revoke=True, names=names, root_identity=root) as (
+            held,
+            _,
+            current,
+        ):
             if current != ident:
                 raise ValueError("The folder item was replaced.")
+            self._unchanged(ws, held, state)
             ws.SetSecurityInfo(
                 held,
                 ws.SE_FILE_OBJECT,
@@ -1002,24 +1135,27 @@ class WindowsPermissions:
             count = 0
             # What removal must leave: the account's own explicit entries from
             # before this grant, and the folders already closed to inheritance.
+            # Every list is keyed by file identity (volume serial and file ID),
+            # never by name: a rename keeps the exemption, a replacement has none.
             manual: list[list[Any]] = []
-            protected_names: list[list[str]] = []
+            protected_ids: list[str] = []
             # Items the account already owned, and null DACLs: both already
             # gave it everything, so removal leaves them as they are.
-            owners: list[list[str]] = []
-            open_dacls: list[list[str]] = []
-            for names, held, ident, acl, directory, protected in self._tree(
+            owners: list[str] = []
+            open_dacls: list[str] = []
+            for names, held, ident, acl, directory, protected, _links in self._tree(
                 ws, path, handle, identity
             ):
+                key = _file_key(ident)
                 if own := self._explicit(ws, acl, sid_text):
-                    manual.append([list(names), own])
+                    manual.append([key, own])
                 if self._owner(ws, held) == sid_text:
-                    owners.append(list(names))
+                    owners.append(key)
                 if acl is None:
-                    open_dacls.append(list(names))
+                    open_dacls.append(key)
                 if protected:
                     count += 1
-                    protected_names.append(list(names))
+                    protected_ids.append(key)
                     continue
                 if acl is None:
                     continue
@@ -1049,13 +1185,13 @@ class WindowsPermissions:
                 identity=identity,
                 items=list(plans.values()),
                 manual=manual,
-                protected=protected_names,
+                protected=protected_ids,
                 owners=owners,
                 open=open_dacls,
             )
             save(delta)  # One complete write-ahead plan, independent of tree size.
             selected = {names[:i] for names in plans for i in range(len(names) + 1)}
-            for names, held, ident, acl, _, _ in self._tree(
+            for names, held, ident, acl, _, _, _links in self._tree(
                 ws, path, handle, identity, selected=selected
             ):
                 item = plans.get(names)
@@ -1086,20 +1222,19 @@ class WindowsPermissions:
             person: str | None = self._owner(ws, handle)
             if person == delta["sid"]:
                 person = None
-            owners_before = {tuple(names) for names in delta.get("owners", [])}
-            open_before = {tuple(names) for names in delta.get("open", [])}
-            recorded = {tuple(item["names"]): item for item in delta["items"]}
-            manual = {
-                tuple(names): [list(ace) for ace in aces] for names, aces in delta.get("manual", [])
-            }
+            # Every exemption is keyed by file identity, never by name.
+            owners_before = set(delta.get("owners", []))
+            open_before = set(delta.get("open", []))
+            recorded = {_file_key(item["identity"]): item for item in delta["items"]}
+            manual = {key: [list(ace) for ace in aces] for key, aces in delta.get("manual", [])}
             # Records from before protected folders were listed keep the old
             # walk, which never entered a protected folder.
-            closed = (
-                {tuple(names) for names in delta["protected"]} if "protected" in delta else None
-            )
+            closed = set(delta["protected"]) if "protected" in delta else None
+            # Files with another name that the owner let removal change.
+            allowed = set(delta.get("allowed", []))
 
-            def descend(names: tuple[str, ...]) -> bool:
-                return closed is not None and names not in closed
+            def descend(names: tuple[str, ...], ident: list[int]) -> bool:
+                return closed is not None and _file_key(ident) not in closed
 
             owned: set[tuple[str, ...]] = set()
             # Eugene's own entries it could not remove: a failure, retried.
@@ -1107,66 +1242,74 @@ class WindowsPermissions:
             unreadable: list[tuple[str, ...]] = []
             # Access Eugene did not add: the owner decides (R23-UNKNOWN). An
             # entry the owner chose to keep no longer holds the removal.
-            accepted = {json.dumps(fp, sort_keys=True) for fp in delta.get("accepted", [])}
+            accepted = {_answer_key(fp) for fp in delta.get("accepted", [])}
             asked: dict[str, dict[str, Any]] = {}
+            retained: dict[str, dict[str, Any]] = {}
 
             def ask(
-                kind: str, names: tuple[str, ...], ident: list[int], words: str, **extra: int
+                kind: str,
+                names: tuple[str, ...],
+                ident: list[int],
+                words: str,
+                held: int | None = None,
+                **extra: int,
             ) -> bool:
-                """List one entry for the owner; False when the owner already kept it."""
+                """List one entry for the owner; False when the owner already kept it.
+
+                The entry carries the item's owner and DACL as they are now, so a
+                later answer is applied only to the state it was asked about."""
                 fingerprint = dict(kind=kind, names=list(names), identity=list(ident), **extra)
-                key = json.dumps(fingerprint, sort_keys=True)
-                if key in accepted:
-                    return False
-                asked.setdefault(
-                    key,
-                    dict(
-                        kind=kind,
-                        path=str(Path(path).joinpath(*names)),
-                        entry=words,
-                        fingerprint=fingerprint,
-                    ),
+                if held is not None:
+                    fingerprint["state"] = self._state(ws, held)
+                key = _answer_key(fingerprint)
+                found = dict(
+                    kind=kind,
+                    path=str(Path(path).joinpath(*names)),
+                    entry=words,
+                    fingerprint=fingerprint,
                 )
+                if key in accepted:
+                    retained.setdefault(key, found)
+                    return False
+                asked.setdefault(key, found)
                 return True
 
-            for names, held, ident, acl, directory, protected in self._tree(
+            for names, held, ident, acl, directory, protected, links in self._tree(
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
-                null = acl is None and names not in open_before
+                key = _file_key(ident)
+                if not directory and links > 1 and key not in allowed:
+                    # One rule, on both systems: a file with another name is never
+                    # changed here, since the change would reach that name too.
+                    ask("hardlink", names, ident, HARDLINK)
+                    continue
+                null = acl is None and key not in open_before
                 if (
                     null
-                    and json.dumps(
-                        dict(kind="null_dacl", names=list(names), identity=list(ident)),
-                        sort_keys=True,
-                    )
-                    not in accepted
+                    and _answer_key(dict(kind="null_dacl", identity=list(ident))) not in accepted
                 ):
                     try:
                         # A null DACL lets everyone do everything; it inherits again.
-                        acl = self._inherit(ws, path, names, ident)
+                        acl = self._inherit(ws, path, names, ident, root=identity)
                     except FileNotFoundError:
                         continue
                     except (OSError, ValueError, pywintypes.error):
-                        ask("null_dacl", names, ident, NULL_DACL)
+                        ask("null_dacl", names, ident, NULL_DACL, held)
                 if (
-                    names not in owners_before
+                    key not in owners_before
                     and self._owner(ws, held) == delta["sid"]
-                    and json.dumps(
-                        dict(kind="owner", names=list(names), identity=list(ident)),
-                        sort_keys=True,
-                    )
-                    not in accepted
+                    and _answer_key(dict(kind="owner", identity=list(ident))) not in accepted
                 ):
                     try:
-                        self._give(ws, path, names, ident, person)
+                        self._give(ws, path, names, ident, person, root=identity)
                     except FileNotFoundError:
                         continue
                     except (OSError, ValueError, pywintypes.error):
-                        ask("owner", names, ident, OWNED.format(account=self.account))
-                item = recorded.get(names)
+                        ask("owner", names, ident, OWNED.format(account=self.account), held)
+                item = recorded.get(key)
                 # Protected since the grant: its inherited copy of Eugene's ACE
                 # became an explicit one with the same rights.
-                changed = protected and descend(names)
+                changed = protected and descend(names, ident)
                 if item is not None:
                     if item.get("removed"):
                         owned.add(names)
@@ -1182,16 +1325,17 @@ class WindowsPermissions:
                 else:
                     continue
                 # An entry the grant found already there is left as it is.
-                aces = manual.get(names, [])
+                aces = manual.get(key, [])
                 matches = self._unrecorded(acl, self._matches(ws, acl, delta, flags), aces)
                 if len(matches) > 1:
                     return False
                 if matches:
-                    # Files/links were inspected with READ_CONTROL only.
-                    # Request WRITE_DAC only for an exact owned ACE.
+                    # Files/links were inspected with READ_CONTROL only. Request
+                    # WRITE_DAC only for an exact owned ACE, and reopen the item
+                    # below the grant, never by its full path.
                     try:
                         with self._open(
-                            str(Path(path).joinpath(*names)), change=True, _single=True, revoke=True
+                            path, change=True, revoke=True, names=names, root_identity=identity
                         ) as (change, _, current_id):
                             if current_id != ident:
                                 continue
@@ -1206,7 +1350,7 @@ class WindowsPermissions:
                                 self._set_acl(ws, change, acl)
                     except FileNotFoundError:
                         continue
-                    except PermissionError:
+                    except (PermissionError, Refused):
                         kept.append(names)
                         continue
                 elif item is not None and item.get("applied"):
@@ -1218,13 +1362,17 @@ class WindowsPermissions:
             # Detect files created in the narrow interval before a parent's
             # ACE was removed, and any entry for the account that was not
             # there before the grant. A retry uses the same recorded plan.
-            for names, held, ident, acl, directory, _ in self._tree(
+            for names, held, ident, acl, directory, _, links in self._tree(
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
-                if acl is None and names not in open_before:
-                    ask("null_dacl", names, ident, NULL_DACL)
-                if names not in owners_before and self._owner(ws, held) == delta["sid"]:
-                    ask("owner", names, ident, OWNED.format(account=self.account))
+                key = _file_key(ident)
+                if not directory and links > 1 and key not in allowed:
+                    ask("hardlink", names, ident, HARDLINK)
+                    continue
+                if acl is None and key not in open_before:
+                    ask("null_dacl", names, ident, NULL_DACL, held)
+                if key not in owners_before and self._owner(ws, held) == delta["sid"]:
+                    ask("owner", names, ident, OWNED.format(account=self.account), held)
                 if (
                     names
                     and names[:-1] in owned
@@ -1236,7 +1384,7 @@ class WindowsPermissions:
                     )
                 if names in kept:
                     continue
-                left = [list(ace) for ace in manual.get(names, [])]
+                left = [list(ace) for ace in manual.get(key, [])]
                 for ace_flags, ace_mask in self._explicit(ws, acl, delta["sid"]):
                     if [ace_flags, ace_mask] in left:
                         left.remove([ace_flags, ace_mask])
@@ -1246,11 +1394,15 @@ class WindowsPermissions:
                         names,
                         ident,
                         self._words(ace_mask, ace_flags),
+                        held,
                         flags=ace_flags,
                         mask=ace_mask,
                     )
             for names in dict.fromkeys(unreadable):
                 ask("unreadable", names, [], UNREADABLE)
+            # What the owner kept and Eugene met again: reported on every
+            # removal, so the record never shows `removed` without it.
+            delta["retained"] = list(retained.values())
             if kept:
                 shown = [str(Path(path).joinpath(*names)) for names in kept[:3]]
                 more = f" and {len(kept) - 3} more" if len(kept) > 3 else ""
@@ -1274,77 +1426,106 @@ class WindowsPermissions:
         return f"{self.account} has {rights}{reach}, set outside Eugene"
 
     def decide(self, path: str, delta: dict, fingerprint: dict, action: str) -> None:
-        """Keep one unknown entry, or check it again and remove only it."""
+        """Keep one unknown entry, or check it again and remove only it.
+
+        Every step reopens the item below the grant's own folder, one component
+        at a time, refusing a link in any of them, and acts only on the owner and
+        DACL it was asked about (StaleEntry otherwise)."""
         import pywintypes
         import win32security as ws
 
         if action == "keep":
-            delta.setdefault("accepted", []).append(fingerprint)
+            accepted = delta.setdefault("accepted", [])
+            if _answer_key(fingerprint) not in {_answer_key(a) for a in accepted}:
+                accepted.append(fingerprint)
             return
         kind, names = fingerprint["kind"], tuple(fingerprint["names"])
         ident = fingerprint["identity"]
+        state = fingerprint.get("state", "")  # none known: it can never match
+        root = delta["identity"]
         if kind == "unreadable":
             raise ValueError(
                 "Eugene cannot read this item's permissions. Change them in the folder's "
                 "Security settings, then choose Remove access again."
             )
+        replaced = StaleEntry(
+            "The item changed since Eugene found it, so the entry was left as it is. "
+            "Eugene asks again about what is there now."
+        )
         try:
-            with self._open(path, change=True) as (handle, _, identity):
-                if identity != delta["identity"]:
-                    raise ValueError("The folder was replaced, so the entry was left as it is.")
-                if kind == "null_dacl":
-                    self._inherit(ws, path, names, ident)
-                    return
-                if kind == "owner":
+            if kind == "hardlink":
+                with self._open(path, revoke=True, names=names, root_identity=root) as (_, _, now):
+                    if now != ident:
+                        raise replaced
+                allowed = delta.setdefault("allowed", [])
+                if _file_key(ident) not in allowed:
+                    allowed.append(_file_key(ident))  # the removal that follows changes it
+                return
+            if kind == "null_dacl":
+                self._inherit(ws, path, names, ident, root=root, state=state)
+                return
+            if kind == "owner":
+                with self._open(path, root_identity=root) as (handle, _, _):
                     person: str | None = self._owner(ws, handle)
-                    self._give(ws, path, names, ident, None if person == delta["sid"] else person)
-                    return
-                with self._open(
-                    str(Path(path).joinpath(*names)), change=True, _single=True, revoke=True
-                ) as (held, _, current):
-                    if current != ident:
-                        raise ValueError(
-                            "The item changed since Eugene found it, "
-                            "so the entry was left as it is."
-                        )
-                    descriptor = ws.GetSecurityInfo(
-                        held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION
-                    )
-                    acl = descriptor.GetSecurityDescriptorDacl()
-                    index = next(
-                        (
-                            i
-                            for i in range(acl.GetAceCount() if acl is not None else 0)
-                            if acl.GetAce(i)[0][0] in (0, 5)
-                            and acl.GetAce(i)[0][1] == fingerprint["flags"]
-                            and acl.GetAce(i)[1] == fingerprint["mask"]
-                            and ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) == delta["sid"]
-                        ),
-                        None,
-                    )
-                    if index is None:
-                        raise ValueError(
-                            "The entry changed since Eugene found it, so it was left as it is. "
-                            "Choose Remove access again to check the folder."
-                        )
-                    acl.DeleteAce(index)
-                    protected = descriptor.GetSecurityDescriptorControl()[0] & 0x1000
-                    # SetSecurityInfo also takes the entry's inherited copies
-                    # off the items below this one.
-                    ws.SetSecurityInfo(
-                        held,
-                        ws.SE_FILE_OBJECT,
-                        ws.DACL_SECURITY_INFORMATION
-                        | (
-                            ws.PROTECTED_DACL_SECURITY_INFORMATION
-                            if protected
-                            else ws.UNPROTECTED_DACL_SECURITY_INFORMATION
-                        ),
-                        None,
-                        None,
-                        acl,
-                        None,
-                    )
+                self._give(
+                    ws,
+                    path,
+                    names,
+                    ident,
+                    None if person == delta["sid"] else person,
+                    root=root,
+                    state=state,
+                )
+                return
+            with self._open(path, change=True, revoke=True, names=names, root_identity=root) as (
+                held,
+                _,
+                current,
+            ):
+                if current != ident:
+                    raise replaced
+                self._unchanged(ws, held, state)
+                descriptor = ws.GetSecurityInfo(
+                    held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION
+                )
+                acl = descriptor.GetSecurityDescriptorDacl()
+                index = next(
+                    (
+                        i
+                        for i in range(acl.GetAceCount() if acl is not None else 0)
+                        if acl.GetAce(i)[0][0] in (0, 5)
+                        and acl.GetAce(i)[0][1] == fingerprint["flags"]
+                        and acl.GetAce(i)[1] == fingerprint["mask"]
+                        and ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) == delta["sid"]
+                    ),
+                    None,
+                )
+                if index is None:
+                    raise replaced
+                acl.DeleteAce(index)
+                protected = descriptor.GetSecurityDescriptorControl()[0] & 0x1000
+                # SetSecurityInfo also takes the entry's inherited copies
+                # off the items below this one.
+                ws.SetSecurityInfo(
+                    held,
+                    ws.SE_FILE_OBJECT,
+                    ws.DACL_SECURITY_INFORMATION
+                    | (
+                        ws.PROTECTED_DACL_SECURITY_INFORMATION
+                        if protected
+                        else ws.UNPROTECTED_DACL_SECURITY_INFORMATION
+                    ),
+                    None,
+                    None,
+                    acl,
+                    None,
+                )
+        except Refused as exc:
+            # A link now stands in the path: nothing outside the grant is touched.
+            raise StaleEntry(
+                "The item changed since Eugene found it (a link now stands in its path), "
+                "so the entry was left as it is. Eugene asks again about what is there now."
+            ) from exc
         except FileNotFoundError:
             return  # Gone: nothing left to remove.
         except pywintypes.error as exc:
@@ -1448,12 +1629,24 @@ class LinuxPermissions:
     def revoke(self, path: str, delta: dict) -> bool:
         result = self._ask("folder-revoke", delta["id"])
         delta["reapplied"] = result.get("reapplied", [])
+        # What the owner kept, from the helper's ledger. Nothing is shown as
+        # removed without it (an old helper that does not say keeps the saved list).
+        if "kept" in result:
+            delta["retained"] = [
+                dict(
+                    kind=found["fingerprint"]["kind"],
+                    path=found["path"],
+                    entry=found["entry"],
+                    fingerprint=found["fingerprint"],
+                )
+                for found in result["kept"]
+            ]
         if result.get("unknown"):
             # The helper left these as they are; the owner decides (R23-UNKNOWN).
             raise UnknownAccess(
                 [
                     dict(
-                        kind="entry",
+                        kind=found["fingerprint"]["kind"],
                         path=found["path"],
                         entry=found["entry"],
                         fingerprint=found["fingerprint"],

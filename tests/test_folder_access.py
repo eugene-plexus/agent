@@ -741,6 +741,139 @@ def test_remove_this_entry_too_deletes_it_and_finishes_the_removal(tmp_path: Pat
     assert done.message == "Eugene's additions were removed. Preexisting permissions stay."
 
 
+class CommittingPermissions(MemoryPermissions):
+    """The helper keeps its own record: Keep is committed there before the agent saves."""
+
+    FOUND: ClassVar[dict] = AskingPermissions.FOUND
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.committed: list[dict] = []
+
+    def revoke(self, path: str, delta: dict) -> bool:
+        fingerprint = self.FOUND["fingerprint"]
+        delta["retained"] = []
+        if fingerprint in self.committed:
+            delta["retained"] = [dict(self.FOUND)]
+            return super().revoke(path, delta)
+        raise fa.UnknownAccess([dict(self.FOUND)])
+
+    def decide(self, path: str, delta: dict, fingerprint: dict, action: str) -> None:
+        self.committed.append(fingerprint)
+
+
+def test_a_keep_the_helper_committed_shows_after_the_agent_failed_to_save(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review 2 (blocker): the helper committed Keep, the agent's save failed, and
+    the retry reported `removed` with no retained access. The helper's record is
+    the truth for what the owner kept."""
+    backend = CommittingPermissions()
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "write", "operator")
+    entry = access.remove("workbench", grant.id).unknown[0]  # type: ignore[index]
+    real_write = access._write
+
+    def crash(rows: dict) -> None:
+        raise OSError("the agent stopped before it saved")
+
+    monkeypatch.setattr(access, "_write", crash)
+    with pytest.raises(OSError, match="stopped"):
+        access.decide("workbench", grant.id, entry.id, "keep")
+    monkeypatch.setattr(access, "_write", real_write)
+    assert backend.committed  # the helper has it; the agent's record still says pending
+    assert [u.decision for u in access.listing("workbench")[0].unknown or []] == ["pending"]
+    retried = access.remove("workbench", grant.id)
+    assert retried.state == "removed"
+    assert retried.unknown is not None
+    assert [(u.path, u.decision) for u in retried.unknown] == [("/srv/acme/sub", "kept")]
+    assert "/srv/acme/sub" in retried.message
+    assert "retained" not in access._read()[grant.id]["delta"]  # never saved in the record
+
+
+def test_a_kept_entry_is_listed_again_while_another_still_waits(tmp_path: Path) -> None:
+    backend = CommittingPermissions()
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "write", "operator")
+    first = access.remove("workbench", grant.id)
+    other = {
+        "kind": "hardlink",
+        "path": "/srv/acme/shared.txt",
+        "entry": fa.HARDLINK,
+        "fingerprint": {"kind": "hardlink", "names": ["shared.txt"], "identity": [7, 8]},
+    }
+
+    def asks_about_another(path: str, delta: dict) -> bool:
+        delta["retained"] = [dict(backend.FOUND)]
+        raise fa.UnknownAccess([other])
+
+    backend.revoke = asks_about_another  # type: ignore[method-assign]
+    second = access.remove("workbench", grant.id)
+    assert first.state == "incomplete" and second.state == "incomplete"
+    assert second.unknown is not None
+    assert sorted((u.path, u.kind, u.decision) for u in second.unknown) == [
+        ("/srv/acme/shared.txt", "hardlink", "pending"),
+        ("/srv/acme/sub", "entry", "kept"),
+    ]
+
+
+def test_linux_revoke_hands_back_what_the_helper_says_the_owner_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    fingerprint = {"kind": "hardlink", "names": ["a.txt"], "identity": [1, 2]}
+    monkeypatch.setattr(
+        backend,
+        "_ask",
+        lambda *_: {
+            "removed": True,
+            "kept": [{"path": "/srv/acme/a.txt", "entry": fa.HARDLINK, "fingerprint": fingerprint}],
+            "unknown": [],
+        },
+    )
+    delta: dict = {"id": "a" * 32}
+    assert backend.revoke("/srv/acme", delta)
+    assert delta["retained"] == [
+        {
+            "kind": "hardlink",
+            "path": "/srv/acme/a.txt",
+            "entry": fa.HARDLINK,
+            "fingerprint": fingerprint,
+        }
+    ]
+
+
+class StalePermissions(AskingPermissions):
+    """The item changed after the question: the old answer is never applied."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.revokes = 0
+
+    def revoke(self, path: str, delta: dict) -> bool:
+        self.revokes += 1
+        return super().revoke(path, delta)
+
+    def decide(self, path: str, delta: dict, fingerprint: dict, action: str) -> None:
+        self.decisions.append((fingerprint, action))
+        raise fa.StaleEntry("The item changed since Eugene found it, so nothing was applied.")
+
+
+def test_a_stale_answer_is_not_applied_and_the_owner_is_asked_again(tmp_path: Path) -> None:
+    """Re-review 2: Windows replaced a whole DACL on an old answer. Now the removal
+    runs again and asks about what is there now, with the item still unchanged."""
+    backend = StalePermissions()
+    access = service(tmp_path, backend)
+    grant = access.add("workbench", "/srv/acme", "write", "operator")
+    entry = access.remove("workbench", grant.id).unknown[0]  # type: ignore[index]
+    asked = access.decide("workbench", grant.id, entry.id, "remove")
+    assert backend.revokes == 2 and len(backend.decisions) == 1
+    assert asked.state == "incomplete"
+    assert asked.unknown is not None
+    assert [(u.path, u.decision) for u in asked.unknown] == [("/srv/acme/sub", "pending")]
+    assert backend.rights == {"manual", "write"}  # nothing was removed on the old answer
+
+
 def test_decide_route_needs_an_operator_session(
     authed_client: TestClient, monkeypatch, tmp_path: Path
 ) -> None:

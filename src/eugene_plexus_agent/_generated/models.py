@@ -4694,7 +4694,10 @@ class FolderAccessUnknownKind(StrEnum):
     a Windows item with no permission list, which lets everyone
     in. owner means the app's account owns the item, so it can
     change the item's permissions. unreadable means Eugene cannot
-    read the item's permissions.
+    read the item's permissions. hardlink is a file with another
+    name outside the folder: removal never changes such a file on
+    its own, since the change would reach that name too. Remove
+    lets the removal change it; Keep leaves it as it is.
 
     """
 
@@ -4702,6 +4705,7 @@ class FolderAccessUnknownKind(StrEnum):
     null_dacl = 'null_dacl'
     owner = 'owner'
     unreadable = 'unreadable'
+    hardlink = 'hardlink'
 
 
 class FolderAccessUnknownDecision(StrEnum):
