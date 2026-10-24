@@ -540,6 +540,25 @@ def test_paths_in_an_interpreter_s_one_argument_are_each_checked(disk: Disk) -> 
     assert exec_trust.assess("/usr/local/bin/tool").kind is exec_trust.Kind.ok
 
 
+def test_a_relative_path_after_the_interpreter_is_refused_naming_it(disk: Disk) -> None:
+    """`#!/usr/local/bin/run ./bin/sh`: the interpreter finds `./bin/sh`
+    from the folder it starts in (`/Users/alice`, say), not as `/bin/sh`.
+    Only `/x`, `--name=/x` and `-f/x` are paths the check can follow; any
+    other word with a `/` is refused, naming it (8c re-review 3, 1)."""
+    disk.file("/bin/sh")
+    disk.file("/usr/local/bin/run")
+    for word in ("./bin/sh", "bin/sh", "../bin/sh", "--file=bin/sh", "-fbin/sh", "-xf/bin/sh"):
+        disk.file("/usr/local/bin/vllm", content=f"#!/usr/local/bin/run {word}\n".encode())
+        assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused, word
+        refused(
+            "/usr/local/bin/vllm",
+            f"names a path the check cannot follow after its interpreter ({word})",
+        )
+    for word in ("/bin/sh", "--file=/bin/sh", "-f/bin/sh"):
+        disk.file("/usr/local/bin/vllm", content=f"#!/usr/local/bin/run {word}\n".encode())
+        assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.ok, word
+
+
 def test_an_environment_whose_settings_cannot_be_checked_is_refused(disk: Disk) -> None:
     """An I/O error is not absence: `pyvenv.cfg` that cannot be looked at
     does not skip the environment's check, so a person's packages there

@@ -207,23 +207,26 @@ def forget(verdict: exec_trust.Verdict) -> None:
     does not bring them back (8c review, re-review).
 
     Also every approval whose chain reaches the same file, by any name: a
-    file in it whose device and inode are those of the file the refused
-    check reached (`Verdict.real_id`), whether it was reached through other
-    links or is a hard link, and whether it is the program or what runs it
-    (8c re-review 2)."""
+    file in it whose device and inode are those of any file the refused
+    check reached at any depth (`Verdict.reached_ids`: the program, each
+    interpreter, each argument), whether through other links or as a hard
+    link (8c re-reviews 2 and 3)."""
     touched = {_key(verdict)}
     if verdict.program is not None:
         touched.add(verdict.program)
     touched.update(f.path for f in verdict.findings if f.problem != "owner")
 
+    reached = set(verdict.reached_ids)
+    if verdict.real_id is not None:
+        reached.add(verdict.real_id)
+
     def reaches(approval: ExecApproval) -> bool:
         if approval.path in touched or any(c.path in touched for c in approval.chain):
             return True
-        if verdict.real_id is None:
+        if not reached:
             return False
         return any(
-            stat.S_ISREG(c.mode) and exec_trust.file_id(c.path) == verdict.real_id
-            for c in approval.chain
+            stat.S_ISREG(c.mode) and exec_trust.file_id(c.path) in reached for c in approval.chain
         )
 
     with _lock:

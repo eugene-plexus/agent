@@ -96,6 +96,9 @@ _MUTATING = frozenset(
 _ACL_ENTRY = re.compile(
     r"^(?:\d+:\s*)?(user|group):(.+?)\s+(?:inherited\s+)?(allow|deny)\s+([a-z_]+(?:,[a-z_]+)*)$"
 )
+#: A word after a shebang's interpreter whose path the check can follow:
+#: `/x`, `--name=/x`, or one short option right before it, `-f/x`.
+_ARGUMENT_PATH = re.compile(r"^(?:--[^=/]+=|-[^-/])?(/.*)$")
 #: Programs that run whatever program PATH finds by the name they are given.
 _PATH_RUNNERS = frozenset({"env"})
 _LINK_HOPS = 40
@@ -164,6 +167,9 @@ class Verdict:
     #: every approval that reaches the same file by another name.
     real: str | None = None
     real_id: tuple[int, int] | None = None
+    #: (device, inode) of every file the check reached, at every depth: the
+    #: program, each interpreter, each argument.
+    reached_ids: tuple[tuple[int, int], ...] = ()
 
     def message(self, instead: str = INSTALL_ENGINE) -> str | None:
         """Why it did not run, naming the path, who can change it, and what
@@ -404,6 +410,8 @@ class _Walk:
         self.findings: list[Finding] = []
         #: The file the program reached (path, device, inode), once known.
         self.real: tuple[str, int, int] | None = None
+        #: (device, inode) of every file the check reached, at every depth.
+        self.reached: list[tuple[int, int]] = []
 
     def find(
         self,
@@ -608,7 +616,21 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> tuple[list[str], 
     arguments: list[str] = []
     for word in words[1:]:
         if "/" in word:
-            arguments.append(word[word.index("/") :])
+            # Only a path the check can follow: `/x`, `--name=/x`, or a
+            # short option right before an absolute path (`-f/x`). Any
+            # other (`./x`, `bin/x`, `--name=rel/x`, `-frel/x`) is found
+            # from the folder the interpreter starts in (8c re-review 3).
+            followed = _ARGUMENT_PATH.match(word)
+            if followed:
+                arguments.append(followed.group(1))
+            else:
+                w.find(
+                    "unknown",
+                    path,
+                    f"{role} names a path the check cannot follow after its interpreter "
+                    f"({word}), which the folder it starts in would decide",
+                    fix="shebang",
+                )
         elif not word.startswith("-"):
             w.find(
                 "unknown",
@@ -726,10 +748,12 @@ def _program(
     if walked is None:
         return None
     resolved, real, info = walked
+    # Every file the check reaches, at every depth (the program, each
+    # interpreter, each argument), whatever it was looked up by and
+    # whatever the check finds next: a refusal drops every approval that
+    # reaches any of them (8c re-reviews 2 and 3).
+    w.reached.append((info.st_dev, info.st_ino))
     if depth == 0:
-        # The file it reaches, whatever it was looked up by and whatever
-        # the check finds next: a refusal drops every approval that reaches
-        # it (8c re-review 2).
         w.real = (str(real), info.st_dev, info.st_ino)
     if argument and stat.S_ISDIR(info.st_mode):
         return resolved
@@ -833,6 +857,7 @@ def assess(path: Path | str) -> Verdict:
         lookup=_absolute(given),
         real=w.real[0] if w.real else None,
         real_id=(w.real[1], w.real[2]) if w.real else None,
+        reached_ids=tuple(dict.fromkeys(w.reached)),
     )
 
 

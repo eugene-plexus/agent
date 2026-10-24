@@ -190,6 +190,31 @@ def test_a_refusal_of_what_runs_a_script_drops_the_script_s_approval(
     assert exec_approvals.listed() == []
 
 
+def test_a_refusal_of_another_script_s_interpreter_drops_this_script_s_approval(
+    disk: Disk,  # noqa: F811
+    store: Path,
+) -> None:
+    """Script A runs `/opt/one/python`; script B runs `/opt/two/python`, a
+    link to the same interpreter. The interpreter becomes `env`'s bytes and
+    B is refused; put back, A does not run on its old approval: the refusal
+    names every file its check reached, the interpreter among them (8c
+    re-review 3, 2)."""
+    disk.file("/usr/bin/env", content=ENV)
+    disk.dir("/opt/one").file("/opt/one/python", content=b"\x7fELF python")
+    disk.dir("/opt/two").link("/opt/two/python", "/opt/one/python")
+    disk.dir("/Users/troy", uid=501)
+    disk.file("/Users/troy/a", uid=501, content=b"#!/opt/one/python\nprint(1)\n")
+    disk.file("/Users/troy/b", uid=501, content=b"#!/opt/two/python\nprint(2)\n")
+    shown = exec_trust.assess("/Users/troy/a")
+    assert shown.kind is exec_trust.Kind.needs_approval and shown.sha256
+    exec_approvals.approve("/Users/troy/a", shown.sha256, by="operator")
+    disk.nodes["/opt/one/python"]["content"] = ENV
+    refused("/Users/troy/b", "is the system's env under another name")
+    disk.nodes["/opt/one/python"]["content"] = b"\x7fELF python"
+    assert exec_approvals.listed() == []
+    refused("/Users/troy/a", "only once an owner approves it")
+
+
 def test_a_refusal_by_a_hard_link_drops_the_approval_of_the_same_file(
     disk: Disk,  # noqa: F811
     store: Path,
