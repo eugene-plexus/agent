@@ -90,7 +90,7 @@ def test_first_boot_declares_control_gateway_and_library(
     client, _ = _boot(settings)
     with client:
         _authenticate(client)
-        assert _names(client) == ["control", "gateway", "library"]
+        assert _names(client) == ["control", "gateway", "library", "store"]
         by_name = {c["name"]: c for c in client.get("/v1/components").json()["components"]}
         # Ports, not string suffixes: Pydantic normalizes a URL on the way
         # out and appends the trailing slash, which is the M5 lesson about
@@ -98,6 +98,7 @@ def test_first_boot_declares_control_gateway_and_library(
         assert urlparse(by_name["gateway"]["url"]).port == 8080
         assert urlparse(by_name["library"]["url"]).port == 8082
         assert urlparse(by_name["control"]["url"]).port == 8083
+        assert urlparse(by_name["store"]["url"]).port == 8084
         assert by_name["control"]["kind"] == ComponentKind.control.value
 
 
@@ -116,6 +117,7 @@ def test_seeded_entries_land_in_the_collection_boot_supervises(tmp_path: Path) -
         "control",
         "gateway",
         "library",
+        "store",
     ]
 
 
@@ -124,10 +126,15 @@ def test_it_persists_so_the_second_boot_is_not_a_first_one(tmp_path: Path) -> No
     client, _ = _boot(settings)
     with client:
         _authenticate(client)
-        assert _names(client) == ["control", "gateway", "library"]
+        assert _names(client) == ["control", "gateway", "library", "store"]
 
     on_disk = yaml.safe_load((tmp_path / "agent.yaml").read_text(encoding="utf-8"))
-    assert sorted(c["name"] for c in on_disk["components"]) == ["control", "gateway", "library"]
+    assert sorted(c["name"] for c in on_disk["components"]) == [
+        "control",
+        "gateway",
+        "library",
+        "store",
+    ]
 
 
 def test_a_deleted_component_stays_deleted_across_a_restart(tmp_path: Path) -> None:
@@ -137,12 +144,12 @@ def test_a_deleted_component_stays_deleted_across_a_restart(tmp_path: Path) -> N
     with client:
         _authenticate(client)
         assert client.delete("/v1/components/gateway").status_code in (200, 204)
-        assert _names(client) == ["control", "library"]
+        assert _names(client) == ["control", "library", "store"]
 
     client, _ = _boot(settings)
     with client:
         _authenticate(client)
-        assert _names(client) == ["control", "library"]
+        assert _names(client) == ["control", "library", "store"]
 
 
 def test_the_bootstrap_load_in_main_does_not_erase_first_boot(tmp_path: Path) -> None:
@@ -162,7 +169,7 @@ def test_the_bootstrap_load_in_main_does_not_erase_first_boot(tmp_path: Path) ->
     client, _ = _boot(settings)
     with client:
         _authenticate(client)
-        assert _names(client) == ["control", "gateway", "library"]
+        assert _names(client) == ["control", "gateway", "library", "store"]
 
 
 def test_an_existing_but_empty_topology_is_left_alone(tmp_path: Path) -> None:
@@ -221,14 +228,14 @@ def test_a_component_that_cannot_import_is_not_declared(
     )
     state = AgentState(tmp_path / "agent.yaml")
     state.load()
-    assert default_topology.seed(state) == ["control", "library"]
+    assert default_topology.seed(state) == ["control", "library", "store"]
 
 
 def test_seeding_is_idempotent_by_name(tmp_path: Path) -> None:
     """A half-seeded install completes rather than conflicting."""
     state = AgentState(tmp_path / "agent.yaml")
     state.load()
-    assert default_topology.seed(state) == ["control", "gateway", "library"]
+    assert default_topology.seed(state) == ["control", "gateway", "library", "store"]
     assert default_topology.seed(state) == []
 
 

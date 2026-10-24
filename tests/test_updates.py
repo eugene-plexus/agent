@@ -87,6 +87,7 @@ def _install_sh(pins: dict[str, str]) -> str:
         "gateway": "GATEWAY",
         "inference-driver": "DRIVER",
         "library": "LIBRARY",
+        "store": "STORE",
         "tool-driver": "TOOL_DRIVER",
         "ui": "UI",
     }

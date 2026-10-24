@@ -57,6 +57,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import ports
 from ._generated.common_models import ConfigUpdateRequest
@@ -81,7 +82,17 @@ DEFAULTS: tuple[DefaultComponent, ...] = (
     DefaultComponent("control", ComponentKind.control, 8083, "eugene_plexus_control"),
     DefaultComponent("gateway", ComponentKind.gateway, 8080, "eugene_plexus_gateway"),
     DefaultComponent("library", ComponentKind.library, 8082, "eugene_plexus_library"),
+    # Row 53: what the gateway's platform doors keep (files first), on the
+    # root beside control. Loopback: other machines reach it through this
+    # agent's proxy, as they reach the library.
+    DefaultComponent("store", ComponentKind.store, 8084, "eugene_plexus_store"),
 )
+
+#: The store joined the defaults after installs existed (row 53). Written
+#: beside agent.yaml the first time this agent declares the store, by
+#: `seed` or by `add_store`, so a store the owner later removed or moved to
+#: another machine is not declared here again.
+STORE_DECLARED_MARKER = ".store-declared"
 
 
 def is_installed(module: str) -> bool:
@@ -208,7 +219,9 @@ def seed(state: AgentState) -> list[str]:
         # Ports already handed to an earlier component in this same loop
         # count as taken: nothing is listening on them yet.
         taken = {_port_of(entry) for entry in state.list_topology_entries()}
-        port = ports.first_free(component.port, reserved=RESERVED_PORTS | taken)
+        port = ports.first_free(
+            component.port, reserved=(RESERVED_PORTS - {component.port}) | taken
+        )
         if port != component.port:
             holder = ports.describe_holder(component.port)
             log.warning(
@@ -221,7 +234,68 @@ def seed(state: AgentState) -> list[str]:
             )
         state.add_topology_entry(entry_for(component, state, port=port))
         declared.append(component.name)
+        if component.kind == ComponentKind.store:
+            _mark_store_declared(state)
     return declared
+
+
+def _store_marker(state: AgentState) -> Path:
+    return Path(state.path).parent / STORE_DECLARED_MARKER
+
+
+def _mark_store_declared(state: AgentState) -> None:
+    try:
+        _store_marker(state).write_text("row 53", encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not record that the store was declared here: %s", exc)
+
+
+def add_store(state: AgentState) -> str | None:
+    """Declare the store on a root that was set up before it existed.
+
+    Every install has one (row 53), on the root, as it has a gateway and a
+    library. A root set up before this release has a topology already, so
+    `seed` never runs again there; this adds the store once, when:
+
+      * this agent runs the install's active control root;
+      * no store is declared here;
+      * this agent never declared one before (the marker), so a store the
+        owner removed, or moved to another machine, stays where they put it;
+      * the package imports from this agent's interpreter.
+
+    Returns the name declared, or None.
+    """
+    store = next(c for c in DEFAULTS if c.kind == ComponentKind.store)
+    entries = state.list_topology_entries()
+    if _store_marker(state).exists():
+        return None
+    if any(e.kind == ComponentKind.store for e in entries):
+        _mark_store_declared(state)
+        return None
+    from .standby import hosts_active_control
+
+    if not hosts_active_control(state):
+        return None
+    if state.get_topology_entry(store.name) is not None:
+        log.warning(
+            "not declaring the store: a component named %r is already declared here", store.name
+        )
+        return None
+    if not is_installed(store.module):
+        log.warning(
+            "not declaring the store: %s does not import from this agent's interpreter. "
+            "Update this install to get it.",
+            store.module,
+        )
+        return None
+    taken = {_port_of(entry) for entry in entries}
+    # A declared port is taken even while nothing listens on it yet: this
+    # runs before supervision starts, and a root that moved control behind
+    # the machine port has it on 8084.
+    port = ports.first_free(store.port, reserved=(RESERVED_PORTS - {store.port}) | taken)
+    state.add_topology_entry(entry_for(store, state, port=port))
+    _mark_store_declared(state)
+    return store.name
 
 
 def _port_of(entry: ComponentEntry) -> int:
@@ -235,7 +309,9 @@ def _port_of(entry: ComponentEntry) -> int:
 __all__ = [
     "DEFAULTS",
     "RESERVED_PORTS",
+    "STORE_DECLARED_MARKER",
     "DefaultComponent",
+    "add_store",
     "entry_for",
     "is_installed",
     "seed",
