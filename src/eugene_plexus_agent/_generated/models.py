@@ -640,6 +640,50 @@ class BackendKind(StrEnum):
     gemini_api = 'gemini_api'
 
 
+class Peer(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class ComputeDevicePcieLink(BaseModel):
+    """
+    Current and supported PCIe link measurements for one card. Each
+    measurement is null independently when its probe fails, so a
+    readable width survives an unreadable generation.
+
+    """
+
+    generation: int | None = Field(
+        ..., description='Current PCIe generation. Null when unreadable.', ge=1
+    )
+    width: int | None = Field(
+        ..., description='Current PCIe lane count. Null when unreadable.', ge=1
+    )
+    maxGeneration: int | None = Field(
+        ...,
+        description='Maximum PCIe generation the card supports. Null when unreadable.',
+        ge=1,
+    )
+    maxWidth: int | None = Field(
+        ...,
+        description='Maximum PCIe lane count the card supports. Null when unreadable.',
+        ge=1,
+    )
+
+
+class ComputeDeviceThrottleReason(StrEnum):
+    """
+    An observed reason a card is slowing down. `thermal` is a heat
+    limit, `power-cap` a power limit, `hardware-slowdown` another
+    hardware slowdown signal, and `other` another active NVML reason.
+
+    """
+
+    thermal = 'thermal'
+    power_cap = 'power-cap'
+    hardware_slowdown = 'hardware-slowdown'
+    other = 'other'
+
+
 class ComputeDeviceKind(StrEnum):
     """
     What kind of device this is.
@@ -2807,7 +2851,24 @@ class ClientKey(BaseModel):
     expiresAt: AwareDatetime
     revokedAt: AwareDatetime | None = None
     lastUsedAt: AwareDatetime | None = Field(
-        None, description='Reserved; not currently measured.'
+        None,
+        description='When the authority last admitted a check or acquisition with this key, to the minute. Absent, no use recorded.',
+    )
+    retiresAt: AwareDatetime | None = Field(
+        None,
+        description='Set when the key was rotated. The token works until then, and new requests on it are refused as replaced afterwards. Running requests finish.',
+    )
+    replaces: str | None = Field(
+        None,
+        description='The id of the key this one replaced.',
+        max_length=128,
+        min_length=1,
+    )
+    replacedBy: str | None = Field(
+        None,
+        description='The id of the key that replaced this one.',
+        max_length=128,
+        min_length=1,
     )
     limits: ClientKeyLimits | None = Field(
         None,
@@ -2835,6 +2896,24 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
+
+
+class ClientKeyRotateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    overlapSeconds: int | None = Field(
+        86400,
+        description='How long the old token keeps working. 0 stops it now. The old and new tokens share one concurrency and rate allowance during the overlap.',
+        ge=0,
+        le=2592000,
+    )
+    ttlDays: int | None = Field(
+        None,
+        description="Lifetime of the new key. Absent, the old key's lifetime.",
+        ge=1,
+        le=3650,
+    )
 
 
 class ClientKeyUpdateRequest(BaseModel):
@@ -3326,6 +3405,95 @@ class RuntimeMode(StrEnum):
     reranking = 'reranking'
 
 
+class LastDevice(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class Change(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class RuntimeMissingDevice(BaseModel):
+    """
+    A missing card, identified from the agent's last observation.
+    """
+
+    uuid: str = Field(
+        ..., description='Stable vendor UUID of the missing card.', min_length=1
+    )
+    name: str = Field(
+        ..., description='Device name when the card was last present.', min_length=1
+    )
+    lastIndex: int = Field(
+        ...,
+        description='Device index when the card was last present, before renumbering.',
+        ge=0,
+    )
+
+
+class Source(StrEnum):
+    """
+    * `embedded` — the reported text matches the model file's
+      embedded template and no operator override selected it.
+    * `eugene` — the reported text matches the Eugene fallback
+      captured at launch, with no operator override in effect.
+    * `override` — the reported text matches the operator's
+      explicit template override captured at launch. This takes
+      precedence even when its contents match a bundled template.
+    * `engine` — the engine reports the text but its origin is
+      unknown, or it does not match the captured selection.
+      Never label an unconfirmed fallback as `eugene`.
+
+    """
+
+    embedded = 'embedded'
+    eugene = 'eugene'
+    override = 'override'
+    engine = 'engine'
+
+
+class RuntimeChatTemplate(BaseModel):
+    """
+    The chat template the running engine reports in effect, not a
+    saved setting or a Library fallback recommendation. Publish only
+    after the engine reports its effective template text; the digest
+    is SHA-256 of those exact UTF-8 bytes, without whitespace or line
+    ending normalization. The source is not inferred from argv alone.
+
+    Omit on stopped runtimes, while the effective template is
+    unconfirmed, and on engines that do not report it. Clear this
+    observation on stop and before each new start, so a changed
+    setting cannot leave a previous process's template on display.
+    Missing information does not block a launch or inference.
+
+    """
+
+    source: Source = Field(
+        ...,
+        description="* `embedded` — the reported text matches the model file's\n  embedded template and no operator override selected it.\n* `eugene` — the reported text matches the Eugene fallback\n  captured at launch, with no operator override in effect.\n* `override` — the reported text matches the operator's\n  explicit template override captured at launch. This takes\n  precedence even when its contents match a bundled template.\n* `engine` — the engine reports the text but its origin is\n  unknown, or it does not match the captured selection.\n  Never label an unconfirmed fallback as `eugene`.\n",
+    )
+    name: str = Field(
+        ...,
+        description='Human-readable name of the effective template. Use an engine\ntemplate label when the origin is unknown; never the name of\na saved override or fallback that was not confirmed.\n',
+        min_length=1,
+    )
+    sha256: str = Field(
+        ...,
+        description='Digest of the effective template text returned by the engine.',
+        pattern='^[0-9a-f]{64}$',
+    )
+    id: str | None = Field(
+        None,
+        description="The Library's `ChatTemplateFallback.id` when source is\n`eugene`; omitted for other sources. The digest identifies\nthe exact template revision in effect.\n",
+        min_length=1,
+    )
+    path: str | None = Field(
+        None,
+        description="Template file on this runtime's node, captured at launch and\nreported only when its captured contents match the engine's\neffective template. Absent for embedded and engine templates,\nand for inline overrides. A later edit to this file does not\nchange the running process's template or digest.\n",
+        min_length=1,
+    )
+
+
 class PromptCacheSource(StrEnum):
     """
     Where a runtime's prompt cache size comes from. `profile` is the
@@ -3389,7 +3557,7 @@ class RuntimeSpeculation(BaseModel):
     )
 
 
-class Source(StrEnum):
+class Source1(StrEnum):
     """
     Which counter answered. On the wire so that "this host cannot
     measure it" stays distinguishable from "this engine is not
@@ -3446,7 +3614,7 @@ class LoadProgress(BaseModel):
         None,
         description='Observed over a short window, so it tracks a share that has\njust got slower rather than averaging the whole load. Null on\nthe first pair of readings.\n',
     )
-    source: Source = Field(
+    source: Source1 = Field(
         ...,
         description='Which counter answered. On the wire so that "this host cannot\nmeasure it" stays distinguishable from "this engine is not\nreading" — both of which make the field absent, and only one\nof which is worth reporting to whoever runs the host.\n',
     )
@@ -4444,6 +4612,11 @@ class ComputeDevice(BaseModel):
     because a host with two cards is the case that makes replicas of
     one model possible.
 
+    Health readings are observations, never estimates. Each optional
+    health field is null when the platform cannot read it. The agent
+    refreshes these with its device list every 600 seconds and on
+    each `GET /v1/node` (row 43).
+
     """
 
     kind: ComputeDeviceKind
@@ -4453,8 +4626,45 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
+        description='Current device ordinal on its own host. It can change when\nanother card disappears; `uuid`, when readable, identifies\nthe same card across that renumbering. NVIDIA launches use\nthe UUID in `CUDA_VISIBLE_DEVICES`, falling back to an index\nwhen no UUID was read. For a `vulkan` device the index is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES` counts\nin.\n',
         ge=0,
+    )
+    uuid: str | None = Field(
+        None,
+        description="Stable vendor device identifier, used to keep a runtime on\nthe same card when indices change. NVIDIA's NVML UUID (for\nexample `GPU-...`) or AMD's sysfs `unique_id`, kept as the\nvendor reports it; not necessarily an RFC UUID. Null when\nthe platform cannot read it.\n",
+        min_length=1,
+    )
+    pciBusId: str | None = Field(
+        None,
+        description='PCI bus address from NVML or the Linux sysfs device path.\nNull when unreadable. A location, not a stable card identity.\n',
+        min_length=1,
+    )
+    pcieLink: ComputeDevicePcieLink | None = Field(
+        None,
+        description="Observed PCIe link against the card's supported link. Null\nwhen no link measurements can be read. A lower generation\nis a warning only when this card's utilisation exceeded 50%\nin the last minute of host history: an idle card can lower\nits generation to save power. A narrower width is a warning\nat any time. Compare only measurements that are known.\n",
+    )
+    powerLimitWatts: float | None = Field(
+        None,
+        description="Power cap in effect, in watts, from NVML's enforced power\nlimit or Linux hwmon `power1_cap`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    powerDefaultLimitWatts: float | None = Field(
+        None,
+        description="The card's default power cap in watts, from NVML or Linux\nhwmon `power1_cap_default`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    throttleReasons: list[ComputeDeviceThrottleReason] | None = Field(
+        None,
+        description='Reasons the card is currently slowing down, read from NVML.\nAn empty list means it reported no throttling. Null when\nunreadable, including AMD and other unsupported platforms.\n',
+    )
+    uncorrectedMemoryErrors: int | None = Field(
+        None,
+        description="Volatile uncorrected ECC memory-error count from NVML, since\nthe device's counter was reset. Zero is a measured result.\nNull when ECC is off, unsupported or unreadable.\n",
+        ge=0,
+    )
+    peers: list[Peer] | None = Field(
+        None,
+        description='UUIDs of other cards this card can reach directly by P2P\nreads, as NVML reports it. Directional: the reverse path is\nreported on the other card. An empty list means no peers\nwere reachable; null means the peer check was unreadable or\nunsupported. Unknown checks never claim that P2P is absent.\n',
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
@@ -5062,7 +5272,7 @@ class RuntimeSpec(BaseModel):
     )
     flags: dict[str, Any] | None = Field(
         None,
-        description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n',
+        description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n\nFor llama.cpp and vLLM, `missingCard` is the agent\'s "If a\ncard is missing" setting, exposed in the engine\'s GUI\n`flagSchema`. `start-on-cards-left` is the default: refit for\nthe cards present and report any temporary context or RAM\noffload changes. `do-not-start` refuses the launch and names\nthe missing card. The profile is not changed; the next start\nuses its saved settings when all cards are back. This setting\ncontrols the agent\'s launch check, not an engine CLI flag.\n',
     )
     extraArgs: list[str] | None = Field(
         None,
@@ -5081,6 +5291,22 @@ class RuntimeSpec(BaseModel):
         description='Override the binary for this one runtime, ignoring whatever\nthe adapter discovered. For running one model on a custom\nbuild without disturbing the rest of the install.\n',
     )
     profile: RuntimeProfile | None = None
+
+
+class RuntimeStartedOnFewerCards(BaseModel):
+    """
+    Observed result of a successful start on the cards left. The
+    console keeps a warning until a start with every expected card
+    clears it, and offers a restart so the person can use a returned
+    card. Never written back to a profile.
+
+    """
+
+    missing: list[RuntimeMissingDevice] = Field(..., min_length=1)
+    changes: list[Change] = Field(
+        ...,
+        description='One sentence per launch change actually applied, such as a\nsmaller context, more of the model in RAM, a changed tensor\nsplit or reduced tensor parallelism. Empty when only the\ndevice selection changed. These describe values in effect,\nnot suggestions from fit that were never used.\n',
+    )
 
 
 class RuntimePromptCache(BaseModel):
@@ -6158,10 +6384,19 @@ class Runtime(BaseModel):
         None, description='Version reported by the binary that is actually running.'
     )
     capabilities: RuntimeCapabilities | None = None
+    chatTemplate: RuntimeChatTemplate | None = None
     lastRestart: AwareDatetime | None = None
     lastError: str | None = Field(
         None,
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
+    )
+    lastDevices: list[LastDevice] | None = Field(
+        None,
+        description='UUIDs of the cards used at the last successful start, recorded\nby the agent. An observation, never a profile setting or a\nreplacement for its saved device pins. Kept across stops and\nfailed starts, and updated only after a successful start.\nAbsent before a successful start has been observed; an empty\nlist means no device UUIDs were available or used.\n',
+    )
+    startedOnFewerCards: RuntimeStartedOnFewerCards | None = Field(
+        None,
+        description='The last successful start used fewer cards because one or\nmore expected cards were missing. Names those cards and the\nlaunch changes actually applied. Null when there is no such\nobservation. Kept until a successful start with every\nexpected card clears it; a returning card does not restart a\nrunning runtime automatically. The profile stays unchanged.\n',
     )
     loadProgress: LoadProgress | None = None
     speculation: RuntimeSpeculation | None = None
