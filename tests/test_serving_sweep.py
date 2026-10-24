@@ -158,7 +158,7 @@ async def test_an_answer_from_another_runtime_stops_the_run():
             random.Random(0),
         )
         with pytest.raises(ValueError, match=r"other.*tower.*r.*tower"):
-            await sweep.level(1, 0.1, "streams")
+            await sweep.level(1, 5.0, "streams")
     assert sweep.partial.errors == 1
 
 
@@ -402,3 +402,132 @@ async def test_the_job_ends_only_after_its_replicas_restart(tmp_path):
     assert seen == [("running", "Starting the stopped replicas again.", None)]
     assert job.state == "failed" and job.detail == "engine refused"
     assert job.restarts[0].state == "restarted" and job.finishedAt is not None
+
+
+class KeyLimitedGateway:
+    """A stand-in gateway whose key allows `allowed` requests at once, as the real one does."""
+
+    def __init__(self, allowed, seconds=0.2):
+        self.allowed, self.seconds = allowed, seconds
+        self.active = self.peak = self.refused = 0
+
+    async def __call__(self, request):
+        if self.active >= self.allowed:
+            self.refused += 1
+            return httpx.Response(
+                429,
+                text="This key's shared concurrency or request-rate limit is reached.",
+            )
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        return httpx.Response(
+            200,
+            headers={"X-Eugene-Plexus-Runtime": "r", "X-Eugene-Plexus-Node": "tower"},
+            stream=Answer(self),
+        )
+
+
+class Answer(httpx.AsyncByteStream):
+    def __init__(self, owner):
+        self.owner, self.released = owner, False
+
+    def release(self):
+        if not self.released:
+            self.released = True
+            self.owner.active -= 1
+
+    async def __aiter__(self):
+        try:
+            for _ in range(4):
+                await asyncio.sleep(self.owner.seconds / 4)
+                yield b'data: {"choices":[{"delta":{"content":"word "}}]}\n\n'
+            yield b'data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":4}}\n\n'
+            yield b"data: [DONE]\n\n"
+        finally:
+            self.release()
+
+    async def aclose(self):
+        self.release()
+
+
+async def run_sweep(gateway, tmp_path, *, limit, maxPeople=8, slot_wait=0.05):
+    store = ServingMeasurements(tmp_path / "runs.json")
+    job = store.new(
+        effective_request(
+            ServingMeasurementRequest(runtime="r", workload="streams", maxPeople=maxPeople), 2
+        ).model_copy(update={"windowSeconds": 1}),
+        "tower",
+        "m",
+        provenance(),
+    )
+
+    async def noop(*args):
+        pass
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as client:
+        sweep = Sweep(
+            client,
+            "http://fixture",
+            "secret",
+            "r",
+            "tower",
+            "m",
+            8192,
+            random.Random(0),
+            limit=limit,
+            slot_wait=slot_wait,
+        )
+        await store.run(job, sweep, noop, noop)
+    return job, sweep
+
+
+@pytest.mark.asyncio
+async def test_a_level_that_needs_more_than_the_key_allows_ends_as_saturated(tmp_path):
+    gateway = KeyLimitedGateway(allowed=4)
+    job, _ = await run_sweep(gateway, tmp_path, limit=4)
+    assert gateway.refused == 0
+    assert gateway.peak <= 4
+    assert job.state == "completed", job.detail
+    assert job.knee and job.knee.found and job.knee.people == 4
+    assert (
+        "Stopped at 8 people: more than 4 requests were waiting at once, "
+        "so the engine is saturated." in job.detail
+    )
+    assert max(level.streamsPeak for level in job.levels) <= 4
+    assert all(level.errors == 0 for level in job.levels)
+
+
+@pytest.mark.asyncio
+async def test_a_429_from_its_own_key_counts_as_saturation_not_an_error(tmp_path):
+    # The sweep believes it may send 64 at once, but the gateway answers 429 from 2.
+    gateway = KeyLimitedGateway(allowed=2)
+    job, _ = await run_sweep(gateway, tmp_path, limit=64, maxPeople=4)
+    assert gateway.refused > 0
+    assert job.state == "completed", job.detail
+    assert job.knee and job.knee.people == 2
+    assert "more than 64 requests were waiting at once" in job.detail
+    assert all(level.errors == 0 for level in job.levels)
+
+
+@pytest.mark.asyncio
+async def test_other_errors_still_fail_the_run(tmp_path):
+    async def broken(request):
+        return httpx.Response(500, text="engine fell over")
+
+    job, _ = await run_sweep(broken, tmp_path, limit=64, maxPeople=2)
+    assert job.state == "failed"
+    assert "engine fell over" in job.detail
+
+
+def test_the_key_and_the_load_generator_share_one_allowance():
+    import inspect
+
+    from eugene_plexus_agent.routes import serving_measurements
+    from eugene_plexus_agent.serving_sweep import MEASUREMENT_KEY_CONCURRENCY
+
+    source = inspect.getsource(serving_measurements)
+    assert "maxConcurrentRequests=MEASUREMENT_KEY_CONCURRENCY" in source
+    assert "limit=MEASUREMENT_KEY_CONCURRENCY" in source
+    assert Sweep(None, "", "", "r", "n", "m", 1, random.Random(0)).limit == (
+        MEASUREMENT_KEY_CONCURRENCY
+    )

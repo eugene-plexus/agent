@@ -4508,6 +4508,55 @@ class PublicEntryPoint(BaseModel):
     )
 
 
+class Provides(StrEnum):
+    """
+    A link provided to another app on the same machine, only
+    between entries from the shipped catalogue. One provider of
+    `memory-server` per machine; a custom entry may not declare
+    this field. `providesPath` is required with it.
+
+    The agent generates a link secret at provider installation,
+    separate from the REST app secret. Only that provider receives
+    `{linkSecret}` for MCP. A shipped consumer with
+    `uses: [inference, memory-server]` receives the exact loopback
+    URL including `providesPath` in
+    `EUGENE_PLEXUS_APP_MEMORY_SERVER_URL`, and the secret's file
+    in `EUGENE_PLEXUS_APP_MEMORY_SERVER_TOKEN_FILE`. The URL never
+    contains the secret. No link is delivered when the provider
+    is absent; link absence must not prevent the consumer starting.
+
+    The consumer also gets
+    `EUGENE_PLEXUS_APP_MEMORY_SERVER_MODEL_FILE`, a read-only file
+    containing the provider's effective `AppSettings` as JSON.
+    This non-secret metadata stays current when the effective
+    model changes; do not retain a snapshot across changes.
+    Workbench reads it at each call and looks up that model's
+    locality in the gateway. If the file is missing or unreadable,
+    the model is unset, or locality cannot be established, treat
+    it as outside and name the observed cause. A loopback server
+    address alone never establishes model locality.
+
+    The credential is an owner-only file granted only to the
+    provider's and authorised consumers' accounts on Windows,
+    and a systemd credential on Linux. A third app gets no grant.
+    It never appears in API responses, per-person records, logs
+    or a service definition. The consumer re-reads its token file
+    when it changes. Provider uninstall withdraws the link;
+    reinstall after purge generates a new secret. Uninstall
+    without purge keeps it privately with the retained data.
+
+    Workbench chooses each person's bank as `wb-` plus the first
+    16 hex characters of SHA-256 of their `sub`, appended to the
+    link path with a trailing slash. The person cannot choose a
+    bank or see the token. Only this exact agent-provided address
+    is exempt from the memory server policy's loopback refusal;
+    person-supplied addresses keep all MV5a checks.
+
+    """
+
+    memory_server = 'memory-server'
+
+
 class Arg(RootModel[str]):
     root: str = Field(..., max_length=512)
 
@@ -4518,19 +4567,21 @@ class UpdateBackupItem(RootModel[str]):
 
 class AppHubSurface(StrEnum):
     """
-    A public hub surface an app's client key may be used on.
+    An app dependency: a public hub surface or a narrow catalogue link.
 
     * `inference` — the gateway's client doors (`/v1/models`,
       `/v1/chat/completions` and the rest), under A5's default
       limits. The operator narrows or widens the key like any other.
 
-    One member today on purpose. A trainer depositing models into the
-    Library would add a second, together with the Library endpoint it
-    names, when a trainer exists to use it — not before.
+    * `memory-server` — the same-machine app link from a shipped
+      catalogue provider. It is not a hub client-key scope and grants
+      no access to the Library, control root or other apps. Link
+      credentials go only to shipped catalogue consumers declaring it.
 
     """
 
     inference = 'inference'
+    memory_server = 'memory-server'
 
 
 class AppIsolation(StrEnum):
@@ -4648,6 +4699,44 @@ class AppInstall(BaseModel):
     finishedAt: AwareDatetime | None = None
 
 
+class AppSettings(BaseModel):
+    """
+    Effective launcher settings for the installed app, persisted in
+    its `apps.yaml` entry under `settings`. For a running app these
+    are the values used to launch that process; for a stopped app
+    they are the values its next start will use. No pending selection
+    may be shown while an old process still runs. An unset model is
+    explicit null, including in API responses. No secret is included.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    memoryModel: str | None = Field(
+        ...,
+        description="The gateway model id Hindsight reads chats with. It is unset\nuntil the owner chooses; null clears the selection and stops\nHindsight. There is no automatic first-model or fallback choice.\nThe console lists chat models from the gateway's `GET /v1/models`,\nmarks the probe or harness measurements as advice, and lets an\nexpert enter a model id. Measurements never block an untested\nmodel. Gateway access limits still apply.\n\nLocality comes from the selected model's gateway metadata, never\nfrom this server's loopback URL. Workbench treats outside or\nunknown locality as an outside model under the person's write\npolicy, as for an MV5a server.\n",
+        max_length=512,
+        min_length=1,
+    )
+
+
+class AppSettingsUpdate(BaseModel):
+    """
+    Partial launcher settings update; omitted fields stay unchanged.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    memoryModel: str | None = Field(
+        None,
+        description="The gateway model id Hindsight reads chats with. It is unset\nuntil the owner chooses; null clears the selection and stops\nHindsight. There is no automatic first-model or fallback choice.\nThe console lists chat models from the gateway's `GET /v1/models`,\nmarks the probe or harness measurements as advice, and lets an\nexpert enter a model id. Measurements never block an untested\nmodel. Gateway access limits still apply.\n\nLocality comes from the selected model's gateway metadata, never\nfrom this server's loopback URL. Workbench treats outside or\nunknown locality as an outside model under the person's write\npolicy, as for an MV5a server.\n",
+        max_length=512,
+        min_length=1,
+    )
+
+
 class AppRestartRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -4695,6 +4784,14 @@ class AppUpdateBackup(BaseModel):
     createdAt: AwareDatetime
 
 
+class Provides1(StrEnum):
+    """
+    The installed manifest's same-machine catalogue link, when provided.
+    """
+
+    memory_server = 'memory-server'
+
+
 class App(BaseModel):
     """
     One installed app: what was installed (persisted in `apps.yaml`
@@ -4721,6 +4818,7 @@ class App(BaseModel):
         None,
         description='Settings last given to the app on its first start or a reset\nstart. Absent before a recorded seed or on an older install.\n',
     )
+    settings: AppSettings | None = None
     availableImageModel: str | None = Field(
         None,
         description="The image model the launcher would select now from the app's key\nlisting, using the local-first rule for `{imageModel}`. This\nis a current offer, not the app's stored setting. The console\ncompares it with `givenSettings.imageModel` to offer Reset\nwhen a model was not given. Absent when no eligible model is\nlisted or the listing fails; `detail` names the observed cause.\n",
@@ -4737,6 +4835,12 @@ class App(BaseModel):
         ...,
         description='The port it binds, allocated from 8190-8289 and persisted so\nits address does not change between restarts.\n',
     )
+    auxPort: int | None = Field(
+        None,
+        description="The auxiliary port reserved for `{auxPort}`, persisted and\ndistinct from every app's main and auxiliary port. Present\nonly when its manifest needs it, including while stopped.\n",
+        ge=8190,
+        le=8289,
+    )
     uiUrl: AnyUrl | None = Field(
         None,
         description="Where a browser opens its UI: this node's advertised host with\nthe app's port, or loopback on a node that advertises none.\nPresent only for an app with `ui: true`.\n",
@@ -4746,8 +4850,22 @@ class App(BaseModel):
         description="The gateway address handed to the app at its last start — the\nlocal gateway when this node runs one, otherwise the owning\nnode's agent proxy (`<agent>/api/proxy/gateway`), which is the\nsame public path a browser uses and survives a port remap that\na component address does not. Absent when none could be found;\nan app we ship then says so and takes an address in its own\nconfig.\n",
     )
     ui: bool
+    experimental: bool | None = Field(
+        False, description="Whether to show the installed app's Experimental badge."
+    )
     configTrio: bool
     uses: list[AppHubSurface]
+    provides: Provides1 | None = Field(
+        None,
+        description="The installed manifest's same-machine catalogue link, when provided.",
+    )
+    providesPath: str | None = Field(
+        None,
+        description="The installed manifest's link path; no credential is returned.",
+        max_length=128,
+        min_length=1,
+        pattern='^/(?:[A-Za-z0-9_~-]+/)*$',
+    )
     keyId: str | None = Field(
         None,
         description='The client key minted for it. Revoking that key cuts the app\noff from the hub; uninstalling revokes it.\n',
@@ -6007,6 +6125,42 @@ class AppManifest(BaseModel):
     It describes account isolation from Eugene, not isolation between
     people using the same app. It is not a user-configurable setting.
 
+    **MV5b's Hindsight entry is Experimental.** Install exactly
+    `hindsight-api-slim[embedded-db]` at `1.0.0`, with the explicit
+    dependency pin `pg0-embedded==0.15.2` and Python 3.12,
+    entry `hindsight_api.main:main`, `ui: false`, `configTrio: false`,
+    `localActions: false`, `healthPath: /health` and `uses: [inference]`.
+    It provides `memory-server` at `/mcp/`. Its LLM, embeddings and
+    reranker addresses and keys all name the gateway, never upstream
+    defaults. Use the OpenAI LLM and embeddings providers, the Cohere
+    reranker at the gateway's full `/v1/rerank` path, and disable OTEL
+    traces. Set `HINDSIGHT_API_LLM_REASONING_EFFORT=none`.
+
+    Set `HINDSIGHT_API_TENANT_EXTENSION` to `ApiKeyTenantExtension`
+    and `HINDSIGHT_API_TENANT_API_KEY` to `{appSecret}`: REST is open
+    otherwise. Enable MCP with `HINDSIGHT_API_MCP_AUTH_TOKEN` set to
+    the separate `{linkSecret}`. A REST key is not an MCP token.
+    Set the database URL to
+    `pg0://hindsight:{databaseSecret}@eugene-plexus-hindsight:{auxPort}`.
+    pg0 `start`, `stop` and `drop` must all use
+    `eugene-plexus-hindsight`, never the default `hindsight` instance.
+    The database must listen on the reserved `{auxPort}`; if that
+    port is in use or pg0 selects another port, the start is refused
+    and names the observed cause. Never report a moved port as ready.
+    On Linux,
+    HOME must be the app's data folder, so pg0 data is contained there.
+    Where pg0 uses the account profile instead, a purge must run
+    `pg0 drop` by instance name before deleting the app's files.
+    Require password authentication in `pg_hba.conf` for TCP and the
+    Unix socket, never `trust`. Acceptance must check that both the
+    default `hindsight`/`hindsight` login and a login with no password
+    are refused over TCP and the Unix socket, while the generated
+    password succeeds. The launcher must redact database credentials
+    from pg0 and Hindsight output, logs and errors, including their
+    connection URIs.
+    Availability follows MV5b-C1: Linux and agent-account installs
+    only; Windows own-account installs wait for data-folder support.
+
     """
 
     model_config = ConfigDict(
@@ -6057,12 +6211,28 @@ class AppManifest(BaseModel):
         False,
         description="Whether the app serves a browser UI on its port. A UI is\nopened on the app's own origin and never embedded in or\nproxied through the console: the console's origin holds the\noperator session and an unauthenticated proxy to every\ncomponent, and anything running there has operator authority.\n",
     )
+    experimental: bool | None = Field(
+        False,
+        description='Show an Experimental badge on the catalogue card and installed app page.',
+    )
     configTrio: bool | None = Field(
         False,
         description='Whether the app serves `GET /v1/config`, `GET\n/v1/config/schema` and `PATCH /v1/config`, requiring the admin\ntoken this agent hands it at each spawn. Required of apps we\nship; optional for a custom entry, whose page then shows\nstatus, logs and Open only.\n',
     )
     uses: list[AppHubSurface] | None = Field(
-        ['inference'], description="The hub surfaces the app's key is scoped to."
+        ['inference'],
+        description="The app's dependencies. `inference` scopes its hub key;\n`memory-server` requests the same-machine catalogue link,\nnever a wider hub credential. Only shipped catalogue entries\nmay consume that link.\n",
+    )
+    provides: Provides | None = Field(
+        None,
+        description="A link provided to another app on the same machine, only\nbetween entries from the shipped catalogue. One provider of\n`memory-server` per machine; a custom entry may not declare\nthis field. `providesPath` is required with it.\n\nThe agent generates a link secret at provider installation,\nseparate from the REST app secret. Only that provider receives\n`{linkSecret}` for MCP. A shipped consumer with\n`uses: [inference, memory-server]` receives the exact loopback\nURL including `providesPath` in\n`EUGENE_PLEXUS_APP_MEMORY_SERVER_URL`, and the secret's file\nin `EUGENE_PLEXUS_APP_MEMORY_SERVER_TOKEN_FILE`. The URL never\ncontains the secret. No link is delivered when the provider\nis absent; link absence must not prevent the consumer starting.\n\nThe consumer also gets\n`EUGENE_PLEXUS_APP_MEMORY_SERVER_MODEL_FILE`, a read-only file\ncontaining the provider's effective `AppSettings` as JSON.\nThis non-secret metadata stays current when the effective\nmodel changes; do not retain a snapshot across changes.\nWorkbench reads it at each call and looks up that model's\nlocality in the gateway. If the file is missing or unreadable,\nthe model is unset, or locality cannot be established, treat\nit as outside and name the observed cause. A loopback server\naddress alone never establishes model locality.\n\nThe credential is an owner-only file granted only to the\nprovider's and authorised consumers' accounts on Windows,\nand a systemd credential on Linux. A third app gets no grant.\nIt never appears in API responses, per-person records, logs\nor a service definition. The consumer re-reads its token file\nwhen it changes. Provider uninstall withdraws the link;\nreinstall after purge generates a new secret. Uninstall\nwithout purge keeps it privately with the retained data.\n\nWorkbench chooses each person's bank as `wb-` plus the first\n16 hex characters of SHA-256 of their `sub`, appended to the\nlink path with a trailing slash. The person cannot choose a\nbank or see the token. Only this exact agent-provided address\nis exempt from the memory server policy's loopback refusal;\nperson-supplied addresses keep all MV5a checks.\n",
+    )
+    providesPath: str | None = Field(
+        None,
+        description='Root-relative link path ending in `/`, such as `/mcp/`.\nRequires `provides`. No origin, query, fragment or dot segments.\n',
+        max_length=128,
+        min_length=1,
+        pattern='^/(?:[A-Za-z0-9_~-]+/)*$',
     )
     signIn: bool | None = Field(
         False,
@@ -6081,7 +6251,7 @@ class AppManifest(BaseModel):
     environment: dict[constr(pattern=r'^[A-Za-z_][A-Za-z0-9_]{0,127}$'), str] | None = (
         Field(
             None,
-            description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{embeddingModel}`, `{rerankModel}` — the install's search\n  model and result sorter as the app's own key sees them (MR6):\n  the first model `GET /v1/models` lists, with that key, whose\n  `x_eugene_plexus.surfaces` include `embeddings` (or `rerank`)\n  and whose `x_eugene_plexus.locality` is `local`, the field\n  Workbench's own chooser reads. Never an outside model, nor\n  one whose locality is `unknown` or absent: documents would\n  leave the install unasked. (Until 2026-10-12 this said\n  `owned_by` is `local`; the gateway lists a runtime's model\n  with its driver's provider there, `openai_compat_custom`,\n  so that rule matched no local model.) A running one\n  (`x_eugene_plexus.ready_backends` above 0, or the field\n  absent) before one that is listed and stopped; a stopped one\n  is still chosen when it is all there is, and the start's\n  notes say it is not running, because an app that keeps what\n  its first start saw is better off with the install's model\n  than with its own default. Read by the launcher at every\n  start; when the gateway lists none, or does not answer\n  within a few seconds, the variable is left unset and the\n  notes say which. A change of model is not a change of\n  connection (`resetOnConnectionChange`): an app's stored\n  vectors belong to the model that made them;\n* `{imageModel}` — the first model the app's key lists with\n  the `image` surface. A local model comes before an external\n  one, and within each locality a running model comes before\n  a stopped one, using the same readiness fields as above.\n  A stopped local model therefore comes before a running\n  external model. An external, paid model is allowed when\n  there is no local image model: an image prompt goes there\n  only when a person asks for an image (OW-IMAGES,\n  2026-10-21). The key's `limits.localOnly` still applies:\n  the gateway refuses every cloud backend for such a key,\n  including fallback targets. When no eligible image model\n  is listed, or the listing fails, leave the variable unset\n  and say why in the start notes;\n* `{imageModelSet}` — `true` when `{imageModel}` has a value,\n  otherwise `false`, including when the listing fails;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**A manifest that names `{gatewayUrl}` is not started while\nthe gateway's address is unknown** (MR6, 2026-10-12). Every\nother placeholder with no value leaves its variable unset, but\nan app without the gateway's address uses its own default, and\nOpen WebUI's is `https://api.openai.com/v1`: documents and\nspeech would go there. The start is refused, naming why, and\nis tried again as any refused start is.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
+            description="The app's own variables, for an app that is not ours and reads\nits settings from names of its own (C4). Each value is literal\ntext with placeholders filled in at every start:\n\n* `{bindHost}`, `{port}` — where to listen;\n* `{auxPort}` — a distinct, persisted auxiliary port from\n  8190-8289, reserved against all app ports and auxiliary ports;\n  Hindsight's named pg0 instance uses it;\n* `{dataDir}` — its private data directory;\n* `{gatewayUrl}` — the gateway, as `EUGENE_PLEXUS_APP_GATEWAY_URL`;\n* `{appUrl}` — the address the console opens it at;\n* `{oidcIssuer}`, `{oidcClientId}` — with `signIn`;\n* `{embeddingModel}`, `{rerankModel}` — the install's search\n  model and result sorter as the app's own key sees them (MR6):\n  the first model `GET /v1/models` lists, with that key, whose\n  `x_eugene_plexus.surfaces` include `embeddings` (or `rerank`)\n  and whose `x_eugene_plexus.locality` is `local`, the field\n  Workbench's own chooser reads. Never an outside model, nor\n  one whose locality is `unknown` or absent: documents would\n  leave the install unasked. (Until 2026-10-12 this said\n  `owned_by` is `local`; the gateway lists a runtime's model\n  with its driver's provider there, `openai_compat_custom`,\n  so that rule matched no local model.) A running one\n  (`x_eugene_plexus.ready_backends` above 0, or the field\n  absent) before one that is listed and stopped; a stopped one\n  is still chosen when it is all there is, and the start's\n  notes say it is not running, because an app that keeps what\n  its first start saw is better off with the install's model\n  than with its own default. Read by the launcher at every\n  start; when the gateway lists none, or does not answer\n  within a few seconds, the variable is left unset and the\n  notes say which. A change of model is not a change of\n  connection (`resetOnConnectionChange`): an app's stored\n  vectors belong to the model that made them;\n* `{imageModel}` — the first model the app's key lists with\n  the `image` surface. A local model comes before an external\n  one, and within each locality a running model comes before\n  a stopped one, using the same readiness fields as above.\n  A stopped local model therefore comes before a running\n  external model. An external, paid model is allowed when\n  there is no local image model: an image prompt goes there\n  only when a person asks for an image (OW-IMAGES,\n  2026-10-21). The key's `limits.localOnly` still applies:\n  the gateway refuses every cloud backend for such a key,\n  including fallback targets. When no eligible image model\n  is listed, or the listing fails, leave the variable unset\n  and say why in the start notes;\n* `{imageModelSet}` — `true` when `{imageModel}` has a value,\n  otherwise `false`, including when the listing fails;\n* `{memoryModel}` — the owner's explicit per-app\n  `settings.memoryModel` in `apps.yaml`, unset until chosen.\n  A manifest using it is refused a start while it is unset;\n  never omit it and let the app choose its own model;\n* `{linkSecret}` — the MCP link credential, only for a shipped\n  `provides: memory-server` entry, read in its launch account.\n  A missing credential refuses the provider's start with the\n  observed cause; never start an unprotected memory server;\n* `{databaseSecret}` — a URL-safe random database password,\n  generated in the launch account at the app's first start,\n  kept in an owner-only file in the app's data directory and\n  reused on subsequent starts. It is separate from\n  `{appSecret}` and `{linkSecret}`. If the launcher cannot\n  obtain it because its file is missing, unreadable or empty,\n  the start is refused with the observed cause; never use a\n  default password or leave the database variable unset.\n  Filled values never appear in `launch.json`, logs, service\n  definitions or API responses;\n* `{clientKey}`, `{oidcClientSecret}`, `{appSecret}` — secrets.\n  `{appSecret}` is a random value made at its first start and\n  kept in its data directory.\n\n**A manifest that names `{gatewayUrl}` is not started while\nthe gateway's address is unknown** (MR6, 2026-10-12). Every\nother placeholder except `{memoryModel}`, `{linkSecret}` and `{databaseSecret}`\nwith no value leaves its variable unset, but\nan app without the gateway's address uses its own default, and\nOpen WebUI's is `https://api.openai.com/v1`: documents and\nspeech would go there. The start is refused, naming why, and\nis tried again as any refused start is.\n\n**Secrets are filled in by the launcher inside the app's own\naccount**, from the files it is given, so they never appear in\nthe spec the agent writes, its logs or the service definition.\nThey are in the app's process environment, as a program that\nreads no files needs them. A name beginning `EUGENE_PLEXUS_` is\nrefused: those are ours.\n",
         )
     )
     healthPath: str | None = Field(
@@ -6115,6 +6285,15 @@ class AppCatalogueEntry(BaseModel):
     installedVersion: str | None = Field(
         None,
         description='The version installed on this node, when one is. Differs from\n`manifest.version` when an update is available.\n',
+    )
+    installable: bool | None = Field(
+        None,
+        description="Whether this particular entry can be installed on this node,\nincluding the catalogue-wide checks. An older agent may omit\nit; absence is unknown, not a refusal. Keep the entry visible\nand give the observed cause in `reason` when false.\nHindsight is available on Linux and agent-account installs\nonly (MV5b-C1). Windows own-account installs are refused\nbecause pg0 cannot keep data in the app's data folder there.\nBeing experimental or an untested model is not a refusal.\n",
+    )
+    reason: str | None = Field(
+        None,
+        description='The observed cause and remedy when this entry\'s `installable`\nis false. Absent when true; never a generic "not supported".\n',
+        min_length=1,
     )
     resetsSettings: bool | None = Field(
         False,

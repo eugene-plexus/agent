@@ -74,6 +74,7 @@ def _format_time(moment: datetime) -> str:
 
 def stamp(line: str, *, now: datetime | None = None) -> str:
     """The file's form of one line of console output."""
+    line = redact(line)
     moment = now or _now()
     child = _CHILD.match(line)
     if child is not None:
@@ -118,6 +119,9 @@ MASK = "[redacted]"
 
 
 def redact(text: str) -> str:
+    from .app_launcher import redact_database
+
+    text = redact_database(text)
     for pattern in _SECRETS:
         text = pattern.sub(MASK, text)
     return text
