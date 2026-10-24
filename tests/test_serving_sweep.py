@@ -158,7 +158,7 @@ async def test_an_answer_from_another_runtime_stops_the_run():
             random.Random(0),
         )
         with pytest.raises(ValueError, match=r"other.*tower.*r.*tower"):
-            await sweep.level(1, 0.1, "streams")
+            await sweep.level(1, 5.0, "streams")
     assert sweep.partial.errors == 1
 
 
