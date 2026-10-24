@@ -74,12 +74,21 @@ def test_copy_is_used_and_runtime_keeps_note_until_next_checked_start(
         assert note and note.startswith("Started from this machine's copy.")
         assert rule.target in note
         assert ("timed out" if blocked else "cannot be checked") in note
-        monkeypatch.setattr(mc, "_stat", stat)
+
+        # The source is back, on a loaded machine that answers slowly but
+        # answers (CI, agent 37a9eab): the blocked check's 30 ms budget must
+        # not decide the next start.
+        def slow(path: str) -> Any:
+            time.sleep(0.05)
+            return stat(path)
+
+        monkeypatch.setattr(mc, "_stat", slow)
         release.set()
         if not blocked:
             (tmp_path / "offline").rename(rule.target)
         assert sup.compose(spec()).localPathNote == note
         # A new start verifies the source and clears the previous start's note.
+        monkeypatch.setattr(mc, "SOURCE_CHECK_SECONDS", 5.0)
         sup._copy_job_for(spec())
         assert sup.compose(spec()).localPathNote is None
     finally:
