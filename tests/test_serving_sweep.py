@@ -285,7 +285,13 @@ async def test_warm_start_is_uncounted_and_precedes_the_level_window():
 
 @pytest.mark.asyncio
 async def test_tokenless_success_is_an_error_and_does_not_invent_speed():
+    answers = 0
+
     async def handle(request):
+        nonlocal answers
+        answers += 1
+        if answers == 3:
+            sweep.saturate()  # end the level after three answers, whatever the runner's speed
         return httpx.Response(
             200,
             text='data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":0}}\n\ndata: [DONE]\n\n',
@@ -293,7 +299,8 @@ async def test_tokenless_success_is_an_error_and_does_not_invent_speed():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         sweep = Sweep(client, "http://fixture", "secret", "r", "tower", "m", 8192, random.Random(0))
-        result = await sweep.level(1, 0.001, "streams")
+        result = await sweep.level(1, 30.0, "streams")
+    assert result.requests == 3, "the level must make the requests this test inspects"
     assert result.errors == result.requests
     assert result.tokensPerSecondEachP50 is None
     assert "no content" in next(iter(result.errorCauses)).lower()
