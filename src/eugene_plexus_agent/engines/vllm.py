@@ -59,7 +59,7 @@ from .._generated.models import (
     RuntimeSpeculation,
 )
 from ..child_env import child_environment
-from . import prompt_cache, speculation
+from . import prompt_cache, same_answer, speculation
 from .base import (
     DiscoveredBinary,
     EngineAdapter,
@@ -245,6 +245,8 @@ class VllmAdapter(EngineAdapter):
         watch it fail on purpose.
         """
         env: dict[str, str] = {}
+        if same_answer.KEY in (spec.flags or {}):
+            env[same_answer.VLLM_ENV] = str(int((spec.flags or {}).get(same_answer.KEY) is True))
         if _is_wsl():
             env["VLLM_WSL2_ENABLE_PIN_MEMORY"] = "1"
         if not _cuda_toolkit_present():
@@ -365,7 +367,12 @@ class VllmAdapter(EngineAdapter):
 
         flags = spec.flags or {}
         for field in self.flag_schema().fields:
-            if field.key == prompt_cache.KV_OFFLOAD_KEY or field.key in speculation.KEYS:
+            if field.key == "missingCard":
+                continue
+            if (
+                field.key in (prompt_cache.KV_OFFLOAD_KEY, same_answer.KEY)
+                or field.key in speculation.KEYS
+            ):
                 continue
             if field.key not in flags:
                 continue
@@ -520,10 +527,12 @@ class VllmAdapter(EngineAdapter):
     # --- configuring ------------------------------------------------------
 
     def flag_schema(self) -> ConfigSchema:
+        from ..card_launch import missing_card_field
+
         return ConfigSchema(
             component="engine:vllm",
             categories=_CATEGORIES,
-            fields=_FLAG_FIELDS,
+            fields=[*_FLAG_FIELDS, missing_card_field()],
         )
 
 
@@ -893,7 +902,48 @@ _FLAG_CLI_NAMES: dict[str, str] = {
     prompt_cache.KV_OFFLOAD_KEY: prompt_cache.KV_OFFLOAD_FLAG,
 }
 
+
+def refit_parallelism(
+    flags: dict[str, object], cards: int, model_path: str
+) -> tuple[dict[str, object], list[str]]:
+    """Largest measured head-dividing tensor group that fits the cards left.
+
+    Missing metadata is untested, so leave the engine to check it rather
+    than inventing a head count or blocking the launch.
+    """
+    out = dict(flags)
+    pipeline = int(str(flags.get("pipelineParallelSize", 1)))
+    requested = int(str(flags.get("tensorParallelSize", 1)))
+    upper = min(requested, cards // pipeline)
+    tried = list(range(upper, 0, -1))
+    if not tried:
+        raise ValueError(
+            f"vLLM has {cards} cards left; tried tensor sizes {tried} "
+            f"with pipeline size {pipeline}."
+        )
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text(encoding="utf-8"))
+        config = config.get("text_config", config)
+        heads = int(config["num_attention_heads"])
+    except (OSError, ValueError, KeyError, TypeError):
+        log.warning(
+            "vLLM attention heads could not be read from %s; the engine will check tensor size %s",
+            model_path,
+            upper,
+        )
+        heads = None
+    chosen = next((n for n in tried if heads is None or heads % n == 0), None)
+    if chosen is None:
+        raise ValueError(
+            f"vLLM has {heads} attention heads; no valid tensor size "
+            f"among {tried} for {cards} cards left."
+        )
+    out["tensorParallelSize"] = chosen
+    return out, [f"Tensor parallel size {requested} → {chosen}."] if chosen != requested else []
+
+
 _FLAG_FIELDS: list[ConfigField] = [
+    same_answer.field(EngineKind.vllm),
     ConfigField(
         key=speculation.REUSE_TEXT_KEY,
         label="Reuse repeated text",

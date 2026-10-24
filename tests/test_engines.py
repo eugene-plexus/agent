@@ -468,7 +468,9 @@ def test_every_schema_flag_reaches_the_command_line_somehow(
     assert not (direct & expanded) and not (collapsed & expanded)
     assert not drafting & (direct | collapsed | expanded)
     keys = {f.key for f in adapter.flag_schema().fields}
-    assert keys == direct | collapsed | expanded | drafting
+    # DI7 composes the existing parallel slot argument; missingCard is acted on
+    # by the agent's preflight, not an engine CLI flag.
+    assert keys == direct | collapsed | expanded | drafting | {"sameAnswerEveryTime", "missingCard"}
 
 
 def test_unknown_flags_are_reported_not_dropped(adapter: LlamaCppAdapter) -> None:
