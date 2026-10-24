@@ -219,7 +219,9 @@ def seed(state: AgentState) -> list[str]:
         # Ports already handed to an earlier component in this same loop
         # count as taken: nothing is listening on them yet.
         taken = {_port_of(entry) for entry in state.list_topology_entries()}
-        port = ports.first_free(component.port, reserved=RESERVED_PORTS | taken)
+        port = ports.first_free(
+            component.port, reserved=(RESERVED_PORTS - {component.port}) | taken
+        )
         if port != component.port:
             holder = ports.describe_holder(component.port)
             log.warning(
@@ -289,10 +291,8 @@ def add_store(state: AgentState) -> str | None:
     taken = {_port_of(entry) for entry in entries}
     # A declared port is taken even while nothing listens on it yet: this
     # runs before supervision starts, and a root that moved control behind
-    # the machine port has it on 8084, which `first_free` would hand out
-    # again because it only skips reserved ports after the preferred one.
-    preferred = next(p for p in range(store.port, store.port + 64) if p not in taken)
-    port = ports.first_free(preferred, reserved=RESERVED_PORTS | taken)
+    # the machine port has it on 8084.
+    port = ports.first_free(store.port, reserved=(RESERVED_PORTS - {store.port}) | taken)
     state.add_topology_entry(entry_for(store, state, port=port))
     _mark_store_declared(state)
     return store.name

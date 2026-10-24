@@ -8,6 +8,7 @@ and `POST /v1/people/known`, through which the store learns who was removed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -202,3 +203,24 @@ def test_control_moving_behind_the_machine_port_never_takes_the_stores_port(
     assert moved is not None and moved not in (8083, 8084)
     store = state.get_topology_entry("store")
     assert store is not None and str(store.url).rstrip("/").endswith(":8084")
+
+
+def test_a_standby_never_takes_the_port_a_store_declared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of row 53: a worker given the store on 8084, then the standby
+    grant before the store has bound, must not put its standby on 8084 too.
+    Every port is free to the operating system at that moment."""
+    from eugene_plexus_agent import ports, standby, tokens
+
+    from .test_standby import _app, _enrolled, _set_grants
+
+    monkeypatch.setattr(ports, "is_free", lambda port, host="127.0.0.1": True)
+    trust, root = _enrolled(tmp_path)
+    app = _app(tmp_path, trust)
+    app.state.agent_state.add_topology_entry(_entry("store", ComponentKind.store, 8084, tmp_path))
+    _set_grants(trust, root, (tokens.GRANT_STANDBY,))
+    asyncio.run(standby.reconcile(app))
+    entry = app.state.agent_state.get_topology_entry("standby")
+    assert entry is not None
+    assert not str(entry.url).rstrip("/").endswith(":8084"), entry.url

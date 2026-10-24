@@ -104,7 +104,12 @@ def first_free(
 
     `reserved` is the rest of the install's own ports, so walking off
     8080 cannot land on the inference-driver default and produce a
-    second collision at the first Launch.
+    second collision at the first Launch. **A reserved port is never
+    returned, the preferred one included** (review of row 53): ports
+    another entry declares are free to the operating system until that
+    entry starts, which at boot is not yet, so the caller passes them here
+    and a preferred port it already gave out is skipped like any other.
+    A caller whose own default sits in the install's set leaves it out.
 
     Returns `preferred` if the whole window is taken. At that point the
     box has sixty-four consecutive occupied ports and the honest answer
@@ -114,7 +119,7 @@ def first_free(
     """
     blocked = set(reserved)
     for candidate in range(preferred, preferred + limit):
-        if candidate != preferred and candidate in blocked:
+        if candidate in blocked:
             continue
         if is_free(candidate, host=host):
             return candidate
