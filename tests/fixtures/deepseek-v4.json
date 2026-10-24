@@ -1,0 +1,19 @@
+{
+  "sourceUrl": "https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/parser/deepseek_v4.py",
+  "revision": "v0.29.0",
+  "samples": [
+    {
+      "dsml": "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"func_name\">\n<｜DSML｜parameter name=\"location\" string=\"true\">杭州</｜DSML｜parameter>\n<｜DSML｜parameter name=\"count\" string=\"false\">5</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+      "tool_calls": [
+        {
+          "id": "call_0",
+          "type": "function",
+          "function": {
+            "name": "func_name",
+            "arguments": "{\"location\":\"杭州\",\"count\":5}"
+          }
+        }
+      ]
+    }
+  ]
+}

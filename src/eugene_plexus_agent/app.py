@@ -50,6 +50,7 @@ from . import (
     ui_assets,
     update_all,
 )
+from ._generated.models import RuntimeSpec
 from ._http import aclose_shared
 from .auth_state import AuthState
 from .client_key_registry import ClientKeyRegistry
@@ -357,6 +358,33 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime_supervisor = app.state.runtime_supervisor
         owns_runtimes = False
     app.state.runtime_supervisor = runtime_supervisor
+    if owns_runtimes:
+        from fastapi import HTTPException
+
+        from .card_launch import CardLaunch, DeviceMemory
+        from .routes.runtimes import _measure_launch
+        from .runtime_context import NodeContext
+
+        runtime_supervisor.device_memory = DeviceMemory(state.path.parent / "runtime-devices.json")
+
+        async def check_runtime_cards(spec: RuntimeSpec) -> CardLaunch:
+            context = NodeContext(app=app)
+            try:
+                admission, _ = await _measure_launch(context, spec)
+            except HTTPException as exc:
+                detail = exc.detail
+                raise ValueError(
+                    detail.get("detail", str(detail)) if isinstance(detail, dict) else str(detail)
+                ) from exc
+            if (
+                admission.decision.value == "refuse"
+                and spec.name not in runtime_supervisor.force_launches
+            ):
+                raise ValueError(admission.reason)
+            launch: CardLaunch = context.state.card_launch
+            return launch
+
+        runtime_supervisor.launch_check = check_runtime_cards
     # `Runtime.node`, from the agent's own identity and nowhere else.
     runtime_supervisor.node_name_provider = lambda: (
         identity.record.name if identity.record.enrolled else None
