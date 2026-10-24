@@ -35,7 +35,11 @@ log = logging.getLogger(__name__)
 
 # The app.state attributes that hold measurement-job managers, and how a
 # refusal names each. One measurement at a time per node, of either kind.
-_MANAGERS = (("benchmarks", "A benchmark"), ("profile_builds", "A settings build"))
+_MANAGERS = (
+    ("benchmarks", "A benchmark"),
+    ("profile_builds", "A settings build"),
+    ("serving_measurements", "A serving measurement"),
+)
 
 
 def active_measurement(app) -> str | None:  # type: ignore[no-untyped-def]

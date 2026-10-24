@@ -234,13 +234,13 @@ def test_the_grant_starts_the_standby_and_its_removal_deletes_the_copy(
     assert not copy.exists(), "the sealed copy does not outlive the grant"
 
 
-def _says(monkeypatch: pytest.MonkeyPatch, role: str | None) -> None:
-    """What the local control root's `/healthz` reports as its role."""
+def _says(monkeypatch: pytest.MonkeyPatch, role: str | None, epoch: int | None = None) -> None:
+    """What the local control root's `/healthz` reports as its role and epoch."""
 
-    async def answer(_entry: ComponentEntry) -> str | None:
-        return role
+    async def answer(_entry: ComponentEntry) -> tuple[str | None, int | None]:
+        return role, epoch
 
-    monkeypatch.setattr(standby, "_local_role", answer)
+    monkeypatch.setattr(standby, "_local_health", answer)
 
 
 def test_a_promoted_standby_is_never_stopped_or_deleted(
@@ -305,3 +305,77 @@ def test_the_node_report_says_whether_this_machine_hosts_the_root(
         )
     )
     assert authed_client.get("/v1/node").json()["hostsControl"] is True
+
+
+# --------------------------------------------------------------------------- row 4
+
+
+def _signed_list(root: FakeRoot, version: int, control: dict[str, Any]) -> str:
+    import jwt
+
+    from eugene_plexus_agent import machine_trust
+
+    payload = {"iat": 1, "version": version, "required": False, "controlPins": [], "nodes": []}
+    return jwt.encode(
+        {**payload, "control": control},
+        root.identity,
+        algorithm="EdDSA",
+        headers={"typ": machine_trust.TYP_MACHINES},
+    )
+
+
+def test_promoted_copy_is_the_active_control_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Row 4: the promoted copy becomes this machine's control root where it
+    runs, with no restart, so it does not come back sealed. Only when the
+    copy says it is a root and a list signed at its epoch names this
+    machine the root: a copy that merely answers `control` is not enough."""
+    from eugene_plexus_agent import machine_port
+    from eugene_plexus_agent.machine_trust import MachineTrust
+
+    trust, root = _enrolled(tmp_path, grants=(tokens.GRANT_STANDBY,))
+    app = _app(tmp_path, trust)
+    machines = MachineTrust(tmp_path, trust._identity)
+    app.state.machine_trust = machines
+    asyncio.run(standby.reconcile(app))
+    state: AgentState = app.state.agent_state
+    copy = state.get_topology_entry("standby")
+    assert copy is not None
+    assert machine_port.active_control_entry(state) is None, "a standby has no route"
+
+    root.epoch = 2
+    machines.accept(_signed_list(root, 4, {"epoch": 2, "node": "other", "url": ROOT_URL}))
+    _set_grants(trust, root, ())  # the promotion took the grant
+    _says(monkeypatch, "control", 2)
+    asyncio.run(standby.reconcile(app))
+    assert machine_port.active_control_entry(state) is None, "the list names another machine"
+    assert not standby.hosts_active_control(state)
+
+    machines.accept(_signed_list(root, 5, {"epoch": 2, "node": "spare", "url": ROOT_URL}))
+    _says(monkeypatch, "control", 1)
+    asyncio.run(standby.reconcile(app))
+    assert machine_port.active_control_entry(state) is None, "a copy at another epoch is not it"
+
+    _says(monkeypatch, "control", 2)
+    with caplog.at_level(logging.WARNING, logger=standby.log.name):
+        asyncio.run(standby.reconcile(app))
+    assert machine_port.active_control_entry(state) == copy, "/control reaches the copy"
+    assert standby.hosts_active_control(state)
+    assert app.state.supervisor.started == ["standby"], "nothing was started"
+    assert app.state.supervisor.stopped == [], "nothing was stopped"
+    assert "is the install's control root at epoch 2" in caplog.text
+
+    # Kept in agent.yaml: after a restart of this agent it is still the root.
+    again = AgentState(tmp_path / "agent.yaml")
+    again.load()
+    assert machine_port.active_control_entry(again) is not None
+    assert standby.hosts_active_control(again)
+
+    # A copy that says it is a standby again is stopped and deleted, and
+    # the mark goes with it.
+    _says(monkeypatch, "standby", 2)
+    asyncio.run(standby.reconcile(app))
+    assert app.state.supervisor.stopped == ["standby"]
+    assert state.get_topology_entry("standby") is None
+    assert not state.standby_promoted()

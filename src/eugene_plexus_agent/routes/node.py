@@ -67,6 +67,7 @@ from .._generated.models import (
     NodeReachResult,
     Os,
     ReachStep,
+    SignedMachineList,
     Step,
     UnenrollRequest,
     UnenrollResult,
@@ -83,6 +84,7 @@ from ..enrollment import (
     resolve_advertise_url,
 )
 from ..firewall import FirewallQuery, read_firewall
+from ..machine_trust import MachineListError, MachineListFenced, MachineListUnsigned
 from ..machine_trust import pull as pull_machine_list
 from ..node_identity import (
     FencedError,
@@ -219,6 +221,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         name=record.name if record.enrolled else None,
         publicKey=record.public_key,
         controlUrl=record.control_url if record.enrolled else None,  # type: ignore[arg-type]
+        controlUrlEpoch=record.control_url_epoch if record.enrolled else None,
         epoch=record.epoch if record.enrolled else None,
         advertiseUrl=advertise,  # type: ignore[arg-type]
         machine=_machine(request),
@@ -234,6 +237,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         devices=list(snapshot.devices),
         agentVersion=__version__,
         hostsControl=standby.hosts_active_control(state),
+        rootLocked=getattr(request.app.state, "root_locked", None),
         standby=_local_standby(request, state, record.control_url),
         # Read at the moment of answering, not cached and not derived
         # from anything: the point of the field is that a console can
@@ -245,9 +249,11 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
 
 
 def _local_standby(request: Request, state: AgentState, control_url: Any) -> LocalStandby | None:
-    """The warm standby this agent runs, if its node holds the grant."""
+    """The warm standby this agent runs, if its node holds the grant. A
+    promoted copy is not a standby: it is the root, and `hostsControl`
+    says so (row 4)."""
     entry = state.get_topology_entry(standby.STANDBY_COMPONENT)
-    if entry is None or not standby.is_standby(entry):
+    if entry is None or not standby.is_standby(entry) or standby.promoted(state):
         return None
     supervisor = getattr(request.app.state, "supervisor", None)
     live = (
@@ -678,6 +684,61 @@ async def take_trust_bundle(request: Request, body: SignedTrustBundle) -> NodeId
     if record.control_url:
         asyncio.get_running_loop().create_task(_refresh_machines(request.app, record.control_url))
     return _identity(request, await _devices(request))
+
+
+@router.post(
+    "/v1/node/machine-list",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def take_machine_list(request: Request, body: SignedMachineList) -> Response:
+    """Take a newer machine list from the control root, and follow a
+    promoted root to its address (row 4).
+
+    The mirror of `take_trust_bundle`: no bearer, because the credential is
+    the signature, checked against the root identity pinned at enrolment.
+    `MachineTrust.accept` judges it: 409 for a list older than the one held
+    or from a superseded root, and a move only for a list at an epoch above
+    the one this node's root address came with (R4-MOVE). The move's own
+    calls (announcing here, the bundle there) run beside this answer, which
+    the root is waiting for."""
+    if not _store(request).record.enrolled:
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "not-enrolled",
+            "Not enrolled",
+            "This agent has not enrolled with a control root, so it has no root identity to "
+            "check a machine list against.",
+        )
+    try:
+        request.app.state.machine_trust.accept(body.jws)
+    except MachineListFenced as exc:
+        log.warning("refused a machine list: %s", exc)
+        raise _problem(
+            status.HTTP_409_CONFLICT, "fenced", "Fenced", f"Refused machine list: {exc}."
+        ) from exc
+    except FencedError as exc:
+        raise _problem(status.HTTP_409_CONFLICT, "fenced", "Fenced", str(exc)) from exc
+    except MachineListUnsigned as exc:
+        log.warning("refused a machine list: %s", exc)
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "signature-rejected",
+            "Signature rejected",
+            f"Refused machine list: {exc}.",
+        ) from exc
+    except MachineListError as exc:
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "older",
+            "Older than the one held",
+            f"Refused machine list: {exc}.",
+        ) from exc
+    # The list may name this machine the root (a promotion of the copy it
+    # runs), whether or not this node moved: the copy is this machine's root
+    # once it says so too (`standby._named_root`).
+    await standby.reconcile(request.app)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --------------------------------------------------------------------------- #

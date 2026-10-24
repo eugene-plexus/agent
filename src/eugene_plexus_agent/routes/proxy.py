@@ -195,17 +195,19 @@ browser sends comes near it.
 _TIMEOUT = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
 
 
-def _problem(status_code: int, title: str, detail: str) -> HTTPException:
-    return HTTPException(
-        status_code=status_code,
-        detail=Problem(
-            type=f"https://github.com/eugene-plexus/agent#{title.replace(' ', '-').lower()}",
-            title=title,
-            status=status_code,
-            detail=detail,
-            component="agent",
-        ).model_dump(exclude_none=True),
-    )
+def _problem(
+    status_code: int, title: str, detail: str, *, cause: str | None = None
+) -> HTTPException:
+    document = Problem(
+        type=f"https://github.com/eugene-plexus/agent#{title.replace(' ', '-').lower()}",
+        title=title,
+        status=status_code,
+        detail=detail,
+        component="agent",
+    ).model_dump(exclude_none=True)
+    if cause is not None:
+        document["cause"] = cause
+    return HTTPException(status_code=status_code, detail=document)
 
 
 def is_valid_target_name(value: str) -> bool:
@@ -692,6 +694,22 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
         upstream = await client.send(upstream_request, stream=True)
     except httpx.HTTPError as exc:
         log.debug("proxy to %s failed: %s", url, exc)
+        if target == "library":
+            if route.node is not None:
+                install_topology(request).invalidate()
+            identity = getattr(request.app.state, "node_identity", None)
+            record = identity.record if identity is not None else None
+            machine = route.node or (record.name if record else None) or "this machine"
+            cause = str(exc) or type(exc).__name__
+            observed = "the check timed out" if isinstance(exc, httpx.TimeoutException) else cause
+            problem = _problem(
+                status.HTTP_502_BAD_GATEWAY,
+                "Library not answering",
+                f"The Library on {machine} is not answering ({observed}). "
+                "Running models keep serving, and machines start models from their own copies.",
+                cause=f"{url}: {cause}",
+            )
+            raise problem from exc
         if route.node is not None:
             # The lookup said this node is reachable and it was not, so
             # the cached answer is stale; the next request re-reads
