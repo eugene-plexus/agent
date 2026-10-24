@@ -18,7 +18,7 @@ import contextlib
 import logging
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -31,6 +31,7 @@ from ._generated.models import (
     EngineInstall,
     EngineKind,
     HostAccelerator,
+    LastDevice,
     LoadProgress,
     ManagedEngine,
     ManualInstall,
@@ -44,7 +45,9 @@ from ._generated.models import (
     RuntimeSpeculation,
     RuntimeStatus,
     StopReason,
+    StrataEffectiveLaunch,
 )
+from .card_launch import CardLaunch, DeviceMemory, refit_on_cards_left, select_cards
 from .child_env import child_environment, reserved_override
 from .companions import companion_name
 from .engines import (
@@ -54,6 +57,7 @@ from .engines import (
     Loading,
     Ready,
     adapter_for,
+    chat_templates,
     default_model_alias,
     interpret_readiness,
     same_answer,
@@ -173,6 +177,7 @@ class _RuntimePlanner:
         log: logging.Logger,
         get_config: ConfigGetter | None = None,
         inherited_rules: RulesProvider | None = None,
+        library_roots: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         self.spec = spec
         self._adapter = adapter
@@ -182,16 +187,21 @@ class _RuntimePlanner:
         # config (2026-09-14). This node's `pathMappings` are the
         # overrides and come first.
         self._inherited_rules = inherited_rules
+        self._library_roots = library_roots
         self.binary: DiscoveredBinary | None = None
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
         so the operator sees the build that is actually running rather than
         whatever is on PATH now."""
         self.opened_path: str | None = None
+        self.before_start: Callable[[RuntimeSpec], Awaitable[CardLaunch | None]] | None = None
+        self.after_start: Callable[[CardLaunch], None] | None = None
+        self.card_launch: CardLaunch | None = None
         """The model path the last plan handed the engine. Read for
         `Runtime.openedPath`, because `localPath` is recomputed on every
         read and a folder's mount can change under a running process."""
         self.same_answer: bool | None = None
         """The effective setting from the last launch, never from a later profile edit."""
+        self.chat_template: chat_templates.CapturedTemplate | None = None
 
     @property
     def name(self) -> str:
@@ -202,6 +212,7 @@ class _RuntimePlanner:
         return f"[engine: {self.spec.name}] "
 
     def plan(self) -> SpawnPlan:
+        self.chat_template = None
         reason = _launch_policy(self.spec, self._adapter, self._get_config)
         if reason is not None:
             raise SpawnPlanError(reason)
@@ -285,8 +296,14 @@ class _RuntimePlanner:
             env[same_answer.VLLM_ENV] = str(
                 int((launch_spec.flags or {}).get(same_answer.KEY) is True)
             )
-        if self.spec.env:
-            env.update({k: str(v) for k, v in self.spec.env.items()})
+        if launch_spec.env:
+            env.update({k: str(v) for k, v in launch_spec.env.items()})
+
+        cwd = self._adapter.working_directory(launch_spec, binary)
+        try:
+            self.chat_template = chat_templates.capture(launch_spec, argv, env, cwd=cwd)
+        except ValueError as exc:
+            raise SpawnPlanError(str(exc)) from exc
 
         self.same_answer = same_answer.effective(launch_spec.engine, argv, env)
         if self.same_answer is not None:
@@ -304,8 +321,47 @@ class _RuntimePlanner:
         return SpawnPlan(
             argv=argv,
             env=env,
-            cwd=self._adapter.working_directory(launch_spec, binary),
+            cwd=cwd,
+            launch_settings=(
+                self._strata_launch_settings(argv)
+                if self.spec.engine is EngineKind.strata
+                else None
+            ),
+            on_spawn=self._record_cards,
         )
+
+    @staticmethod
+    def _strata_launch_settings(argv: list[str]) -> dict[str, object] | None:
+        from .engines.strata_settings import effective_launch
+
+        # Snapshot this private configuration now. The process records it only
+        # after a successful spawn; later profile/file edits cannot rewrite it.
+        try:
+            import json
+
+            config = Path(argv[argv.index("--config") + 1])
+            applied = effective_launch(json.loads(config.read_text(encoding="utf-8")))
+            return applied.model_dump(mode="json") if applied is not None else None
+        except (OSError, ValueError, IndexError) as exc:
+            raise SpawnPlanError(
+                f"Cannot read Strata's applied launch configuration: {exc}"
+            ) from exc
+
+    async def plan_async(self) -> SpawnPlan:
+        """The supervisor awaits this before every spawn, crash respawns included."""
+        reason = _launch_policy(self.spec, self._adapter, self._get_config)
+        if reason is not None:
+            raise SpawnPlanError(reason)
+        if self.before_start is not None:
+            try:
+                self.card_launch = await self.before_start(self.spec)
+            except ValueError as exc:
+                raise SpawnPlanError(str(exc)) from exc
+        return await asyncio.to_thread(self.plan)
+
+    def _record_cards(self) -> None:
+        if self.card_launch is not None and self.after_start is not None:
+            self.after_start(self.card_launch)
 
     def _rules(self) -> list[PathRule]:
         return effective_rules(
@@ -332,7 +388,7 @@ class _RuntimePlanner:
         """
         rules, settings = self._rules(), self._copy_settings()
         resolved = resolve_local_path(self.spec.modelPath, rules, settings)
-        spec = self.spec
+        spec = self.card_launch.spec if self.card_launch is not None else self.spec
         if resolved.path != spec.modelPath:
             self._log.info(
                 "%s: opening %s as %s (%s)",
@@ -356,7 +412,9 @@ class _RuntimePlanner:
     def _copy_settings(self) -> model_copies.CopySettings:
         if self._get_config is None:
             return model_copies.CopySettings(enabled=False, directory=None, min_free_bytes=0)
-        return model_copies.settings_from_config(self._get_config)
+        return model_copies.settings_from_config(
+            self._get_config, folder_roots=self._library_roots() if self._library_roots else ()
+        )
 
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
         """Let the engine's own adapter read the wreckage.
@@ -433,12 +491,14 @@ class RuntimeSupervisor:
         get_config: ConfigGetter | None = None,
         inherited_rules: RulesProvider | None = None,
         stop_memory: StopMemory | None = None,
+        library_roots: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
         # A person's Stop outlives the agent: before agent#11 every runtime
         # with `autoStart` came back at the next boot, so a model stopped to
         # free the GPU took it back after every update and reboot.
         self._stop_memory = stop_memory
+        self._library_roots = library_roots
         # Read live at plan time, so an operator who sets `vllmBinary` in
         # the UI gets the new path on the next spawn without restarting
         # the agent.
@@ -449,6 +509,9 @@ class RuntimeSupervisor:
         self._inherited_rules = inherited_rules
         self._processes: dict[str, SupervisedProcess] = {}
         self._planners: dict[str, _RuntimePlanner] = {}
+        self.device_memory = DeviceMemory()
+        self.launch_check: Callable[[RuntimeSpec], Awaitable[CardLaunch]] | None = None
+        self.force_launches: set[str] = set()
         # Latest readiness per runtime. Held here rather than on the
         # process because it is an *observation*, not loop state — the
         # same reason component safe-mode observations live on Supervisor.
@@ -564,14 +627,41 @@ class RuntimeSupervisor:
         """Start supervising for real. Reached directly when there is no
         copy to make, and after the copy when there was one."""
         planner = _RuntimePlanner(
-            spec, adapter, self._log, self._get_config, inherited_rules=self._inherited_rules
+            spec,
+            adapter,
+            self._log,
+            self._get_config,
+            inherited_rules=self._inherited_rules,
+            library_roots=self._library_roots,
         )
+        planner.before_start = self._check_cards
+        planner.after_start = lambda launch: self.device_memory.record(spec, launch)
         sp = SupervisedProcess(planner, self._log, stop_on_startup_crash=True)
         self._planners[spec.name] = planner
         self._processes[spec.name] = sp
         self._stop_reasons.pop(spec.name, None)
         self._forget_stop(spec.name)
         sp.start()
+
+    async def _check_cards(self, spec: RuntimeSpec) -> CardLaunch:
+        if self.launch_check is not None:
+            return await self.launch_check(spec)
+        from .admission import check_admission
+
+        snapshot = await asyncio.to_thread(detect_devices)
+        launch = select_cards(spec, snapshot, expected=self.device_memory.expected(spec))
+        if not launch.missing:
+            return launch
+
+        async def measure(candidate: RuntimeSpec):  # type: ignore[no-untyped-def]
+            return await check_admission(
+                candidate, snapshot=snapshot, library=None, running=[], mappings=self._rules()
+            )
+
+        launch, answer = await refit_on_cards_left(launch, measure)
+        if answer.decision.value == "refuse":
+            raise ValueError(answer.reason)
+        return launch
 
     # --- the local copy ---------------------------------------------------
 
@@ -580,7 +670,9 @@ class RuntimeSupervisor:
         the next start with no restart."""
         if self._get_config is None:
             return model_copies.CopySettings(enabled=False, directory=None, min_free_bytes=0)
-        return model_copies.settings_from_config(self._get_config)
+        return model_copies.settings_from_config(
+            self._get_config, folder_roots=self._library_roots() if self._library_roots else ()
+        )
 
     def _copy_job_for(self, spec: RuntimeSpec) -> _CopyJob | None:
         """A copy to make before this runtime starts, or None.
@@ -598,8 +690,15 @@ class RuntimeSupervisor:
         if plan is None:
             self._copy_notes.pop(spec.name, None)
             return None
-        if model_copies.copy_is_current(plan):
-            self._copy_notes.pop(spec.name, None)
+        check = model_copies.check_copy(plan)
+        if check.usable:
+            if check.note:
+                self._copy_notes[spec.name] = check.note
+            else:
+                self._copy_notes.pop(spec.name, None)
+            return None
+        if check.refusal:
+            self._copy_notes[spec.name] = f"The copy {check.refusal}"
             return None
         try:
             size = model_copies.total_size(plan)
@@ -903,6 +1002,13 @@ class RuntimeSupervisor:
 
         job = self._copy_jobs.get(name)
         status = self._status_for(sp, readiness, copying=job is not None)
+        effective = (
+            planner.card_launch.spec
+            if planner is not None
+            and planner.card_launch is not None
+            and status in _PROCESS_RUNNING
+            else spec
+        )
         capabilities: RuntimeCapabilities | None = None
         engine_version: str | None = None
         adapter = adapter_for(spec.engine)
@@ -994,7 +1100,12 @@ class RuntimeSupervisor:
             # otherwise there is nothing to explain, and a note on every
             # runtime would train the operator to ignore the one that
             # matters.
-            localPathNote=None if resolved.is_copy else self._copy_notes.get(name),
+            localPathNote=(
+                self._copy_notes.get(name)
+                if not resolved.is_copy
+                or self._copy_notes.get(name, "").startswith("Started from this machine's copy.")
+                else None
+            ),
             copyProgress=(
                 CopyProgress(
                     bytesCopied=job.state.bytes_copied,
@@ -1019,14 +1130,14 @@ class RuntimeSupervisor:
             idleUnloadSeconds=None if searching else spec.idleUnloadSeconds,
             startOnDemand=None if searching else spec.startOnDemand,
             flags=(
-                {**(spec.flags or {}), same_answer.KEY: planner.same_answer}
+                {**(effective.flags or {}), same_answer.KEY: planner.same_answer}
                 if planner is not None
                 and spec.engine in (EngineKind.llama_cpp, EngineKind.vllm)
                 and status in _PROCESS_RUNNING
-                else spec.flags
+                else effective.flags
             ),
             extraArgs=spec.extraArgs,
-            env=spec.env,
+            env=effective.env,
             workingDirectory=spec.workingDirectory,
             binary=spec.binary,
             # Recorded by whoever declared it, reported, never read.
@@ -1041,12 +1152,33 @@ class RuntimeSupervisor:
             argv=sp.last_argv if sp is not None else None,
             pid=sp.pid if sp is not None else None,
             engineVersion=engine_version,
+            effectiveLaunch=(
+                StrataEffectiveLaunch.model_validate(sp.last_launch_settings)
+                if spec.engine is EngineKind.strata
+                and sp is not None
+                and getattr(sp, "last_launch_settings", None) is not None
+                else None
+            ),
             capabilities=capabilities,
+            chatTemplate=(
+                chat_templates.confirmed(
+                    readiness.chat_template, planner.chat_template if planner else None
+                )
+                if isinstance(readiness, Ready)
+                and readiness.chat_template
+                and status is RuntimeStatus.ready
+                and sp is not None
+                and sp.pid is not None
+                and self._proved_ready.get(name) == _run_of(sp)
+                else None
+            ),
             lastRestart=last_restart,
             lastError=last_error,
             loadProgress=load_progress,
             speculation=self._speculation_for(spec, adapter, argv, status),
             promptCache=self._prompt_cache_for(spec, adapter, argv, status),
+            lastDevices=[LastDevice(d) for d in self.device_memory.observed(spec)[0]] or None,
+            startedOnFewerCards=self.device_memory.observed(spec)[1],
         )
 
     def _prompt_cache_for(

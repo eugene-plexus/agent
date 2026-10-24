@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Eugene Plexus durable run protocol",
-    "version": "1.0.0",
-    "description": "Library owns the durable intent. Only its assigned agent may claim, checkpoint, or create the run profile. Operator sessions alone submit, answer, cancel and dismiss. Claims expire after 120 seconds. Cancellation prevents subsequent stages; a side effect already started is reconciled, not rolled back. No credentials are persisted."
+    "description": "Library owns the durable intent. Only its assigned agent may claim, checkpoint, or create the run profile. Operator sessions alone submit, answer, cancel and dismiss. Claims expire after 120 seconds. Cancellation prevents subsequent stages; a side effect already started is reconciled, not rolled back. No credentials are persisted.",
+    "version": "1.0.0"
   },
   "paths": {
     "/v1/run-operations": {
@@ -886,6 +886,47 @@
           "answer"
         ],
         "title": "Answer"
+      },
+      "ChatTemplateFallback": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Id",
+            "description": "Eugene's template identifier; distinct variants have distinct ids."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Name",
+            "description": "Human-readable template name for the model page."
+          },
+          "engines": {
+            "items": {
+              "$ref": "#/components/schemas/EngineKind"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Engines",
+            "description": "Engines whose Eugene adapters can apply this fallback. This\nis not a list of engines proved to load the model; consult\neligibility for that. No engine is rejected because it is\nabsent from this list.\n"
+          },
+          "sourceUrl": {
+            "type": "string",
+            "minLength": 1,
+            "format": "uri",
+            "title": "Sourceurl",
+            "description": "Published upstream format or template used for the review."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "engines",
+          "sourceUrl"
+        ],
+        "title": "ChatTemplateFallback",
+        "description": "A reviewed template Eugene can supply for this model family when\nits header confirms both the architecture and that it has no\nembedded chat template. Absent when that evidence is unknown,\nwhen the file embeds a template, or when Eugene has no reviewed\nfallback for this variant. A filename or a catalogue name alone\nis not evidence.\n\nThis is availability, not the template in effect. The model page\ncan say \"This model ships no chat template; Eugene supplies\nDeepSeek V4's\" and name the engines below, while keeping\n`ModelCapabilities.chatTemplate` false. The running agent reports\nthe effective template separately as `Runtime.chatTemplate`.\n\nDefault precedence is an explicit operator override, then the\nfile's embedded template, then this fallback on an engine listed\nbelow, then the engine's own behaviour. The override is exposed\nthrough the engine's GUI flag schema. Missing fallback information\ndoes not block a launch: engine eligibility is still decided by\nthe existing eligibility API, and untested engines remain eligible\nunder that API's rules."
       },
       "Checkpoint": {
         "properties": {
@@ -1812,6 +1853,16 @@
               }
             ]
           },
+          "chatTemplateFallback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatTemplateFallback"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "recommendedSampling": {
             "anyOf": [
               {
@@ -2390,7 +2441,7 @@
               }
             ],
             "title": "Chattemplate",
-            "description": "The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n"
+            "description": "The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n\nAn available Eugene fallback (`GgufDetail.chatTemplateFallback`\nor `CataloguePreflight.chatTemplateFallback`) never changes\nthis to true. Unknown metadata leaves this field absent.\n"
           },
           "decision": {
             "anyOf": [
@@ -3007,19 +3058,68 @@
             "anyOf": [
               {
                 "type": "integer",
-                "exclusiveMinimum": 0.0
+                "minimum": 1.0
               },
               {
                 "type": "null"
               }
             ],
             "title": "Contextsize",
-            "description": "The context the engine prepares for. Absent: the engine's own recommendation for the node."
+            "description": "The context to prepare for. Absent uses the engine's recommendation for the node."
           },
           "vision": {
-            "$ref": "#/components/schemas/PreparationVisionMode",
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreparationVisionMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
             "description": "Image encoder placement. Off preserves text-only preparation.",
             "default": "off"
+          },
+          "speedProjection": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeedProjectionMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Changes answers when on; experimental. Off preserves stock model behavior.",
+            "default": "off"
+          },
+          "gpus": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/StrataGpuSelectionItem"
+                },
+                "type": "array",
+                "minItems": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gpus",
+            "description": "Ordered card ordinals from this node's ComputeDevice inventory;\nthe main card is first. The node validates each selected card\nagainst its current inventory and resolves process visibility at\nevery preparation and launch. Two or more cards share the model.\nOmission in a preparation keeps the existing automatic single-card\nselection. Omission in a profile preserves the prepared selection.\nAn empty list is not automatic selection.\nThis inventory has kind and index, not row 43's stable UUIDs;\nordinals are local to the selected node and must not be treated\nas stable identities or silently replaced by another card.\n"
+          },
+          "layerSplit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Layersplit",
+            "description": "auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+            "default": "auto"
           }
         },
         "additionalProperties": false,
@@ -3028,7 +3128,7 @@
           "engine"
         ],
         "title": "PreparationIntent",
-        "description": "Prepare the model for an engine before running it (LS5). Asked for,\nnever implied: Run without it picks an engine that runs the model as it is."
+        "description": "Prepare the model for an engine before running it. Asked for,\nnever implied: Run without it picks an engine that runs the model\nas it is. This is the source schema for the durable run protocol's\nPreparationIntent; regenerate openapi/run-operations.json from the\nLibrary after adopting this schema, rather than editing its copy.\nThe Strata choices use the same keys as that engine's profile\nflags. Unsupported or ignored choices must name the observed\ncause; no requested value may be reported as applied by default."
       },
       "PreparationStatus": {
         "properties": {
@@ -4067,6 +4167,20 @@
         "type": "object",
         "title": "SafetensorsDetail",
         "description": "Safetensors-specific metadata. Present iff `format` is\n`safetensors`. **No quant tier** — a safetensors model is\nsized, not tiered. The one exception to \"no quant fields\" is\n`mlxQuantization` below, which is a conversion marker rather\nthan a tier: it says which loader the directory was prepared\nfor, not how good the weights are."
+      },
+      "SpeedProjectionMode": {
+        "type": "string",
+        "enum": [
+          "off",
+          "on"
+        ],
+        "title": "SpeedProjectionMode",
+        "description": "Changes the model's answers when on; experimental and off by default.\nStrata's bundled refusal-direction projection reduces refusals and\nalso changes ordinary predictions. Upstream measures a 0.2-0.4%\ncost per token on identical text, not a guaranteed speed-up.\nPreparation uses --experimental-speed-projection on|off. Launch\napplies the prepared control vector and reports the applied mode;\na requested mode alone is not evidence that it took effect."
+      },
+      "StrataGpuSelectionItem": {
+        "type": "integer",
+        "minimum": 0.0,
+        "title": "StrataGpuSelectionItem"
       },
       "ValidationError": {
         "properties": {

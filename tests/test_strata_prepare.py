@@ -47,7 +47,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ap = argparse.ArgumentParser()
-for flag in ("--family", "--model", "--gguf-dir", "--data-dir", "--context", "--gpu", "--vision",
+for flag in ("--family", "--model", "--gguf-dir", "--data-dir", "--context", "--gpu", "--gpus", "--layer-split", "--vision",
              "--experimental-speed-projection"):
     ap.add_argument(flag)
 for flag in ("--no-browser", "--no-start", "--yes"):
@@ -94,6 +94,20 @@ args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", ple,
 cfg = {"exe": str(ROOT / "engine" / "strata.exe"), "args": args, "cwd": str(ROOT),
        "tokenizer": str(pack / "tokenizer"), "model_name": "qwen3.8-flash-next-" + a.model.lower(),
        "log": str(ROOT / f"strata-{tag}.log"), "lib_dirs": [], "port": 8080}
+cfg["gpu"] = [int(x) for x in a.gpus.split(",")] if a.gpus else int(a.gpu or 0)
+if os.environ.get("FAKE_SETUP_NO_GPU"):
+    cfg.pop("gpu")
+if a.gpus:
+    cfg["layer_split"] = a.layer_split or "auto"
+    args += ["--mmap-experts", "--remote-expert-opt"]
+if a.experimental_speed_projection == "on":
+    if a.family in ("qwen", "coder"):
+        args += ["--control-vector-scaled", str(ROOT / "data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf") + ":1.0",
+                 "--control-vector-layer-range", "4", "44", "--cvec-mode", "project", "--cvec-dir", "per-layer"]
+    else:
+        print("[!] the experimental speed projection is not tested with this model: left off", flush=True)
+if os.environ.get("FAKE_SETUP_WRONG_GPU"):
+    cfg["gpu"] = 0
 if os.environ.get("FAKE_SETUP_VISION"):
     cfg["vision"] = {"exe": "strata-vision.exe"}
 elif a.vision in ("cpu", "gpu"):
@@ -116,6 +130,14 @@ print("All set.", flush=True)
 def build(tmp_path, monkeypatch):
     """A Strata build (setup.py beside serve/ and engine/), its preparation
     tools already present, and both shards of IQ2_XS in a Library folder."""
+    from .strata_fakes import cuda, snap
+
+    monkeypatch.setattr(
+        strata_prepare,
+        "detect_devices",
+        lambda: snap(cuda(24, index=0), cuda(16, index=1), cuda(16, index=2)),
+        raising=False,
+    )
     root = tmp_path / "engines" / "strata" / "v0.1.39" / "source" / "Strata-x"
     (root / "serve").mkdir(parents=True)
     (root / "serve" / "server.py").write_text("")
@@ -161,6 +183,91 @@ def _plan(build, **kw):
     }
     args.update(kw)
     return strata_prepare.plan(**args)
+
+
+@pytest.mark.parametrize("mode", ["off", "on"])
+def test_the_projection_follows_the_setting(build, mode):
+    recipe = _plan(build, speed_projection=mode)
+    argv = recipe.argv()
+    assert argv[argv.index("--experimental-speed-projection") + 1] == mode
+
+
+def test_preparation_without_card_choices_on_a_cpu_node(build, monkeypatch):
+    from .conftest import fake_devices
+
+    monkeypatch.setattr(strata_prepare, "detect_devices", lambda: fake_devices(count=0))
+    monkeypatch.setenv("FAKE_SETUP_NO_GPU", "1")
+    recipe = _plan(build)
+    assert "--gpu" not in recipe.argv() and "--gpus" not in recipe.argv()
+    result = recipe.run(Progress())
+    cfg = json.loads(result.entry.read_text())
+    assert "gpu" not in cfg
+    assert cfg.get("layer_split") is None
+    assert "--control-vector-scaled" not in cfg["args"]
+
+
+@pytest.mark.parametrize("gpus", [[], [0], [0, 2]])
+def test_cpu_preparation_refuses_explicit_card_choices(build, monkeypatch, gpus):
+    from .conftest import fake_devices
+
+    monkeypatch.setattr(strata_prepare, "detect_devices", lambda: fake_devices(count=0))
+    with pytest.raises(PreparationError, match=r"nonempty|card 0.*cpu"):
+        _plan(build, gpus=gpus)
+
+
+def test_preparation_uses_selected_cards_and_layer_boundaries(build, monkeypatch):
+    from .strata_fakes import cuda, snap
+
+    recipe = _plan(build, gpus=[2, 0], layer_split="24")
+    argv = recipe.argv()
+    assert argv[argv.index("--gpus") + 1] == "2,0"
+    assert argv[argv.index("--layer-split") + 1] == "24"
+    monkeypatch.setattr(strata_prepare, "detect_devices", lambda: snap(cuda(24, index=0)))
+    with pytest.raises(PreparationError, match=r"2.*not.*present"):
+        _plan(build, gpus=[2, 0])
+    with pytest.raises(PreparationError, match=r"2.*not.*present"):
+        recipe.run(Progress())
+
+
+@pytest.mark.parametrize("split", ["1", "48", "24,32", "x"])
+def test_preparation_rejects_invalid_boundaries(build, split):
+    with pytest.raises(PreparationError, match=r"boundary|boundaries"):
+        _plan(build, gpus=[0, 2], layer_split=split)
+
+
+def test_preparation_adopts_the_actual_split_and_projection(build):
+    root, _, _ = build
+    vector = (
+        root
+        / "data/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf"
+    )
+    vector.parent.mkdir(parents=True)
+    vector.touch()
+    result = _plan(build, gpus=[2, 0], speed_projection="on").run(Progress())
+    cfg = json.loads(result.entry.read_text())
+    assert cfg["gpu"] == [2, 0] and cfg["layer_split"] == "auto"
+    assert "--mmap-experts" in cfg["args"] and "--remote-expert-opt" in cfg["args"]
+    assert str(root) not in cfg["args"][cfg["args"].index("--control-vector-scaled") + 1]
+    assert vector not in result.files
+
+
+def test_preparation_reports_upstreams_projection_fallback(build):
+    from eugene_plexus_agent.engines.strata import prepared_config
+
+    root, _, _ = build
+    recipe = _plan(build, speed_projection="on")
+    recipe.choice = SETUP_CHOICES["swift-IQ2_XS"]
+    progress = Progress()
+    result = recipe.run(progress)
+    assert any("left off" in w for w in progress.warnings)
+    cfg = prepared_config(result.entry, alias="a", root=root)
+    assert "--control-vector-scaled" not in cfg["args"]
+
+
+def test_preparation_refuses_an_observed_gpu_fallback(build, monkeypatch):
+    monkeypatch.setenv("FAKE_SETUP_WRONG_GPU", "1")
+    with pytest.raises(PreparationError, match=r"selected.*0.*requested.*2"):
+        _plan(build, gpus=[2, 0]).run(Progress())
 
 
 # --- the list, as setup names and sizes it --------------------------------------
@@ -219,7 +326,7 @@ def test_off_the_list_is_refused_naming_the_list(build):
     _root, _folder, gguf = build
     other = gguf.with_name("Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00002.gguf")
     other.write_bytes(b"GGUF")
-    with pytest.raises(PreparationError, match="only the files on its own list"):
+    with pytest.raises(PreparationError, match=r"only the files on its own list"):
         _plan(build, gguf=other)
 
 
@@ -231,7 +338,7 @@ def test_a_missing_shard_is_named(build):
 
 
 def test_a_context_setup_does_not_offer_is_refused(build):
-    with pytest.raises(PreparationError, match="not 50000"):
+    with pytest.raises(PreparationError, match=r"not 50000"):
         _plan(build, context=50000)
 
 
@@ -283,7 +390,7 @@ def test_too_little_disk_names_both_numbers(build, monkeypatch):
 def test_an_install_without_setup_says_reinstall(build):
     root, _folder, _gguf = build
     (root / "setup.py").unlink()
-    with pytest.raises(PreparationError, match="reinstall Strata"):
+    with pytest.raises(PreparationError, match=r"reinstall Strata"):
         _plan(build)
 
 
@@ -396,7 +503,7 @@ def test_setups_failure_is_the_cause(build, monkeypatch):
 
 def test_a_configuration_eugene_cannot_launch_is_not_listed(build, monkeypatch):
     monkeypatch.setenv("FAKE_SETUP_VISION", "1")
-    with pytest.raises(PreparationError, match="enabled images although images were off"):
+    with pytest.raises(PreparationError, match=r"enabled images although images were off"):
         _plan(build).run(Progress())
 
 
@@ -530,14 +637,14 @@ def test_a_path_outside_the_models_files_is_refused(build, monkeypatch, tmp_path
     outside = tmp_path / "elsewhere.gguf"
     outside.write_bytes(b"GGUF")
     monkeypatch.setenv("FAKE_SETUP_OUTSIDE", str(outside))
-    with pytest.raises(PreparationError, match="not among the model's files"):
+    with pytest.raises(PreparationError, match=r"not among the model's files"):
         _plan(build).run(Progress())
 
 
 def test_a_shard_outside_the_library_folder_is_refused(build, tmp_path):
     other = tmp_path / "another-library-folder"
     other.mkdir()
-    with pytest.raises(PreparationError, match="not inside the Library folder"):
+    with pytest.raises(PreparationError, match=r"not inside the Library folder"):
         _plan(build, folder=other)
 
 
@@ -618,7 +725,7 @@ def test_the_install_downloads_the_tools_with_the_engine():
 def test_a_preparation_without_the_tools_names_the_reinstall(tmp_path):
     root = tmp_path / "root"
     root.mkdir()
-    with pytest.raises(PreparationError, match="Reinstall Strata"):
+    with pytest.raises(PreparationError, match=r"Reinstall Strata"):
         strata_prepare.check_tools(root)
 
 

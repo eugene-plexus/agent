@@ -18,6 +18,244 @@ from pydantic import (
 )
 
 
+class ServingWorkload(StrEnum):
+    """
+    A person is one top-level session, not a stream or sub-agent.
+    `agents` uses growing histories, the published pauses and bursts,
+    and an uncounted warm start at a random turn. `chat` uses short
+    questions and reading pauses. `streams` is closed loop with no
+    pause or history growth, comparable with a concurrency sweep.
+    All use the profile builder's bundled corpus and seeded sampling.
+
+    """
+
+    agents = 'agents'
+    chat = 'chat'
+    streams = 'streams'
+
+
+class ServingRuntime(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str = Field(
+        ..., description='Node identity used by the node proxy.', min_length=1
+    )
+    runtime: str = Field(..., min_length=1)
+    model: str = Field(
+        ..., description='The model alias exposed by the gateway.', min_length=1
+    )
+
+
+class ServingMeasurementPreflight(BaseModel):
+    otherReplicas: list[ServingRuntime] = Field(
+        ...,
+        description='Other ready replicas of the same alias, including replicas on other nodes.',
+    )
+    otherRuntimes: list[ServingRuntime] = Field(
+        ...,
+        description='Other running runtimes on this node; informational, never stopped implicitly.',
+    )
+    problems: list[str] = Field(
+        ...,
+        description='Observed causes that prevent starting, one sentence each. Empty when it can start.',
+    )
+    estimateSeconds: int | None = Field(
+        ...,
+        description='Estimated total of the level windows; null when it cannot be estimated.',
+        ge=0,
+    )
+
+
+class ServingLevel(BaseModel):
+    """
+    One tested number of people, including all requests begun in its
+    window and their drain time. Excludes warm-up requests. Unknown
+    observations are null, never fabricated zeroes. Latencies are
+    client-side through the gateway; speed after the first content
+    token excludes TTFT. A level remains readable with no successful
+    requests, including a failed or cancelled partial level.
+
+    """
+
+    people: int = Field(..., ge=1, le=256)
+    streamsMean: float = Field(
+        ...,
+        description='Time-weighted mean requests in flight, including sub-agents.',
+        ge=0.0,
+    )
+    streamsPeak: int = Field(
+        ..., description='Peak requests in flight, including sub-agents.', ge=0
+    )
+    requests: int = Field(
+        ...,
+        description='Counted requests attempted, including requests that failed.',
+        ge=0,
+    )
+    errors: int = Field(..., ge=0)
+    errorCauses: dict[str, int] = Field(
+        ...,
+        description="Counts by observed cause, including the engine or gateway's error words.",
+    )
+    ttftP50Ms: float | None = Field(
+        ...,
+        description='Median time to first content token; null when no request produced content.',
+        ge=0.0,
+    )
+    ttftP90Ms: float | None = Field(..., ge=0.0)
+    itlP50Ms: float | None = Field(
+        ...,
+        description='Median inter-token latency; null when there are no measured intervals.',
+        ge=0.0,
+    )
+    itlP90Ms: float | None = Field(..., ge=0.0)
+    tokensPerSecondEachP50: float | None = Field(
+        ...,
+        description='Median per-request decode speed after the first content token, not total speed divided by people.',
+        ge=0.0,
+    )
+    tokensPerSecondEachP10: float | None = Field(..., ge=0.0)
+    tokensPerSecondTotal: float | None = Field(
+        ...,
+        description='Actual counted output tokens divided by durationSeconds; null if output usage is unavailable.',
+        ge=0.0,
+    )
+    promptTokens: int = Field(
+        ...,
+        description="Sum of reported prompt usage; missing usage is named in the job's detail.",
+        ge=0,
+    )
+    cachedTokens: int = Field(
+        ...,
+        description="Sum of reported cached prompt usage; missing usage is named in the job's detail.",
+        ge=0,
+    )
+    waitedP50Ms: float | None = Field(
+        ...,
+        description='Median X-Eugene-Plexus-Waited-Ms; null when the header was unavailable.',
+        ge=0.0,
+    )
+    foreignRequests: int | None = Field(
+        ...,
+        description="Engine request-counter delta minus this job's requests; null means others' use is unknown.",
+        ge=0,
+    )
+    watts: float | None = Field(
+        ...,
+        description='Mean GPU power from host history over the level; null when history has no power readings.',
+        ge=0.0,
+    )
+    outputTokens: int = Field(
+        ...,
+        description='Actual reported output tokens, including any output from failed requests; never max_tokens.',
+        ge=0,
+    )
+    durationSeconds: float = Field(
+        ...,
+        description='Observed duration including drain time; permits interpreting total throughput on partial levels.',
+        ge=0.0,
+    )
+    promptReuse: float | None = Field(
+        ...,
+        description='Fraction of prompt tokens reused as an unchanged prefix between turns; null when not observed.',
+        ge=0.0,
+        le=1.0,
+    )
+    loopLagMaxMs: float = Field(
+        ...,
+        description='Largest measured event-loop scheduling delay during this level.',
+        ge=0.0,
+    )
+    loopLagged: bool = Field(
+        ...,
+        description='True when loopLagMaxMs exceeds 50 ms; marks a potentially load-generator-limited level.',
+    )
+
+
+class ServingKnee(BaseModel):
+    """
+    The last level before TTFT p50 exceeds request.ttftThresholdMs
+    or per-request median speed falls below request.speedRatioThreshold
+    times level 1's. These owner-editable thresholds follow Troy's
+    MEASURE-KNEE-2 call. `found: false` means the limit was not reached;
+    `people` and speeds then describe the largest tested usable level,
+    not an extrapolation. An unfinished or unusable run has a null knee.
+
+    """
+
+    found: bool
+    people: int = Field(..., ge=1, le=256)
+    tokensPerSecondEach: float = Field(..., ge=0.0)
+    ttftP50Ms: float = Field(..., ge=0.0)
+
+
+class ServingGpu(BaseModel):
+    name: str
+    uuid: str | None = Field(..., description='Stable device identity when available.')
+    memoryBytes: int | None = Field(..., ge=0)
+
+
+class ServingProvenance(BaseModel):
+    """
+    Snapshot of the engine, effective launch, model file and hardware
+    measured. Unknown identity fields are null and remain visible as
+    unknown; their absence never makes an untested engine unsupported.
+    Model identity is its local path, size and mtime, not a model hash.
+    Does not hold prompts, answers, credentials or raw client keys.
+
+    """
+
+    engine: str = Field(..., min_length=1)
+    engineBuild: str | None
+    binaryHash: str | None = Field(
+        ...,
+        description='sha256 of the running engine binary, when readable.',
+        pattern='^[0-9a-f]{64}$',
+    )
+    launchArgv: list[str] = Field(
+        ...,
+        description='Effective engine launch argv at measurement time, with credentials redacted.',
+    )
+    modelPath: str
+    modelSizeBytes: int | None = Field(..., ge=0)
+    modelModifiedAt: AwareDatetime | None
+    gpus: list[ServingGpu] = Field(
+        ...,
+        description='GPUs used by the runtime, in stable device order; empty for CPU-only.',
+    )
+    driver: str | None = Field(
+        ..., description='GPU driver version or versions, in stable device order.'
+    )
+    cpu: str | None
+    ramBytes: int | None = Field(..., ge=0)
+    agentCommit: str | None
+    gatewayCommit: str | None
+
+
+class ServingDrafting(BaseModel):
+    """
+    Drafting in effect during this run, for comparing on and off
+    records of the same model and machine. No automatic off pass.
+    Acceptance is an observation and is not part of provenanceKey;
+    drafting configuration is captured by the effective launch argv.
+
+    """
+
+    type: str | None = Field(
+        ..., description="Engine's drafting type, off when disabled, null when unknown."
+    )
+    model: str | None = Field(
+        ...,
+        description='Draft model path or identity; null when no separate draft model is used or it is unknown.',
+    )
+    acceptance: float | None = Field(
+        ...,
+        description='Accepted draft tokens divided by proposed draft tokens; null when not observed.',
+        ge=0.0,
+        le=1.0,
+    )
+
+
 class MeasurementPreflight(BaseModel):
     """
     What starting a benchmark or a profile build with this request
@@ -640,6 +878,50 @@ class BackendKind(StrEnum):
     gemini_api = 'gemini_api'
 
 
+class Peer(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class ComputeDevicePcieLink(BaseModel):
+    """
+    Current and supported PCIe link measurements for one card. Each
+    measurement is null independently when its probe fails, so a
+    readable width survives an unreadable generation.
+
+    """
+
+    generation: int | None = Field(
+        ..., description='Current PCIe generation. Null when unreadable.', ge=1
+    )
+    width: int | None = Field(
+        ..., description='Current PCIe lane count. Null when unreadable.', ge=1
+    )
+    maxGeneration: int | None = Field(
+        ...,
+        description='Maximum PCIe generation the card supports. Null when unreadable.',
+        ge=1,
+    )
+    maxWidth: int | None = Field(
+        ...,
+        description='Maximum PCIe lane count the card supports. Null when unreadable.',
+        ge=1,
+    )
+
+
+class ComputeDeviceThrottleReason(StrEnum):
+    """
+    An observed reason a card is slowing down. `thermal` is a heat
+    limit, `power-cap` a power limit, `hardware-slowdown` another
+    hardware slowdown signal, and `other` another active NVML reason.
+
+    """
+
+    thermal = 'thermal'
+    power_cap = 'power-cap'
+    hardware_slowdown = 'hardware-slowdown'
+    other = 'other'
+
+
 class ComputeDeviceKind(StrEnum):
     """
     What kind of device this is.
@@ -833,6 +1115,76 @@ class PreparationVisionMode(StrEnum):
     gpu = 'gpu'
 
 
+class SpeedProjectionMode(StrEnum):
+    """
+    Changes the model's answers when on; experimental and off by default.
+    Strata's bundled refusal-direction projection reduces refusals and
+    also changes ordinary predictions. Upstream measures a 0.2-0.4%
+    cost per token on identical text, not a guaranteed speed-up.
+    Preparation uses --experimental-speed-projection on|off. Launch
+    applies the prepared control vector and reports the applied mode;
+    a requested mode alone is not evidence that it took effect.
+
+    """
+
+    off = 'off'
+    on = 'on'
+
+
+class StrataGpuSelectionItem(RootModel[int]):
+    root: int = Field(..., ge=0)
+
+
+class StrataLayerSplit(RootModel[str]):
+    root: str = Field(
+        ...,
+        description="auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+        min_length=1,
+    )
+
+
+class PreparationIntent(BaseModel):
+    """
+    Prepare the model for an engine before running it. Asked for,
+    never implied: Run without it picks an engine that runs the model
+    as it is. This is the source schema for the durable run protocol's
+    PreparationIntent; regenerate openapi/run-operations.json from the
+    Library after adopting this schema, rather than editing its copy.
+    The Strata choices use the same keys as that engine's profile
+    flags. Unsupported or ignored choices must name the observed
+    cause; no requested value may be reported as applied by default.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    engine: EngineKind
+    contextSize: int | None = Field(
+        None,
+        description="The context to prepare for. Absent uses the engine's recommendation for the node.",
+        ge=1,
+    )
+    vision: PreparationVisionMode | None = Field(
+        'off',
+        description='Image encoder placement. Off preserves text-only preparation.',
+    )
+    speedProjection: SpeedProjectionMode | None = Field(
+        'off',
+        description='Changes answers when on; experimental. Off preserves stock model behavior.',
+    )
+    gpus: list[StrataGpuSelectionItem] | None = Field(
+        None,
+        description="Ordered card ordinals from this node's ComputeDevice inventory;\nthe main card is first. The node validates each selected card\nagainst its current inventory and resolves process visibility at\nevery preparation and launch. Two or more cards share the model.\nOmission in a preparation keeps the existing automatic single-card\nselection. Omission in a profile preserves the prepared selection.\nAn empty list is not automatic selection.\nThis inventory has kind and index, not row 43's stable UUIDs;\nordinals are local to the selected node and must not be treated\nas stable identities or silently replaced by another card.\n",
+        min_length=1,
+    )
+    layerSplit: str | None = Field(
+        'auto',
+        description="auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+        min_length=1,
+    )
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -862,6 +1214,10 @@ class ModelPreparation(BaseModel):
     visionModes: list[PreparationVisionMode] | None = Field(
         None,
         description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
+    )
+    speedProjectionModes: list[SpeedProjectionMode] | None = Field(
+        None,
+        description="Changes answers when on; experimental. Choices this model's\npreparation offers for the bundled projection. Absent means\nno projection choice is advertised, not a claim that an\nuntested model cannot run. Omitting the choice in a run\nintent selects off. An upstream fallback must be reported\nas the mode that actually took effect, with its cause.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -2919,7 +3275,24 @@ class ClientKey(BaseModel):
     expiresAt: AwareDatetime
     revokedAt: AwareDatetime | None = None
     lastUsedAt: AwareDatetime | None = Field(
-        None, description='Reserved; not currently measured.'
+        None,
+        description='When the authority last admitted a check or acquisition with this key, to the minute. Absent, no use recorded.',
+    )
+    retiresAt: AwareDatetime | None = Field(
+        None,
+        description='Set when the key was rotated. The token works until then, and new requests on it are refused as replaced afterwards. Running requests finish.',
+    )
+    replaces: str | None = Field(
+        None,
+        description='The id of the key this one replaced.',
+        max_length=128,
+        min_length=1,
+    )
+    replacedBy: str | None = Field(
+        None,
+        description='The id of the key that replaced this one.',
+        max_length=128,
+        min_length=1,
     )
     limits: ClientKeyLimits | None = Field(
         None,
@@ -2947,6 +3320,24 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
+
+
+class ClientKeyRotateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    overlapSeconds: int | None = Field(
+        86400,
+        description='How long the old token keeps working. 0 stops it now. The old and new tokens share one concurrency and rate allowance during the overlap.',
+        ge=0,
+        le=2592000,
+    )
+    ttlDays: int | None = Field(
+        None,
+        description="Lifetime of the new key. Absent, the old key's lifetime.",
+        ge=1,
+        le=3650,
+    )
 
 
 class ClientKeyUpdateRequest(BaseModel):
@@ -3438,6 +3829,124 @@ class RuntimeMode(StrEnum):
     reranking = 'reranking'
 
 
+class LastDevice(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class StrataEffectiveLaunch(BaseModel):
+    """
+    Strata's applied launch settings, read from the launch configuration
+    that was successfully spawned, not the current profile or prepared
+    file, which may have changed since. Unknown values leave this record
+    absent; they never acquire an intent default. A stopped runtime may
+    retain the last successful launch, labelled as such. This records
+    launch settings, not a claim of successful inference or measured speed.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    speedProjection: SpeedProjectionMode = Field(
+        ...,
+        description='Changes answers when on; experimental. Applied mode from the\nloaded control vector and launch sampling default together.\nA vector absent or disabled in that configuration means off.\n',
+    )
+    gpus: list[StrataGpuSelectionItem] = Field(
+        ...,
+        description='Selected node inventory ordinals, main first, resolved from the applied launch and its visibility mapping.',
+        min_length=1,
+    )
+    layerSplit: StrataLayerSplit | None = Field(
+        ...,
+        description='null with one card. Otherwise the applied boundaries or auto\nwhen upstream chooses them. auto reports the selected mode,\nnot measured boundaries or an assumed equal split.\n',
+    )
+
+
+class Change(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class RuntimeMissingDevice(BaseModel):
+    """
+    A missing card, identified from the agent's last observation.
+    """
+
+    uuid: str = Field(
+        ..., description='Stable vendor UUID of the missing card.', min_length=1
+    )
+    name: str = Field(
+        ..., description='Device name when the card was last present.', min_length=1
+    )
+    lastIndex: int = Field(
+        ...,
+        description='Device index when the card was last present, before renumbering.',
+        ge=0,
+    )
+
+
+class Source(StrEnum):
+    """
+    * `embedded` — the reported text matches the model file's
+      embedded template and no operator override selected it.
+    * `eugene` — the reported text matches the Eugene fallback
+      captured at launch, with no operator override in effect.
+    * `override` — the reported text matches the operator's
+      explicit template override captured at launch. This takes
+      precedence even when its contents match a bundled template.
+    * `engine` — the engine reports the text but its origin is
+      unknown, or it does not match the captured selection.
+      Never label an unconfirmed fallback as `eugene`.
+
+    """
+
+    embedded = 'embedded'
+    eugene = 'eugene'
+    override = 'override'
+    engine = 'engine'
+
+
+class RuntimeChatTemplate(BaseModel):
+    """
+    The chat template the running engine reports in effect, not a
+    saved setting or a Library fallback recommendation. Publish only
+    after the engine reports its effective template text; the digest
+    is SHA-256 of those exact UTF-8 bytes, without whitespace or line
+    ending normalization. The source is not inferred from argv alone.
+
+    Omit on stopped runtimes, while the effective template is
+    unconfirmed, and on engines that do not report it. Clear this
+    observation on stop and before each new start, so a changed
+    setting cannot leave a previous process's template on display.
+    Missing information does not block a launch or inference.
+
+    """
+
+    source: Source = Field(
+        ...,
+        description="* `embedded` — the reported text matches the model file's\n  embedded template and no operator override selected it.\n* `eugene` — the reported text matches the Eugene fallback\n  captured at launch, with no operator override in effect.\n* `override` — the reported text matches the operator's\n  explicit template override captured at launch. This takes\n  precedence even when its contents match a bundled template.\n* `engine` — the engine reports the text but its origin is\n  unknown, or it does not match the captured selection.\n  Never label an unconfirmed fallback as `eugene`.\n",
+    )
+    name: str = Field(
+        ...,
+        description='Human-readable name of the effective template. Use an engine\ntemplate label when the origin is unknown; never the name of\na saved override or fallback that was not confirmed.\n',
+        min_length=1,
+    )
+    sha256: str = Field(
+        ...,
+        description='Digest of the effective template text returned by the engine.',
+        pattern='^[0-9a-f]{64}$',
+    )
+    id: str | None = Field(
+        None,
+        description="The Library's `ChatTemplateFallback.id` when source is\n`eugene`; omitted for other sources. The digest identifies\nthe exact template revision in effect.\n",
+        min_length=1,
+    )
+    path: str | None = Field(
+        None,
+        description="Template file on this runtime's node, captured at launch and\nreported only when its captured contents match the engine's\neffective template. Absent for embedded and engine templates,\nand for inline overrides. A later edit to this file does not\nchange the running process's template or digest.\n",
+        min_length=1,
+    )
+
+
 class PromptCacheSource(StrEnum):
     """
     Where a runtime's prompt cache size comes from. `profile` is the
@@ -3501,7 +4010,7 @@ class RuntimeSpeculation(BaseModel):
     )
 
 
-class Source(StrEnum):
+class Source1(StrEnum):
     """
     Which counter answered. On the wire so that "this host cannot
     measure it" stays distinguishable from "this engine is not
@@ -3558,7 +4067,7 @@ class LoadProgress(BaseModel):
         None,
         description='Observed over a short window, so it tracks a share that has\njust got slower rather than averaging the whole load. Null on\nthe first pair of readings.\n',
     )
-    source: Source = Field(
+    source: Source1 = Field(
         ...,
         description='Which counter answered. On the wire so that "this host cannot\nmeasure it" stays distinguishable from "this engine is not\nreading" — both of which make the field absent, and only one\nof which is worth reporting to whoever runs the host.\n',
     )
@@ -4304,6 +4813,115 @@ class App(BaseModel):
     )
 
 
+class ServingMeasurementRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    runtime: str = Field(
+        ...,
+        description='The name of an existing runtime on this node; it must be ready.',
+        min_length=1,
+    )
+    workload: ServingWorkload | None = 'agents'
+    maxPeople: int | None = Field(
+        None,
+        description='Defaults to min(256, 4 * parallelSlots) of the running runtime.',
+        ge=1,
+        le=256,
+    )
+    windowSeconds: int | None = Field(
+        None,
+        description="Per level. Defaults to 300 for agents and chat, 120 for streams.\nWith `full: true` the effective window is 3,600 seconds, even\nwhen a different window was supplied. Requests still in flight\nat the window's end finish and count, adding drain time.\n",
+        ge=10,
+        le=3600,
+    )
+    full: bool | None = Field(False, description='Use a one-hour window at each level.')
+    seed: int | None = Field(
+        0,
+        description='Seed for workload sampling; does not promise identical model output.',
+    )
+    ttftThresholdMs: float | None = Field(
+        1000,
+        description="The owner's first-token ceiling, in milliseconds; editable on\nthe run page. Troy's MEASURE-KNEE-2 call sets the default to\nfirst content after more than one second.\n",
+        gt=0.0,
+    )
+    speedRatioThreshold: float | None = Field(
+        0.6666666666666666,
+        description="Minimum per-person median speed as a fraction of level 1's;\neditable on the run page. Default is two thirds (Troy's\nMEASURE-KNEE-2 call). A speed below this crosses the knee.\n",
+        gt=0.0,
+        le=1.0,
+    )
+    stopReplicas: list[ServingRuntime] | None = Field(
+        [],
+        description='The other replicas the operator agreed to stop after seeing\nthe preflight, identified by node, runtime and model alias.\nOnly replicas of the measured alias may be listed, never the\nmeasured runtime. The job calls their agents to stop them,\nthen restarts exactly those it stopped when the run ends.\nAn unlisted ready replica is a 409, including one that became\nready after the preflight. Already stopped entries are not\nrestarted by this job.\n',
+        validate_default=True,
+    )
+
+
+class ServingMeasurementRestart(BaseModel):
+    node: str
+    runtime: str
+    state: MeasurementRestartState
+    detail: str | None = Field(
+        ...,
+        description='Observed cause of a refusal or failed restart; null when no explanation is needed.',
+    )
+
+
+class ServingMeasurement(BaseModel):
+    """
+    A serving measurement kept on the runtime's node for rows 11,
+    13, 14 and 69 and the speed nudge. Agent restart marks an unfinished
+    run failed and names that cause; it keeps partial levels and never
+    resumes load silently. Final records keep their state when cancel
+    is used only to revoke a key. Does not persist prompts or answers.
+
+    """
+
+    id: str
+    node: str
+    runtime: str
+    model: str = Field(..., description='The measured gateway model alias.')
+    state: BenchmarkState
+    request: ServingMeasurementRequest = Field(
+        ...,
+        description='The effective request, including resolved workload, maxPeople,\nwindowSeconds, full, seed, both knee thresholds and stopReplicas.\nReturned settings always describe the values in effect, including\nthe one-hour window when full overrides a supplied shorter one.\n',
+    )
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str = Field(
+        ...,
+        description="One sentence of progress, or the observed cause of a failure, including the upstream's words.",
+    )
+    levels: list[ServingLevel]
+    knee: ServingKnee | None
+    provenance: ServingProvenance
+    provenanceKey: str = Field(
+        ...,
+        description="Lowercase sha256 of provenance as UTF-8 JSON with sorted object\nkeys, compact separators and unescaped Unicode. Array order is\npreserved. Includes null identity fields; excludes observations\nsuch as drafting acceptance and the request's workload seed.\n",
+        pattern='^[0-9a-f]{64}$',
+    )
+    current: bool = Field(
+        ...,
+        description="Recomputed on read; true only when the runtime's present provenance matches this record.",
+    )
+    staleBecause: list[str] = Field(
+        ...,
+        description='What changed since measurement, with old and new values; empty when current. A missing runtime is named.',
+    )
+    keyLive: bool = Field(
+        ...,
+        description='True until the control root confirms revocation or expiry; a failed revocation is named in detail.',
+    )
+    restarts: list[ServingMeasurementRestart]
+    drafting: ServingDrafting
+
+
+class ServingMeasurementList(BaseModel):
+    measurements: list[ServingMeasurement]
+
+
 class Component(BaseModel):
     """
     Combined declarative + operational view of one supervised
@@ -4438,6 +5056,11 @@ class ComputeDevice(BaseModel):
     because a host with two cards is the case that makes replicas of
     one model possible.
 
+    Health readings are observations, never estimates. Each optional
+    health field is null when the platform cannot read it. The agent
+    refreshes these with its device list every 600 seconds and on
+    each `GET /v1/node` (row 43).
+
     """
 
     kind: ComputeDeviceKind
@@ -4447,8 +5070,45 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
+        description='Current device ordinal on its own host. It can change when\nanother card disappears; `uuid`, when readable, identifies\nthe same card across that renumbering. NVIDIA launches use\nthe UUID in `CUDA_VISIBLE_DEVICES`, falling back to an index\nwhen no UUID was read. For a `vulkan` device the index is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES` counts\nin.\n',
         ge=0,
+    )
+    uuid: str | None = Field(
+        None,
+        description="Stable vendor device identifier, used to keep a runtime on\nthe same card when indices change. NVIDIA's NVML UUID (for\nexample `GPU-...`) or AMD's sysfs `unique_id`, kept as the\nvendor reports it; not necessarily an RFC UUID. Null when\nthe platform cannot read it.\n",
+        min_length=1,
+    )
+    pciBusId: str | None = Field(
+        None,
+        description='PCI bus address from NVML or the Linux sysfs device path.\nNull when unreadable. A location, not a stable card identity.\n',
+        min_length=1,
+    )
+    pcieLink: ComputeDevicePcieLink | None = Field(
+        None,
+        description="Observed PCIe link against the card's supported link. Null\nwhen no link measurements can be read. A lower generation\nis a warning only when this card's utilisation exceeded 50%\nin the last minute of host history: an idle card can lower\nits generation to save power. A narrower width is a warning\nat any time. Compare only measurements that are known.\n",
+    )
+    powerLimitWatts: float | None = Field(
+        None,
+        description="Power cap in effect, in watts, from NVML's enforced power\nlimit or Linux hwmon `power1_cap`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    powerDefaultLimitWatts: float | None = Field(
+        None,
+        description="The card's default power cap in watts, from NVML or Linux\nhwmon `power1_cap_default`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    throttleReasons: list[ComputeDeviceThrottleReason] | None = Field(
+        None,
+        description='Reasons the card is currently slowing down, read from NVML.\nAn empty list means it reported no throttling. Null when\nunreadable, including AMD and other unsupported platforms.\n',
+    )
+    uncorrectedMemoryErrors: int | None = Field(
+        None,
+        description="Volatile uncorrected ECC memory-error count from NVML, since\nthe device's counter was reset. Zero is a measured result.\nNull when ECC is off, unsupported or unreadable.\n",
+        ge=0,
+    )
+    peers: list[Peer] | None = Field(
+        None,
+        description='UUIDs of other cards this card can reach directly by P2P\nreads, as NVML reports it. Directional: the reverse path is\nreported on the other card. An empty list means no peers\nwere reachable; null means the peer check was unreadable or\nunsupported. Unknown checks never claim that P2P is absent.\n',
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
@@ -5056,7 +5716,7 @@ class RuntimeSpec(BaseModel):
     )
     flags: dict[str, Any] | None = Field(
         None,
-        description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n',
+        description='Curated engine flags, keyed by the field names in the\nadapter\'s `flagSchema`. Validated on write: an unknown key\nis a 400, never a silent drop.\n\nThis is the per-model settings surface — the reason\n"tweaking llama.cpp settings for every different model" is a\ncomplaint we answer. Values here are engine *launch* flags;\nsampling parameters that ride on each request are the\ngateway\'s, not these.\n\nFor llama.cpp and vLLM, `missingCard` is the agent\'s "If a\ncard is missing" setting, exposed in the engine\'s GUI\n`flagSchema`. `start-on-cards-left` is the default: refit for\nthe cards present and report any temporary context or RAM\noffload changes. `do-not-start` refuses the launch and names\nthe missing card. The profile is not changed; the next start\nuses its saved settings when all cards are back. This setting\ncontrols the agent\'s launch check, not an engine CLI flag.\n',
     )
     extraArgs: list[str] | None = Field(
         None,
@@ -5075,6 +5735,22 @@ class RuntimeSpec(BaseModel):
         description='Override the binary for this one runtime, ignoring whatever\nthe adapter discovered. For running one model on a custom\nbuild without disturbing the rest of the install.\n',
     )
     profile: RuntimeProfile | None = None
+
+
+class RuntimeStartedOnFewerCards(BaseModel):
+    """
+    Observed result of a successful start on the cards left. The
+    console keeps a warning until a start with every expected card
+    clears it, and offers a restart so the person can use a returned
+    card. Never written back to a profile.
+
+    """
+
+    missing: list[RuntimeMissingDevice] = Field(..., min_length=1)
+    changes: list[Change] = Field(
+        ...,
+        description='One sentence per launch change actually applied, such as a\nsmaller context, more of the model in RAM, a changed tensor\nsplit or reduced tensor parallelism. Empty when only the\ndevice selection changed. These describe values in effect,\nnot suggestions from fit that were never used.\n',
+    )
 
 
 class RuntimePromptCache(BaseModel):
@@ -6032,7 +6708,7 @@ class Runtime(BaseModel):
     )
     localPathNote: str | None = Field(
         None,
-        description='Why this node is **not** opening a local copy, when it is\nnot and the operator asked for one: not enough free space to\nleave the configured headroom, the copy failed, the source\ncould not be read. Absent when the copy was used, and absent\nwhen copying is switched off — a node that was never asked\nhas nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
+        description='Why a requested local copy was skipped or used without\nchecking its source. A skipped copy names the observed cause:\nnot enough free space to leave the configured headroom, a\nfailed copy, or a source that could not be read.\n\nWhen the source\'s Library folder root on this machine raises\nan OSError or exceeds the 5 s check limit, a copy whose size\nmatches its saved source record may be used. The note starts\n"Started from this machine\'s copy" and names the folder root\nand the observed cause. It remains until the next start that\nchecks the source. A missing file in a readable folder does\nnot permit this fallback.\n\nAbsent when the source was checked and the copy was used,\nand absent when copying is switched off — a node that was\nnever asked has nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
     )
     copyProgress: CopyProgress | None = None
     modelAlias: str | None = Field(
@@ -6091,10 +6767,23 @@ class Runtime(BaseModel):
         None, description='Version reported by the binary that is actually running.'
     )
     capabilities: RuntimeCapabilities | None = None
+    effectiveLaunch: StrataEffectiveLaunch | None = Field(
+        None,
+        description='Strata settings applied by the last successful launch, read\nfrom its private launch configuration. Absent before a\nlaunch or when unknown; never copied from saved flags.\n',
+    )
+    chatTemplate: RuntimeChatTemplate | None = None
     lastRestart: AwareDatetime | None = None
     lastError: str | None = Field(
         None,
         description='Most recent failure for this runtime — a spawn error, a\nnon-zero exit, or a readiness probe that never passed.\nCleared on a successful start.\n',
+    )
+    lastDevices: list[LastDevice] | None = Field(
+        None,
+        description='UUIDs of the cards used at the last successful start, recorded\nby the agent. An observation, never a profile setting or a\nreplacement for its saved device pins. Kept across stops and\nfailed starts, and updated only after a successful start.\nAbsent before a successful start has been observed; an empty\nlist means no device UUIDs were available or used.\n',
+    )
+    startedOnFewerCards: RuntimeStartedOnFewerCards | None = Field(
+        None,
+        description='The last successful start used fewer cards because one or\nmore expected cards were missing. Names those cards and the\nlaunch changes actually applied. Null when there is no such\nobservation. Kept until a successful start with every\nexpected card clears it; a returning card does not restart a\nrunning runtime automatically. The profile stays unchanged.\n',
     )
     loadProgress: LoadProgress | None = None
     speculation: RuntimeSpeculation | None = None
@@ -6189,6 +6878,10 @@ class NodeIdentity(BaseModel):
         description="Whether this agent keeps a passphrase of its own (row 5): the\nroot machine's agent, and a machine set up on its own before\nit joined. The control root sends a changed passphrase only to\nthese. Absent from an agent older than row 5.\n",
     )
     standby: LocalStandby | None = None
+    rootLocked: bool | None = Field(
+        None,
+        description="This machine runs the install's control root, and it is locked:\nnothing can be signed until the owner signs in with the\npassphrase (row 4). Home says so. Common after a restart under\n`prompt_on_startup`, and after a promoted copy restarts before\nany other machine heard of the promotion. Absent when this\nmachine runs no root, or its state is not known yet.\n",
+    )
     hostsControl: bool | None = Field(
         None,
         description="This agent supervises the install's active control root. The\nroot reads it from its probe of each node to know its own\nmachine, which can never be its standby\n(`docs/design/warm-standby.md`). A standby this agent runs does\nnot count.\n",

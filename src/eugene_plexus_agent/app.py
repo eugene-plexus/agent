@@ -50,6 +50,7 @@ from . import (
     ui_assets,
     update_all,
 )
+from ._generated.models import RuntimeSpec
 from ._http import aclose_shared
 from .auth_state import AuthState
 from .client_key_registry import ClientKeyRegistry
@@ -71,6 +72,7 @@ from .routes import oidc_forward as oidc_forward_routes
 from .routes import profile_builds as profile_build_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
+from .routes import serving_measurements as serving_measurement_routes
 from .routes import site_link as site_link_routes
 from .routes import updates as update_routes
 from .runtimes import RuntimeSupervisor, close_installers
@@ -350,6 +352,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             log=log,
             get_config=state.get_config,
             inherited_rules=folders_cache.inherited_rules,
+            library_roots=lambda: [folder.path for folder in folders_cache.folders or []],
             stop_memory=state,
         )
         owns_runtimes = True
@@ -357,6 +360,33 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         runtime_supervisor = app.state.runtime_supervisor
         owns_runtimes = False
     app.state.runtime_supervisor = runtime_supervisor
+    if owns_runtimes:
+        from fastapi import HTTPException
+
+        from .card_launch import CardLaunch, DeviceMemory
+        from .routes.runtimes import _measure_launch
+        from .runtime_context import NodeContext
+
+        runtime_supervisor.device_memory = DeviceMemory(state.path.parent / "runtime-devices.json")
+
+        async def check_runtime_cards(spec: RuntimeSpec) -> CardLaunch:
+            context = NodeContext(app=app)
+            try:
+                admission, _ = await _measure_launch(context, spec)
+            except HTTPException as exc:
+                detail = exc.detail
+                raise ValueError(
+                    detail.get("detail", str(detail)) if isinstance(detail, dict) else str(detail)
+                ) from exc
+            if (
+                admission.decision.value == "refuse"
+                and spec.name not in runtime_supervisor.force_launches
+            ):
+                raise ValueError(admission.reason)
+            launch: CardLaunch = context.state.card_launch
+            return launch
+
+        runtime_supervisor.launch_check = check_runtime_cards
     # `Runtime.node`, from the agent's own identity and nowhere else.
     runtime_supervisor.node_name_provider = lambda: (
         identity.record.name if identity.record.enrolled else None
@@ -701,6 +731,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await asyncio.gather(apps_task, return_exceptions=True)
         if app_manager is not None:
             await app_manager.aclose()
+        serving_measurements = getattr(app.state, "serving_measurements", None)
+        if serving_measurements is not None:
+            await serving_measurements.close()
         await registry.close()
         benchmarks = getattr(app.state, "benchmarks", None)
         if benchmarks is not None:
@@ -1163,6 +1196,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(runtimes_routes.router)
     app.include_router(benchmark_routes.router)
     app.include_router(profile_build_routes.router)
+    app.include_router(serving_measurement_routes.router)
     # Optional apps. Operator-only on every route; declared on the router.
     app.include_router(apps_routes.router)
     # This host's identity and devices; reads only, operator or service.

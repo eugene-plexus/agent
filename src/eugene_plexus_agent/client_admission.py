@@ -161,6 +161,24 @@ class AdmissionClock:
         return current
 
 
+def lineage_of(key: dict[str, Any] | None, key_id: str) -> str:
+    """The id of the bucket a key's requests count in (row 24).
+
+    A rotated key's old and new tokens share one allowance, so a replacement
+    carries the first key's id as its `lineage`. Every key made before
+    rotation existed is its own lineage, so the ledger needs no migration.
+    """
+    return str((key or {}).get("lineage") or key_id)
+
+
+def retired(key: dict[str, Any] | None) -> bool:
+    """True once a replaced key's overlap has ended."""
+    retires = (key or {}).get("retiresAt")
+    if isinstance(retires, str):
+        retires = datetime.fromisoformat(retires.replace("Z", "+00:00")).timestamp()
+    return isinstance(retires, int | float) and retires <= time.time()
+
+
 def decide(
     ledger: dict[str, Any],
     key: dict[str, Any] | None,
@@ -179,7 +197,7 @@ def decide(
     if limits is not None:
         result["limits"] = limits
     buckets = clean_buckets(ledger["buckets"], now)
-    bucket = buckets.setdefault(key_id, {})
+    bucket = buckets.setdefault(lineage_of(key, key_id), {})
     existing = bucket.get(request_id)
     if action != "release":
         expiry = key.get("expiresAt") if key else None
@@ -190,6 +208,13 @@ def decide(
         )
         if not key or key.get("revokedAt") is not None or not expires or expires <= time.time():
             raise AdmissionRefusal(401, "This client key is unregistered, expired or revoked.")
+        if action != "renew" and retired(key):
+            # A renewal stays open, so a stream that began in the overlap finishes.
+            raise AdmissionRefusal(
+                401,
+                "This key was replaced. Paste its replacement into this app, "
+                "or make a new key under Home -> Use it from your apps.",
+            )
     if action == "check":
         return result, None
     policy = {"limits": limits, "principal": principal} if principal else limits

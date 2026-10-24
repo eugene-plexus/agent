@@ -227,6 +227,7 @@ class LibraryFitClient:
         self._transport = transport
         self._own_client: httpx.AsyncClient | None = None
         self.last_error: str | None = None
+        self.folders_safe_mode = False
         """Why the last folder read returned None, for the node's copy to
         keep and the Folders page to show."""
 
@@ -285,6 +286,7 @@ class LibraryFitClient:
         inherits its path rules from (2026-09-14). None when it could not
         answer, and the node keeps its last copy."""
         self.last_error = None
+        self.folders_safe_mode = False
         try:
             client = self._client()
             response = await client.get(f"{self._base}/v1/folders", headers=self._headers)
@@ -295,7 +297,9 @@ class LibraryFitClient:
                 )
                 log.warning("library folder list: %s", self.last_error)
                 return None
-            folders = response.json().get("folders")
+            body = response.json()
+            self.folders_safe_mode = body.get("safeMode") is True
+            folders = body.get("folders")
             if isinstance(folders, list):
                 return folders
             self.last_error = f"The Library at {self._base} answered without a folder list."
@@ -517,13 +521,17 @@ def explicit_devices(
         match = _DEVICE_NAME_RE.match(name)
         backend = match.group("backend").lower() if match else ""
         kind = {"cuda": ComputeDeviceKind.cuda, "rocm": ComputeDeviceKind.rocm}.get(backend)
+        selector = match.group("index") if match else ""
+        raw = (
+            (spec.env or {}).get("CUDA_VISIBLE_DEVICES") if kind is ComputeDeviceKind.cuda else None
+        )
+        if raw is not None and match is not None:
+            visible = raw.split(",")
+            ordinal = int(match.group("index"))
+            selector = visible[ordinal].strip() if ordinal < len(visible) else ""
         device = (
             next(
-                (
-                    d
-                    for d in accelerators
-                    if d.kind is kind and d.index == int(match.group("index"))
-                ),
+                (d for d in accelerators if d.kind is kind and selector_matches(d, selector)),
                 None,
             )
             if match and kind is not None
@@ -534,6 +542,26 @@ def explicit_devices(
         elif device not in mapped:
             mapped.append(device)
     return mapped, unmapped
+
+
+def selector_matches(device: ComputeDevice, selector: str) -> bool:
+    """One vendor selector against a host device; never an empty UUID prefix."""
+    return bool(selector) and (
+        str(device.index) == selector or bool(device.uuid and device.uuid.startswith(selector))
+    )
+
+
+def main_device(spec: RuntimeSpec, devices: Sequence[ComputeDevice]) -> ComputeDevice | None:
+    index = (spec.flags or {}).get("mainGpu")
+    if index is None:
+        return None
+    selector = str(index)
+    raw = (spec.env or {}).get("CUDA_VISIBLE_DEVICES")
+    if raw is not None:
+        visible = raw.split(",")
+        ordinal = _int_flag(index, -1)
+        selector = visible[ordinal].strip() if 0 <= ordinal < len(visible) else ""
+    return next((d for d in devices if selector_matches(d, selector)), None)
 
 
 def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeDevice]:
@@ -557,14 +585,29 @@ def target_devices(spec: RuntimeSpec, snapshot: DeviceSnapshot) -> list[ComputeD
             cpu = snapshot.cpu()
             return [cpu] if cpu is not None else accelerators
         return accelerators
+    for var, selected_kind in _PIN_KINDS.items():
+        raw = (spec.env or {}).get(var)
+        if raw is not None and any(part.strip().startswith("GPU-") for part in raw.split(",")):
+            selected = []
+            for token in raw.split(","):
+                matches = [
+                    d
+                    for d in accelerators
+                    if d.kind is selected_kind and d.uuid and d.uuid.startswith(token.strip())
+                ]
+                if len(matches) == 1:
+                    selected.append(matches[0])
+            return selected or accelerators
     pinned = pinned_indices(spec.env)
     if pinned is None:
         return accelerators
     kind = pin_kind(spec.env)
+    raw = next((str((spec.env or {})[v]) for v in _PIN_ENV_VARS if v in (spec.env or {})), "")
     chosen = [
         d
+        for token in raw.split(",")
         for d in accelerators
-        if d.index is not None and d.index in pinned and (kind is None or d.kind is kind)
+        if selector_matches(d, token.strip()) and (kind is None or d.kind is kind)
     ]
     # A pin to a device this host does not have is an engine error at
     # spawn; admission measures against everything rather than nothing.
@@ -723,6 +766,8 @@ def place(
         device = max(
             targets, key=lambda d: (s if (s := spare(d)) is not None else -1, -(d.index or 0))
         )
+        if str((spec.flags or {}).get("splitMode", "")).lower() == "none":
+            device = main_device(spec, targets) or device
         reserved = held(device)
         free = device.memoryFreeBytes
         return Placement(
@@ -750,11 +795,7 @@ def place(
         budget = int(min((s or 0) / p for s, p in zip(spares, fractions, strict=True)))
     frees = [d.memoryFreeBytes for d in devices]
     totals = [d.memoryTotalBytes for d in devices]
-    main_index = (spec.flags or {}).get("mainGpu")
-    main = next(
-        (d for d in devices if main_index is not None and d.index == _int_flag(main_index, -1)),
-        devices[0],
-    )
+    main = main_device(spec, devices) or devices[0]
     return Placement(
         main=main,
         devices=devices,
@@ -1125,26 +1166,46 @@ def strata_admission(
     holds that card's free memory while it loads (`requiredBytes`): a second
     launch on the card in that window is refused, not starved.
     """
-    from .engines.strata import choice_of_runtime, strata_card
+    from .engines.strata import choice_of_runtime, runtime_cards
     from .engines.strata_models import experts_in_ram_bytes, setup_fit
 
-    card = strata_card(snapshot)
+    try:
+        cards = runtime_cards(spec, Path(location.localPath or spec.modelPath), snapshot)
+    except ValueError as exc:
+        return Admission(
+            decision=AdmissionDecision.refuse,
+            fit=AdmissionFit.unknown,
+            basis=AdmissionBasis.engine_table,
+            location=location,
+            reason=f"Cannot use the selected Strata cards: {exc}",
+        )
+    card = cards[0] if cards else None
     choice = choice_of_runtime(Path(location.localPath or spec.modelPath))
-    held = (
+    held = sum(
         held_bytes(
             reservations,
-            device_index=card.index,
+            device_index=d.index,
             exclude=spec.name,
-            device_kind=card.kind.value,
+            device_kind=d.kind.value,
         )
-        if card is not None
-        else 0
+        for d in cards
     )
-    free = card.memoryFreeBytes if card is not None else None
+    free = (
+        sum(d.memoryFreeBytes or 0 for d in cards)
+        if cards and all(d.memoryFreeBytes is not None for d in cards)
+        else None
+    )
+    total = (
+        sum(d.memoryTotalBytes or 0 for d in cards)
+        if cards and all(d.memoryTotalBytes is not None for d in cards)
+        else None
+    )
     room = max(0, free - held) if free is not None else None
-    blockers = _blockers(spec, [card], snapshot, running) if card is not None else []
+    blockers = _blockers(spec, cards, snapshot, running) if cards else []
     where = (
-        f"device {card.index} ({card.name or card.kind.value})" if card is not None else "no card"
+        ", ".join(f"device {d.index} ({d.name or d.kind.value})" for d in cards)
+        if cards
+        else "no card"
     )
 
     from . import drives
@@ -1164,8 +1225,9 @@ def strata_admission(
             requiredBytes=room if fit is not AdmissionFit.unknown else None,
             freeBytes=free,
             reservedBytes=held or None,
-            totalBytes=card.memoryTotalBytes if card is not None else None,
+            totalBytes=total,
             device=card,
+            devices=cards if len(cards) > 1 else None,
             blockers=blockers,
             location=location,
             reason=reason,
@@ -1190,7 +1252,11 @@ def strata_admission(
             f"sizes {choice.model} by it.",
             "; ".join(warnings) or "RAM could not be read",
         )
-    vram_gib = (card.memoryTotalBytes or 0) / 2**30 if card is not None else None
+    vram_gib = (
+        [d.memoryTotalBytes / 2**30 if d.memoryTotalBytes is not None else None for d in cards]
+        if cards
+        else None
+    )
     verdict = setup_fit(choice, ram_total / 2**30, vram_gib)
     fit = _STRATA_FIT[verdict.verdict.value]
     words = verdict.words
@@ -1284,6 +1350,12 @@ async def check_admission(
     # as long as the OS takes to give up.
     location = await asyncio.to_thread(_locate, spec, mappings, is_there, sizer, copy_settings)
     if not location.exists:
+        copy_refusal = None
+        if copy_settings is not None:
+            resolved = await asyncio.to_thread(
+                model_copies.resolve_local_path, spec.modelPath, mappings, copy_settings
+            )
+            copy_refusal = resolved.refusal
         return _refuse_missing(
             spec,
             location,
@@ -1291,6 +1363,7 @@ async def check_admission(
             context_length=context_length,
             warnings=warnings,
             folders_unread=folders_unread,
+            copy_refusal=copy_refusal,
         )
 
     # Each engine by its own fit model (LS6, Troy's L11): never another
@@ -1694,8 +1767,11 @@ def _locate(
     resolution = resolve_model_path(spec.modelPath, mappings)
     local = resolution.local_path
     if copy_settings is not None:
-        local = model_copies.resolve_local_path(spec.modelPath, mappings, copy_settings).path
-    present = bool(is_there(local))
+        resolved = model_copies.resolve_local_path(spec.modelPath, mappings, copy_settings)
+        local = resolved.path
+        present = not resolved.refusal and bool(is_there(local))
+    else:
+        present = bool(is_there(local))
     return ModelLocation(
         path=spec.modelPath,
         localPath=local,
@@ -1738,11 +1814,14 @@ def _refuse_missing(
     context_length: int | None,
     warnings: list[str],
     folders_unread: str | None = None,
+    copy_refusal: str | None = None,
 ) -> Admission:
     """The one launch failure the dry run can predict with certainty."""
     where = f"on {node_name}" if node_name else "on this host"
     tab = f"Library -> {node_name or 'this machine'} -> Folders"
-    if location.mapping is None and folders_unread:
+    if copy_refusal:
+        fix = f"The copy of {spec.modelPath} {where} {copy_refusal}"
+    elif location.mapping is None and folders_unread:
         # Not "set a mount": the operator may well have set one. This node
         # could not read the folders, so none of their mounts applied and
         # the Library's own spelling was tried (2026-09-27, the live

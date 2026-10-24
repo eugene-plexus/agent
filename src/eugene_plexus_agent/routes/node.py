@@ -237,6 +237,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         devices=list(snapshot.devices),
         agentVersion=__version__,
         hostsControl=standby.hosts_active_control(state),
+        rootLocked=getattr(request.app.state, "root_locked", None),
         standby=_local_standby(request, state, record.control_url),
         # Read at the moment of answering, not cached and not derived
         # from anything: the point of the field is that a console can

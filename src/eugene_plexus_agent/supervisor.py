@@ -262,12 +262,18 @@ class SpawnPlan:
     component's safe mode). Surfaced back out so the mapping layer can
     report it; the loop itself only records it."""
 
+    launch_settings: dict[str, object] | None = None
+    """Applied launch facts. Recorded only after the child was spawned."""
+
     port: int | None = None
     """The TCP port this child will try to bind, when the planner knows
     it. Used only to say something useful when the bind fails: a child
     whose port is taken exits instantly with an OS error, and the loop's
     answer to that is a crash-backoff cycle that names neither the port
     nor what is holding it. Optional because not every plan has one."""
+
+    on_spawn: Callable[[], None] | None = None
+    """Record observations only after a process was successfully created."""
 
 
 class SpawnPlanner(Protocol):
@@ -625,6 +631,7 @@ class SupervisedProcess:
         #: `last_restart` cannot -- on Windows under Python 3.12 the clock ticks every
         #: 15.6 ms, so a respawn can carry the same time as the run it replaced.
         self.spawns = 0
+        self.last_launch_settings: dict[str, object] | None = None
 
     @classmethod
     def for_component(
@@ -1005,6 +1012,7 @@ class SupervisedProcess:
         self.degraded = plan.degraded
         self._last_port = plan.port
         self.last_argv = list(plan.argv)
+        self.last_launch_settings = plan.launch_settings
         # `plan.env` is None for an engine -- adapters build argv and
         # inherit the environment -- and an engine has no bind host to
         # record anyway. Reading it unguarded raised AttributeError
@@ -1018,6 +1026,8 @@ class SupervisedProcess:
         self.last_restart = datetime.now(UTC)
         self.spawns += 1
         self.last_error = None
+        if plan.on_spawn is not None:
+            plan.on_spawn()
 
         # Background reader: drains the child's stdout pipe and re-emits
         # each line with a `[<name>]` prefix on the agent's own stdout.
