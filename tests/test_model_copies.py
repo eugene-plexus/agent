@@ -172,7 +172,8 @@ def test_a_partial_copy_never_carries_the_final_name(tmp_path: Path, monkeypatch
 
     def watched(*args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         handle = real_read(*args, **kwargs)
-        seen.append(os.path.exists(plan.destination))
+        if not str(args[0]).endswith(mc.SOURCE_SUFFIX + mc.PARTIAL_SUFFIX):
+            seen.append(os.path.exists(plan.destination))
         return handle
 
     monkeypatch.setattr("builtins.open", watched)

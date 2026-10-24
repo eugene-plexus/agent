@@ -272,6 +272,24 @@ def test_an_unreachable_upstream_is_a_502_naming_it(app: FastAPI, client: TestCl
     assert "gw.invalid" in response.json()["detail"]["detail"]
 
 
+def test_library_outage_says_what_still_works(app: FastAPI, client: TestClient) -> None:
+    def refuse(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    app.state.ui_proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(refuse))
+    declare(app, "library", "library", "http://nas.invalid:12345/")
+    response = client.get("/api/proxy/library/v1/models")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["detail"].startswith("The Library on ")
+    assert (
+        "Running models keep serving, and machines start models from their own copies."
+        in detail["detail"]
+    )
+    assert "connection refused" in detail["detail"]
+    assert "nas.invalid" in detail["cause"]
+
+
 def test_the_proxy_needs_no_session_of_its_own(
     client: TestClient, sent: list[httpx.Request]
 ) -> None:

@@ -645,15 +645,13 @@ def _port_of(url: str) -> int | None:
 
 
 def active_control_entry(state: Any) -> Any | None:
-    """The active control root this agent spawns, never its standby."""
+    """The active control root this agent spawns, never its standby. A
+    standby copy once promoted is the root (row 4): `/control` and the
+    plain branch reach it, with no restart."""
     from . import standby
 
     for entry in state.list_topology_entries():
-        if (
-            entry.kind.value == "control"
-            and entry.spawn is not None
-            and not standby.is_standby(entry)
-        ):
+        if entry.spawn is not None and standby.is_root(entry, state):
             return entry
     return None
 

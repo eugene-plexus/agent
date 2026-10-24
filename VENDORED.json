@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "files": {
     "contracts/run-operations.json": {
-      "sha256": "1a14a4bb4a110c3f8ddf5864ae3b84636abe1afdb4dd95bf1311399d6ea4fca5"
+      "sha256": "b27907f558b325268cc3c2ec2a29320ac020f9b478c8fcaa10a5bab15ea98121"
     },
     "scripts/check-vendored.py": {
       "sha256": "e9427b74fb4194ecd1df1abf1d510a3df18606e3c07a2a60043e74bba7422d11"
@@ -19,7 +19,7 @@
       "sha256": "4cfc268ebe5fbdd4315c209d8c5d4652f6458155bf1c81a8ae3824e469d3e083"
     },
     "src/eugene_plexus_agent/tokens.py": {
-      "sha256": "b4ea043831d6609a5b1feb419791506b4b509ea31c9d9dc7054527c1a4665dcb"
+      "sha256": "1068f80fe3705560c640c040bea4de5a7cfd2b1863c758ab6cc55003969e2e00"
     }
   }
 }
