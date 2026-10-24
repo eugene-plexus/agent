@@ -862,7 +862,9 @@ class SupervisedProcess:
                 line = await stream.readline()
                 if not line:
                     return
-                text = line.decode("utf-8", errors="replace")
+                from .app_launcher import redact_database
+
+                text = redact_database(line.decode("utf-8", errors="replace"))
                 # Suppress successful /healthz access logs — every spawned
                 # component answers a probe every ~1.5s, dwarfing the rest
                 # of the log. Non-2xx healthz still passes through so a
