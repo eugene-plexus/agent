@@ -116,16 +116,22 @@ def store_passphrase(path: Path | None, passphrase: str) -> bool:
     file now holds it. Never raises: a sign-in must not fail because a
     convenience did.
     """
+    return why_not_stored(path, passphrase) is None
+
+
+def why_not_stored(path: Path | None, passphrase: str) -> str | None:
+    """`store_passphrase`, saying why not (row 5): None when the file now
+    holds `passphrase`, else the cause, for the root to show the owner."""
     if path is None:
         log.warning(
             "securityMode is passphrase_file but EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE is not "
             "set, so there is nowhere to keep the passphrase; this agent will be locked "
             "after its next restart"
         )
-        return False
+        return "no passphrase file is set for this machine"
     try:
         if path.is_file() and path.read_bytes() == passphrase.encode("utf-8"):
-            return True
+            return None
     except OSError:
         pass  # unreadable is a reason to write it, not to give up
     try:
@@ -137,9 +143,9 @@ def store_passphrase(path: Path | None, passphrase: str) -> bool:
             path,
             exc,
         )
-        return False
+        return str(exc) or type(exc).__name__
     log.info("passphrase kept in %s for unlocking after a restart", path)
-    return True
+    return None
 
 
 def unlock_key(path: Path | None, state: Any) -> bytes | None:

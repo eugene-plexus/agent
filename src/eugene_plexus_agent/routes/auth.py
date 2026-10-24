@@ -76,6 +76,7 @@ from .._generated.models import (
     ClientKeyRotateRequest,
     ClientKeyUpdateRequest,
     NodePassphraseRequest,
+    NodePassphraseResult,
     PassphraseChangeRequest,
     PassphraseChangeResult,
     ServiceTokenRequest,
@@ -592,11 +593,14 @@ def _failed(auth: AuthState, remote: str) -> None:
     )
 
 
-def _take_new_passphrase(request: Request, master_key: bytes, new: str, *, unlock: bool) -> str:
+def _take_new_passphrase(
+    request: Request, master_key: bytes, new: str, *, unlock: bool
+) -> tuple[str, str | None]:
     """Wrap this agent's master key under `new` and keep the new hash. The key
     stays, so every secret sealed under it still opens; `masterSalt` stays,
     so the keyring entry stays where it is. Returns the passphrase file's
-    state: `matches`, `old` (it could not be written) or `none`.
+    state, `matches`, `old` (it could not be written) or `none`, and why
+    it is `old`.
 
     `unlock` puts the key in memory, as a sign-in does. The root's push does
     not: a change is not a sign-in, and a locked machine stays locked."""
@@ -612,8 +616,9 @@ def _take_new_passphrase(request: Request, master_key: bytes, new: str, *, unloc
         auth.set_master_key(master_key)
         _persist_master_key_if_keyring_mode(state, master_key)
     if state.get_config("securityMode") != "passphrase_file":
-        return "none"
-    return "matches" if passphrase_file.store_passphrase(_passphrase_path(request), new) else "old"
+        return "none", None
+    why = passphrase_file.why_not_stored(_passphrase_path(request), new)
+    return ("matches", None) if why is None else ("old", why)
 
 
 async def _verified_forward(request: Request, passphrase: str, *, remote: str) -> AuthLoginResponse:
@@ -719,7 +724,7 @@ async def change_passphrase(request: Request) -> PassphraseChangeResult:
     auth.clear_login_failures(remote)
     held = auth.master_key
     key = held if held is not None else state.master_key_for(current)
-    file_state = _take_new_passphrase(request, key, new, unlock=True)
+    file_state, _ = _take_new_passphrase(request, key, new, unlock=True)
     log.warning("this agent's passphrase changed; its master key was wrapped under the new one")
     return PassphraseChangeResult.model_validate(
         {"changedAt": datetime.now(UTC), "machines": [], "passphraseFile": file_state}
@@ -775,8 +780,12 @@ async def _forward_change(
 _CHANGE_TIMEOUT_SECONDS = 60.0
 
 
-@router.post("/v1/node/passphrase", status_code=204)
-async def take_node_passphrase(request: Request) -> None:
+@router.post(
+    "/v1/node/passphrase",
+    response_model=NodePassphraseResult,
+    response_model_exclude_none=True,
+)
+async def take_node_passphrase(request: Request) -> NodePassphraseResult:
     """The root's: take Eugene's new passphrase (row 5).
 
     The control root's own token, and only over TLS (the machine port, whose
@@ -814,8 +823,11 @@ async def take_node_passphrase(request: Request) -> None:
     key: bytes = (
         held if held is not None else await asyncio.to_thread(state.master_key_for, current)
     )
-    await asyncio.to_thread(_take_new_passphrase, request, key, new, unlock=False)
+    file_state, why = await asyncio.to_thread(_take_new_passphrase, request, key, new, unlock=False)
     log.warning("this machine took the install's new passphrase from the control root")
+    # Row 5: the root shows the owner a file this machine could not save,
+    # because after a restart this machine stays locked until a sign-in.
+    return NodePassphraseResult.model_validate({"passphraseFile": file_state, "detail": why})
 
 
 def _audience(session: str) -> tuple[str, ...]:

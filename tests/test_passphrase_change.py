@@ -133,7 +133,8 @@ def test_the_root_sends_the_new_passphrase_over_tls_only(
     )
 
     taken = c.post("https://testserver/v1/node/passphrase", json=body, headers=control)
-    assert taken.status_code == 204, taken.text
+    assert taken.status_code == 200, taken.text
+    assert taken.json() == {"passphraseFile": "none"}
     state = c.app.state.agent_state  # type: ignore[attr-defined]
     assert security.verify_passphrase(NEW, state.get_passphrase_hash())
     assert c.app.state.auth_state.master_key == key  # type: ignore[attr-defined]
@@ -274,3 +275,43 @@ def test_the_passphrase_file_is_rewritten(tmp_path: Path) -> None:
 def test_a_damaged_wrap_opens_nothing(bad: str) -> None:
     with pytest.raises(ValueError):
         security.unwrap_master_key(bad, NEW, "c2FsdHNhbHRzYWx0c2FsdA==")
+
+
+def test_the_root_hears_when_this_machine_could_not_save_its_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review: a read-only passphrase file made the agent's change return
+    `old` internally, and the root reported `changed`. The agent says so."""
+    from eugene_plexus_agent import _private_files
+
+    from .conftest import StubRuntimeSupervisor, StubSupervisor
+
+    secret = tmp_path / "passphrase"
+    settings = Settings(
+        config_file=tmp_path / "agent.yaml", default_topology=False, passphrase_file=secret
+    )
+    app = create_app(settings=settings)
+    app.state.supervisor = StubSupervisor()
+    app.state.runtime_supervisor = StubRuntimeSupervisor()
+    with TestClient(app) as c:
+        started = c.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE}).json()
+        c.headers["Authorization"] = f"Bearer {started['sessionToken']}"
+        assert c.patch("/v1/config", json={"securityMode": "passphrase_file"}).status_code == 200
+        root = FakeRoot()
+        enroll_app(app, root, NODE)
+
+        def read_only(*_: Any, **__: Any) -> None:
+            raise OSError(30, "Read-only file system")
+
+        monkeypatch.setattr(_private_files, "write_private", read_only)
+        control = {"Authorization": f"Bearer {root.service(f'node:{NODE}')}"}
+        taken = c.post(
+            "https://testserver/v1/node/passphrase",
+            json={"current": TEST_PASSPHRASE, "new": NEW},
+            headers=control,
+        )
+    assert taken.status_code == 200, taken.text
+    assert taken.json() == {
+        "passphraseFile": "old",
+        "detail": "[Errno 30] Read-only file system",
+    }
