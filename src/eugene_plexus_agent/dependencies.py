@@ -25,6 +25,8 @@ because a service token named a kind and every machine shared one key.
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -95,6 +97,23 @@ def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> 
         raise _problem(
             status.HTTP_401_UNAUTHORIZED, "Invalid token", f"Bearer token rejected: {exc}"
         ) from exc
+    # Row 4: the bundle refuses a root token below its own epoch; this node
+    # may already hold a higher one, from a promoted root's signed list, before
+    # that root's bundle arrives. A root it no longer follows commands nothing.
+    record = getattr(getattr(request.app.state, "node_identity", None), "record", None)
+    held = getattr(record, "epoch", None)
+    if claims.epoch is not None and held is not None and claims.epoch < held:
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Superseded root",
+            tokens.no_longer_followed(claims.epoch, held),
+        )
+    if _legacy_root_token_after_a_promotion(auth, claims, record):
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Superseded root",
+            tokens.no_longer_followed("unknown", int(held or 0)),
+        )
     # An operator session that arrived through the HTTPS entry point keeps a
     # configuration applied from Settings; without one it goes back
     # (`entrypoint_setup`). A console kept on its own port has not moved, so
@@ -112,6 +131,26 @@ def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> 
 
         confirm(request.app)
     return claims
+
+
+def _legacy_root_token_after_a_promotion(auth: Any, claims: tokens.Claims, record: Any) -> bool:
+    """A root token without `ep` (a root older than row 4), once this node
+    knows of a promotion (row 4 re-review): it holds an epoch above its
+    bundle's (a promoted root's list came first), or above the epoch it held
+    when it first ran row 4 code or joined. Such a token cannot be told
+    from one the replaced root signed after it was replaced."""
+    if claims.iss != tokens.ISSUER_CONTROL or claims.typ == tokens.TYP_CLIENT:
+        return False
+    if claims.epoch is not None:
+        return False
+    held = getattr(record, "epoch", None)
+    if held is None:
+        return False
+    bundle = auth.trust.bundle
+    if bundle is not None and held > bundle.epoch:
+        return True
+    legacy = getattr(record, "legacy_token_epoch", None)
+    return legacy is not None and held > legacy
 
 
 def _bearer(creds: HTTPAuthorizationCredentials | None) -> str:

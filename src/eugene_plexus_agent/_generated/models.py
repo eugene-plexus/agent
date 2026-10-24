@@ -18,6 +18,244 @@ from pydantic import (
 )
 
 
+class ServingWorkload(StrEnum):
+    """
+    A person is one top-level session, not a stream or sub-agent.
+    `agents` uses growing histories, the published pauses and bursts,
+    and an uncounted warm start at a random turn. `chat` uses short
+    questions and reading pauses. `streams` is closed loop with no
+    pause or history growth, comparable with a concurrency sweep.
+    All use the profile builder's bundled corpus and seeded sampling.
+
+    """
+
+    agents = 'agents'
+    chat = 'chat'
+    streams = 'streams'
+
+
+class ServingRuntime(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    node: str = Field(
+        ..., description='Node identity used by the node proxy.', min_length=1
+    )
+    runtime: str = Field(..., min_length=1)
+    model: str = Field(
+        ..., description='The model alias exposed by the gateway.', min_length=1
+    )
+
+
+class ServingMeasurementPreflight(BaseModel):
+    otherReplicas: list[ServingRuntime] = Field(
+        ...,
+        description='Other ready replicas of the same alias, including replicas on other nodes.',
+    )
+    otherRuntimes: list[ServingRuntime] = Field(
+        ...,
+        description='Other running runtimes on this node; informational, never stopped implicitly.',
+    )
+    problems: list[str] = Field(
+        ...,
+        description='Observed causes that prevent starting, one sentence each. Empty when it can start.',
+    )
+    estimateSeconds: int | None = Field(
+        ...,
+        description='Estimated total of the level windows; null when it cannot be estimated.',
+        ge=0,
+    )
+
+
+class ServingLevel(BaseModel):
+    """
+    One tested number of people, including all requests begun in its
+    window and their drain time. Excludes warm-up requests. Unknown
+    observations are null, never fabricated zeroes. Latencies are
+    client-side through the gateway; speed after the first content
+    token excludes TTFT. A level remains readable with no successful
+    requests, including a failed or cancelled partial level.
+
+    """
+
+    people: int = Field(..., ge=1, le=256)
+    streamsMean: float = Field(
+        ...,
+        description='Time-weighted mean requests in flight, including sub-agents.',
+        ge=0.0,
+    )
+    streamsPeak: int = Field(
+        ..., description='Peak requests in flight, including sub-agents.', ge=0
+    )
+    requests: int = Field(
+        ...,
+        description='Counted requests attempted, including requests that failed.',
+        ge=0,
+    )
+    errors: int = Field(..., ge=0)
+    errorCauses: dict[str, int] = Field(
+        ...,
+        description="Counts by observed cause, including the engine or gateway's error words.",
+    )
+    ttftP50Ms: float | None = Field(
+        ...,
+        description='Median time to first content token; null when no request produced content.',
+        ge=0.0,
+    )
+    ttftP90Ms: float | None = Field(..., ge=0.0)
+    itlP50Ms: float | None = Field(
+        ...,
+        description='Median inter-token latency; null when there are no measured intervals.',
+        ge=0.0,
+    )
+    itlP90Ms: float | None = Field(..., ge=0.0)
+    tokensPerSecondEachP50: float | None = Field(
+        ...,
+        description='Median per-request decode speed after the first content token, not total speed divided by people.',
+        ge=0.0,
+    )
+    tokensPerSecondEachP10: float | None = Field(..., ge=0.0)
+    tokensPerSecondTotal: float | None = Field(
+        ...,
+        description='Actual counted output tokens divided by durationSeconds; null if output usage is unavailable.',
+        ge=0.0,
+    )
+    promptTokens: int = Field(
+        ...,
+        description="Sum of reported prompt usage; missing usage is named in the job's detail.",
+        ge=0,
+    )
+    cachedTokens: int = Field(
+        ...,
+        description="Sum of reported cached prompt usage; missing usage is named in the job's detail.",
+        ge=0,
+    )
+    waitedP50Ms: float | None = Field(
+        ...,
+        description='Median X-Eugene-Plexus-Waited-Ms; null when the header was unavailable.',
+        ge=0.0,
+    )
+    foreignRequests: int | None = Field(
+        ...,
+        description="Engine request-counter delta minus this job's requests; null means others' use is unknown.",
+        ge=0,
+    )
+    watts: float | None = Field(
+        ...,
+        description='Mean GPU power from host history over the level; null when history has no power readings.',
+        ge=0.0,
+    )
+    outputTokens: int = Field(
+        ...,
+        description='Actual reported output tokens, including any output from failed requests; never max_tokens.',
+        ge=0,
+    )
+    durationSeconds: float = Field(
+        ...,
+        description='Observed duration including drain time; permits interpreting total throughput on partial levels.',
+        ge=0.0,
+    )
+    promptReuse: float | None = Field(
+        ...,
+        description='Fraction of prompt tokens reused as an unchanged prefix between turns; null when not observed.',
+        ge=0.0,
+        le=1.0,
+    )
+    loopLagMaxMs: float = Field(
+        ...,
+        description='Largest measured event-loop scheduling delay during this level.',
+        ge=0.0,
+    )
+    loopLagged: bool = Field(
+        ...,
+        description='True when loopLagMaxMs exceeds 50 ms; marks a potentially load-generator-limited level.',
+    )
+
+
+class ServingKnee(BaseModel):
+    """
+    The last level before TTFT p50 exceeds request.ttftThresholdMs
+    or per-request median speed falls below request.speedRatioThreshold
+    times level 1's. These owner-editable thresholds follow Troy's
+    MEASURE-KNEE-2 call. `found: false` means the limit was not reached;
+    `people` and speeds then describe the largest tested usable level,
+    not an extrapolation. An unfinished or unusable run has a null knee.
+
+    """
+
+    found: bool
+    people: int = Field(..., ge=1, le=256)
+    tokensPerSecondEach: float = Field(..., ge=0.0)
+    ttftP50Ms: float = Field(..., ge=0.0)
+
+
+class ServingGpu(BaseModel):
+    name: str
+    uuid: str | None = Field(..., description='Stable device identity when available.')
+    memoryBytes: int | None = Field(..., ge=0)
+
+
+class ServingProvenance(BaseModel):
+    """
+    Snapshot of the engine, effective launch, model file and hardware
+    measured. Unknown identity fields are null and remain visible as
+    unknown; their absence never makes an untested engine unsupported.
+    Model identity is its local path, size and mtime, not a model hash.
+    Does not hold prompts, answers, credentials or raw client keys.
+
+    """
+
+    engine: str = Field(..., min_length=1)
+    engineBuild: str | None
+    binaryHash: str | None = Field(
+        ...,
+        description='sha256 of the running engine binary, when readable.',
+        pattern='^[0-9a-f]{64}$',
+    )
+    launchArgv: list[str] = Field(
+        ...,
+        description='Effective engine launch argv at measurement time, with credentials redacted.',
+    )
+    modelPath: str
+    modelSizeBytes: int | None = Field(..., ge=0)
+    modelModifiedAt: AwareDatetime | None
+    gpus: list[ServingGpu] = Field(
+        ...,
+        description='GPUs used by the runtime, in stable device order; empty for CPU-only.',
+    )
+    driver: str | None = Field(
+        ..., description='GPU driver version or versions, in stable device order.'
+    )
+    cpu: str | None
+    ramBytes: int | None = Field(..., ge=0)
+    agentCommit: str | None
+    gatewayCommit: str | None
+
+
+class ServingDrafting(BaseModel):
+    """
+    Drafting in effect during this run, for comparing on and off
+    records of the same model and machine. No automatic off pass.
+    Acceptance is an observation and is not part of provenanceKey;
+    drafting configuration is captured by the effective launch argv.
+
+    """
+
+    type: str | None = Field(
+        ..., description="Engine's drafting type, off when disabled, null when unknown."
+    )
+    model: str | None = Field(
+        ...,
+        description='Draft model path or identity; null when no separate draft model is used or it is unknown.',
+    )
+    acceptance: float | None = Field(
+        ...,
+        description='Accepted draft tokens divided by proposed draft tokens; null when not observed.',
+        ge=0.0,
+        le=1.0,
+    )
+
+
 class MeasurementPreflight(BaseModel):
     """
     What starting a benchmark or a profile build with this request
@@ -883,6 +1121,76 @@ class PreparationVisionMode(StrEnum):
     gpu = 'gpu'
 
 
+class SpeedProjectionMode(StrEnum):
+    """
+    Changes the model's answers when on; experimental and off by default.
+    Strata's bundled refusal-direction projection reduces refusals and
+    also changes ordinary predictions. Upstream measures a 0.2-0.4%
+    cost per token on identical text, not a guaranteed speed-up.
+    Preparation uses --experimental-speed-projection on|off. Launch
+    applies the prepared control vector and reports the applied mode;
+    a requested mode alone is not evidence that it took effect.
+
+    """
+
+    off = 'off'
+    on = 'on'
+
+
+class StrataGpuSelectionItem(RootModel[int]):
+    root: int = Field(..., ge=0)
+
+
+class StrataLayerSplit(RootModel[str]):
+    root: str = Field(
+        ...,
+        description="auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+        min_length=1,
+    )
+
+
+class PreparationIntent(BaseModel):
+    """
+    Prepare the model for an engine before running it. Asked for,
+    never implied: Run without it picks an engine that runs the model
+    as it is. This is the source schema for the durable run protocol's
+    PreparationIntent; regenerate openapi/run-operations.json from the
+    Library after adopting this schema, rather than editing its copy.
+    The Strata choices use the same keys as that engine's profile
+    flags. Unsupported or ignored choices must name the observed
+    cause; no requested value may be reported as applied by default.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    engine: EngineKind
+    contextSize: int | None = Field(
+        None,
+        description="The context to prepare for. Absent uses the engine's recommendation for the node.",
+        ge=1,
+    )
+    vision: PreparationVisionMode | None = Field(
+        'off',
+        description='Image encoder placement. Off preserves text-only preparation.',
+    )
+    speedProjection: SpeedProjectionMode | None = Field(
+        'off',
+        description='Changes answers when on; experimental. Off preserves stock model behavior.',
+    )
+    gpus: list[StrataGpuSelectionItem] | None = Field(
+        None,
+        description="Ordered card ordinals from this node's ComputeDevice inventory;\nthe main card is first. The node validates each selected card\nagainst its current inventory and resolves process visibility at\nevery preparation and launch. Two or more cards share the model.\nOmission in a preparation keeps the existing automatic single-card\nselection. Omission in a profile preserves the prepared selection.\nAn empty list is not automatic selection.\nThis inventory has kind and index, not row 43's stable UUIDs;\nordinals are local to the selected node and must not be treated\nas stable identities or silently replaced by another card.\n",
+        min_length=1,
+    )
+    layerSplit: str | None = Field(
+        'auto',
+        description="auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+        min_length=1,
+    )
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -912,6 +1220,10 @@ class ModelPreparation(BaseModel):
     visionModes: list[PreparationVisionMode] | None = Field(
         None,
         description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
+    )
+    speedProjectionModes: list[SpeedProjectionMode] | None = Field(
+        None,
+        description="Changes answers when on; experimental. Choices this model's\npreparation offers for the bundled projection. Absent means\nno projection choice is advertised, not a claim that an\nuntested model cannot run. Omitting the choice in a run\nintent selects off. An upstream fallback must be reported\nas the mode that actually took effect, with its cause.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -1755,6 +2067,19 @@ class RevokedSession(BaseModel):
     exp: int = Field(..., description="The session's own `exp`, unix seconds.")
 
 
+class TokenEpochs(BaseModel):
+    """
+    Since when every token the control root signs carries `ep`
+    (row 4): the time in unix seconds, and the epoch it was then.
+    Absent from a root older than row 4, and every root token
+    without `ep` is then accepted as before.
+
+    """
+
+    since: int
+    epoch: int
+
+
 class TrustBundle(BaseModel):
     """
     The set of keys every verifier in the install trusts, and what
@@ -1794,7 +2119,20 @@ class TrustBundle(BaseModel):
        the issuer's own, 14 days for a session, 10 minutes for an
        exchanged token, and 400 days for a client key;
     5. refuses a session that is listed in `revokedSessions`, or
-       whose `aud` names a node no longer in the bundle.
+       whose `aud` names a node no longer in the bundle;
+    6. refuses a token the control root signed, other than a client
+       key, whose `ep` claim (the epoch of the root that minted it,
+       row 4) is below this bundle's `epoch`: "This command came from a
+       root this machine no longer follows (epoch 2; it follows epoch
+       3)." A promotion keeps the root's token key, so this is what
+       stops the root it replaced. A root token without `ep` (from a
+       root older than row 4) is refused once `tokenEpochs` says roots
+       mark theirs, if it was minted after `tokenEpochs.since` or the
+       epoch has risen past `tokenEpochs.epoch`.
+
+    **Bundles are ordered by epoch first** (row 4): a higher `epoch`
+    replaces whatever its `version`, a lower one never does, and at
+    one epoch the version decides.
 
     No hard expiry, deliberately. A bundle that stopped verifying
     when the root was dead would end the data path's guarantee to
@@ -1805,11 +2143,15 @@ class TrustBundle(BaseModel):
 
     version: int = Field(
         ...,
-        description="The control root's replicated log index when this bundle was\nbuilt, so it only grows, including across a promotion. A\nverifier refuses a lower version than it holds (rollback)\nand replaces its bundle with an equal or higher one.\n",
+        description="The control root's replicated log index when this bundle was\nbuilt. At one epoch a verifier refuses a lower version than it\nholds (rollback) and replaces its bundle with an equal or\nhigher one. A root promoted from a copy that was behind may\nnumber below the root it replaced, so a higher `epoch` wins\nwhatever the version.\n",
         ge=0,
     )
     epoch: int = Field(
         ..., description="The control root's epoch; an agent refuses a lower one.", ge=0
+    )
+    tokenEpochs: TokenEpochs | None = Field(
+        None,
+        description='Since when every token the control root signs carries `ep`\n(row 4): the time in unix seconds, and the epoch it was then.\nAbsent from a root older than row 4, and every root token\nwithout `ep` is then accepted as before.\n',
     )
     iat: int = Field(
         ...,
@@ -2084,6 +2426,13 @@ class ComponentStatus(StrEnum):
     exited = 'exited'
     crashed = 'crashed'
     unreachable = 'unreachable'
+
+
+class SignedMachineList(BaseModel):
+    jws: str = Field(
+        ...,
+        description='A JWS compact serialization with header\n`{"alg": "EdDSA", "typ": "ep-machines+jwt"}` whose payload is a\n`MachineList` (`control.yaml`), signed with the root identity\nthis node pinned at enrolment.\n',
+    )
 
 
 class LocalStandby(BaseModel):
@@ -3453,6 +3802,35 @@ class LastDevice(RootModel[str]):
     root: str = Field(..., min_length=1)
 
 
+class StrataEffectiveLaunch(BaseModel):
+    """
+    Strata's applied launch settings, read from the launch configuration
+    that was successfully spawned, not the current profile or prepared
+    file, which may have changed since. Unknown values leave this record
+    absent; they never acquire an intent default. A stopped runtime may
+    retain the last successful launch, labelled as such. This records
+    launch settings, not a claim of successful inference or measured speed.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    speedProjection: SpeedProjectionMode = Field(
+        ...,
+        description='Changes answers when on; experimental. Applied mode from the\nloaded control vector and launch sampling default together.\nA vector absent or disabled in that configuration means off.\n',
+    )
+    gpus: list[StrataGpuSelectionItem] = Field(
+        ...,
+        description='Selected node inventory ordinals, main first, resolved from the applied launch and its visibility mapping.',
+        min_length=1,
+    )
+    layerSplit: StrataLayerSplit | None = Field(
+        ...,
+        description='null with one card. Otherwise the applied boundaries or auto\nwhen upstream chooses them. auto reports the selected mode,\nnot measured boundaries or an assumed equal split.\n',
+    )
+
+
 class Change(RootModel[str]):
     root: str = Field(..., min_length=1)
 
@@ -4402,6 +4780,115 @@ class App(BaseModel):
         None,
         description='Something the operator should know that is not an error — the\ngateway could not be found, say — in words they can act on.\n',
     )
+
+
+class ServingMeasurementRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    runtime: str = Field(
+        ...,
+        description='The name of an existing runtime on this node; it must be ready.',
+        min_length=1,
+    )
+    workload: ServingWorkload | None = 'agents'
+    maxPeople: int | None = Field(
+        None,
+        description='Defaults to min(256, 4 * parallelSlots) of the running runtime.',
+        ge=1,
+        le=256,
+    )
+    windowSeconds: int | None = Field(
+        None,
+        description="Per level. Defaults to 300 for agents and chat, 120 for streams.\nWith `full: true` the effective window is 3,600 seconds, even\nwhen a different window was supplied. Requests still in flight\nat the window's end finish and count, adding drain time.\n",
+        ge=10,
+        le=3600,
+    )
+    full: bool | None = Field(False, description='Use a one-hour window at each level.')
+    seed: int | None = Field(
+        0,
+        description='Seed for workload sampling; does not promise identical model output.',
+    )
+    ttftThresholdMs: float | None = Field(
+        1000,
+        description="The owner's first-token ceiling, in milliseconds; editable on\nthe run page. Troy's MEASURE-KNEE-2 call sets the default to\nfirst content after more than one second.\n",
+        gt=0.0,
+    )
+    speedRatioThreshold: float | None = Field(
+        0.6666666666666666,
+        description="Minimum per-person median speed as a fraction of level 1's;\neditable on the run page. Default is two thirds (Troy's\nMEASURE-KNEE-2 call). A speed below this crosses the knee.\n",
+        gt=0.0,
+        le=1.0,
+    )
+    stopReplicas: list[ServingRuntime] | None = Field(
+        [],
+        description='The other replicas the operator agreed to stop after seeing\nthe preflight, identified by node, runtime and model alias.\nOnly replicas of the measured alias may be listed, never the\nmeasured runtime. The job calls their agents to stop them,\nthen restarts exactly those it stopped when the run ends.\nAn unlisted ready replica is a 409, including one that became\nready after the preflight. Already stopped entries are not\nrestarted by this job.\n',
+        validate_default=True,
+    )
+
+
+class ServingMeasurementRestart(BaseModel):
+    node: str
+    runtime: str
+    state: MeasurementRestartState
+    detail: str | None = Field(
+        ...,
+        description='Observed cause of a refusal or failed restart; null when no explanation is needed.',
+    )
+
+
+class ServingMeasurement(BaseModel):
+    """
+    A serving measurement kept on the runtime's node for rows 11,
+    13, 14 and 69 and the speed nudge. Agent restart marks an unfinished
+    run failed and names that cause; it keeps partial levels and never
+    resumes load silently. Final records keep their state when cancel
+    is used only to revoke a key. Does not persist prompts or answers.
+
+    """
+
+    id: str
+    node: str
+    runtime: str
+    model: str = Field(..., description='The measured gateway model alias.')
+    state: BenchmarkState
+    request: ServingMeasurementRequest = Field(
+        ...,
+        description='The effective request, including resolved workload, maxPeople,\nwindowSeconds, full, seed, both knee thresholds and stopReplicas.\nReturned settings always describe the values in effect, including\nthe one-hour window when full overrides a supplied shorter one.\n',
+    )
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None
+    progress: float = Field(..., ge=0.0, le=1.0)
+    detail: str = Field(
+        ...,
+        description="One sentence of progress, or the observed cause of a failure, including the upstream's words.",
+    )
+    levels: list[ServingLevel]
+    knee: ServingKnee | None
+    provenance: ServingProvenance
+    provenanceKey: str = Field(
+        ...,
+        description="Lowercase sha256 of provenance as UTF-8 JSON with sorted object\nkeys, compact separators and unescaped Unicode. Array order is\npreserved. Includes null identity fields; excludes observations\nsuch as drafting acceptance and the request's workload seed.\n",
+        pattern='^[0-9a-f]{64}$',
+    )
+    current: bool = Field(
+        ...,
+        description="Recomputed on read; true only when the runtime's present provenance matches this record.",
+    )
+    staleBecause: list[str] = Field(
+        ...,
+        description='What changed since measurement, with old and new values; empty when current. A missing runtime is named.',
+    )
+    keyLive: bool = Field(
+        ...,
+        description='True until the control root confirms revocation or expiry; a failed revocation is named in detail.',
+    )
+    restarts: list[ServingMeasurementRestart]
+    drafting: ServingDrafting
+
+
+class ServingMeasurementList(BaseModel):
+    measurements: list[ServingMeasurement]
 
 
 class Component(BaseModel):
@@ -6196,7 +6683,7 @@ class Runtime(BaseModel):
     )
     localPathNote: str | None = Field(
         None,
-        description='Why this node is **not** opening a local copy, when it is\nnot and the operator asked for one: not enough free space to\nleave the configured headroom, the copy failed, the source\ncould not be read. Absent when the copy was used, and absent\nwhen copying is switched off — a node that was never asked\nhas nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
+        description='Why a requested local copy was skipped or used without\nchecking its source. A skipped copy names the observed cause:\nnot enough free space to leave the configured headroom, a\nfailed copy, or a source that could not be read.\n\nWhen the source\'s Library folder root on this machine raises\nan OSError or exceeds the 5 s check limit, a copy whose size\nmatches its saved source record may be used. The note starts\n"Started from this machine\'s copy" and names the folder root\nand the observed cause. It remains until the next start that\nchecks the source. A missing file in a readable folder does\nnot permit this fallback.\n\nAbsent when the source was checked and the copy was used,\nand absent when copying is switched off — a node that was\nnever asked has nothing to explain.\n\nOn the wire because a silently skipped copy is the failure\nmode of this whole feature: the model still serves, the\nlaunch still succeeds, and the only visible symptom is that\nit is four minutes slower than the operator expected.\n',
     )
     copyProgress: CopyProgress | None = None
     modelAlias: str | None = Field(
@@ -6255,6 +6742,10 @@ class Runtime(BaseModel):
         None, description='Version reported by the binary that is actually running.'
     )
     capabilities: RuntimeCapabilities | None = None
+    effectiveLaunch: StrataEffectiveLaunch | None = Field(
+        None,
+        description='Strata settings applied by the last successful launch, read\nfrom its private launch configuration. Absent before a\nlaunch or when unknown; never copied from saved flags.\n',
+    )
     chatTemplate: RuntimeChatTemplate | None = None
     lastRestart: AwareDatetime | None = None
     lastError: str | None = Field(
@@ -6352,7 +6843,16 @@ class NodeIdentity(BaseModel):
     controlUrl: AnyUrl | None = Field(
         None, description='The control root this node answers to.'
     )
+    controlUrlEpoch: int | None = Field(
+        None,
+        description='The epoch `controlUrl` came with (row 4): the epoch at\nenrolment, or of the promoted root this node moved to. A node\nmoves only for a signed machine list at a higher epoch. Set to\nthe epoch held when a node updated to row 4 first starts, so an\nupdate never moves a node. Absent until enrolled.\n',
+        ge=0,
+    )
     standby: LocalStandby | None = None
+    rootLocked: bool | None = Field(
+        None,
+        description="This machine runs the install's control root, and it is locked:\nnothing can be signed until the owner signs in with the\npassphrase (row 4). Home says so. Common after a restart under\n`prompt_on_startup`, and after a promoted copy restarts before\nany other machine heard of the promotion. Absent when this\nmachine runs no root, or its state is not known yet.\n",
+    )
     hostsControl: bool | None = Field(
         None,
         description="This agent supervises the install's active control root. The\nroot reads it from its probe of each node to know its own\nmachine, which can never be its standby\n(`docs/design/warm-standby.md`). A standby this agent runs does\nnot count.\n",

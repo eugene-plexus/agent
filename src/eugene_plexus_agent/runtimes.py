@@ -18,7 +18,7 @@ import contextlib
 import logging
 import shutil
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -45,6 +45,7 @@ from ._generated.models import (
     RuntimeSpeculation,
     RuntimeStatus,
     StopReason,
+    StrataEffectiveLaunch,
 )
 from .card_launch import CardLaunch, DeviceMemory, refit_on_cards_left, select_cards
 from .child_env import child_environment, reserved_override
@@ -176,6 +177,7 @@ class _RuntimePlanner:
         log: logging.Logger,
         get_config: ConfigGetter | None = None,
         inherited_rules: RulesProvider | None = None,
+        library_roots: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         self.spec = spec
         self._adapter = adapter
@@ -185,6 +187,7 @@ class _RuntimePlanner:
         # config (2026-09-14). This node's `pathMappings` are the
         # overrides and come first.
         self._inherited_rules = inherited_rules
+        self._library_roots = library_roots
         self.binary: DiscoveredBinary | None = None
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
         so the operator sees the build that is actually running rather than
@@ -319,8 +322,30 @@ class _RuntimePlanner:
             argv=argv,
             env=env,
             cwd=cwd,
+            launch_settings=(
+                self._strata_launch_settings(argv)
+                if self.spec.engine is EngineKind.strata
+                else None
+            ),
             on_spawn=self._record_cards,
         )
+
+    @staticmethod
+    def _strata_launch_settings(argv: list[str]) -> dict[str, object] | None:
+        from .engines.strata_settings import effective_launch
+
+        # Snapshot this private configuration now. The process records it only
+        # after a successful spawn; later profile/file edits cannot rewrite it.
+        try:
+            import json
+
+            config = Path(argv[argv.index("--config") + 1])
+            applied = effective_launch(json.loads(config.read_text(encoding="utf-8")))
+            return applied.model_dump(mode="json") if applied is not None else None
+        except (OSError, ValueError, IndexError) as exc:
+            raise SpawnPlanError(
+                f"Cannot read Strata's applied launch configuration: {exc}"
+            ) from exc
 
     async def plan_async(self) -> SpawnPlan:
         """The supervisor awaits this before every spawn, crash respawns included."""
@@ -387,7 +412,9 @@ class _RuntimePlanner:
     def _copy_settings(self) -> model_copies.CopySettings:
         if self._get_config is None:
             return model_copies.CopySettings(enabled=False, directory=None, min_free_bytes=0)
-        return model_copies.settings_from_config(self._get_config)
+        return model_copies.settings_from_config(
+            self._get_config, folder_roots=self._library_roots() if self._library_roots else ()
+        )
 
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
         """Let the engine's own adapter read the wreckage.
@@ -464,12 +491,14 @@ class RuntimeSupervisor:
         get_config: ConfigGetter | None = None,
         inherited_rules: RulesProvider | None = None,
         stop_memory: StopMemory | None = None,
+        library_roots: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
         # A person's Stop outlives the agent: before agent#11 every runtime
         # with `autoStart` came back at the next boot, so a model stopped to
         # free the GPU took it back after every update and reboot.
         self._stop_memory = stop_memory
+        self._library_roots = library_roots
         # Read live at plan time, so an operator who sets `vllmBinary` in
         # the UI gets the new path on the next spawn without restarting
         # the agent.
@@ -598,7 +627,12 @@ class RuntimeSupervisor:
         """Start supervising for real. Reached directly when there is no
         copy to make, and after the copy when there was one."""
         planner = _RuntimePlanner(
-            spec, adapter, self._log, self._get_config, inherited_rules=self._inherited_rules
+            spec,
+            adapter,
+            self._log,
+            self._get_config,
+            inherited_rules=self._inherited_rules,
+            library_roots=self._library_roots,
         )
         planner.before_start = self._check_cards
         planner.after_start = lambda launch: self.device_memory.record(spec, launch)
@@ -636,7 +670,9 @@ class RuntimeSupervisor:
         the next start with no restart."""
         if self._get_config is None:
             return model_copies.CopySettings(enabled=False, directory=None, min_free_bytes=0)
-        return model_copies.settings_from_config(self._get_config)
+        return model_copies.settings_from_config(
+            self._get_config, folder_roots=self._library_roots() if self._library_roots else ()
+        )
 
     def _copy_job_for(self, spec: RuntimeSpec) -> _CopyJob | None:
         """A copy to make before this runtime starts, or None.
@@ -654,8 +690,15 @@ class RuntimeSupervisor:
         if plan is None:
             self._copy_notes.pop(spec.name, None)
             return None
-        if model_copies.copy_is_current(plan):
-            self._copy_notes.pop(spec.name, None)
+        check = model_copies.check_copy(plan)
+        if check.usable:
+            if check.note:
+                self._copy_notes[spec.name] = check.note
+            else:
+                self._copy_notes.pop(spec.name, None)
+            return None
+        if check.refusal:
+            self._copy_notes[spec.name] = f"The copy {check.refusal}"
             return None
         try:
             size = model_copies.total_size(plan)
@@ -1057,7 +1100,12 @@ class RuntimeSupervisor:
             # otherwise there is nothing to explain, and a note on every
             # runtime would train the operator to ignore the one that
             # matters.
-            localPathNote=None if resolved.is_copy else self._copy_notes.get(name),
+            localPathNote=(
+                self._copy_notes.get(name)
+                if not resolved.is_copy
+                or self._copy_notes.get(name, "").startswith("Started from this machine's copy.")
+                else None
+            ),
             copyProgress=(
                 CopyProgress(
                     bytesCopied=job.state.bytes_copied,
@@ -1104,6 +1152,13 @@ class RuntimeSupervisor:
             argv=sp.last_argv if sp is not None else None,
             pid=sp.pid if sp is not None else None,
             engineVersion=engine_version,
+            effectiveLaunch=(
+                StrataEffectiveLaunch.model_validate(sp.last_launch_settings)
+                if spec.engine is EngineKind.strata
+                and sp is not None
+                and getattr(sp, "last_launch_settings", None) is not None
+                else None
+            ),
             capabilities=capabilities,
             chatTemplate=(
                 chat_templates.confirmed(
