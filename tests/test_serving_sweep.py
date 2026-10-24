@@ -182,7 +182,7 @@ async def test_the_same_runtime_on_another_machine_stops_the_run(metadata, count
         sweep = Sweep(client, "http://fixture", "secret", "r", "tower", "m", 8192, random.Random(0))
         with pytest.raises(ValueError, match=r"studio.*tower.*run stopped"):
             if counted:
-                await sweep.level(1, 0.01, "streams")
+                await sweep.level(1, 5.0, "streams")
             else:
                 await sweep.turn(Session(random.Random(0), "warmup", "agents", 8192), counted=False)
     assert sweep.fatal is not None
@@ -203,7 +203,7 @@ async def test_an_answer_with_missing_provenance_stops_the_run(missing):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
         sweep = Sweep(client, "http://fixture", "secret", "r", "tower", "m", 8192, random.Random(0))
         with pytest.raises(ValueError, match=r"did not report.*run stopped"):
-            await sweep.level(1, 0.01, "streams")
+            await sweep.level(1, 5.0, "streams")
     assert sweep.fatal is not None
     assert sweep.partial.errors == 1
 
