@@ -680,6 +680,9 @@ def move_control_behind(state: Any, machine_port: int) -> int | None:
     taken = {
         port for e in state.list_topology_entries() if (port := _port_of(str(e.url))) is not None
     }
+    # Every declared port is passed: this runs before anything is started, so
+    # a port another entry declares (the store's 8084, row 53) is still free
+    # to the operating system.
     port = ports.first_free(machine_port + 1, reserved=RESERVED_PORTS | taken | {machine_port})
     state.update_topology_entry(
         entry.name, entry.model_copy(update={"url": f"http://127.0.0.1:{port}"})

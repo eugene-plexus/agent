@@ -88,7 +88,7 @@ _HIT_TTL_SECONDS = 30.0
 # from a snapshot taken while it was down.
 _MISS_TTL_SECONDS = 5.0
 
-_SINGLETON_KINDS = ("gateway", "library", "control")
+_SINGLETON_KINDS = ("gateway", "library", "control", "store")
 
 
 class InstallLookupError(Exception):

@@ -68,6 +68,7 @@ from .routes import log_ingress as log_ingress_routes
 from .routes import logs as logs_routes
 from .routes import node as node_routes
 from .routes import oidc_forward as oidc_forward_routes
+from .routes import people as people_routes
 from .routes import profile_builds as profile_build_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
@@ -474,6 +475,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "Edit or add to it from the UI, or set "
                 "EUGENE_PLEXUS_AGENT_DEFAULT_TOPOLOGY=0 on a node that will enroll.",
                 ", ".join(declared),
+            )
+    # Row 53: every install has a store, on the root. A root set up before
+    # it existed gets one here, once; one the owner removed or moved stays
+    # where they put it (`default_topology.add_store`).
+    if not settings.safe_mode and settings.default_topology:
+        added = default_topology.add_store(state)
+        if added:
+            log.info(
+                "declared the store on this root (%s): it keeps what apps upload through the "
+                "gateway's /v1/files. Settings -> Store changes what it keeps.",
+                added,
             )
 
     # The machine port (LT1): on the root, control leaves 8083 first, so the
@@ -1205,6 +1217,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(log_ingress_routes.router)
     # Signing in with Eugene (C2): /oidc/* forwards to the control root.
     app.include_router(oidc_forward_routes.router)
+    # Row 53: this machine's store asks which people the root still has.
+    app.include_router(people_routes.router)
     # A Job Site: the link page at the machine (J27, J37), and the root's
     # removal of a link (§3.2).
     app.include_router(site_link_routes.router)

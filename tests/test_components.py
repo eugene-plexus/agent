@@ -234,3 +234,41 @@ def test_unauthenticated_read_still_rejected(authed_client: TestClient) -> None:
     a request with no token at all is still 401 on the read endpoints."""
     authed_client.headers.pop("Authorization", None)
     assert authed_client.get("/v1/components").status_code == 401
+
+
+def test_a_root_install_starts_the_store_by_default(tmp_path, monkeypatch) -> None:
+    """Row 53: a fresh root declares the store beside control, gateway and
+    library, on its own port, and plans it the way it plans the gateway: its
+    own module and prefix, and the auth wiring every child gets."""
+    import logging
+    from pathlib import Path
+
+    from eugene_plexus_agent import default_topology
+    from eugene_plexus_agent._generated.models import ComponentKind
+    from eugene_plexus_agent.app import create_app
+    from eugene_plexus_agent.settings import Settings
+    from eugene_plexus_agent.supervisor import _ComponentPlanner
+
+    from .conftest import TEST_PASSPHRASE, StubSupervisor
+
+    monkeypatch.setattr(default_topology, "is_installed", lambda module: True)
+    monkeypatch.setattr(default_topology.ports, "first_free", lambda port, **_: port)
+    app = create_app(Settings(config_file=Path(tmp_path) / "agent.yaml", default_topology=True))
+    app.state.supervisor = StubSupervisor()
+    with TestClient(app) as client:
+        login = client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
+        client.headers["Authorization"] = f"Bearer {login.json()['sessionToken']}"
+        listed = {c["name"]: c for c in client.get("/v1/components").json()["components"]}
+        assert listed["store"]["kind"] == "store"
+        assert listed["store"]["url"].rstrip("/").endswith(":8084")
+        entry = app.state.agent_state.get_topology_entry("store")
+        assert entry is not None and entry.kind == ComponentKind.store
+        plan = _ComponentPlanner(
+            entry, logging.getLogger("test"), auth_state=app.state.auth_state
+        ).plan()
+        assert plan is not None
+        assert plan.argv[-1] == "eugene_plexus_store"
+        assert plan.env["EUGENE_PLEXUS_STORE_BIND_PORT"] == "8084"
+        assert plan.env["EUGENE_PLEXUS_STORE_CONFIG_FILE"].endswith("store.yaml")
+        assert plan.env["EUGENE_PLEXUS_STORE_SERVICE_TOKEN"]
+        assert "EUGENE_PLEXUS_STORE_MASTER_KEY" not in plan.env
