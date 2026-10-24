@@ -32,10 +32,15 @@ What it decides (call R8-EXEC-TRUST, Choice 3):
 - `refused`: a group or others can change an item (mode bits; on macOS an
   ACL entry that lets someone else write, append, delete, add or change
   it, or a volume that ignores ownership), two or more other accounts own
-  items, a script lets PATH choose its interpreter (`env`, under any name,
-  or a relative path), an ACL entry is not understood, or something cannot
-  be checked or read (a script whose first line cannot be read, an
-  environment's settings). It never runs, and an approval of it is dropped.
+  items, a script lets PATH choose its interpreter (`env` under any name,
+  a link, a copy or a hard link of it; a relative path; a bare program name
+  after the interpreter), an ACL entry is not understood, or something
+  cannot be checked or read (a script whose first line cannot be read, an
+  environment's settings; any error but "no such file" is not absence).
+  It never runs, and every approval its refusal touches is dropped.
+
+An engine Eugene's own account starts gets a PATH of checked folders only
+(`search_path`), never the one the agent inherited.
 
 The walk returns the path to execute: absolute, every folder in it
 resolved, and its last name kept when that name is a link (a venv's
@@ -233,6 +238,29 @@ def _sha256(path: PurePosixPath | Path) -> str:
         return digest.hexdigest()
     finally:
         os.close(fd)
+
+
+#: Where a system keeps `env`: one followed link apart on usr-merged Linux.
+_ENV_PATHS = ("/usr/bin/env", "/bin/env")
+
+
+def _system_env() -> list[tuple[int, int, int, str]]:
+    """The system's `env`, by what identifies it whatever it is called:
+    (device, inode, size, SHA-256) of each file the usual paths reach."""
+    found: list[tuple[int, int, int, str]] = []
+    for spelled in _ENV_PATHS:
+        try:
+            info = os.stat(spelled)
+        except OSError:
+            continue
+        if any((info.st_dev, info.st_ino) == (dev, ino) for dev, ino, _, _ in found):
+            continue
+        try:
+            digest = _sha256(PurePosixPath(spelled))
+        except OSError:
+            digest = ""
+        found.append((info.st_dev, info.st_ino, info.st_size, digest))
+    return found
 
 
 def _platform() -> str:
@@ -561,6 +589,18 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
             fix="shebang",
         )
         return []
+    # A bare name after the interpreter is a program PATH would find,
+    # whatever the interpreter is called (a copy of `env` named `run`), so
+    # it is refused; options and absolute paths are not (8c re-review).
+    named = next((word for word in words[1:] if not word.startswith("-")), None)
+    if named is not None and not named.startswith("/"):
+        w.find(
+            "unknown",
+            path,
+            f"{role} names a program by a bare name after its interpreter ({named}), which "
+            "PATH would find",
+            fix="shebang",
+        )
     found = [words[0]]
     if len(lines) > 1:
         trampoline = re.match(r"""^'''exec' "(.+?)" "\$0" "\$@"$""", lines[1].strip())
@@ -582,18 +622,41 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
     return absolute
 
 
-def _exists(path: PurePosixPath) -> bool:
+def _exists(path: PurePosixPath, w: _Walk | None = None, role: str = "it") -> bool:
+    """Something is at PATH (a link counts). Only "no such file" and "not a
+    folder" mean absent (8c re-review): any other error is not known to be
+    absence, so on a walk it is a finding (refused, naming the cause) and
+    the branch stops; asked alone, it counts as present, so what follows
+    checks it and fails closed."""
     try:
         _lstat(path)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as e:
+        if w is None:
+            return True
+        w.find(
+            "unknown", path, f"{role} cannot be checked at {path} ({e.strerror or e})", fix="check"
+        )
         return False
     return True
 
 
 def present(path: str) -> bool:
     """Something is at PATH, a POSIX path (a link counts), as the check
-    reads the disk."""
+    reads the disk; an error other than absence counts as present."""
     return _exists(PurePosixPath(path))
+
+
+def _is_system_env(path: PurePosixPath, info: os.stat_result) -> bool:
+    """PATH is the system's `env` under another name: the same file (its
+    device and inode, a hard link) or the same bytes (a copy)."""
+    for dev, ino, size, digest in _system_env():
+        if (info.st_dev, info.st_ino) == (dev, ino):
+            return True
+        if digest and getattr(info, "st_size", None) == size and _sha256(path) == digest:
+            return True
+    return False
 
 
 def _environment(w: _Walk, root: PurePosixPath) -> None:
@@ -618,7 +681,7 @@ def _environment(w: _Walk, root: PurePosixPath) -> None:
             continue
         for name in names:
             packages = root / lib / name / "site-packages"
-            if name.startswith("python") and _exists(packages):
+            if name.startswith("python") and _exists(packages, w, role):
                 _walk(w, str(packages), f"its packages {packages}")
     try:
         text = _head(root / "pyvenv.cfg").decode("utf-8", errors="replace")
@@ -633,7 +696,7 @@ def _environment(w: _Walk, root: PurePosixPath) -> None:
     home = re.search(r"(?m)^home\s*=\s*(.+?)\s*$", text)
     if home:
         base = _walk(w, home.group(1), f"the Python it was made from ({home.group(1)})")
-        if base is not None and _exists(base[0].parent / "lib"):
+        if base is not None and _exists(base[0].parent / "lib", w, role):
             lib_dir = base[0].parent / "lib"
             _walk(w, str(lib_dir), f"that Python's standard library ({lib_dir})")
 
@@ -655,6 +718,20 @@ def _program(w: _Walk, given: str, depth: int, role: str) -> PurePosixPath | Non
             fix="shebang" if depth else "check",
         )
         return None
+    try:
+        system_env = _is_system_env(real, info)
+    except OSError as e:
+        w.find("unknown", resolved, f"{role} cannot be read ({e.strerror or e})", fix="check")
+        return None
+    if system_env:
+        # A copy or a hard link of `env` (8c re-review).
+        w.find(
+            "unknown",
+            resolved,
+            f"{role} is the system's env under another name, which lets PATH choose the program",
+            fix="shebang" if depth else "check",
+        )
+        return None
     for interpreter in _interpreters(w, resolved, role):
         if depth >= _INTERPRETER_DEPTH:
             w.find("unknown", resolved, f"{role} goes through too many interpreters", fix="check")
@@ -663,7 +740,7 @@ def _program(w: _Walk, given: str, depth: int, role: str) -> PurePosixPath | Non
     # The environment by the path as spelled (a venv's `bin/python` is a
     # link out of it) and by the path it resolves to.
     for program in (PurePosixPath(_absolute(given)), resolved):
-        if _exists(program.parent.parent / "pyvenv.cfg"):
+        if _exists(program.parent.parent / "pyvenv.cfg", w, role):
             _environment(w, program.parent.parent)
     return resolved
 
@@ -733,6 +810,28 @@ def assess_path(path: Path | str) -> Verdict:
     w = _Walk(uid)
     walked = _walk(w, given, "it")
     return _decide(w, given, walked[0] if walked else None, hashed=False)
+
+
+#: The folders a program Eugene's own account starts may find programs in,
+#: before each is checked (sudo's `secure_path`).
+_SYSTEM_PATH = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def search_path(configured: str | None = None) -> str | None:
+    """PATH for an engine Eugene's own account starts, never the one it
+    inherited (8c re-review): CONFIGURED (a runtime's own `PATH`) and then
+    the system's folders, each kept only when the check finds it `ok` (root
+    or Eugene's account alone can change it). Outside Eugene's own account,
+    None: the process keeps the PATH it was given."""
+    if not own_account():
+        return None
+    kept: list[str] = []
+    for folder in [*(configured.split(":") if configured else []), *_SYSTEM_PATH]:
+        if not folder.startswith("/") or folder in kept:
+            continue
+        if assess_path(folder).kind is Kind.ok:
+            kept.append(folder)
+    return ":".join(kept)
 
 
 def runs(verdict: Verdict) -> bool:

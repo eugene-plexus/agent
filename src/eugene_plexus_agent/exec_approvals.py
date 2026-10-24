@@ -57,6 +57,10 @@ FILE_NAME = "exec-approvals.json"
 
 _folder: Path | None = None
 _lock = threading.RLock()
+#: Approvals a check dropped that the file still holds, because writing it
+#: failed: not honoured meanwhile, and taken out at the next write that
+#: succeeds (8c re-review: a failed deletion fails closed).
+_revoked: set[str] = set()
 
 
 class NotApprovable(Exception):
@@ -68,6 +72,7 @@ def configure(folder: Path | None) -> None:
     none (and approves nothing)."""
     global _folder
     _folder = folder
+    _revoked.clear()
 
 
 def _file() -> Path | None:
@@ -104,7 +109,8 @@ def _read() -> list[ExecApproval]:
         log.warning("approved programs could not be read, so none runs: %s", e)
         return []
     try:
-        return list(ExecApprovalList.model_validate_json(raw).approvals)
+        approvals = ExecApprovalList.model_validate_json(raw).approvals
+        return [a for a in approvals if a.id not in _revoked]
     except ValidationError as e:
         log.warning("%s is not a list of approvals, so none runs: %s", path, e)
         return []
@@ -117,8 +123,39 @@ def _write(approvals: list[ExecApproval]) -> None:
     why = _kept_safe(path)
     if why is not None:
         raise NotApprovable(f"No approval is kept, because others could change it: {why}")
-    body = ExecApprovalList(approvals=approvals).model_dump_json(indent=2) + "\n"
+    kept = [a for a in approvals if a.id not in _revoked]
+    body = ExecApprovalList(approvals=kept).model_dump_json(indent=2) + "\n"
     write_private(path, body)
+    _revoked.clear()
+
+
+def _drop(dropped: list[ExecApproval], approvals: list[ExecApproval], why: str) -> None:
+    """Take DROPPED out of APPROVALS: in memory at once, so none of them is
+    honoured again whatever the write does, then in the file."""
+    if not dropped:
+        return
+    for approval in dropped:
+        log.warning("the approval to run %s lapsed (%s); it asks again", approval.path, why)
+    _revoked.update(a.id for a in dropped)
+    try:
+        _write([a for a in approvals if a.id not in _revoked])
+    except (OSError, NotApprovable) as e:
+        log.warning(
+            "the lapsed approvals could not be taken out of the file, so they stay refused "
+            "in memory until a write succeeds: %s",
+            e,
+        )
+
+
+def _flush() -> None:
+    """Write the file once more when an earlier write failed to take a
+    dropped approval out of it."""
+    if not _revoked:
+        return
+    try:
+        _write(_read())
+    except (OSError, NotApprovable) as e:
+        log.debug("the lapsed approvals are still in the file: %s", e)
 
 
 def _key(verdict: exec_trust.Verdict) -> str:
@@ -149,6 +186,7 @@ def holds(verdict: exec_trust.Verdict) -> bool:
     if verdict.kind is not exec_trust.Kind.needs_approval or verdict.program is None:
         return False
     with _lock:
+        _flush()
         approvals = _read()
         match = next((a for a in approvals if a.path == _key(verdict)), None)
         if match is None:
@@ -156,28 +194,26 @@ def holds(verdict: exec_trust.Verdict) -> bool:
         why = _lapsed(match, verdict)
         if why is None:
             return True
-        log.warning("the approval to run %s lapsed (%s); it asks again", match.path, why)
-        try:
-            _write([a for a in approvals if a.id != match.id])
-        except (OSError, NotApprovable) as e:
-            log.warning("the lapsed approval of %s could not be removed: %s", match.path, e)
+        _drop([match], approvals, why)
         return False
 
 
 def forget(verdict: exec_trust.Verdict) -> None:
-    """Drop any approval of a program the check refused now: putting back
-    what made it refused does not bring the approval back (8c review)."""
-    key = _key(verdict)
+    """Drop every approval a refusal touches: the program's own (by the
+    path it was looked up by), and every approval whose walked chain goes
+    through the refused program or through what made it refused (a folder
+    others can change, an item that cannot be checked). Putting things back
+    does not bring them back (8c review, re-review)."""
+    touched = {_key(verdict)}
+    if verdict.program is not None:
+        touched.add(verdict.program)
+    touched.update(f.path for f in verdict.findings if f.problem != "owner")
     with _lock:
         approvals = _read()
-        kept = [a for a in approvals if a.path != key]
-        if len(kept) == len(approvals):
-            return
-        log.warning("the approval to run %s lapsed (it is refused now); it asks again", key)
-        try:
-            _write(kept)
-        except (OSError, NotApprovable) as e:
-            log.warning("the lapsed approval of %s could not be removed: %s", key, e)
+        dropped = [
+            a for a in approvals if a.path in touched or any(c.path in touched for c in a.chain)
+        ]
+        _drop(dropped, approvals, f"{_key(verdict)} is refused now")
 
 
 def approve(path: str, sha256: str, *, by: str | None) -> ExecApproval:
@@ -222,6 +258,7 @@ def approve(path: str, sha256: str, *, by: str | None) -> ExecApproval:
 
 def listed() -> list[ExecApproval]:
     with _lock:
+        _flush()
         return _read()
 
 

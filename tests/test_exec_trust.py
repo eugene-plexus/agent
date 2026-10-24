@@ -45,6 +45,8 @@ class Disk:
         self.noowners: set[str] = set()
         self.unreadable: set[str] = set()
         self.unlistable: set[str] = set()
+        #: Paths whose `lstat` fails with an I/O error, not absence.
+        self.broken: set[str] = set()
         self.hashed: list[str] = []
         self.dir("/")
 
@@ -80,6 +82,7 @@ class Disk:
         content: bytes = b"\x7fELF",
         acl: list[str] | None = None,
         gid: int = 0,
+        ino: int | None = None,
     ) -> Disk:
         self._parents(path)
         self.nodes[_key(path)] = {
@@ -89,6 +92,7 @@ class Disk:
             "mode": mode,
             "content": content,
             "acl": acl or [],
+            "ino": ino,
         }
         return self
 
@@ -106,6 +110,8 @@ class Disk:
     # --- what exec_trust reads ---
 
     def lstat(self, path: Any) -> Any:
+        if _key(path) in self.broken:
+            raise OSError(5, "Input/output error")
         node = self.nodes.get(_key(path))
         if node is None:
             raise FileNotFoundError(2, "No such file or directory")
@@ -114,7 +120,8 @@ class Disk:
             st_gid=node.get("gid", 0),
             st_mode=node["kind"] | node["mode"],
             st_dev=1,
-            st_ino=hash(_key(path)),
+            st_ino=node.get("ino") or hash(_key(path)),
+            st_size=len(node.get("content", b"")),
             st_ctime_ns=0,
         )
 
@@ -139,6 +146,14 @@ class Disk:
         if key in self.unreadable:
             raise PermissionError(13, "Permission denied")
         return bytes(node["content"])
+
+    def system_env(self) -> list[tuple[int, int, int, str]]:
+        """The system's `env`, as `exec_trust._system_env` reads it."""
+        if "/usr/bin/env" not in self.nodes:
+            return []
+        info = self.lstat("/usr/bin/env")
+        content = bytes(self.nodes["/usr/bin/env"]["content"])
+        return [(info.st_dev, info.st_ino, info.st_size, hashlib.sha256(content).hexdigest())]
 
     def sha256(self, path: Any) -> str:
         self.hashed.append(_key(path))
@@ -182,6 +197,7 @@ def disk(monkeypatch: pytest.MonkeyPatch) -> Disk:
     monkeypatch.setattr(exec_trust, "_group_name", lambda gid: GROUPS.get(gid))
     monkeypatch.setattr(exec_trust, "_account_home", lambda uid: HOME)
     monkeypatch.setattr(exec_trust, "_sha256", d.sha256)
+    monkeypatch.setattr(exec_trust, "_system_env", d.system_env)
     monkeypatch.setattr(exec_trust, "_platform", lambda: "linux")
     monkeypatch.setattr(exec_trust, "_cwd", lambda: "/usr/local/eugene-plexus")
     as_eugene(monkeypatch)
@@ -419,21 +435,71 @@ def test_uv_s_exec_line_naming_a_relative_python_is_refused(disk: Disk) -> None:
     refused("/usr/local/bin/vllm", "names its interpreter by a relative path (python3)")
 
 
+ENV = b"\xcf\xfa\xed\xfe the system's env"
+
+
 def test_an_interpreter_that_is_env_under_another_name_is_refused(disk: Disk) -> None:
-    """`#!/usr/local/bin/run python3`, with `run` a link to `env`: PATH
-    chooses the program all the same (8c review, 3)."""
-    disk.file("/usr/bin/env")
+    """`#!/usr/local/bin/run`, with `run` a link to `env`: PATH chooses the
+    program all the same (8c review, 3)."""
+    disk.file("/usr/bin/env", content=ENV)
     disk.link("/usr/local/bin/run", "/usr/bin/env")
-    disk.file("/usr/local/bin/vllm", content=b"#!/usr/local/bin/run python3\nimport vllm\n")
+    disk.file("/usr/local/bin/vllm", content=b"#!/usr/local/bin/run\nimport vllm\n")
     assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused
     refused("/usr/local/bin/vllm", "is env, which lets PATH choose the program")
 
 
 def test_a_program_that_is_env_under_another_name_is_refused(disk: Disk) -> None:
-    disk.file("/usr/bin/env")
+    disk.file("/usr/bin/env", content=ENV)
     disk.link("/usr/local/bin/llama-server", "/usr/bin/env")
     assert exec_trust.assess("/usr/local/bin/llama-server").kind is exec_trust.Kind.refused
     refused("/usr/local/bin/llama-server", "is env, which lets PATH choose the program")
+
+
+def test_a_copy_of_env_under_another_name_is_refused(disk: Disk) -> None:
+    """Root's copy of `/usr/bin/env` at `/usr/local/bin/run`: same bytes,
+    another name and file (8c re-review, 2)."""
+    disk.file("/usr/bin/env", content=ENV)
+    disk.file("/usr/local/bin/run", content=ENV)
+    disk.file("/usr/local/bin/vllm", content=b"#!/usr/local/bin/run\nimport vllm\n")
+    assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/vllm", "is the system's env under another name")
+    assert exec_trust.assess("/usr/local/bin/run").kind is exec_trust.Kind.refused
+
+
+def test_a_hard_link_to_env_is_refused(disk: Disk) -> None:
+    """The same file as `/usr/bin/env` by another name (its device and
+    inode), whatever its bytes are taken to be."""
+    disk.file("/usr/bin/env", content=ENV, ino=4242)
+    disk.file("/usr/local/bin/llama-server", content=b"\x7fELF not the same bytes", ino=4242)
+    assert exec_trust.assess("/usr/local/bin/llama-server").kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/llama-server", "is the system's env under another name")
+
+
+def test_a_shebang_naming_a_bare_program_after_its_interpreter_is_refused(disk: Disk) -> None:
+    """`#!/usr/local/bin/run python3`: whatever `run` is, a bare name after
+    it is a program PATH would find (8c re-review, 2)."""
+    disk.file("/usr/local/bin/run")
+    disk.file("/usr/local/bin/vllm", content=b"#!/usr/local/bin/run -S python3 -u\nimport vllm\n")
+    assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/vllm", "names a program by a bare name after its interpreter (python3)")
+
+
+def test_options_after_an_interpreter_are_not_a_program_name(disk: Disk) -> None:
+    disk.file("/usr/bin/python3")
+    disk.file("/usr/local/bin/vllm", content=b"#!/usr/bin/python3 -I -u\nimport vllm\n")
+    assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.ok
+
+
+def test_an_environment_whose_settings_cannot_be_checked_is_refused(disk: Disk) -> None:
+    """An I/O error is not absence: `pyvenv.cfg` that cannot be looked at
+    does not skip the environment's check, so a person's packages there
+    are not run unasked (8c re-review, 3)."""
+    disk.dir("/opt/py").dir("/opt/py/bin").file("/opt/py/bin/python3.12").dir("/opt/py/lib")
+    _venv(disk, "/opt/venv", home="/opt/py/bin", site_uid=502)
+    assert exec_trust.assess("/opt/venv/bin/vllm").kind is exec_trust.Kind.needs_approval
+    disk.broken.add("/opt/venv/pyvenv.cfg")
+    assert exec_trust.assess("/opt/venv/bin/vllm").kind is exec_trust.Kind.refused
+    refused("/opt/venv/bin/vllm", "cannot be checked at /opt/venv/pyvenv.cfg (Input/output error)")
 
 
 def test_a_script_it_cannot_read_is_refused_naming_the_cause(disk: Disk) -> None:
@@ -767,6 +833,49 @@ def test_a_refused_runtime_binary_is_named_for_the_console_and_cleared_when_it_r
     planner.plan()
     assert planner.refused_binary is None
     assert supervisor.compose(spec).execTrust is None
+
+
+def test_an_engine_eugene_s_account_starts_finds_programs_only_in_trusted_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run as Eugene's own account, an engine's PATH is the system's
+    folders that pass the check, never the inherited one: a person's folder
+    on it, or on the runtime's own `PATH`, is dropped (8c re-review, 2)."""
+    import logging
+
+    from eugene_plexus_agent.runtimes import _RuntimePlanner
+
+    exe = tmp_path / "llama-server"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    trusted = {"/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/cuda/bin"}
+    monkeypatch.setattr(exec_trust, "own_account", lambda: True)
+    monkeypatch.setattr(
+        exec_trust,
+        "assess_path",
+        lambda path: exec_trust.Verdict(
+            exec_trust.Kind.ok if str(path) in trusted else exec_trust.Kind.refused, str(path)
+        ),
+    )
+    monkeypatch.setattr(exec_trust, "trusted_program", lambda path, **kw: Path(str(path)))
+    monkeypatch.setattr(LlamaCppAdapter, "probe_version", lambda self, binary: "1")
+    monkeypatch.setenv("PATH", "/Users/alice/bin:/usr/bin")
+
+    def plan(env: dict[str, str] | None) -> dict[str, str]:
+        planner = _RuntimePlanner(
+            _spec(binary=str(exe), port=8090, env=env),
+            LlamaCppAdapter(),
+            logging.getLogger("test"),
+            get_config=lambda key: [str(tmp_path)] if key == "engineBinaryRoots" else None,
+        )
+        return planner.plan().env
+
+    assert plan(None)["PATH"] == "/usr/sbin:/usr/bin:/sbin:/bin"
+    assert plan({"PATH": "/Users/alice/bin:/opt/cuda/bin"})["PATH"] == (
+        "/opt/cuda/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    )
+    # A person's own install keeps the PATH it was given.
+    monkeypatch.setattr(exec_trust, "own_account", lambda: False)
+    assert plan(None)["PATH"] == "/Users/alice/bin:/usr/bin"
 
 
 def test_an_engine_found_but_not_run_says_why_in_the_engine_list(

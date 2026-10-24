@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import exec_approvals, model_copies, ports
+from . import exec_approvals, exec_trust, model_copies, ports
 from ._generated.models import (
     CopyProgress,
     EngineAcquisition,
@@ -314,6 +314,12 @@ class _RuntimePlanner:
             )
         if launch_spec.env:
             env.update({k: str(v) for k, v in launch_spec.env.items()})
+        # Run as Eugene's own account, the engine finds programs only in
+        # folders nobody else can change (row 8c): the runtime's own PATH
+        # and the system's, each checked; never the one the agent inherited.
+        search = exec_trust.search_path(str((launch_spec.env or {}).get("PATH") or "") or None)
+        if search is not None:
+            env["PATH"] = search
 
         cwd = self._adapter.working_directory(launch_spec, binary)
         try:

@@ -113,6 +113,60 @@ def test_an_approval_does_not_carry_over_to_a_refused_program(disk: Disk, store:
     refused(path, "only once an owner approves it")
 
 
+def _linked(disk: Disk) -> str:  # noqa: F811
+    """`/Users/troy/current -> /opt/a`, and root's program there."""
+    disk.dir("/Users/troy", uid=501).dir("/opt/a").file("/opt/a/llama-server")
+    disk.link("/Users/troy/current", "/opt/a")
+    named = "/Users/troy/current/llama-server"
+    shown = exec_trust.assess(named)
+    assert shown.kind is exec_trust.Kind.needs_approval and shown.sha256
+    exec_approvals.approve(named, shown.sha256, by="operator")
+    assert ran(named) == "/opt/a/llama-server"
+    return named
+
+
+def test_a_refusal_by_the_real_path_drops_the_approval_of_the_name_reaching_it(
+    disk: Disk,  # noqa: F811
+    store: Path,
+) -> None:
+    """`/opt/a` opened to anyone and checked by its own path, then closed
+    again: the approval of the link that reaches it does not revive (8c
+    re-review, 4)."""
+    named = _linked(disk)
+    disk.dir("/opt/a", mode=0o777)
+    refused("/opt/a/llama-server", "will not run", "mode 0777: anyone")
+    disk.dir("/opt/a", mode=0o755)
+    assert exec_approvals.listed() == []
+    refused(named, "only once an owner approves it")
+
+
+def test_a_refusal_holds_when_the_approvals_cannot_be_written(
+    disk: Disk,  # noqa: F811
+    store: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The store cannot be written when a refusal drops an approval: the
+    refusal is held in memory, so the program does not run again when what
+    made it refused is put back; the next write that succeeds drops it
+    from the file too."""
+    named = _linked(disk)
+    real_write = exec_approvals.write_private
+
+    def cannot(path: Any, data: Any, **kw: Any) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(exec_approvals, "write_private", cannot)
+    disk.dir("/opt/a", mode=0o777)
+    refused(named, "will not run", "mode 0777: anyone")
+    disk.dir("/opt/a", mode=0o755)
+    refused(named, "only once an owner approves it")
+    assert json.loads(store.read_text(encoding="utf-8"))["approvals"]  # still in the file
+    assert exec_approvals.listed() == []
+    monkeypatch.setattr(exec_approvals, "write_private", real_write)
+    refused(named, "only once an owner approves it")
+    assert json.loads(store.read_text(encoding="utf-8"))["approvals"] == []
+
+
 def test_a_program_reached_through_a_linked_folder_is_approved_by_the_path_it_is_named_by(
     disk: Disk,  # noqa: F811
     store: Path,
