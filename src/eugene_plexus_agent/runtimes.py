@@ -317,7 +317,12 @@ class _RuntimePlanner:
         # Run as Eugene's own account, the engine finds programs only in
         # folders nobody else can change (row 8c): the runtime's own PATH
         # and the system's, each checked; never the one the agent inherited.
-        search = exec_trust.search_path(str((launch_spec.env or {}).get("PATH") or "") or None)
+        # No folder passes: the engine is not started (an empty PATH would
+        # search the folder it starts in).
+        try:
+            search = exec_trust.search_path(str((launch_spec.env or {}).get("PATH") or "") or None)
+        except exec_trust.Untrusted as e:
+            raise SpawnPlanError(str(e)) from e
         if search is not None:
             env["PATH"] = search
 

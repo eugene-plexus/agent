@@ -13,10 +13,11 @@ it installs apps with, an app's interpreter -- is judged first, by
 What is walked: the path, from `/`, one name at a time with every link
 followed by hand -- every folder stepped into on every hop, and the file;
 a script's interpreter (`#!`, and the `exec` line uv writes under
-`#!/bin/sh` for a path too long for a shebang) the same way; and the Python
-environment the program belongs to (its root, its `site-packages` folders,
-the interpreter it was made from, `home` in `pyvenv.cfg`, with that
-interpreter's standard library).
+`#!/bin/sh` for a path too long for a shebang) the same way, and every path
+in what follows the interpreter, which it may run (`env` by any name, `sh`
+with a script); and the Python environment the program belongs to (its
+root, its `site-packages` folders, the interpreter it was made from, `home`
+in `pyvenv.cfg`, with that interpreter's standard library).
 
 What it decides (call R8-EXEC-TRUST, Choice 3):
 
@@ -158,6 +159,11 @@ class Verdict:
     chain: tuple[ChainItem, ...] = ()
     findings: tuple[Finding, ...] = ()
     home: str = "Eugene's folder"
+    #: The file the program reached, every link followed, and its (device,
+    #: inode): set even when the check stopped there, so a refusal can drop
+    #: every approval that reaches the same file by another name.
+    real: str | None = None
+    real_id: tuple[int, int] | None = None
 
     def message(self, instead: str = INSTALL_ENGINE) -> str | None:
         """Why it did not run, naming the path, who can change it, and what
@@ -396,6 +402,8 @@ class _Walk:
         self.me = _account_name(uid)
         self.chain: list[ChainItem] = []
         self.findings: list[Finding] = []
+        #: The file the program reached (path, device, inode), once known.
+        self.real: tuple[str, int, int] | None = None
 
     def find(
         self,
@@ -557,13 +565,21 @@ def _walk(
     return run_as or current, current, info
 
 
-def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
+def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> tuple[list[str], list[str]]:
     """What runs a script, or nothing for a binary: the program `#!` names,
     and under `#!/bin/sh` the python uv's `'''exec' "<python>" "$0" "$@"`
     line names. Each must be an absolute path (a bare name is found from
     the folder the script starts in, or by PATH, not where this looks), and
     `env` is refused (PATH would choose). A file it cannot read is refused:
-    what runs it is not known (8c review)."""
+    what runs it is not known (8c review).
+
+    Also the paths in what follows the interpreter, which it may run (`env`
+    by any name, `sh` with a script, `nice`, `timeout`): every word with a
+    `/` in it, from its first `/` (so `--file=/x` and `-f/x` too), to be
+    checked like a program. The kernel hands Linux's interpreter all of it
+    as one argument and macOS's as words; the paths are the same either
+    way. A word with no `/` is an option, or a bare name PATH would find,
+    which is refused (8c re-reviews)."""
     try:
         head = _head(path)
     except OSError as e:
@@ -573,13 +589,13 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
             f"{role} cannot be read to find what runs it ({e.strerror or e})",
             fix="check",
         )
-        return []
+        return [], []
     if not head.startswith(b"#!"):
-        return []
+        return [], []
     lines = head.decode("utf-8", errors="replace").splitlines()
     words = lines[0][2:].split()
     if not words:
-        return []
+        return [], []
     if PurePosixPath(words[0]).name in _PATH_RUNNERS:
         w.find(
             "unknown",
@@ -588,19 +604,19 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
             "would run is not known",
             fix="shebang",
         )
-        return []
-    # A bare name after the interpreter is a program PATH would find,
-    # whatever the interpreter is called (a copy of `env` named `run`), so
-    # it is refused; options and absolute paths are not (8c re-review).
-    named = next((word for word in words[1:] if not word.startswith("-")), None)
-    if named is not None and not named.startswith("/"):
-        w.find(
-            "unknown",
-            path,
-            f"{role} names a program by a bare name after its interpreter ({named}), which "
-            "PATH would find",
-            fix="shebang",
-        )
+        return [], []
+    arguments: list[str] = []
+    for word in words[1:]:
+        if "/" in word:
+            arguments.append(word[word.index("/") :])
+        elif not word.startswith("-"):
+            w.find(
+                "unknown",
+                path,
+                f"{role} names a program by a bare name after its interpreter ({word}), which "
+                "PATH would find",
+                fix="shebang",
+            )
     found = [words[0]]
     if len(lines) > 1:
         trampoline = re.match(r"""^'''exec' "(.+?)" "\$0" "\$@"$""", lines[1].strip())
@@ -619,7 +635,7 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
             "starts in or PATH would choose",
             fix="shebang",
         )
-    return absolute
+    return absolute, arguments
 
 
 def _exists(path: PurePosixPath, w: _Walk | None = None, role: str = "it") -> bool:
@@ -701,11 +717,22 @@ def _environment(w: _Walk, root: PurePosixPath) -> None:
             _walk(w, str(lib_dir), f"that Python's standard library ({lib_dir})")
 
 
-def _program(w: _Walk, given: str, depth: int, role: str) -> PurePosixPath | None:
+def _program(
+    w: _Walk, given: str, depth: int, role: str, *, argument: bool = False
+) -> PurePosixPath | None:
+    """GIVEN, as a program: the walk, then what runs it. ARGUMENT: a path an
+    interpreter was given, which may also be a folder (`-I/usr/share/perl`)."""
     walked = _walk(w, given, role)
     if walked is None:
         return None
     resolved, real, info = walked
+    if depth == 0:
+        # The file it reaches, whatever it was looked up by and whatever
+        # the check finds next: a refusal drops every approval that reaches
+        # it (8c re-review 2).
+        w.real = (str(real), info.st_dev, info.st_ino)
+    if argument and stat.S_ISDIR(info.st_mode):
+        return resolved
     if not stat.S_ISREG(info.st_mode):
         w.find("unknown", resolved, f"{role} is not a file", fix="check")
         return None
@@ -732,11 +759,16 @@ def _program(w: _Walk, given: str, depth: int, role: str) -> PurePosixPath | Non
             fix="shebang" if depth else "check",
         )
         return None
-    for interpreter in _interpreters(w, resolved, role):
-        if depth >= _INTERPRETER_DEPTH:
-            w.find("unknown", resolved, f"{role} goes through too many interpreters", fix="check")
-            break
+    interpreters, arguments = _interpreters(w, resolved, role)
+    if (interpreters or arguments) and depth >= _INTERPRETER_DEPTH:
+        w.find("unknown", resolved, f"{role} goes through too many interpreters", fix="check")
+        interpreters, arguments = [], []
+    for interpreter in interpreters:
         _program(w, interpreter, depth + 1, f"its interpreter {interpreter}")
+    # What follows the interpreter may be a program it runs: each path in
+    # it is checked like one, and the verdict is the worst of them all.
+    for path in arguments:
+        _program(w, path, depth + 1, f"its interpreter's argument {path}", argument=True)
     # The environment by the path as spelled (a venv's `bin/python` is a
     # link out of it) and by the path it resolves to.
     for program in (PurePosixPath(_absolute(given)), resolved):
@@ -796,7 +828,21 @@ def assess(path: Path | str) -> Verdict:
     assert uid is not None
     w = _Walk(uid)
     verdict = _decide(w, given, _program(w, given, 0, "it"), hashed=True)
-    return dataclasses.replace(verdict, lookup=_absolute(given))
+    return dataclasses.replace(
+        verdict,
+        lookup=_absolute(given),
+        real=w.real[0] if w.real else None,
+        real_id=(w.real[1], w.real[2]) if w.real else None,
+    )
+
+
+def file_id(path: str) -> tuple[int, int] | None:
+    """PATH's (device, inode), as the check reads the disk, or None."""
+    try:
+        info = _lstat(PurePosixPath(path))
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
 
 
 def assess_path(path: Path | str) -> Verdict:
@@ -822,15 +868,29 @@ def search_path(configured: str | None = None) -> str | None:
     inherited (8c re-review): CONFIGURED (a runtime's own `PATH`) and then
     the system's folders, each kept only when the check finds it `ok` (root
     or Eugene's account alone can change it). Outside Eugene's own account,
-    None: the process keeps the PATH it was given."""
+    None: the process keeps the PATH it was given.
+
+    Never empty, nor with an empty folder in it: either is a search of the
+    folder the engine starts in. When no folder passes, Untrusted, naming
+    the first folder's cause, and the engine is not started (8c re-review
+    2)."""
     if not own_account():
         return None
     kept: list[str] = []
+    first: str | None = None
     for folder in [*(configured.split(":") if configured else []), *_SYSTEM_PATH]:
         if not folder.startswith("/") or folder in kept:
             continue
-        if assess_path(folder).kind is Kind.ok:
+        verdict = assess_path(folder)
+        if verdict.kind is Kind.ok:
             kept.append(folder)
+        elif first is None:
+            first = f"{folder}: {verdict.why()}"
+    if not kept:
+        raise Untrusted(
+            "Eugene's own account starts no engine without a folder it may find programs in, "
+            f"and no folder to find programs in passed the check ({first})"
+        )
     return ":".join(kept)
 
 

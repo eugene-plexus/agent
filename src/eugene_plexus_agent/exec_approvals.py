@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import stat
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -203,16 +204,31 @@ def forget(verdict: exec_trust.Verdict) -> None:
     path it was looked up by), and every approval whose walked chain goes
     through the refused program or through what made it refused (a folder
     others can change, an item that cannot be checked). Putting things back
-    does not bring them back (8c review, re-review)."""
+    does not bring them back (8c review, re-review).
+
+    Also every approval whose chain reaches the same file, by any name: a
+    file in it whose device and inode are those of the file the refused
+    check reached (`Verdict.real_id`), whether it was reached through other
+    links or is a hard link, and whether it is the program or what runs it
+    (8c re-review 2)."""
     touched = {_key(verdict)}
     if verdict.program is not None:
         touched.add(verdict.program)
     touched.update(f.path for f in verdict.findings if f.problem != "owner")
+
+    def reaches(approval: ExecApproval) -> bool:
+        if approval.path in touched or any(c.path in touched for c in approval.chain):
+            return True
+        if verdict.real_id is None:
+            return False
+        return any(
+            stat.S_ISREG(c.mode) and exec_trust.file_id(c.path) == verdict.real_id
+            for c in approval.chain
+        )
+
     with _lock:
         approvals = _read()
-        dropped = [
-            a for a in approvals if a.path in touched or any(c.path in touched for c in a.chain)
-        ]
+        dropped = [a for a in approvals if reaches(a)]
         _drop(dropped, approvals, f"{_key(verdict)} is refused now")
 
 

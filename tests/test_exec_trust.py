@@ -490,6 +490,56 @@ def test_options_after_an_interpreter_are_not_a_program_name(disk: Disk) -> None
     assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.ok
 
 
+def _alice_s_python(disk: Disk) -> None:
+    disk.dir("/Users/alice", uid=502).dir("/Users/alice/bin", uid=502)
+    disk.file("/Users/alice/bin/python3", uid=502, content=b"\x7fELF alice's python")
+
+
+def test_a_path_after_a_padded_env_is_checked_like_a_program(disk: Disk) -> None:
+    """`run` is `env` plus one byte, so no fingerprint knows it, and it runs
+    the program its argument names: that program is checked like any
+    other, and the verdict is the worst of the two (8c re-review 2, 2)."""
+    disk.file("/usr/bin/env", content=ENV)
+    disk.file("/usr/local/bin/run", content=ENV + b"\0")
+    _alice_s_python(disk)
+    disk.file(
+        "/usr/local/bin/vllm",
+        content=b"#!/usr/local/bin/run /Users/alice/bin/python3\nimport vllm\n",
+    )
+    found = exec_trust.assess("/usr/local/bin/vllm")
+    assert found.kind is exec_trust.Kind.needs_approval and found.account == "alice"
+    refused("/usr/local/bin/vllm", "/Users/alice, which belongs to alice")
+
+
+def test_a_script_path_after_a_shell_is_checked_like_a_program(disk: Disk) -> None:
+    """`#!/bin/sh /Users/alice/x.sh`: the shell runs alice's script."""
+    disk.file("/bin/sh")
+    disk.dir("/Users/alice", uid=502).file("/Users/alice/x.sh", uid=502, content=b"echo hi\n")
+    disk.file("/usr/local/bin/vllm", content=b"#!/bin/sh /Users/alice/x.sh\n")
+    found = exec_trust.assess("/usr/local/bin/vllm")
+    assert found.kind is exec_trust.Kind.needs_approval and found.account == "alice"
+
+
+def test_paths_in_an_interpreter_s_one_argument_are_each_checked(disk: Disk) -> None:
+    """Linux hands everything after the interpreter to it as one argument
+    (`/Users/alice/bin/python3 -u`), macOS as words; either way each path
+    in it, `--file=` and `-f` forms included, is checked."""
+    disk.file("/usr/local/bin/run")
+    _alice_s_python(disk)
+    disk.dir("/opt/a", mode=0o777).file("/opt/a/x.py")
+    for first_line, kind in (
+        (b"#!/usr/local/bin/run /Users/alice/bin/python3 -u\n", exec_trust.Kind.needs_approval),
+        (b"#!/usr/local/bin/run --file=/Users/alice/bin/python3\n", exec_trust.Kind.needs_approval),
+        (b"#!/usr/local/bin/run -f/opt/a/x.py\n", exec_trust.Kind.refused),
+    ):
+        disk.file("/usr/local/bin/vllm", content=first_line)
+        assert exec_trust.assess("/usr/local/bin/vllm").kind is kind, first_line
+    disk.dir("/usr/share/perl")
+    disk.file("/usr/bin/perl")
+    disk.file("/usr/local/bin/tool", content=b"#!/usr/bin/perl -I/usr/share/perl -w\n")
+    assert exec_trust.assess("/usr/local/bin/tool").kind is exec_trust.Kind.ok
+
+
 def test_an_environment_whose_settings_cannot_be_checked_is_refused(disk: Disk) -> None:
     """An I/O error is not absence: `pyvenv.cfg` that cannot be looked at
     does not skip the environment's check, so a person's packages there
@@ -876,6 +926,46 @@ def test_an_engine_eugene_s_account_starts_finds_programs_only_in_trusted_folder
     # A person's own install keeps the PATH it was given.
     monkeypatch.setattr(exec_trust, "own_account", lambda: False)
     assert plan(None)["PATH"] == "/Users/alice/bin:/usr/bin"
+
+
+def test_an_engine_with_no_folder_to_find_programs_in_is_not_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every candidate for PATH fails its check (an I/O error, here): an
+    empty PATH would search the folder the engine starts in, so the engine
+    is not started at all, and the refusal names the cause (8c re-review 2,
+    3)."""
+    import logging
+
+    from eugene_plexus_agent.runtimes import _RuntimePlanner
+    from eugene_plexus_agent.supervisor import SpawnPlanError
+
+    exe = tmp_path / "llama-server"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(exec_trust, "own_account", lambda: True)
+
+    def broken(path: Any) -> exec_trust.Verdict:
+        finding = exec_trust.Finding(
+            "unknown", str(path), None, f"it cannot be checked at {path} (Input/output error)"
+        )
+        return exec_trust.Verdict(exec_trust.Kind.refused, str(path), findings=(finding,))
+
+    monkeypatch.setattr(exec_trust, "assess_path", broken)
+    monkeypatch.setattr(exec_trust, "trusted_program", lambda path, **kw: Path(str(path)))
+    monkeypatch.setattr(LlamaCppAdapter, "probe_version", lambda self, binary: "1")
+    planner = _RuntimePlanner(
+        _spec(binary=str(exe), port=8090, env={"PATH": "a::b"}, workingDirectory=str(tmp_path)),
+        LlamaCppAdapter(),
+        logging.getLogger("test"),
+        get_config=lambda key: [str(tmp_path)] if key == "engineBinaryRoots" else None,
+    )
+    with pytest.raises(SpawnPlanError) as caught:
+        planner.plan()
+    said = str(caught.value)
+    assert "no folder to find programs in passed the check" in said, said
+    assert "/usr/local/sbin: it cannot be checked at /usr/local/sbin (Input/output error)" in said
+    with pytest.raises(exec_trust.Untrusted):
+        exec_trust.search_path("a::b")
 
 
 def test_an_engine_found_but_not_run_says_why_in_the_engine_list(

@@ -140,6 +140,76 @@ def test_a_refusal_by_the_real_path_drops_the_approval_of_the_name_reaching_it(
     refused(named, "only once an owner approves it")
 
 
+ENV = b"\xcf\xfa\xed\xfe the system's env"
+
+
+def test_a_refusal_by_one_alias_drops_the_approval_of_another(
+    disk: Disk,  # noqa: F811
+    store: Path,
+) -> None:
+    """Alias A -> server is approved; server becomes `env`'s bytes; alias B
+    -> server is checked (refused, and the check stops before it returns a
+    program); server is put back. A does not run again: the refusal names
+    the file it reached, whatever it was looked up by (8c re-review 2, 4)."""
+    disk.file("/usr/bin/env", content=ENV)
+    disk.dir("/Users/troy", uid=501).dir("/opt/srv").file("/opt/srv/server", content=b"\x7fELF srv")
+    disk.link("/Users/troy/a", "/opt/srv/server")
+    disk.link("/Users/troy/b", "/opt/srv/server")
+    shown = exec_trust.assess("/Users/troy/a")
+    assert shown.kind is exec_trust.Kind.needs_approval and shown.sha256
+    exec_approvals.approve("/Users/troy/a", shown.sha256, by="operator")
+    assert ran("/Users/troy/a") == "/Users/troy/a"
+    disk.nodes["/opt/srv/server"]["content"] = ENV
+    refused("/Users/troy/b", "is the system's env under another name")
+    disk.nodes["/opt/srv/server"]["content"] = b"\x7fELF srv"
+    assert exec_approvals.listed() == []
+    refused("/Users/troy/a", "only once an owner approves it")
+
+
+def test_a_refusal_of_what_runs_a_script_drops_the_script_s_approval(
+    disk: Disk,  # noqa: F811
+    store: Path,
+) -> None:
+    """troy's script runs root's `/opt/py/python`, which another name
+    (`/usr/local/bin/py`) reaches too: refused by that name, the script's
+    approval goes, though the interpreter is not the file it approved."""
+    disk.file("/usr/bin/env", content=ENV)
+    disk.dir("/opt/py").file("/opt/py/python", content=b"\x7fELF python")
+    disk.link("/usr/local/bin/py", "/opt/py/python")
+    disk.dir("/usr/share/tool")
+    # The interpreter is not the last file the chain holds: its argument is.
+    disk.dir("/Users/troy", uid=501).file(
+        "/Users/troy/tool", uid=501, content=b"#!/opt/py/python -I/usr/share/tool\nprint(1)\n"
+    )
+    shown = exec_trust.assess("/Users/troy/tool")
+    assert shown.kind is exec_trust.Kind.needs_approval and shown.sha256
+    exec_approvals.approve("/Users/troy/tool", shown.sha256, by="operator")
+    disk.nodes["/opt/py/python"]["content"] = ENV
+    refused("/usr/local/bin/py", "is the system's env under another name")
+    disk.nodes["/opt/py/python"]["content"] = b"\x7fELF python"
+    assert exec_approvals.listed() == []
+
+
+def test_a_refusal_by_a_hard_link_drops_the_approval_of_the_same_file(
+    disk: Disk,  # noqa: F811
+    store: Path,
+) -> None:
+    """The same file by two names that are not links (its device and inode):
+    a refusal by one drops the approval of the other."""
+    disk.file("/usr/bin/env", content=ENV)
+    disk.dir("/Users/troy", uid=501).file("/Users/troy/server", uid=501, ino=77)
+    disk.dir("/opt/srv").file("/opt/srv/server", uid=501, ino=77)
+    shown = exec_trust.assess("/Users/troy/server")
+    assert shown.kind is exec_trust.Kind.needs_approval and shown.sha256
+    exec_approvals.approve("/Users/troy/server", shown.sha256, by="operator")
+    for name in ("/Users/troy/server", "/opt/srv/server"):
+        disk.nodes[name]["content"] = ENV
+    refused("/opt/srv/server", "is the system's env under another name")
+    for name in ("/Users/troy/server", "/opt/srv/server"):
+        disk.nodes[name]["content"] = b"\x7fELF"
+    assert exec_approvals.listed() == []
+
+
 def test_a_refusal_holds_when_the_approvals_cannot_be_written(
     disk: Disk,  # noqa: F811
     store: Path,
