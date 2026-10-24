@@ -45,6 +45,7 @@ from ._generated.models import (
     RuntimeSpeculation,
     RuntimeStatus,
     StopReason,
+    StrataEffectiveLaunch,
 )
 from .card_launch import CardLaunch, DeviceMemory, refit_on_cards_left, select_cards
 from .child_env import child_environment, reserved_override
@@ -321,8 +322,30 @@ class _RuntimePlanner:
             argv=argv,
             env=env,
             cwd=cwd,
+            launch_settings=(
+                self._strata_launch_settings(argv)
+                if self.spec.engine is EngineKind.strata
+                else None
+            ),
             on_spawn=self._record_cards,
         )
+
+    @staticmethod
+    def _strata_launch_settings(argv: list[str]) -> dict[str, object] | None:
+        from .engines.strata_settings import effective_launch
+
+        # Snapshot this private configuration now. The process records it only
+        # after a successful spawn; later profile/file edits cannot rewrite it.
+        try:
+            import json
+
+            config = Path(argv[argv.index("--config") + 1])
+            applied = effective_launch(json.loads(config.read_text(encoding="utf-8")))
+            return applied.model_dump(mode="json") if applied is not None else None
+        except (OSError, ValueError, IndexError) as exc:
+            raise SpawnPlanError(
+                f"Cannot read Strata's applied launch configuration: {exc}"
+            ) from exc
 
     async def plan_async(self) -> SpawnPlan:
         """The supervisor awaits this before every spawn, crash respawns included."""
@@ -1129,6 +1152,13 @@ class RuntimeSupervisor:
             argv=sp.last_argv if sp is not None else None,
             pid=sp.pid if sp is not None else None,
             engineVersion=engine_version,
+            effectiveLaunch=(
+                StrataEffectiveLaunch.model_validate(sp.last_launch_settings)
+                if spec.engine is EngineKind.strata
+                and sp is not None
+                and getattr(sp, "last_launch_settings", None) is not None
+                else None
+            ),
             capabilities=capabilities,
             chatTemplate=(
                 chat_templates.confirmed(
