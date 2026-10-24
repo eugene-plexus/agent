@@ -60,6 +60,13 @@ from .conftest import local_service_token
         ("D:\\mapped", {"network": True}, "network"),
         ("/mnt/disk", {"mount_root": True}, "drive_root"),
         ("/srv/missing", {"is_dir": False}, "not_a_folder"),
+        # A folder another rule refuses names that rule, not its parent: on
+        # Linux, Eugene's prefix and a person's home belong to that account,
+        # so every folder inside them also has an "unsafe" parent.
+        ("/srv/ep/apps", {"eugene": ("/srv/ep",), "unsafe_parent": "/srv/ep"}, "eugene"),
+        ("/home/person/projects", {"unsafe_parent": "/home/person"}, "home"),
+        ("/tmp/shared", {"unsafe_parent": "/tmp"}, "system"),
+        ("/srv/shared/acme", {"unsafe_parent": "/srv/shared"}, "unsafe_parent"),
         ("D:\\Projects\\acme", {}, None),
         ("/srv/acme", {}, None),
         ("/srv/project\\notes", {}, None),
@@ -67,6 +74,39 @@ from .conftest import local_service_token
 )
 def test_refusals(path: str, extra: dict, cause: str | None) -> None:
     assert fa.refusal(fa.Facts(path, **extra)) == cause
+
+
+@pytest.mark.parametrize(
+    ("path", "extra", "words"),
+    [
+        (
+            "/srv/ep/apps",
+            {"eugene": ("/srv/ep",), "unsafe_parent": "/srv/ep"},
+            "This is Eugene's own folder. /srv/ep/apps",
+        ),
+        (
+            "/home/person/projects",
+            {"unsafe_parent": "/home/person"},
+            "This is inside a person's home. Use a Job Site to work in your own folders. "
+            "/home/person/projects",
+        ),
+        (
+            "/srv/shared/acme",
+            {"unsafe_parent": "/srv/shared"},
+            "/srv/shared can be changed by other accounts.",
+        ),
+    ],
+)
+def test_refusal_message_names_the_refused_folder(
+    tmp_path: Path, path: str, extra: dict, words: str
+) -> None:
+    backend = MemoryPermissions()
+    backend.inspect = lambda p: (fa.Facts(p, **extra), [])  # type: ignore[method-assign]
+    access = service(tmp_path, backend)
+    with pytest.raises(fa.Refused) as refused:
+        access.add("workbench", path, "read", "operator")
+    assert str(refused.value) == words
+    assert not access.file.exists()
 
 
 class MemoryPermissions:

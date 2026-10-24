@@ -97,7 +97,19 @@ def _overlaps(path: PurePath, roots: tuple[str, ...]) -> bool:
 
 
 def refusal(facts: Facts) -> str | None:
-    """Own prefix/data first; otherwise system, home, then other install ancestors."""
+    """Own prefix/data first; otherwise system, home, then other install ancestors.
+
+    An unsafe parent comes last. On Linux, Eugene's prefix and a person's home
+    belong to their own accounts, so every folder inside them also has such a
+    parent; the person is told the rule that refuses the folder itself.
+    """
+    cause = _policy_refusal(facts)
+    if cause is None and facts.unsafe_parent:
+        return "unsafe_parent"
+    return cause
+
+
+def _policy_refusal(facts: Facts) -> str | None:
     path = _path(facts.path)
     if facts.path.startswith(("\\\\?\\", "\\\\.\\")):
         return "not_a_folder"
@@ -111,8 +123,6 @@ def refusal(facts: Facts) -> str | None:
         or any(ord(c) < 32 or ord(c) == 127 for c in facts.path)
     ):
         return "not_a_folder"
-    if facts.unsafe_parent:
-        return "unsafe_parent"
     if facts.mount_root or str(path) == path.anchor:
         return "drive_root"
     if any(path.is_relative_to(_path(root)) for root in facts.eugene):
@@ -283,7 +293,7 @@ class Access:
         with _LOCK:
             facts, identity = self._inspect(path)
             if cause := refusal(facts):
-                raise Refused(cause, facts.unsafe_parent or path)
+                raise Refused(cause, facts.unsafe_parent if cause == "unsafe_parent" else path)
             rows = self._read()
             for existing in rows.values():
                 if (
@@ -922,7 +932,7 @@ class LinuxPermissions:
     def grant(self, path: str, mode: str, save: Callable[[dict], None]) -> tuple[dict, int, bool]:
         facts, identity = self.inspect(path)
         if cause := refusal(facts):
-            raise Refused(cause, facts.unsafe_parent or path)
+            raise Refused(cause, facts.unsafe_parent if cause == "unsafe_parent" else path)
         ident = uuid.uuid4().hex
         delta = dict(added=True, id=ident, identity=identity)
         save(delta)
