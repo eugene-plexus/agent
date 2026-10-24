@@ -293,6 +293,29 @@ def test_linux_inspection_failure_cleans_request(tmp_path: Path, monkeypatch) ->
     assert not list(backend.ctl.glob("*.path"))
 
 
+def test_linux_inspection_names_a_helper_that_never_answers(tmp_path: Path, monkeypatch) -> None:
+    """An inspection runs under the module lock; a silent helper must not hold it forever."""
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(fa, "sys", SimpleNamespace(platform="linux"))
+    clock = {"now": 0.0, "sleeps": 0}
+
+    def sleep(seconds: float) -> None:
+        clock["sleeps"] += 1
+        clock["now"] += seconds
+        if clock["sleeps"] > 10_000:  # 2000 simulated seconds: the wait never ends
+            raise AssertionError("The agent waited for an inspection that never came")
+
+    monkeypatch.setattr(fa.time, "sleep", sleep)
+    monkeypatch.setattr(fa.time, "perf_counter", lambda: clock["now"])
+    access = fa.Access(tmp_path / "access.json", backend)
+    with pytest.raises(fa.InspectionFailed, match="helper did not answer in 30 seconds"):
+        access.add("workbench", "/srv/acme", "read", "operator")
+    assert clock["now"] < 31
+    # The request is withdrawn, so a helper that starts later does not act on it.
+    assert not list(backend.ctl.iterdir())
+    assert not access.file.exists()
+
+
 @pytest.mark.parametrize(
     ("extra", "cause"),
     [

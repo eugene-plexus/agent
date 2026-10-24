@@ -851,6 +851,12 @@ class WindowsPermissions:
 class LinuxPermissions:
     """Ask the installed root broker; its root-owned ledger is authoritative."""
 
+    #: An inspection changes nothing and takes the helper well under a second.
+    #: It runs under the module lock, so a helper that never answers (not
+    #: installed, its path unit stopped, or busy with a large grant) must end
+    #: the wait and name itself, not hold every folder-access request forever.
+    INSPECT_TIMEOUT_SECONDS = 30.0
+
     def __init__(self, app: str, apps: Path, *, eugene: tuple[str, ...]) -> None:
         from .app_accounts import dynamic_user
 
@@ -884,7 +890,10 @@ class LinuxPermissions:
         result = self.ctl / f"{request_id}.res"
         write_private(request, f"{verb} {self.app} {mode} {ident}\n")
         # A root helper may still be applying a large plan after 900 seconds.
-        # Only its result can declare success or failure.
+        # Only its result can declare a grant or a revoke done, so those wait.
+        # An inspection changes nothing and may give up.
+        timeout = self.INSPECT_TIMEOUT_SECONDS if verb == "folder-inspect" else None
+        started = time.perf_counter() if timeout is not None else 0.0
         while True:
             if result.is_file():
                 try:
@@ -900,6 +909,14 @@ class LinuxPermissions:
                     )
                 result_body: dict = json.loads(answer["output"])
                 return result_body
+            if timeout is not None and time.perf_counter() - started >= timeout:
+                # Withdraw the request, so a helper that starts later does not
+                # act on it for nobody.
+                request.unlink(missing_ok=True)
+                raise TimeoutError(
+                    f"the folder permission helper did not answer in {timeout:g} seconds "
+                    "(it is busy changing a large folder, or it is not running)"
+                )
             time.sleep(0.2)
 
     def grant(self, path: str, mode: str, save: Callable[[dict], None]) -> tuple[dict, int, bool]:
