@@ -55,15 +55,15 @@ import httpx
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from .. import client_keys, keyring_store, leaving, passphrase_file, peer, security, tokens
 from .._generated.common_models import (
-    AuthLoginRequest,
     AuthLoginResponse,
     Problem,
 )
 from .._generated.models import (
+    AgentLoginRequest,
     AuthStatus,
     ClientAdmissionRequest,
     ClientAdmissionResult,
@@ -75,6 +75,9 @@ from .._generated.models import (
     ClientKeyPolicy,
     ClientKeyRotateRequest,
     ClientKeyUpdateRequest,
+    NodePassphraseRequest,
+    PassphraseChangeRequest,
+    PassphraseChangeResult,
     ServiceTokenRequest,
     ServiceTokenResponse,
 )
@@ -84,6 +87,7 @@ from ..client_admission import AdmissionRefusal, validate_limits
 from ..client_key_registry import registry
 from ..client_keys import ClientKeyStore
 from ..dependencies import (
+    require_control,
     require_local_service,
     require_operator_or_gateway,
     require_operator_session,
@@ -324,7 +328,7 @@ async def initialize(request: Request, body: _InitializeRequest) -> AuthLoginRes
 
 
 @router.post("/v1/auth/login", response_model=AuthLoginResponse)
-async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
+async def login(request: Request, body: AgentLoginRequest) -> AuthLoginResponse:
     """Verify the passphrase, issue a session token, and cache the
     derived master key. Rate-limited per source IP."""
     state: AgentState = request.app.state.agent_state
@@ -367,6 +371,10 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
 
     stored = state.get_passphrase_hash()
     if stored is None or not security.verify_passphrase(body.passphrase, stored):
+        if enrolled and stored is not None:
+            # Row 5: the root may hold a passphrase this machine has not
+            # taken yet (it was off when the passphrase changed).
+            return await _catch_up(request, body, remote=remote)
         auth.record_login_failure(
             remote,
             window_seconds=_RATE_LIMIT_WINDOW_SECONDS,
@@ -382,9 +390,9 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
     auth.clear_login_failures(remote)
 
     # Re-derive the master key on every login so it's in memory for
-    # this process. Idempotent — same passphrase + salt → same key.
-    salt_b64 = state.get_master_salt_b64()
-    if salt_b64 is None:
+    # this process. Idempotent: the same passphrase gives the same key,
+    # derived from the salt or (row 5) unwrapped after a change.
+    if state.get_master_salt_b64() is None:
         # Shouldn't happen if initialize() was used; defensive nonetheless.
         raise _problem(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -392,9 +400,16 @@ async def login(request: Request, body: AuthLoginRequest) -> AuthLoginResponse:
             "Passphrase hash present but master-key salt missing. Restore "
             "agent.yaml from a known-good backup or re-initialize.",
         )
-    salt = base64.b64decode(salt_b64)
     had_master_key = auth.has_master_key()
-    derived = security.derive_master_key(body.passphrase, salt)
+    try:
+        derived = state.master_key_for(body.passphrase)
+    except ValueError as exc:
+        raise _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Corrupt auth state",
+            "The passphrase matched, and the key it wraps did not open "
+            f"({exc}). Restore agent.yaml from a known-good backup.",
+        ) from exc
     auth.set_master_key(derived)
 
     # If the operator's chosen mode is OS-keyring, persist the freshly
@@ -503,6 +518,304 @@ async def _forward_login(
         )
     log.info("operator signed in through the control root%s", f" from {remote}" if remote else "")
     return signed_in
+
+
+# --------------------------------------------------------------------- #
+# Changing the passphrase (row 5, 5b)
+# --------------------------------------------------------------------- #
+
+
+def _typed_problem(status_code: int, slug: str, title: str, detail: str) -> HTTPException:
+    """A problem whose `type` the contract names (`.../<slug>`)."""
+    return HTTPException(
+        status_code=status_code,
+        detail=Problem(
+            type=f"https://github.com/eugene-plexus/agent#{slug}",
+            title=title,
+            status=status_code,
+            detail=detail,
+            component="agent",
+        ).model_dump(exclude_none=True),
+    )
+
+
+async def _passphrase_body(request: Request, model: type[Any]) -> tuple[str, str]:
+    """`{current, new}`, checked here and not by FastAPI: a validation error
+    would echo the passphrase it refused back in its `input`."""
+    try:
+        raw = await request.json()
+    except ValueError:
+        raw = None
+    try:
+        body = model.model_validate(raw)
+    except ValidationError as exc:
+        if any(e.get("loc") == ("new",) for e in exc.errors(include_input=False)):
+            raise _problem(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "Passphrase too short",
+                f"Choose a new passphrase of at least {security.MIN_PASSPHRASE_LENGTH} "
+                "characters. A few ordinary words in a row works.",
+            ) from None
+        raise _problem(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "Passphrases required",
+            "Send the current passphrase and the new one.",
+        ) from None
+    return body.current.get_secret_value(), body.new.get_secret_value()
+
+
+def _remote(request: Request) -> str:
+    return (
+        peer.peer_of(
+            request.client.host if request.client else None,
+            request.headers.get(peer.PEER_HEADER),
+        )
+        or "unknown"
+    )
+
+
+def _limited(auth: AuthState, remote: str) -> None:
+    if auth.is_login_rate_limited(
+        remote, window_seconds=_RATE_LIMIT_WINDOW_SECONDS, max_in_window=_RATE_LIMIT_MAX_FAILURES
+    ):
+        raise _problem(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "Rate limited",
+            f"Too many wrong passphrases from {remote}. Wait {_RATE_LIMIT_WINDOW_SECONDS} "
+            "seconds and try again.",
+        )
+
+
+def _failed(auth: AuthState, remote: str) -> None:
+    auth.record_login_failure(
+        remote, window_seconds=_RATE_LIMIT_WINDOW_SECONDS, max_in_window=_RATE_LIMIT_MAX_FAILURES
+    )
+
+
+def _take_new_passphrase(request: Request, master_key: bytes, new: str, *, unlock: bool) -> str:
+    """Wrap this agent's master key under `new` and keep the new hash. The key
+    stays, so every secret sealed under it still opens; `masterSalt` stays,
+    so the keyring entry stays where it is. Returns the passphrase file's
+    state: `matches`, `old` (it could not be written) or `none`.
+
+    `unlock` puts the key in memory, as a sign-in does. The root's push does
+    not: a change is not a sign-in, and a locked machine stays locked."""
+    state: AgentState = request.app.state.agent_state
+    auth: AuthState = request.app.state.auth_state
+    kek_salt, wrapped = security.wrap_master_key(master_key, new)
+    state.change_passphrase(
+        passphrase_hash=security.hash_passphrase(new),
+        kek_salt_b64=kek_salt,
+        wrapped_master_key=wrapped,
+    )
+    if unlock:
+        auth.set_master_key(master_key)
+        _persist_master_key_if_keyring_mode(state, master_key)
+    if state.get_config("securityMode") != "passphrase_file":
+        return "none"
+    return "matches" if passphrase_file.store_passphrase(_passphrase_path(request), new) else "old"
+
+
+async def _verified_forward(request: Request, passphrase: str, *, remote: str) -> AuthLoginResponse:
+    """The root's sign-in for `passphrase`, believed only for a session this
+    machine's trust bundle verifies and that names this machine: a forged
+    answer must not make this machine take a passphrase."""
+    auth: AuthState = request.app.state.auth_state
+    signed_in = await _forward_login(request, passphrase, remote=remote)
+    try:
+        claims = auth.trust.verify(signed_in.sessionToken, classes=(tokens.TYP_SESSION,))
+    except tokens.TokenError as exc:
+        raise _problem(
+            status.HTTP_502_BAD_GATEWAY,
+            "Control root answer did not verify",
+            "The control root's session did not verify against this machine's trust "
+            "bundle, so this machine took nothing from it.",
+        ) from exc
+    if auth.trust.recipient not in claims.aud:
+        raise _problem(
+            status.HTTP_502_BAD_GATEWAY,
+            "Control root answer did not verify",
+            "The control root's session does not name this machine.",
+        )
+    return signed_in
+
+
+async def _catch_up(request: Request, body: AgentLoginRequest, *, remote: str) -> AuthLoginResponse:
+    """Row 5: a passphrase this machine's own hash refuses, on an enrolled
+    machine. When the root accepts it, the passphrase changed while this
+    machine was off: unlocked, it wraps its key under the new one now;
+    locked, it asks once for the old one, which opens its key."""
+    state: AgentState = request.app.state.agent_state
+    auth: AuthState = request.app.state.auth_state
+    key = auth.master_key
+    previous = body.previousPassphrase
+    if key is None and previous is not None:
+        stored = state.get_passphrase_hash()
+        if stored is None or not security.verify_passphrase(previous, stored):
+            _failed(auth, remote)
+            raise _problem(
+                status.HTTP_401_UNAUTHORIZED,
+                "Wrong passphrase",
+                "That is not the passphrase this machine had. Repeated failures from one "
+                "source are rate-limited.",
+            )
+        try:
+            key = state.master_key_for(previous)
+        except ValueError as exc:
+            raise _problem(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Corrupt auth state",
+                f"The old passphrase matched, and the key it wraps did not open ({exc}).",
+            ) from exc
+    signed_in = await _verified_forward(request, body.passphrase, remote=remote)
+    if key is None:
+        raise _typed_problem(
+            status.HTTP_409_CONFLICT,
+            "old-passphrase-needed",
+            "Old passphrase needed",
+            "This machine was off when the passphrase changed. Enter the old passphrase "
+            "once to finish.",
+        )
+    had_master_key = auth.has_master_key()
+    _take_new_passphrase(request, key, body.passphrase, unlock=True)
+    if not had_master_key:
+        await _restart_supervised_children_if_present(request)
+        await connect_shares(request)
+    log.warning(
+        "this machine took the install's new passphrase at sign-in (it changed while this "
+        "machine was off)"
+    )
+    return signed_in
+
+
+@router.post(
+    "/v1/auth/passphrase",
+    response_model=PassphraseChangeResult,
+    response_model_exclude_none=True,
+)
+async def change_passphrase(request: Request) -> PassphraseChangeResult:
+    """Change Eugene's passphrase: the console's door (row 5).
+
+    Enrolled, the root does it (`control.yaml`), and sends the new
+    passphrase back to this machine if it keeps its own. Standalone, this
+    agent wraps its own key under the new passphrase."""
+    require_operator_session(request, await _bearer_scheme(request))
+    current, new = await _passphrase_body(request, PassphraseChangeRequest)
+    auth: AuthState = request.app.state.auth_state
+    state: AgentState = request.app.state.agent_state
+    remote = _remote(request)
+    _limited(auth, remote)
+    if auth.trust.enrolled:
+        return await _forward_change(request, current, new, remote=remote)
+    stored = state.get_passphrase_hash()
+    if stored is None or not security.verify_passphrase(current, stored):
+        _failed(auth, remote)
+        log.warning("a passphrase change from %s gave the wrong current passphrase", remote)
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Wrong passphrase",
+            "The current passphrase did not match. Nothing changed.",
+        )
+    auth.clear_login_failures(remote)
+    held = auth.master_key
+    key = held if held is not None else state.master_key_for(current)
+    file_state = _take_new_passphrase(request, key, new, unlock=True)
+    log.warning("this agent's passphrase changed; its master key was wrapped under the new one")
+    return PassphraseChangeResult.model_validate(
+        {"changedAt": datetime.now(UTC), "machines": [], "passphraseFile": file_state}
+    )
+
+
+async def _forward_change(
+    request: Request, current: str, new: str, *, remote: str
+) -> PassphraseChangeResult:
+    """The root's `POST /v1/auth/passphrase`, with the caller's session and
+    the browser's address, and its answer as it gave it."""
+    auth: AuthState = request.app.state.auth_state
+    identity = request.app.state.node_identity.record
+    control_url = str(identity.control_url).rstrip("/")
+    transport = getattr(request.app.state, "control_transport", None)
+    try:
+        async with internal_client(timeout=_CHANGE_TIMEOUT_SECONDS, transport=transport) as client:
+            response = await client.post(
+                f"{control_url}/v1/auth/passphrase",
+                json={"current": current, "new": new},
+                headers={
+                    "Authorization": request.headers.get("authorization", ""),
+                    peer.PEER_HEADER: remote,
+                },
+            )
+    except httpx.HTTPError as exc:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Control root unreachable",
+            f"Changing the passphrase needs the control root at {control_url}, and it did "
+            f"not answer ({type(exc).__name__}). Nothing changed.",
+        ) from exc
+    if response.status_code == 200:
+        auth.clear_login_failures(remote)
+        return PassphraseChangeResult.model_validate(response.json())
+    if response.status_code == 401:
+        _failed(auth, remote)
+    try:
+        detail = response.json().get("detail")
+    except ValueError:
+        detail = None
+    if isinstance(detail, dict):
+        raise HTTPException(status_code=response.status_code, detail=detail)
+    raise _problem(
+        status.HTTP_502_BAD_GATEWAY,
+        "Control root refused the change",
+        f"The control root at {control_url} answered {response.status_code}.",
+    )
+
+
+#: Two Argon2id runs at the root, then one call to each machine that keeps
+#: its own passphrase.
+_CHANGE_TIMEOUT_SECONDS = 60.0
+
+
+@router.post("/v1/node/passphrase", status_code=204)
+async def take_node_passphrase(request: Request) -> None:
+    """The root's: take Eugene's new passphrase (row 5).
+
+    The control root's own token, and only over TLS (the machine port, whose
+    key the root pinned) or from this machine (the root that runs here). A
+    replay carries a `current` that no longer verifies, so it changes
+    nothing. A locked agent stays locked: it wraps the key `current` opens."""
+    require_control(request, await _bearer_scheme(request))
+    if request.url.scheme != "https" and not _from_this_machine(request):
+        raise _problem(
+            status.HTTP_403_FORBIDDEN,
+            "Not over TLS",
+            "A passphrase is taken only over this machine's TLS port, or from this machine. "
+            "Nothing changed.",
+        )
+    current, new = await _passphrase_body(request, NodePassphraseRequest)
+    state: AgentState = request.app.state.agent_state
+    auth: AuthState = request.app.state.auth_state
+    stored = state.get_passphrase_hash()
+    if stored is None:
+        raise _typed_problem(
+            status.HTTP_409_CONFLICT,
+            "no-own-passphrase",
+            "No passphrase of its own",
+            "This machine keeps no passphrase of its own; the root's is the one it uses.",
+        )
+    if not await asyncio.to_thread(security.verify_passphrase, current, stored):
+        raise _typed_problem(
+            status.HTTP_409_CONFLICT,
+            "passphrase-differs",
+            "Its own passphrase differs",
+            "This machine's own passphrase is not the one that changed; it takes the new one "
+            "at its next sign-in. Nothing changed.",
+        )
+    held = auth.master_key
+    key: bytes = (
+        held if held is not None else await asyncio.to_thread(state.master_key_for, current)
+    )
+    await asyncio.to_thread(_take_new_passphrase, request, key, new, unlock=False)
+    log.warning("this machine took the install's new passphrase from the control root")
 
 
 def _audience(session: str) -> tuple[str, ...]:

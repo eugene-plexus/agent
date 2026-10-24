@@ -194,3 +194,50 @@ def open_envelope(envelope: Envelope, master_key: bytes) -> str:
         return box.decrypt(ciphertext, nonce).decode("utf-8")
     except nacl.exceptions.CryptoError as e:
         raise ValueError(f"envelope decryption failed: {e}") from e
+
+
+# --------------------------------------------------------------------------- #
+# The master key, wrapped under a changed passphrase (row 5)
+# --------------------------------------------------------------------------- #
+#
+# Until a passphrase changes, the master key is Argon2id(passphrase,
+# masterSalt). A change keeps that key, because every secret this agent and
+# its children sealed is sealed under it, and wraps it instead: a key
+# encryption key, Argon2id(new passphrase, kekSalt), seals the master key,
+# and `agent.yaml` keeps `kekSalt` and `wrappedMasterKey` beside the hash.
+# `masterSalt` stays, so the keyring entry's install id stays too.
+
+
+def wrap_master_key(master_key: bytes, passphrase: str) -> tuple[str, str]:
+    """(`kekSalt`, `wrappedMasterKey`), both base64: `master_key` sealed under
+    a key derived from `passphrase` and a fresh salt."""
+    if len(master_key) != 32:
+        raise ValueError("master key must be 32 bytes")
+    salt = generate_master_key_salt()
+    kek = derive_master_key(passphrase, salt)
+    envelope = seal(base64.b64encode(master_key).decode("ascii"), kek)
+    return (
+        base64.b64encode(salt).decode("ascii"),
+        f"{envelope.nonce}.{envelope.ciphertext}",
+    )
+
+
+def unwrap_master_key(wrapped: str, passphrase: str, kek_salt_b64: str) -> bytes:
+    """The inverse of `wrap_master_key`. Raises ValueError when the wrap is
+    damaged or the passphrase is not the one it was wrapped under."""
+    try:
+        nonce, ciphertext = wrapped.split(".", 1)
+        salt = base64.b64decode(kek_salt_b64, validate=True)
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"the wrapped master key is malformed: {exc}") from exc
+    kek = derive_master_key(passphrase, salt)
+    opened = open_envelope(
+        Envelope(alg="secretbox-xsalsa20poly1305", nonce=nonce, ciphertext=ciphertext), kek
+    )
+    try:
+        key = base64.b64decode(opened, validate=True)
+    except ValueError as exc:
+        raise ValueError(f"the wrapped master key is malformed: {exc}") from exc
+    if len(key) != 32:
+        raise ValueError("the wrapped master key is not 32 bytes")
+    return key

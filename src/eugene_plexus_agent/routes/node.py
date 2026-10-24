@@ -222,6 +222,8 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         publicKey=record.public_key,
         controlUrl=record.control_url if record.enrolled else None,  # type: ignore[arg-type]
         controlUrlEpoch=record.control_url_epoch if record.enrolled else None,
+        # Row 5: the root sends a changed passphrase only to these.
+        ownPassphrase=state.has_passphrase(),
         epoch=record.epoch if record.enrolled else None,
         advertiseUrl=advertise,  # type: ignore[arg-type]
         machine=_machine(request),

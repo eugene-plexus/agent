@@ -39,6 +39,7 @@ import logging
 import os
 import stat
 from pathlib import Path
+from typing import Any
 
 from . import _private_files, security
 
@@ -141,25 +142,33 @@ def store_passphrase(path: Path | None, passphrase: str) -> bool:
     return True
 
 
-def unlock_key(path: Path | None, *, passphrase_hash: str, salt: bytes) -> bytes | None:
+def unlock_key(path: Path | None, state: Any) -> bytes | None:
     """The master key, from the passphrase in `path`, or None.
 
     Verified against the install's own hash before anything is derived:
     a file holding some other passphrase would otherwise derive a key
     that opens nothing, and every sealed value would read as corrupt
-    rather than locked. Two Argon2id runs; call it off the event loop.
+    rather than locked. The key comes from `state.master_key_for`, so a
+    key wrapped after a passphrase change (row 5) opens the same way. Two
+    Argon2id runs; call it off the event loop.
     """
     passphrase = read_passphrase(path)
     if passphrase is None:
         return None
-    if not security.verify_passphrase(passphrase, passphrase_hash):
+    passphrase_hash = state.get_passphrase_hash()
+    if passphrase_hash is None or not security.verify_passphrase(passphrase, passphrase_hash):
         log.warning(
             "the passphrase in %s is not this install's; this agent stays locked until "
             "someone signs in, which replaces it",
             path,
         )
         return None
-    return security.derive_master_key(passphrase, salt)
+    try:
+        key: bytes = state.master_key_for(passphrase)
+    except ValueError as exc:
+        log.warning("the passphrase in %s verified but opened no key (%s)", path, exc)
+        return None
+    return key
 
 
 def _warn_if_widely_readable(path: Path) -> None:
