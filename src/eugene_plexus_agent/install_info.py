@@ -37,15 +37,16 @@ from ._generated.models import (
     NodeInstall,
 )
 
-#: The seven packages, in the installers' order, by the name the installers
+#: The eight packages, in the installers' order, by the name the installers
 #: pin them under and the module each one imports as. `tool-driver` joined
-#: at P8 (2026-09-29).
+#: at P8 (2026-09-29), `store` at row 53 (2026-10-23).
 COMPONENTS: tuple[tuple[ComponentName, str], ...] = (
     (ComponentName.agent, "eugene_plexus_agent"),
     (ComponentName.control, "eugene_plexus_control"),
     (ComponentName.gateway, "eugene_plexus_gateway"),
     (ComponentName.inference_driver, "eugene_plexus_inference_driver"),
     (ComponentName.library, "eugene_plexus_library"),
+    (ComponentName.store, "eugene_plexus_store"),
     (ComponentName.tool_driver, "eugene_plexus_tool_driver"),
     (ComponentName.ui, "eugene_plexus_ui"),
 )

@@ -115,7 +115,14 @@ PROXY_PREFIX = "/api/proxy"
 # Targets resolved from the topology by kind, because an install has
 # exactly one of each and a second place recording the URL is a second
 # place it can be wrong.
-_SINGLETON_KINDS = {"gateway": "gateway", "library": "library", "control": "control"}
+_SINGLETON_KINDS = {
+    "gateway": "gateway",
+    "library": "library",
+    "control": "control",
+    # Row 53: the gateway reaches the install's store here, on this machine or
+    # through the machine that holds it, with its own token translated.
+    "store": "store",
+}
 
 #: The kinds a target names by `name` rather than by kind.
 _NAMED_KINDS = frozenset({"inference-driver", "tool-driver"})
