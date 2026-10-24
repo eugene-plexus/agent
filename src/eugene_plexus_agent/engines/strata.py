@@ -23,7 +23,9 @@ from pydantic import ValidationError
 from .._generated.models import (
     ComputeDevice,
     ComputeDeviceKind,
+    ConfigField,
     ConfigSchema,
+    ConfigValueType,
     EngineFitModel,
     EngineKind,
     ModelFormat,
@@ -36,6 +38,7 @@ from .._generated.models import (
 )
 from ..preparation import Recipe
 from ..supervisor import SpawnPlanError
+from . import strata_settings as settings
 from .base import (
     PREPARED_SUFFIX,
     DiscoveredBinary,
@@ -49,7 +52,7 @@ from .base import (
     default_model_alias,
     probe_client,
 )
-from .devices import DeviceSnapshot, DevicesReader
+from .devices import DeviceSnapshot, DevicesReader, detect_devices
 from .strata_models import (
     PREPARATION,
     STRATA_FILES,
@@ -82,7 +85,7 @@ VALUE_ARGS = {
     "--pool-workers",
     "--pcie-frac",
 }
-BOOL_ARGS = {"--resident-experts", "--mmap-experts", "--vision"}
+BOOL_ARGS = {"--resident-experts", "--mmap-experts", "--vision", "--remote-expert-opt"}
 #: The arguments naming the source model's own files, its GGUF shards: a
 #: node copies them as that model's, and a provenance file does not list them.
 SOURCE_ARGS = frozenset({"--native", "--ple-gguf", "vision.model"})
@@ -97,6 +100,7 @@ PASS_KEYS = {
     "fit_max_tokens",
     "anthropic_thinking",
     "gpu",
+    "layer_split",
 }
 # Setup writes these; Eugene supplies its own copies. Nontrivial unsupported
 # features must be refused instead of silently changing the operator's intent.
@@ -295,11 +299,22 @@ def runtime_lib_dirs(root: Path) -> list[str]:
     return sorted({str(p.parent) for p in libraries.rglob("*.dll")})
 
 
-def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
+def prepared_config(
+    path: Path, *, alias: str, root: Path, flags: dict[str, object] | None = None
+) -> dict[str, object]:
     try:
         cfg = json.loads(path.read_text(encoding="utf-8-sig"))
         if not isinstance(cfg, dict):
             raise ValueError("expected a JSON object")
+        flags = flags or {}
+        if "speedProjection" in flags:
+            settings.apply_projection(cfg, flags["speedProjection"], root)
+        if "gpus" in flags:
+            cfg["gpu"] = settings.gpu_selection(flags["gpus"])
+            if "layerSplit" not in flags:
+                cfg["layer_split"] = "auto" if len(cfg["gpu"]) > 1 else None
+        if "layerSplit" in flags:
+            cfg["layer_split"] = flags["layerSplit"]
         allowed = (
             PASS_KEYS
             | OWNED_KEYS
@@ -332,6 +347,13 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
         args = cfg.get("args")
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise ValueError("args must be a list of strings")
+        sampling = cfg.get("sampling")
+        if sampling is not None:
+            if not isinstance(sampling, dict):
+                raise ValueError("sampling must be an object")
+            mode = sampling.get("experimental_speed_projection")
+            if mode is not None and type(mode) is not bool:
+                raise ValueError("sampling.experimental_speed_projection must be true or false")
         normalized: list[str] = []
         seen: set[str] = set()
         i = 0
@@ -344,6 +366,28 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
             i += 1
             if flag in BOOL_ARGS:
                 continue
+            if flag in settings.PROJECTION_ARGS:
+                count = settings.PROJECTION_ARGS[flag]
+                values = args[i : i + count]
+                if len(values) != count or any(v.startswith("--") for v in values):
+                    raise ValueError(f"missing value for {flag}")
+                if flag == "--control-vector-scaled":
+                    values = [settings.vector_value(values[0], root=root, cwd=cwd)]
+                elif flag == "--control-vector-layer-range":
+                    if (
+                        not all(v.isdigit() for v in values)
+                        or not 0 <= int(values[0]) <= int(values[1]) < 48
+                    ):
+                        raise ValueError(
+                            "control vector layer range must rise within the model's 48 layers"
+                        )
+                elif flag == "--cvec-mode" and values[0] != "project":
+                    raise ValueError("speed projection requires --cvec-mode project")
+                elif flag == "--cvec-dir" and values[0] != "per-layer":
+                    raise ValueError("speed projection requires --cvec-dir per-layer")
+                normalized.extend(values)
+                i += count
+                continue
             if flag not in PATH_ARGS | VALUE_ARGS:
                 raise ValueError(f"unsupported native flag: {flag}")
             if i == len(args) or args[i].startswith("--"):
@@ -352,6 +396,32 @@ def prepared_config(path: Path, *, alias: str, root: Path) -> dict[str, object]:
             i += 1
         if not {"--pack", "--native", "--max-context"} <= seen:
             raise ValueError("args must include --pack, --native and --max-context")
+        if (
+            any(flag in seen for flag in settings.PROJECTION_ARGS)
+            and not settings.PROJECTION_ARGS.keys() <= seen
+        ):
+            raise ValueError(
+                "speed projection requires the vector, layer range, mode and direction together"
+            )
+        gpu = cfg.get("gpu")
+        if gpu is not None:
+            cards = settings.gpu_selection([gpu] if type(gpu) is int else gpu)
+            native_model = Path(normalized[normalized.index("--native") + 1])
+            cfg["layer_split"] = settings.layer_split(
+                cfg.get("layer_split"), len(cards), settings.layer_count(native_model)
+            )
+            if len(cards) > 1 and "--resident-experts" in seen:
+                raise ValueError(
+                    "--resident-experts has no layer split in this engine; prepare the model "
+                    "for several cards to use --mmap-experts"
+                )
+            if len(cards) > 1 and "--resident-budget-gib" in seen:
+                raise ValueError(
+                    "--resident-budget-gib has no layer split in this engine; prepare the "
+                    "model for several cards without its RAM budget"
+                )
+        elif cfg.get("layer_split") not in (None, "auto"):
+            raise ValueError("layer boundaries require several selected cards")
         tokenizer = Path(existing(cfg.get("tokenizer")))
         for name in ("vocab.json", "merges.txt", "token_type.json"):
             if not (tokenizer / name).is_file():
@@ -426,6 +496,24 @@ def strata_card(snapshot: DeviceSnapshot) -> ComputeDevice | None:
     if not cards:
         return None
     return min(cards, key=lambda d: (-round((d.memoryTotalBytes or 0) / 2**30), d.index or 0))
+
+
+def runtime_cards(spec: RuntimeSpec, path: Path, snapshot: DeviceSnapshot) -> list[ComputeDevice]:
+    """The profile override, otherwise the prepared selection, for admission."""
+    flags = spec.flags or {}
+    selection = flags.get("gpus")
+    if "gpus" not in flags:
+        try:
+            cfg = read_config(prepared_entry(path))
+            selection = cfg.get("gpu")
+            if type(selection) is int:
+                selection = [selection]
+        except (SpawnPlanError, PreparedInspectError):
+            selection = None
+    if selection is not None:
+        return settings.selected_cards(snapshot, selection)
+    card = strata_card(snapshot)
+    return [card] if card is not None else []
 
 
 class StrataAdapter(EngineAdapter):
@@ -513,11 +601,14 @@ class StrataAdapter(EngineAdapter):
         source_path: str,
         context: int | None,
         vision: PreparationVisionMode = PreparationVisionMode.off,
+        speed_projection: str | None = None,
+        gpus: list[int] | None = None,
+        layer_split: str | None = None,
     ) -> Recipe:
         """Upstream's setup, into `Strata-data` in this node's folder for the
         Library folder (B43, B45, B101); see `strata_prepare`."""
         from .devices import host_memory
-        from .strata_prepare import main_gpu, plan
+        from .strata_prepare import plan
 
         total, _available = host_memory()
         return plan(
@@ -528,8 +619,10 @@ class StrataAdapter(EngineAdapter):
             source_path=source_path,
             context=context,
             ram_bytes=total,
-            gpu=main_gpu(),
             vision=vision,
+            speed_projection=speed_projection,
+            gpus=gpus,
+            layer_split=layer_split,
         )
 
     answers_while_loading = False
@@ -541,11 +634,24 @@ class StrataAdapter(EngineAdapter):
         python = root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
         if not python.is_file():
             raise SpawnPlanError(f"Strata's isolated Python is missing: {python}")
-        return prepared_config(
+        config = prepared_config(
             prepared_entry(Path(spec.modelPath)),
             alias=spec.modelAlias or default_model_alias(spec.modelPath),
             root=root,
+            flags=spec.flags,
         )
+        try:
+            gpu = config.get("gpu")
+            cards = settings.selected_cards(detect_devices(), [gpu] if type(gpu) is int else gpu)
+            indices = [d.index for d in cards]
+            if indices:
+                config["gpu"] = indices if len(indices) > 1 else indices[0]
+            else:
+                config.pop("gpu", None)
+            config["layer_split"] = settings.layer_split(config.get("layer_split"), len(cards))
+        except ValueError as exc:
+            raise SpawnPlanError(str(exc)) from exc
+        return config
 
     def build_argv(self, spec: RuntimeSpec, binary: DiscoveredBinary, port: int) -> list[str]:
         config = self.prepare_config(spec, binary)
@@ -663,4 +769,58 @@ class StrataAdapter(EngineAdapter):
         )
 
     def flag_schema(self) -> ConfigSchema:
-        return ConfigSchema(component="engine:strata", categories={}, fields=[])
+        return ConfigSchema(
+            component="engine:strata",
+            categories={"launch": "Launch settings"},
+            fields=[
+                ConfigField(
+                    key="speedProjection",
+                    label="Speed projection (experimental)",
+                    category="launch",
+                    valueType=ConfigValueType.enum,
+                    enumValues=["off", "on"],
+                    description=(
+                        "Changes answers; experimental.\nStrata describes this as a "
+                        "refusal-direction projection: it removes a direction from layers 4-44, "
+                        "reduces refusals and shifts ordinary predictions. On identical text "
+                        "upstream measures a 0.2-0.4% cost per token; chat speed depends on the "
+                        "text generated. See https://github.com/Niko1221/Strata/blob/"
+                        "6f32ec070f23ced9f50e704d854d775da52591ab/"
+                        "data/experimental-speed-projection/README.md"
+                    ),
+                    unsetMeans=(
+                        "Keep the prepared projection and sampling default. "
+                        "New preparations default off."
+                    ),
+                ),
+                ConfigField(
+                    key="gpus",
+                    label="Graphics cards, main first",
+                    category="launch",
+                    valueType=ConfigValueType.string_list,
+                    description=(
+                        "Add this node's card numbers in order, main first, for example 0 then 2. "
+                        "Each card must be present and compatible. Several cards share the layers."
+                    ),
+                    unsetMeans=(
+                        "Keep the prepared cards. If none were prepared, "
+                        "choose the compatible card with the most memory."
+                    ),
+                ),
+                ConfigField(
+                    key="layerSplit",
+                    label="Layer boundaries",
+                    category="launch",
+                    valueType=ConfigValueType.string,
+                    description=(
+                        "Use auto for placement by free graphics memory. For three cards, "
+                        "16,32 starts each later card at that layer. These are boundaries, "
+                        "not layer counts."
+                    ),
+                    unsetMeans=(
+                        "Keep the prepared boundaries. New card selections use auto "
+                        "with several cards, and no split with one."
+                    ),
+                ),
+            ],
+        )

@@ -59,10 +59,19 @@ async def test_worker_passes_the_requested_image_mode(authed_client, monkeypatch
     node = NodeActions(app)
     progress = Progress(state="running")
     monkeypatch.setattr(node.preparations, "start", lambda *args, **kwargs: progress)
-    preparation = {"engine": "strata", **({"vision": vision} if vision else {})}
+    preparation = {
+        "engine": "strata",
+        "speedProjection": "on",
+        "gpus": [2, 0],
+        "layerSplit": "24",
+        **({"vision": vision} if vision else {}),
+    }
     job = _job("preparing", intent={"modelId": "g", "preparation": preparation})
     assert await node.prepare(job) is progress
     assert planned[0]["vision"] == (vision or "off")
+    assert planned[0]["speed_projection"] == "on"
+    assert planned[0]["gpus"] == [2, 0]
+    assert planned[0]["layer_split"] == "24"
 
 
 def _verdict(engine, verdict, *, available=True, reason="runs it after preparing it"):

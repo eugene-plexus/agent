@@ -49,7 +49,9 @@ from ..preparation import (
 )
 from ..prepared_facts import facts_fields
 from ..supervisor import SpawnPlanError
+from . import strata_settings as settings
 from .base import PreparedInspectError
+from .devices import detect_devices
 from .strata import (
     OWNED_KEYS,
     PATH_ARGS,
@@ -242,6 +244,9 @@ def plan(
     ram_bytes: int | None,
     gpu: int | None = None,
     vision: PreparationVisionMode = PreparationVisionMode.off,
+    speed_projection: str | None = None,
+    gpus: list[int] | None = None,
+    layer_split: str | None = None,
 ) -> StrataPreparation:
     """Check what can be checked before anything starts (B51), or say why not.
 
@@ -256,6 +261,17 @@ def plan(
             "them (its setup refuses any other GGUF)."
         )
     supported, choice = found
+    try:
+        cards = settings.selected_cards(
+            detect_devices(), gpus if gpus is not None else [gpu] if gpu is not None else None
+        )
+        indices = [d.index for d in cards if d.index is not None]
+        split = settings.layer_split(layer_split, len(cards), settings.layer_count(gguf))
+        projection = settings.projection_mode(
+            speed_projection if speed_projection is not None else "off"
+        )
+    except ValueError as exc:
+        raise PreparationError(str(exc)) from exc
     vision = PreparationVisionMode(vision)
     modes = supported.preparation.visionModes if supported.preparation is not None else None
     if vision is not PreparationVisionMode.off and vision not in (modes or []):
@@ -303,6 +319,9 @@ def plan(
         source_path=source_path,
         bytes_needed=need,
         vision=PreparationVisionMode(vision),
+        gpus=indices,
+        layer_split=split,
+        speed_projection=projection,
     )
 
 
@@ -339,6 +358,9 @@ class StrataPreparation:
     source_path: str
     bytes_needed: int | None
     vision: PreparationVisionMode = PreparationVisionMode.off
+    gpus: list[int] = field(default_factory=list)
+    layer_split: str | None = None
+    speed_projection: str = "off"
     _failure: list[str] = field(default_factory=list)
     _pending: str = ""
     #: The folder setup is given as the GGUF's (B102).
@@ -384,15 +406,22 @@ class StrataPreparation:
             "--vision",
             "no" if self.vision is PreparationVisionMode.off else self.vision.value,
             "--experimental-speed-projection",
-            "off",
+            self.speed_projection,
             "--no-browser",
             "--no-start",
             "--yes",
         ]
         if self.context is not None:
             out += ["--context", str(self.context)]
-        if self.gpu is not None:
-            out += ["--gpu", str(self.gpu)]
+        if len(self.gpus) > 1:
+            out += [
+                "--gpus",
+                ",".join(map(str, self.gpus)),
+                "--layer-split",
+                self.layer_split or "auto",
+            ]
+        elif self.gpus:
+            out += ["--gpu", str(self.gpus[0])]
         return out
 
     def environment(self, settings: Path) -> dict[str, str]:
@@ -429,6 +458,11 @@ class StrataPreparation:
         ]
 
     def run(self, progress: Progress) -> PreparationResult:
+        try:
+            if self.gpus:
+                settings.selected_cards(detect_devices(), self.gpus)
+        except ValueError as exc:
+            raise PreparationError(str(exc)) from exc
         check_tools(self.root)
         progress.check_cancelled()
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -449,11 +483,11 @@ class StrataPreparation:
         progress.log_name = self.log_path.relative_to(self.work).as_posix()
         with tempfile.TemporaryDirectory(
             prefix="eugene-strata-setup-", ignore_cleanup_errors=True
-        ) as settings:
+        ) as setup_settings:
             code = run_process(
                 self.argv(),
                 cwd=self.root,
-                env=self.environment(Path(settings)),
+                env=self.environment(Path(setup_settings)),
                 log_path=self.log_path,
                 progress=progress,
                 on_output=lambda text: self._read(text, progress),
@@ -464,7 +498,7 @@ class StrataPreparation:
             raise PreparationError(self._stopped(code, progress))
         progress.step = "Making it a Library model"
         progress.message = None
-        entry = self._adopt_config()
+        entry = self._adopt_config(progress)
         try:
             facts = facts_fields(inspect_config(entry), folder=entry.parent)
         except PreparedInspectError as exc:
@@ -606,7 +640,7 @@ class StrataPreparation:
             )
         return Path(os.path.relpath(path, self.data_dir)).as_posix()
 
-    def _adopt_config(self) -> Path:
+    def _adopt_config(self, progress: Progress) -> Path:
         """Setup's configuration, moved into the data folder (B48), and
         checked the way a launch checks it before the library lists it."""
         produced = self.root / self.config_name
@@ -623,6 +657,36 @@ class StrataPreparation:
         if not isinstance(cfg, dict) or not isinstance(cfg.get("args"), list):
             raise PreparationError(f"Strata's setup wrote {self.config_name} without its args")
         args = [str(a) for a in cfg["args"]]
+        gpu = cfg.get("gpu")
+        actual = [gpu] if type(gpu) is int else [] if gpu is None else gpu
+        if actual != self.gpus:
+            raise PreparationError(
+                f"Strata's setup selected cards {actual} instead of requested cards "
+                f"{self.gpus}; check its setup log"
+            )
+        try:
+            actual_split = settings.layer_split(
+                cfg.get("layer_split"), len(self.gpus), settings.layer_count(self.gguf)
+            )
+        except ValueError as exc:
+            raise PreparationError(f"Strata's setup wrote invalid layer boundaries: {exc}") from exc
+        if actual_split != self.layer_split:
+            raise PreparationError(
+                f"Strata's setup selected layer split {actual_split} "
+                f"instead of requested {self.layer_split}"
+            )
+        applied = settings.effective_projection(cfg)
+        if applied != self.speed_projection:
+            progress.warn(
+                f"Strata's setup left speed projection {applied} instead of requested "
+                f"{self.speed_projection}; see the setup log for its observed reason"
+            )
+        if "--control-vector-scaled" in args:
+            # The vector is an installed engine asset, not model data to copy.
+            at = args.index("--control-vector-scaled") + 1
+            name, _, scale = args[at].rpartition(":")
+            if Path(name).name == settings.VECTOR.name:
+                args[at] = f"{settings.VECTOR.as_posix()}:{scale}"
         pack = self.data_dir / "packs" / self.choice.tag
         for i in range(len(args) - 1):
             if args[i] == "--expert-profile":

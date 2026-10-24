@@ -42,6 +42,7 @@ import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -269,6 +270,15 @@ async def refresh(
         cache.note_failure(
             getattr(library, "last_error", None) or "The Library did not answer with its folders."
         )
+        return False
+    if getattr(library, "folders_safe_mode", False):
+        kept = (
+            "keeps the folder list from "
+            + datetime.fromtimestamp(cache._fetched_at).strftime("%H:%M")
+            if cache._fetched_at is not None
+            else "has no saved folder list"
+        )
+        cache.note_failure(f"The Library is in safe mode, so this machine {kept}.")
         return False
     cache.update(parse_folders(answer), library_url=getattr(library, "base_url", None))
     return True

@@ -261,6 +261,9 @@ class NodeActions:
                 source_path=model["path"],
                 context=wanted.get("contextSize"),
                 vision=wanted.get("vision", "off"),
+                speed_projection=wanted.get("speedProjection"),
+                gpus=wanted.get("gpus"),
+                layer_split=wanted.get("layerSplit"),
             )
 
         try:

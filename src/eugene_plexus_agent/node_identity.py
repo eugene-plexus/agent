@@ -437,6 +437,19 @@ class IdentityRecord:
     deleted when the change stops or fails."""
     machine_key_change: dict[str, Any] | None = None
     """The last machine key change, as `machine_key_change` keeps it."""
+    control_url_epoch: int | None = None
+    legacy_token_epoch: int | None = None
+    """The epoch this node held when it first ran row 4 code, or joined
+    (re-review): the last at which a root may have signed tokens without
+    `ep`. Once this node holds a higher epoch, a promotion happened, and a
+    root token without `ep` is refused."""
+    list_epoch: int | None = None
+    """The highest root epoch a machine list this node took named
+    (re-review). Once set, a list that names no root is a replay of an older
+    root's, and is refused, across a restart too."""
+    """The epoch `control_url` came with (row 4): the epoch at enrolment, or
+    of the promoted root this node moved to. Only a signed machine list at a
+    higher epoch moves the node (`machine_trust`)."""
 
     @property
     def enrolled(self) -> bool:
@@ -463,6 +476,9 @@ _FIELDS: tuple[tuple[str, str], ...] = (
     ("tlsNextPrivateKey", "tls_next_private_key"),
     ("tlsNextCertificate", "tls_next_certificate"),
     ("machineKeyChange", "machine_key_change"),
+    ("controlUrlEpoch", "control_url_epoch"),
+    ("legacyTokenEpoch", "legacy_token_epoch"),
+    ("listEpoch", "list_epoch"),
 )
 
 
@@ -498,8 +514,12 @@ class NodeIdentityStore:
             values: dict[str, Any] = {}
             for wire, attr in _FIELDS:
                 value = raw.get(wire)
-                if attr == "epoch":
-                    values[attr] = int(value) if isinstance(value, int) else None
+                if attr in ("epoch", "control_url_epoch", "legacy_token_epoch", "list_epoch"):
+                    values[attr] = (
+                        int(value)
+                        if isinstance(value, int) and not isinstance(value, bool)
+                        else None
+                    )
                 elif attr == "machine_key_change":
                     values[attr] = dict(value) if isinstance(value, dict) else None
                 elif attr == "advertise_sequence":
@@ -516,6 +536,32 @@ class NodeIdentityStore:
                     self._record.control_url,
                     self._record.epoch,
                 )
+            held = self._record.epoch or 0
+            if self._record.enrolled and (
+                self._record.control_url_epoch is None or self._record.legacy_token_epoch is None
+            ):
+                # Row 4: a node enrolled before the root's address could
+                # move. Its address came with the epoch it holds, so an
+                # update never moves it; only a later promotion can. And a
+                # root may have signed tokens without `ep` up to this epoch.
+                adopted = replace(
+                    self._record,
+                    control_url_epoch=(
+                        held
+                        if self._record.control_url_epoch is None
+                        else self._record.control_url_epoch
+                    ),
+                    legacy_token_epoch=(
+                        held
+                        if self._record.legacy_token_epoch is None
+                        else self._record.legacy_token_epoch
+                    ),
+                )
+                try:
+                    self._write_locked(adopted)
+                except OSError as exc:
+                    log.warning("could not record controlUrlEpoch in %s: %s", self._path, exc)
+                    self._record = adopted
 
     # ----- mutations --------------------------------------------------
 
@@ -590,6 +636,9 @@ class NodeIdentityStore:
                     name=name,
                     control_url=control_url.rstrip("/"),
                     epoch=epoch,
+                    control_url_epoch=epoch,
+                    legacy_token_epoch=epoch,
+                    list_epoch=None,
                     control_public_key=control_public_key,
                     recovery_public_key=recovery_public_key,
                     advertise_url=advertise_url,
@@ -721,6 +770,9 @@ class NodeIdentityStore:
                     self._record,
                     name=None,
                     control_url=None,
+                    control_url_epoch=None,
+                    legacy_token_epoch=None,
+                    list_epoch=None,
                     control_public_key=None,
                     recovery_public_key=None,
                     epoch=None,
@@ -734,6 +786,41 @@ class NodeIdentityStore:
                     machine_key_change=None,
                 )
             )
+            return self._record
+
+    def follow_root(self, url: str | None, epoch: int) -> IdentityRecord:
+        """Row 4: the root as a signed machine list names it at `epoch`, in
+        one write. The caller (`machine_trust`) has checked the list.
+
+        Holds `epoch`, as a bundle at that epoch would: the list is signed by
+        the same identity. With `url`, the root's address becomes `url`, and
+        came with `epoch`; the root's machine key from the join token goes,
+        because it was the old root's, and the list names the new root's.
+        Raises `FencedError` for an epoch below the one held."""
+        with self._lock:
+            record = self._record
+            held = record.epoch or 0
+            if epoch < held:
+                raise FencedError(
+                    f"refusing epoch {epoch}: this node has already acknowledged epoch {held}"
+                )
+            changes: dict[str, Any] = {"epoch": epoch}
+            if url is not None:
+                new = url.rstrip("/")
+                changes["control_url_epoch"] = epoch
+                if new != (record.control_url or "").rstrip("/"):
+                    changes.update(control_url=new, control_pins=None)
+            updated = replace(record, **changes)
+            if updated != record:
+                self._write_locked(updated)
+            return self._record
+
+    def record_list_epoch(self, epoch: int) -> IdentityRecord:
+        """Keep the highest root epoch a taken machine list named (row 4
+        re-review); written only when it rises."""
+        with self._lock:
+            if epoch > int(self._record.list_epoch or 0):
+                self._write_locked(replace(self._record, list_epoch=epoch))
             return self._record
 
     def accept_epoch(self, epoch: int) -> None:

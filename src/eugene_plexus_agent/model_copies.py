@@ -43,13 +43,17 @@ elsewhere in this project:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
 import shutil
+import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -67,6 +71,8 @@ DEFAULT_MIN_FREE_GB = 50
 #: open, and deliberately in the destination directory rather than a
 #: temp dir, so the rename is on one filesystem and therefore atomic.
 PARTIAL_SUFFIX = ".ep-partial"
+SOURCE_SUFFIX = ".source.json"
+SOURCE_CHECK_SECONDS = 5.0
 
 #: Read/write chunk. Large enough that the syscall overhead is noise
 #: against a gigabit link, small enough that a headroom breach or a
@@ -88,6 +94,7 @@ class CopySettings:
     enabled: bool
     directory: str | None
     min_free_bytes: int
+    folder_roots: tuple[str, ...] = ()
 
     @property
     def usable(self) -> bool:
@@ -97,7 +104,9 @@ class CopySettings:
         return self.enabled and bool(self.directory)
 
 
-def settings_from_config(get_config: Callable[[str], Any]) -> CopySettings:
+def settings_from_config(
+    get_config: Callable[[str], Any], *, folder_roots: Sequence[str] = ()
+) -> CopySettings:
     """Read the trio. Anything malformed degrades to "off" rather than
     raising: `degraded-mode-required` applies to a convenience feature
     more strongly than to anything else, not less."""
@@ -118,6 +127,7 @@ def settings_from_config(get_config: Callable[[str], Any]) -> CopySettings:
         enabled=enabled,
         directory=os.path.expanduser(directory) if directory else None,
         min_free_bytes=min_free_gb * GIB,
+        folder_roots=tuple(folder_roots),
     )
 
 
@@ -191,6 +201,7 @@ class CopyPlan:
     source: str
     destination: str
     members: tuple[CopyMember, ...] = ()
+    root: str | None = None
 
     @property
     def partial(self) -> str:
@@ -311,7 +322,33 @@ def plan_for(
     destination = os.path.join(settings.directory, *relative.split("/"))
     if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(destination)):
         return None
-    files = members_of(source)
+    depth = len(relative.split("/"))
+    parents = (PureWindowsPath if is_windows_shaped(source) else PurePosixPath)(source).parents
+    if not 0 < depth <= len(parents):
+        return None
+    root = str(parents[depth - 1])
+    layout_root = root
+    folders = [
+        folder
+        for folder in settings.folder_roots
+        if match(PathRule(folder, folder), declared) is not None
+    ]
+    if folders:
+        folder = max(
+            folders, key=lambda folder: len(_parts(folder, windows=is_windows_shaped(folder))[0])
+        )
+        root = resolve_model_path(folder, rules, expand=expand).local_path
+    try:
+        files = _bounded(source + ":members", lambda: members_of(source))
+    except (OSError, TimeoutError):
+        files = None
+    if files is None:
+        # Prepared and sharded models must keep the entire saved set. Never
+        # treat an unreadable multi-file source as one complete file.
+        record = _record(destination)
+        saved_members = record.get("members") if record else None
+        if isinstance(saved_members, list) and all(isinstance(p, str) for p in saved_members):
+            files = tuple(saved_members)
     if files is None:
         return None
     for extra in companions:
@@ -319,26 +356,19 @@ def plan_for(
         if os.path.isfile(local) and local not in files:
             files = (*files, local)
     if len(files) <= 1:
-        return CopyPlan(declared=declared, source=source, destination=destination)
-    # The Library folder as this node reaches it: the source less the part
-    # the copy is named by, so every member keeps its place beside the rest.
-    depth = len(relative.split("/"))
-    # In the source's own convention: a node reaching a share by a drive
-    # letter is Windows-shaped wherever this check runs.
-    parents = (PureWindowsPath if is_windows_shaped(source) else PurePosixPath)(source).parents
-    if not 0 < depth <= len(parents):
-        return None
-    root = str(parents[depth - 1])
+        return CopyPlan(declared=declared, source=source, destination=destination, root=root)
+    # Keep the established copy layout, independently of which Library
+    # folder root must answer before a missing member means removal.
     members: list[CopyMember] = []
     for path in files:
-        inside = os.path.relpath(path, root)
+        inside = os.path.relpath(path, layout_root)
         if os.path.isabs(inside) or inside == ".." or inside.startswith(".." + os.sep):
             # A file outside the model's Library folder cannot keep its
             # place in the copy: the model runs from where it is.
             return None
         members.append(CopyMember(path, os.path.join(settings.directory, inside)))
     return CopyPlan(
-        declared=declared, source=source, destination=destination, members=tuple(members)
+        declared=declared, source=source, destination=destination, members=tuple(members), root=root
     )
 
 
@@ -373,6 +403,7 @@ def wanted(
                 source=held.source,
                 destination=held.destination,
                 members=tuple(members.values()),
+                root=held.root,
             )
     return out
 
@@ -396,7 +427,180 @@ def _stat(path: str) -> Stat | None:
 
 def copy_is_current(plan: CopyPlan, *, mtime_tolerance: float = 2.0) -> bool:
     """Every file of the copy is current (`member_is_current`)."""
-    return all(member_is_current(m, mtime_tolerance=mtime_tolerance) for m in plan.files)
+    return check_copy(plan, mtime_tolerance=mtime_tolerance).usable
+
+
+_pending_checks: dict[str, tuple[float, Future[Any]]] = {}
+_checks_lock = threading.Lock()
+
+
+def _bounded(key: str, read: Callable[[], Any]) -> Any:
+    """One daemon per pending path: a stuck mount cannot hold shutdown open."""
+    with _checks_lock:
+        held = _pending_checks.get(key)
+        if held is None or held[1].done():
+            future: Future[Any] = Future()
+
+            def run() -> None:
+                try:
+                    future.set_result(read())
+                except BaseException as exc:
+                    future.set_exception(exc)
+
+            held = (time.perf_counter(), future)
+            _pending_checks[key] = held
+            threading.Thread(target=run, daemon=True, name="copy-source-check").start()
+    started, future = held
+    try:
+        return future.result(
+            timeout=max(0.0, SOURCE_CHECK_SECONDS - (time.perf_counter() - started))
+        )
+    finally:
+        if future.done():
+            with _checks_lock:
+                if _pending_checks.get(key) == held:
+                    _pending_checks.pop(key, None)
+
+
+_record_lock = threading.RLock()
+
+
+def _record(destination: str) -> dict[str, Any] | None:
+    with _record_lock:
+        return _read_record(destination)
+
+
+def _read_record(destination: str) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(Path(destination + SOURCE_SUFFIX).read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _save_source(member: CopyMember, source: Stat, members: Sequence[str] = ()) -> None:
+    with _record_lock:
+        held = _read_record(member.destination)
+        if (
+            held
+            and held.get("source") == member.source
+            and held.get("size") == source.size
+            and held.get("mtime") == source.mtime
+            and held.get("copiedAt")
+            and (not members or held.get("members") == list(members))
+        ):
+            return
+        _write_source(member, source, members)
+
+
+def _write_source(member: CopyMember, source: Stat, members: Sequence[str]) -> None:
+    payload: dict[str, Any] = {
+        "source": member.source,
+        "size": source.size,
+        "mtime": source.mtime,
+        "copiedAt": datetime.now(UTC).isoformat(),
+    }
+    if members:
+        payload["members"] = list(members)
+    path = member.destination + SOURCE_SUFFIX
+    partial = path + PARTIAL_SUFFIX
+    try:
+        with open(partial, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(partial, path)
+    except OSError as exc:
+        _remove_quietly(partial)
+        log.warning("could not record the source of %s: %s", member.destination, exc)
+
+
+@dataclass(frozen=True)
+class CopyCheck:
+    usable: bool
+    note: str | None = None
+    refusal: str | None = None
+
+
+def check_copy(plan: CopyPlan, *, mtime_tolerance: float = 2.0) -> CopyCheck:
+    root = plan.root or os.path.dirname(plan.source)
+
+    def probe() -> tuple[list[Stat | None], str | None]:
+        try:
+            sources = [_stat(member.source) for member in plan.files]
+        except OSError:
+            sources = [None] * len(plan.files)
+        if any(source is None for source in sources):
+            try:
+                with os.scandir(root) as entries:
+                    next(entries, None)
+            except OSError as exc:
+                return sources, str(exc)
+        return sources, None
+
+    try:
+        sources, cause = _bounded(plan.source + ":stat", probe)
+    except TimeoutError:
+        sources = [None] * len(plan.files)
+        cause = f"the check timed out after {SOURCE_CHECK_SECONDS:g} seconds"
+    destinations = [_stat(member.destination) for member in plan.files]
+    if cause is not None:
+        records = [_record(member.destination) for member in plan.files]
+        recorded = all(
+            record
+            and record.get("source") == member.source
+            and isinstance(record.get("size"), int)
+            and record.get("mtime") is not None
+            and record.get("copiedAt")
+            for member, record in zip(plan.files, records, strict=True)
+        )
+        if recorded and all(
+            destination is not None and record is not None and destination.size == record["size"]
+            for destination, record in zip(destinations, records, strict=True)
+        ):
+            return CopyCheck(
+                True, f"Started from this machine's copy. {root} cannot be checked: {cause}."
+            )
+        if not recorded and any(destination is not None for destination in destinations):
+            return CopyCheck(
+                False,
+                refusal=(
+                    "was made before Eugene recorded its source, and "
+                    f"{root} cannot be checked now: {cause}."
+                ),
+            )
+        return CopyCheck(
+            False, refusal=f"cannot be used because {root} cannot be checked: {cause}."
+        )
+    for member, source, destination in zip(plan.files, sources, destinations, strict=True):
+        if source is None or destination is None or source.size != destination.size:
+            return CopyCheck(False)
+        if abs(source.mtime - destination.mtime) > mtime_tolerance:
+            # Existing Ollama hard links have the blob's timestamp.
+            try:
+
+                def same_blob(member: CopyMember = member) -> bool:
+                    blob = matching_ollama_blob(member.source)
+                    return blob is not None and os.path.samefile(blob, member.destination)
+
+                same = _bounded(member.source + ":samefile", same_blob)
+            except (OSError, TimeoutError):
+                same = False
+            if not same:
+                return CopyCheck(False)
+    for member, source in zip(plan.files, sources, strict=True):
+        assert source is not None
+        saved_record = _record(member.destination)
+        if not saved_record or any(
+            saved_record.get(key) != value
+            for key, value in (
+                ("source", member.source),
+                ("size", source.size),
+                ("mtime", source.mtime),
+            )
+        ):
+            _save_source(member, source, [m.source for m in plan.files])
+    return CopyCheck(True)
 
 
 def total_size(plan: CopyPlan) -> int:
@@ -586,6 +790,10 @@ def copy_file(
             continue
         copied = _copy_one(member, settings, state, copied, should_cancel)
         state.files_copied += 1
+    for member in files:
+        source = _stat(member.source)
+        if source is not None:
+            _save_source(member, source, [m.source for m in files])
 
 
 def _copy_one(
@@ -695,7 +903,7 @@ def copies_on_disk(directory: str | None) -> list[str]:
     out: list[str] = []
     for root, _dirs, files in os.walk(directory):
         for name in files:
-            if name.endswith(PARTIAL_SUFFIX):
+            if name.endswith((PARTIAL_SUFFIX, SOURCE_SUFFIX)):
                 continue
             out.append(os.path.join(root, name))
     return sorted(out)
@@ -735,6 +943,7 @@ def clear(
         except OSError as exc:
             result.skipped.append(Skipped(path=path, reason=str(exc)))
             continue
+        _remove_quietly(path + SOURCE_SUFFIX)
         result.deleted.append(path)
         result.bytes_freed += st.size if st is not None else 0
     _prune_empty_dirs(directory)
@@ -781,6 +990,7 @@ def evict_for_headroom(
         except OSError as exc:
             result.skipped.append(Skipped(path=path, reason=str(exc)))
             continue
+        _remove_quietly(path + SOURCE_SUFFIX)
         result.deleted.append(path)
         result.bytes_freed += st.size if st is not None else 0
     _prune_empty_dirs(directory, keep)
@@ -818,6 +1028,7 @@ def remove_unwanted(
         except OSError as exc:
             result.skipped.append(Skipped(path=path, reason=str(exc)))
             continue
+        _remove_quietly(path + SOURCE_SUFFIX)
         result.deleted.append(path)
         result.bytes_freed += st.size if st is not None else 0
         log.info("removed local copy %s: no runtime points at it any more", path)
@@ -868,6 +1079,8 @@ class LocalPath:
 
     path: str
     source: str  # same_path | inherited | override | copy
+    note: str | None = None
+    refusal: str | None = None
 
     @property
     def is_copy(self) -> bool:
@@ -894,14 +1107,18 @@ def resolve_local_path(
     serve yesterday's weights from a path the operator cannot see.
     """
     plan = plan_for(declared, rules, settings, expand=expand)
-    if plan is not None and copy_is_current(plan):
-        return LocalPath(path=plan.destination, source="copy")
+    check = check_copy(plan) if plan is not None else CopyCheck(False)
+    if plan is not None and check.usable:
+        return LocalPath(path=plan.destination, source="copy", note=check.note)
     resolution = resolve_model_path(declared, rules, expand=expand)
     if rule_source is not None:
-        return LocalPath(path=resolution.local_path, source=rule_source(resolution.rule))
+        return LocalPath(
+            path=resolution.local_path, source=rule_source(resolution.rule), refusal=check.refusal
+        )
     return LocalPath(
         path=resolution.local_path,
         source="same_path" if resolution.rule is None else "override",
+        refusal=check.refusal,
     )
 
 

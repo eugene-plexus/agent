@@ -56,6 +56,101 @@ class MachineListError(Exception):
     """A machine list that does not verify, or is older than the one held."""
 
 
+class MachineListUnsigned(MachineListError):
+    """Not a machine list signed by the root this node pinned (or not a
+    machine list at all). The push route answers 401."""
+
+
+class MachineListFenced(MachineListError):
+    """A list from a superseded root (row 4): its `control.epoch` is below
+    the epoch this node holds. The push route answers 409."""
+
+
+def control_of(claims: dict[str, Any] | None) -> dict[str, Any] | None:
+    """`MachineList.control` of a verified list (row 4): `{epoch, node, url}`,
+    or None from a root older than row 4 or a block that does not hold
+    together."""
+    block = (claims or {}).get("control")
+    if not isinstance(block, dict):
+        return None
+    epoch = block.get("epoch")
+    if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1:
+        return None
+    url = block.get("url")
+    node = block.get("node")
+    return {
+        "epoch": epoch,
+        "node": node if isinstance(node, str) and node else None,
+        "url": url.strip().rstrip("/") if isinstance(url, str) and url.strip() else None,
+    }
+
+
+def checked_control(claims: dict[str, Any]) -> dict[str, Any] | None:
+    """`control_of`, refusing a `control` block that is there and does not
+    hold together (row 4 review): a list that names a root must name it
+    properly, or it is not taken at all."""
+    if "control" not in claims or claims.get("control") is None:
+        return None
+    control = control_of(claims)
+    if control is None:
+        raise MachineListError("the machine list names its root in a form this node cannot read")
+    return control
+
+
+def _content(claims: dict[str, Any] | None) -> dict[str, Any]:
+    """What a list says, apart from when it was signed."""
+    return {k: v for k, v in (claims or {}).items() if k != "iat"}
+
+
+def _plain_door(url: Any) -> str | None:
+    """`http://host:port` of a machine port's `https://host:port`."""
+    origin = _origin(url) if isinstance(url, str) else None
+    if origin is None or not origin.startswith("https://"):
+        return None
+    return "http://" + origin.removeprefix("https://")
+
+
+def _not_bound(claims: dict[str, Any], control: dict[str, Any]) -> str | None:
+    """Why a list's root is not one of the machines it lists, at the door
+    and with the keys that machine registered (row 4 review); None when it
+    is. A root signs its own list, so this holds for every list a root
+    makes, and a list that names a stranger, or an address or keys its
+    machine never registered, moves no one."""
+    name = control["node"]
+    if name is None:
+        return "it names no machine as the root"
+    entry = next(
+        (n for n in claims.get("nodes") or [] if isinstance(n, dict) and n.get("name") == name),
+        None,
+    )
+    if entry is None:
+        return f"it names {name} the root but does not list {name}"
+    door = _plain_door(entry.get("machineUrl"))
+    if door is None:
+        if str(control["url"]).startswith("https://"):
+            return None  # the nodes name of a root with no machine port
+        return f"{name} registered no machine port for {control['url']}"
+    if door != control["url"]:
+        return f"{control['url']} is not the machine port {name} registered ({door})"
+    pins = {p for p in entry.get("pins") or [] if isinstance(p, str)}
+    listed = {p for p in claims.get("controlPins") or [] if isinstance(p, str)}
+    if not listed or not listed <= pins:
+        return f"the keys the list gives the root are not the keys {name} registered"
+    return None
+
+
+def _why_not_followed(url: str) -> str | None:
+    """Why a root address in a signed list is not one this node moves to."""
+    from .node_identity import not_a_node_address
+
+    why = not_a_node_address(url)
+    if why is not None:
+        return why
+    if is_loopback_host(urlsplit(url).hostname):
+        return "it is on the root's own machine only"
+    return None
+
+
 def verify(jws: str, authority: str) -> dict[str, Any]:
     """The claims of a signed machine list, checked against the pinned root key."""
     try:
@@ -68,13 +163,13 @@ def verify(jws: str, authority: str) -> dict[str, Any]:
             leeway=tokens.LEEWAY_SECONDS,
         )
     except (jwt.InvalidTokenError, ValueError) as exc:
-        raise MachineListError(
+        raise MachineListUnsigned(
             f"the machine list is not signed by this node's root: {exc}"
         ) from exc
     if header.get("typ") != TYP_MACHINES:
-        raise MachineListError("that is not a machine list")
+        raise MachineListUnsigned("that is not a machine list")
     if not isinstance(claims.get("version"), int) or not isinstance(claims.get("nodes"), list):
-        raise MachineListError("the machine list is malformed")
+        raise MachineListUnsigned("the machine list is malformed")
     return claims
 
 
@@ -217,6 +312,12 @@ class MachineTrust:
         self._acknowledged: int | None = None
         self._write_failed = False
         self.on_required_changed: Any = None
+        #: Row 4: called (no arguments) once this node has followed a
+        #: promoted root to a new address; the agent announces itself there
+        #: and pulls the bundle (`leaving.after_root_moved`).
+        self.on_moved: Any = None
+        #: Row 4: the last root this node could not follow, said once.
+        self._unfollowed: tuple[int, str] | None = None
         self.own_urls: Any = lambda: ()
         #: Whether the root serves a machine list: False once it answered 404
         #: (a root older than LT1), None until it has answered at all.
@@ -251,7 +352,19 @@ class MachineTrust:
         try:
             kept = json.loads(self.list_path.read_text(encoding="utf-8"))
             if record.enrolled and record.control_public_key and isinstance(kept, dict):
-                self.claims = verify(str(kept["jws"]), record.control_public_key)
+                claims = verify(str(kept["jws"]), record.control_public_key)
+                control = checked_control(claims)
+                if control is None and record.list_epoch is not None:
+                    raise MachineListFenced(
+                        "it names no root epoch, and this node has taken lists that do"
+                    )
+                # Row 4 review: the epoch this node holds fences a kept list
+                # as it fences one offered.
+                if control is not None and control["epoch"] < (record.epoch or 0):
+                    raise MachineListFenced(
+                        f"epoch {control['epoch']} is below the {record.epoch} this node holds"
+                    )
+                self.claims = claims
                 self.taken_at = float(kept.get("takenAt") or 0) or None
         except FileNotFoundError:
             pass
@@ -260,26 +373,74 @@ class MachineTrust:
         self.rebuild()
 
     def accept(self, jws: str) -> bool:
-        """Take a list from the root. Returns whether anything changed."""
+        """Take a list from the root. Returns whether anything changed.
+
+        Row 4: a list names the root (`control`). One from a superseded root
+        (its epoch below the one this node holds) is refused outright
+        (`MachineListFenced`). Between two lists that name roots at different
+        epochs the higher epoch is the newer, whatever their versions: each
+        root numbers its own. And a list at an epoch above the one this
+        node's `controlUrl` came with moves the node there (`_follow`)."""
         record = self._identity.record
         if not record.enrolled or not record.control_public_key:
             raise MachineListError("this node is not enrolled, so it trusts no machine list")
         claims = verify(jws, record.control_public_key)
         held = int((self.claims or {}).get("version") or 0)
-        if claims["version"] < held:
+        offered, had = checked_control(claims), control_of(self.claims)
+        held_epoch = record.epoch or 0
+        seen = had["epoch"] if had is not None else record.list_epoch
+        if offered is None and seen is not None:
+            # Row 4 review: once this node has taken a list that names its
+            # root, a list that names none is a replay of an older root's.
+            # Kept in `node.yaml` (re-review), so a restart that dropped the
+            # kept list does not open the door again.
+            raise MachineListFenced(
+                f"it names no root epoch, and this node has taken lists of a root at epoch {seen}"
+            )
+        if offered is not None and offered["epoch"] < held_epoch:
+            raise MachineListFenced(
+                f"epoch {offered['epoch']} is below the {held_epoch} this node holds"
+            )
+        if offered is not None and had is not None and offered["epoch"] != had["epoch"]:
+            if offered["epoch"] < had["epoch"]:
+                raise MachineListError(
+                    f"the root sent a machine list of epoch {offered['epoch']}, older than "
+                    f"the one of epoch {had['epoch']} held"
+                )
+            same = False
+        elif claims["version"] < held:
             raise MachineListError(
                 f"the root sent machine list {claims['version']}, older than the {held} held"
             )
+        elif claims["version"] == held and _content(claims) != _content(self.claims):
+            # Row 4 review: one version is one list. Another one under the
+            # same number is refused, and nothing of it is kept.
+            raise MachineListError(
+                f"the root sent machine list {held} again, with other content than the one held"
+            )
+        else:
+            same = claims["version"] == held
+        # Only now, with every check passed, is it kept (row 4 review: what
+        # memory refuses is never written, so a restart cannot take it).
         self.taken_at = time.time()
         write_private(self.list_path, json.dumps({"jws": jws, "takenAt": self.taken_at}))
-        if claims["version"] == held:
-            if self._write_failed:
-                # The same list again: write the table it could not.
+        if offered is not None:
+            self._identity.record_list_epoch(int(offered["epoch"]))
+        # Before the table: it is built for the root's address.
+        moved = self._follow(offered, claims)
+        if same:
+            if self._write_failed or moved:
+                # The same list again: write the table it could not, or the
+                # one for the root it has just followed.
                 self.rebuild()
-            return False
+            if moved:
+                self._said_moved(offered)
+            return moved
         was_required = self.required
         self.claims = claims
         self.rebuild()
+        if moved:
+            self._said_moved(offered)
         log.info(
             "took machine list %d: %d machine(s)%s",
             claims["version"],
@@ -289,6 +450,56 @@ class MachineTrust:
         if self.required != was_required and self.on_required_changed is not None:
             self.on_required_changed(self.required)
         return True
+
+    def _follow(self, control: dict[str, Any] | None, claims: dict[str, Any]) -> bool:
+        """Row 4 (R4-MOVE): move this node to the root a verified, newer list
+        names, when it names one at an epoch above the one this node's
+        `controlUrl` came with. Returns whether `controlUrl` changed.
+
+        The same epoch never moves a node: it may reach its root at an
+        address the root does not know (a tailnet address), and every list
+        names the root's own. An epoch above the one held is held as a
+        bundle at that epoch would be; the caller has refused one below."""
+        if control is None:
+            return False
+        record = self._identity.record
+        epoch = int(control["epoch"])
+        if epoch <= int(record.control_url_epoch or 0):
+            if epoch > int(record.epoch or 0):
+                self._identity.follow_root(None, epoch)
+            return False
+        url = control["url"]
+        why = "it names no address" if url is None else _why_not_followed(str(url))
+        if why is None:
+            why = _not_bound(claims, control)
+        if why is not None:
+            if self._unfollowed != (epoch, why):
+                self._unfollowed = (epoch, why)
+                log.error(
+                    "the install's root is at epoch %d now, but this node cannot follow it there: "
+                    "%s. It keeps %s",
+                    epoch,
+                    why,
+                    record.control_url,
+                )
+            self._identity.follow_root(None, epoch)
+            return False
+        before = record.control_url
+        after = self._identity.follow_root(str(url), epoch)
+        return (after.control_url or "").rstrip("/") != (before or "").rstrip("/")
+
+    def _said_moved(self, control: dict[str, Any] | None) -> None:
+        """The log line, and what the agent does next (`on_moved`)."""
+        if control is None:
+            return
+        log.warning(
+            "the install's root moved to %s (epoch %d); this node follows it at %s",
+            control["node"] or control["url"],
+            control["epoch"],
+            control["url"],
+        )
+        if self.on_moved is not None:
+            self.on_moved()
 
     def table(self) -> dict[str, Any]:
         record = self._identity.record

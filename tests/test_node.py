@@ -644,7 +644,14 @@ def test_a_lower_epoch_is_fenced_with_409(authed_client: TestClient, control: Fa
     stale = _push(authed_client, control.root.bundle())
     assert stale.status_code == 409
     assert "epoch" in stale.text
-    assert authed_client.get("/v1/node").json()["epoch"] == 3
+    # A session without `ep` is refused once a promotion is known (row 4):
+    # read with one the root signed at the epoch it now has.
+    signer = tokens.Signer(key=control.root.token.key, issuer="control", epoch=3)
+    session, _ = signer.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=["node:gpu-box"], ttl_seconds=600
+    )
+    node = authed_client.get("/v1/node", headers={"Authorization": f"Bearer {session}"})
+    assert node.json()["epoch"] == 3
 
 
 def test_a_lost_bundle_still_fences_a_lower_epoch(

@@ -205,6 +205,30 @@ async def test_strata_in_its_low_ram_mode_is_admitted(tmp_path: Path) -> None:
     assert answer.decision is AdmissionDecision.admit and answer.fit is AdmissionFit.split
 
 
+@pytest.mark.parametrize("profile_override", [False, True])
+async def test_strata_fit_uses_only_selected_cards(tmp_path, profile_override):
+    from .strata_fakes import cuda
+
+    node = replace(
+        _node(ram=27 * GIB, available=20 * GIB),
+        devices=(cuda(16, index=0), cuda(16, index=2), cuda(96, index=3)),
+    )
+    path = _prepared(
+        tmp_path, source="IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
+    )
+    entry = tmp_path / "strata-iq2_xs.json"
+    entry.write_text(json.dumps({"args": [], "gpu": [0, 2], "layer_split": "auto"}))
+    spec = _strata(path)
+    if profile_override:
+        spec = spec.model_copy(update={"flags": {"gpus": [2, 0]}})
+    answer = await check_admission(spec, snapshot=node, library=None, running=[])
+    assert answer.decision is AdmissionDecision.admit and answer.fit is AdmissionFit.split
+    assert [d.index for d in answer.devices] == ([2, 0] if profile_override else [0, 2])
+    assert answer.totalBytes == 32 * GIB
+    assert answer.requiredBytes == 32 * GIB
+    assert "SSD" in answer.reason
+
+
 async def test_strata_that_does_not_fit_is_refused(tmp_path: Path) -> None:
     # A 32 GB card would make up for 16 GB of RAM (the low-RAM mode); a 16 GB
     # card does not: 16 - 6 + 11 is short of IQ2_XS's 35.5 GB of experts.

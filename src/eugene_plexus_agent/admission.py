@@ -227,6 +227,7 @@ class LibraryFitClient:
         self._transport = transport
         self._own_client: httpx.AsyncClient | None = None
         self.last_error: str | None = None
+        self.folders_safe_mode = False
         """Why the last folder read returned None, for the node's copy to
         keep and the Folders page to show."""
 
@@ -285,6 +286,7 @@ class LibraryFitClient:
         inherits its path rules from (2026-09-14). None when it could not
         answer, and the node keeps its last copy."""
         self.last_error = None
+        self.folders_safe_mode = False
         try:
             client = self._client()
             response = await client.get(f"{self._base}/v1/folders", headers=self._headers)
@@ -295,7 +297,9 @@ class LibraryFitClient:
                 )
                 log.warning("library folder list: %s", self.last_error)
                 return None
-            folders = response.json().get("folders")
+            body = response.json()
+            self.folders_safe_mode = body.get("safeMode") is True
+            folders = body.get("folders")
             if isinstance(folders, list):
                 return folders
             self.last_error = f"The Library at {self._base} answered without a folder list."
@@ -1162,26 +1166,46 @@ def strata_admission(
     holds that card's free memory while it loads (`requiredBytes`): a second
     launch on the card in that window is refused, not starved.
     """
-    from .engines.strata import choice_of_runtime, strata_card
+    from .engines.strata import choice_of_runtime, runtime_cards
     from .engines.strata_models import experts_in_ram_bytes, setup_fit
 
-    card = strata_card(snapshot)
+    try:
+        cards = runtime_cards(spec, Path(location.localPath or spec.modelPath), snapshot)
+    except ValueError as exc:
+        return Admission(
+            decision=AdmissionDecision.refuse,
+            fit=AdmissionFit.unknown,
+            basis=AdmissionBasis.engine_table,
+            location=location,
+            reason=f"Cannot use the selected Strata cards: {exc}",
+        )
+    card = cards[0] if cards else None
     choice = choice_of_runtime(Path(location.localPath or spec.modelPath))
-    held = (
+    held = sum(
         held_bytes(
             reservations,
-            device_index=card.index,
+            device_index=d.index,
             exclude=spec.name,
-            device_kind=card.kind.value,
+            device_kind=d.kind.value,
         )
-        if card is not None
-        else 0
+        for d in cards
     )
-    free = card.memoryFreeBytes if card is not None else None
+    free = (
+        sum(d.memoryFreeBytes or 0 for d in cards)
+        if cards and all(d.memoryFreeBytes is not None for d in cards)
+        else None
+    )
+    total = (
+        sum(d.memoryTotalBytes or 0 for d in cards)
+        if cards and all(d.memoryTotalBytes is not None for d in cards)
+        else None
+    )
     room = max(0, free - held) if free is not None else None
-    blockers = _blockers(spec, [card], snapshot, running) if card is not None else []
+    blockers = _blockers(spec, cards, snapshot, running) if cards else []
     where = (
-        f"device {card.index} ({card.name or card.kind.value})" if card is not None else "no card"
+        ", ".join(f"device {d.index} ({d.name or d.kind.value})" for d in cards)
+        if cards
+        else "no card"
     )
 
     from . import drives
@@ -1201,8 +1225,9 @@ def strata_admission(
             requiredBytes=room if fit is not AdmissionFit.unknown else None,
             freeBytes=free,
             reservedBytes=held or None,
-            totalBytes=card.memoryTotalBytes if card is not None else None,
+            totalBytes=total,
             device=card,
+            devices=cards if len(cards) > 1 else None,
             blockers=blockers,
             location=location,
             reason=reason,
@@ -1227,7 +1252,11 @@ def strata_admission(
             f"sizes {choice.model} by it.",
             "; ".join(warnings) or "RAM could not be read",
         )
-    vram_gib = (card.memoryTotalBytes or 0) / 2**30 if card is not None else None
+    vram_gib = (
+        [d.memoryTotalBytes / 2**30 if d.memoryTotalBytes is not None else None for d in cards]
+        if cards
+        else None
+    )
     verdict = setup_fit(choice, ram_total / 2**30, vram_gib)
     fit = _STRATA_FIT[verdict.verdict.value]
     words = verdict.words
@@ -1321,6 +1350,12 @@ async def check_admission(
     # as long as the OS takes to give up.
     location = await asyncio.to_thread(_locate, spec, mappings, is_there, sizer, copy_settings)
     if not location.exists:
+        copy_refusal = None
+        if copy_settings is not None:
+            resolved = await asyncio.to_thread(
+                model_copies.resolve_local_path, spec.modelPath, mappings, copy_settings
+            )
+            copy_refusal = resolved.refusal
         return _refuse_missing(
             spec,
             location,
@@ -1328,6 +1363,7 @@ async def check_admission(
             context_length=context_length,
             warnings=warnings,
             folders_unread=folders_unread,
+            copy_refusal=copy_refusal,
         )
 
     # Each engine by its own fit model (LS6, Troy's L11): never another
@@ -1731,8 +1767,11 @@ def _locate(
     resolution = resolve_model_path(spec.modelPath, mappings)
     local = resolution.local_path
     if copy_settings is not None:
-        local = model_copies.resolve_local_path(spec.modelPath, mappings, copy_settings).path
-    present = bool(is_there(local))
+        resolved = model_copies.resolve_local_path(spec.modelPath, mappings, copy_settings)
+        local = resolved.path
+        present = not resolved.refusal and bool(is_there(local))
+    else:
+        present = bool(is_there(local))
     return ModelLocation(
         path=spec.modelPath,
         localPath=local,
@@ -1775,11 +1814,14 @@ def _refuse_missing(
     context_length: int | None,
     warnings: list[str],
     folders_unread: str | None = None,
+    copy_refusal: str | None = None,
 ) -> Admission:
     """The one launch failure the dry run can predict with certainty."""
     where = f"on {node_name}" if node_name else "on this host"
     tab = f"Library -> {node_name or 'this machine'} -> Folders"
-    if location.mapping is None and folders_unread:
+    if copy_refusal:
+        fix = f"The copy of {spec.modelPath} {where} {copy_refusal}"
+    elif location.mapping is None and folders_unread:
         # Not "set a mount": the operator may well have set one. This node
         # could not read the folders, so none of their mounts applied and
         # the Library's own spelling was tried (2026-09-27, the live

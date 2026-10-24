@@ -75,6 +75,7 @@ from .routes import oidc_forward as oidc_forward_routes
 from .routes import profile_builds as profile_build_routes
 from .routes import proxy as proxy_routes
 from .routes import runtimes as runtimes_routes
+from .routes import serving_measurements as serving_measurement_routes
 from .routes import site_link as site_link_routes
 from .routes import updates as update_routes
 from .runtimes import RuntimeSupervisor, close_installers
@@ -197,6 +198,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     machine_trust.load()
     app.state.machine_trust = machine_trust
+    # Row 4: once this node follows a promoted root to its address, it
+    # announces itself there and pulls the bundle, beside whatever took the
+    # list (a push or a pull), which must not wait for it.
+    app.state.root_moved_task = None
+
+    def _root_moved() -> None:
+        from . import leaving
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        app.state.root_moved_task = loop.create_task(
+            leaving.after_root_moved(app), name="root-moved"
+        )
+
+    machine_trust.on_moved = _root_moved
 
     # The sessions signed out before this start. Outside the `hasattr`
     # above, and in safe mode too: a sign-out that was not read back is
@@ -350,6 +368,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             log=log,
             get_config=state.get_config,
             inherited_rules=folders_cache.inherited_rules,
+            library_roots=lambda: [folder.path for folder in folders_cache.folders or []],
             stop_memory=state,
         )
         owns_runtimes = True
@@ -745,6 +764,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await asyncio.gather(apps_task, return_exceptions=True)
         if app_manager is not None:
             await app_manager.aclose()
+        serving_measurements = getattr(app.state, "serving_measurements", None)
+        if serving_measurements is not None:
+            await serving_measurements.close()
         await registry.close()
         benchmarks = getattr(app.state, "benchmarks", None)
         if benchmarks is not None:
@@ -755,6 +777,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if announce_task is not None and not announce_task.done():
             announce_task.cancel()
             await asyncio.gather(announce_task, return_exceptions=True)
+        moving = getattr(app.state, "root_moved_task", None)
+        if moving is not None and not moving.done():
+            moving.cancel()
+            await asyncio.gather(moving, return_exceptions=True)
         if key_change_task is not None:
             key_change_task.cancel()
             await asyncio.gather(key_change_task, return_exceptions=True)
@@ -1206,6 +1232,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(exec_approval_routes.router)
     app.include_router(benchmark_routes.router)
     app.include_router(profile_build_routes.router)
+    app.include_router(serving_measurement_routes.router)
     # Optional apps. Operator-only on every route; declared on the router.
     app.include_router(apps_routes.router)
     # This host's identity and devices; reads only, operator or service.
