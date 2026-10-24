@@ -318,6 +318,8 @@ class Access:
                     raise ValueError(
                         "Remove the existing access record before changing this folder's mode."
                     )
+            if not getattr(self.permissions, "overlap", True):
+                self._refuse_overlap(rows, app, facts.path)
             ident = uuid.uuid4().hex
             row: dict[str, Any] = dict(
                 id=ident,
@@ -386,6 +388,32 @@ class Access:
             return snapshot
         apply()
         return FolderAccess.model_validate(row)
+
+    @staticmethod
+    def _refuse_overlap(rows: dict[str, dict], app: str, path: str) -> None:
+        """One grant per item where a backend cannot tell two grants' rights apart.
+
+        On Windows a grant inside another finds the outer grant's inherited
+        rights and adds nothing, so removing the outer grant would also take
+        the inner one's access while its record still said ready.
+        """
+        new = _path(path)
+        for existing in rows.values():
+            if existing["app"] != app or existing["state"] == "removed":
+                continue
+            other = _path(existing["path"])
+            if other == new:
+                continue
+            if new.is_relative_to(other):
+                raise ValueError(
+                    f"{path} is inside {existing['path']}, which Workbench can already open. "
+                    f"Remove access to {existing['path']} first, then give access again."
+                )
+            if other.is_relative_to(new):
+                raise ValueError(
+                    f"{path} holds {existing['path']}, which Workbench can already open. "
+                    f"Remove access to {existing['path']} first, then give access again."
+                )
 
     def remove(self, app: str, ident: str) -> FolderAccess:
         with _LOCK:
@@ -489,6 +517,8 @@ class WindowsPermissions:
 
     READ = 0x1200A9
     WRITE = READ | 0x116  # FILE_GENERIC_WRITE without DELETE or DELETE_CHILD
+    #: A grant inside another cannot tell its own rights from the outer one's.
+    overlap = False
 
     def __init__(
         self, account: str, *, eugene: tuple[str, ...], homes: tuple[str, ...] | None = None
@@ -619,8 +649,14 @@ class WindowsPermissions:
         *,
         revoke: bool = False,
         selected: set[tuple[str, ...]] | None = None,
+        descend: Callable[[tuple[str, ...]], bool] | None = None,
+        unreadable: list[tuple[str, ...]] | None = None,
     ) -> Iterator[tuple[tuple[str, ...], int, list[int], Any, bool, bool]]:
-        """Yield one live file handle; only traversal directories remain open."""
+        """Yield one live file handle; only traversal directories remain open.
+
+        A protected folder is entered only when `descend` says so. An item that
+        cannot be opened is listed in `unreadable` when that list is given.
+        """
 
         def walk(
             current: Path,
@@ -633,7 +669,11 @@ class WindowsPermissions:
             descriptor = ws.GetSecurityInfo(held, ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION)
             protected = bool(names and descriptor.GetSecurityDescriptorControl()[0] & 0x1000)
             yield names, held, ident, descriptor.GetSecurityDescriptorDacl(), directory, protected
-            if directory and not protected and not link:
+            if (
+                directory
+                and not link
+                and (not protected or (descend is not None and descend(names)))
+            ):
                 for entry in current.iterdir():
                     if selected is not None and (*names, entry.name) not in selected:
                         continue
@@ -656,6 +696,10 @@ class WindowsPermissions:
                     except FileNotFoundError:
                         if not revoke:
                             raise
+                    except PermissionError:
+                        if unreadable is None:
+                            raise
+                        unreadable.append((*names, entry.name))
 
         yield from walk(Path(path), (), handle, identity, True)
 
@@ -707,17 +751,31 @@ class WindowsPermissions:
         return ordered
 
     @staticmethod
-    def _matches(ws: Any, acl: Any, delta: dict, flags: int) -> list[int]:
+    def _matches(ws: Any, acl: Any, delta: dict, flags: set[int]) -> list[int]:
         if acl is None:
             return []
         return [
             i
             for i in range(acl.GetAceCount())
             if (
-                acl.GetAce(i)[0] == (0, flags)
+                acl.GetAce(i)[0][0] == 0
+                and acl.GetAce(i)[0][1] in flags
                 and acl.GetAce(i)[1] == delta["mask"]
                 and ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) == delta["sid"]
             )
+        ]
+
+    @staticmethod
+    def _explicit(ws: Any, acl: Any, sid_text: str) -> list[list[int]]:
+        """[flags, mask] of each explicit allow ACE that names the account."""
+        if acl is None:
+            return []
+        return [
+            [ace[0][1], ace[1]]
+            for ace in (acl.GetAce(i) for i in range(acl.GetAceCount()))
+            if ace[0][0] in (0, 5)
+            and not ace[0][1] & 0x10
+            and ws.ConvertSidToStringSid(ace[-1]) == sid_text
         ]
 
     def grant(self, path: str, mode: str, save: Callable[[dict], None]) -> tuple[dict, int, bool]:
@@ -735,11 +793,18 @@ class WindowsPermissions:
                 raise Refused(cause, path)
             plans: dict[tuple[str, ...], dict[str, Any]] = {}
             count = 0
+            # What removal must leave: the account's own explicit entries from
+            # before this grant, and the folders already closed to inheritance.
+            manual: list[list[Any]] = []
+            protected_names: list[list[str]] = []
             for names, _, ident, acl, directory, protected in self._tree(
                 ws, path, handle, identity
             ):
+                if own := self._explicit(ws, acl, sid_text):
+                    manual.append([list(names), own])
                 if protected:
                     count += 1
+                    protected_names.append(list(names))
                     continue
                 if acl is None:
                     continue
@@ -768,6 +833,8 @@ class WindowsPermissions:
                 mask=mask,
                 identity=identity,
                 items=list(plans.values()),
+                manual=manual,
+                protected=protected_names,
             )
             save(delta)  # One complete write-ahead plan, independent of tree size.
             selected = {names[:i] for names in plans for i in range(len(names) + 1)}
@@ -797,11 +864,28 @@ class WindowsPermissions:
             if identity != delta["identity"]:
                 return False
             recorded = {tuple(item["names"]): item for item in delta["items"]}
-            owned = set()
+            manual = {
+                tuple(names): [list(ace) for ace in aces] for names, aces in delta.get("manual", [])
+            }
+            # Records from before protected folders were listed keep the old
+            # walk, which never entered a protected folder.
+            closed = (
+                {tuple(names) for names in delta["protected"]} if "protected" in delta else None
+            )
+
+            def descend(names: tuple[str, ...]) -> bool:
+                return closed is not None and names not in closed
+
+            owned: set[tuple[str, ...]] = set()
+            kept: list[tuple[str, ...]] = []
+            unreadable: list[tuple[str, ...]] = []
             for names, _held, ident, acl, directory, protected in self._tree(
-                ws, path, handle, identity, revoke=True
+                ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
                 item = recorded.get(names)
+                # Protected since the grant: its inherited copy of Eugene's ACE
+                # became an explicit one with the same rights.
+                changed = protected and descend(names)
                 if item is not None:
                     if item.get("removed"):
                         owned.add(names)
@@ -809,9 +893,11 @@ class WindowsPermissions:
                     if ident != item["identity"]:
                         # A replacement never inherits the recorded explicit ACE.
                         continue
-                    flags = item["flags"]
+                    flags = {item["flags"]} | ({item["flags"] & ~0x10} if changed else set())
                 elif names and names[:-1] in owned and not protected:
-                    flags = 19 if directory else 16
+                    flags = {19 if directory else 16}
+                elif changed and names[:-1] in owned:
+                    flags = {3 if directory else 0}
                 else:
                     continue
                 matches = self._matches(ws, acl, delta, flags)
@@ -835,6 +921,9 @@ class WindowsPermissions:
                                 self._set_acl(ws, change, acl)
                     except FileNotFoundError:
                         continue
+                    except PermissionError:
+                        kept.append(names)
+                        continue
                 elif item is not None and item.get("applied"):
                     # It was already removed externally; no owned rights remain.
                     pass
@@ -842,19 +931,35 @@ class WindowsPermissions:
                 if item is not None:
                     item["removed"] = True
             # Detect files created in the narrow interval before a parent's
-            # ACE was removed. A retry uses the same recorded plan.
+            # ACE was removed, and any entry for the account that was not
+            # there before the grant. A retry uses the same recorded plan.
             for names, _, _, acl, directory, _ in self._tree(
-                ws, path, handle, identity, revoke=True
+                ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
                 if (
                     names
                     and names[:-1] in owned
-                    and self._matches(ws, acl, delta, 19 if directory else 16)
+                    and self._matches(ws, acl, delta, {19 if directory else 16})
                 ):
                     raise OSError(
                         "New files inherited access during removal. "
                         "Some additions remain; try Remove access again."
                     )
+                if names not in kept and any(
+                    ace not in manual.get(names, [])
+                    for ace in self._explicit(ws, acl, delta["sid"])
+                ):
+                    kept.append(names)
+            remaining = list(dict.fromkeys(kept + unreadable))
+            if remaining:
+                shown = [str(Path(path).joinpath(*names)) for names in remaining[:3]]
+                more = f" and {len(remaining) - 3} more" if len(remaining) > 3 else ""
+                raise RemovalIncomplete(
+                    f"Workbench's account can still open {', '.join(shown)}{more}: "
+                    f"{'its' if len(remaining) == 1 else 'their'} permissions were changed "
+                    "outside Eugene. Remove that access in the folder's Security settings, "
+                    "then try Remove access again."
+                )
             return True
 
 
@@ -866,6 +971,9 @@ class LinuxPermissions:
     #: installed, its path unit stopped, or busy with a large grant) must end
     #: the wait and name itself, not hold every folder-access request forever.
     INSPECT_TIMEOUT_SECONDS = 30.0
+    #: The root helper records each grant's own entries and restores the
+    #: overlapping grants that remain when one is removed.
+    overlap = True
 
     def __init__(self, app: str, apps: Path, *, eugene: tuple[str, ...]) -> None:
         from .app_accounts import dynamic_user

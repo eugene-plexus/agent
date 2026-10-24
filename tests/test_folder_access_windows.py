@@ -305,3 +305,115 @@ def test_windows_old_and_device_paths_have_correct_refusal(tmp_path: Path) -> No
     with pytest.raises(fa.Refused) as exc:
         access.add("workbench", "\\\\?\\" + str(tmp_path), "read", "operator")
     assert exc.value.cause == "not_a_folder"
+
+
+USERS = "S-1-5-32-545"
+
+
+def sid_aces(path: Path, sid: str = USERS) -> list[tuple[int, int]]:
+    """(flags, mask) of every ACE that names `sid` on `path`."""
+    import win32security as ws
+
+    acl = ws.GetFileSecurity(str(path), 4).GetSecurityDescriptorDacl()
+    return [
+        (acl.GetAce(i)[0][1], acl.GetAce(i)[1])
+        for i in range(acl.GetAceCount())
+        if ws.ConvertSidToStringSid(acl.GetAce(i)[-1]) == sid
+    ]
+
+
+def icacls(path: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["icacls", str(path), *args], check=True, capture_output=True)
+
+
+def owner(path: Path) -> str:
+    import win32security as ws
+
+    return str(
+        ws.ConvertSidToStringSid(
+            ws.GetFileSecurity(
+                str(path), ws.OWNER_SECURITY_INFORMATION
+            ).GetSecurityDescriptorOwner()
+        )
+    )
+
+
+def test_revoke_removes_rights_a_later_protected_folder_made_explicit(tmp_path: Path) -> None:
+    """Review blocker: an app protects a folder it made, so Eugene's inherited ACE
+    becomes an explicit copy; removal reported success while the copy stayed."""
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    keep = root / "keep"
+    keep.mkdir()
+    (keep / "secret.txt").write_text("app data")
+    icacls(keep, "/inheritance:d")  # what the app's own account may do to a folder it owns
+    assert (3, backend.WRITE) in sid_aces(keep)
+    assert backend.revoke(str(root), delta)
+    for item in (root, keep, keep / "secret.txt"):
+        assert sid_aces(item) == [], item
+
+
+def test_revoke_names_access_it_cannot_attribute_and_never_reports_success(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    locked = root / "locked"
+    locked.mkdir()
+    icacls(
+        locked,
+        "/inheritance:r",
+        "/grant:r",
+        f"*{owner(locked)}:(OI)(CI)(F)",
+        f"*{USERS}:(OI)(CI)(F)",
+    )
+    with pytest.raises(fa.RemovalIncomplete, match=r"locked.*changed outside Eugene"):
+        backend.revoke(str(root), delta)
+    # Its origin is unknown, so it stays; the record says what is left.
+    assert sid_aces(locked) == [(3, 0x1F01FF)]
+    assert sid_aces(root) == []
+
+
+def test_revoke_keeps_a_by_hand_entry_in_a_folder_protected_before_the_grant(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    closed = root / "closed"
+    closed.mkdir()
+    icacls(
+        closed,
+        "/inheritance:r",
+        "/grant:r",
+        f"*{owner(closed)}:(OI)(CI)(F)",
+        f"*{USERS}:(OI)(CI)(RX)",
+    )
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, count, _ = backend.grant(str(root), "read", lambda _: None)
+    assert count == 1
+    assert backend.revoke(str(root), delta)
+    assert sid_aces(closed) == [(3, backend.READ)]
+
+
+def test_windows_refuses_a_grant_inside_or_around_another(tmp_path: Path) -> None:
+    """Review: a child grant found the parent's inherited rights and recorded nothing,
+    so removing the parent took the child's access while its record said ready."""
+    root = tmp_path / "shared"
+    (root / "sub").mkdir(parents=True)
+    private_acl(root)
+    access = fa.Access(tmp_path / "access.json", fa.WindowsPermissions(USERS, eugene=(), homes=()))
+    parent = access.add("workbench", str(root), "read", "operator")
+    assert parent.state == "ready"
+    with pytest.raises(ValueError, match=r"is inside .*shared, which Workbench can already open"):
+        access.add("workbench", str(root / "sub"), "write", "operator")
+    assert access.remove("workbench", parent.id).state == "removed"
+    assert access.add("workbench", str(root / "sub"), "write", "operator").state == "ready"

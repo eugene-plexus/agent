@@ -146,6 +146,35 @@ def test_add_records_and_remove_only_added(tmp_path: Path) -> None:
     assert backend.rights == {"manual"}
 
 
+class ExclusivePermissions(MemoryPermissions):
+    """A backend whose grants cannot share an item with another grant (Windows)."""
+
+    overlap = False
+
+
+def test_overlapping_grants_are_refused_when_the_backend_cannot_share(tmp_path: Path) -> None:
+    access = service(tmp_path, ExclusivePermissions())
+    parent = access.add("workbench", "D:\\Projects", "read", "operator")
+    with pytest.raises(ValueError) as inside:
+        access.add("workbench", "D:\\Projects\\acme", "write", "operator")
+    assert str(inside.value) == (
+        "D:\\Projects\\acme is inside D:\\Projects, which Workbench can already open. "
+        "Remove access to D:\\Projects first, then give access again."
+    )
+    with pytest.raises(ValueError, match=r"^D:\\Projects holds D:\\Projects\\acme"):
+        fresh = service(tmp_path / "second", ExclusivePermissions())
+        fresh.add("workbench", "D:\\Projects\\acme", "read", "operator")
+        fresh.add("workbench", "D:\\Projects", "read", "operator")
+    # Another app's grant, a sibling and a removed grant do not overlap.
+    assert access.add("other", "D:\\Projects\\acme", "write", "operator").state == "ready"
+    assert access.add("workbench", "D:\\Projects2", "read", "operator").state == "ready"
+    assert access.remove("workbench", parent.id).state == "removed"
+    assert access.add("workbench", "D:\\Projects\\acme", "write", "operator").state == "ready"
+    # Linux records each grant's own entries and restores the others on removal.
+    assert fa.WindowsPermissions.overlap is False
+    assert fa.LinuxPermissions.overlap is True
+
+
 def test_preexisting_rights_left_alone(tmp_path: Path) -> None:
     backend = MemoryPermissions()
     backend.rights.add("read")
