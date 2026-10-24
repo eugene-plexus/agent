@@ -32,8 +32,10 @@ What it decides (call R8-EXEC-TRUST, Choice 3):
 - `refused`: a group or others can change an item (mode bits; on macOS an
   ACL entry that lets someone else write, append, delete, add or change
   it, or a volume that ignores ownership), two or more other accounts own
-  items, a script lets PATH choose its interpreter (`#!/usr/bin/env`), or
-  something cannot be checked. It never runs.
+  items, a script lets PATH choose its interpreter (`env`, under any name,
+  or a relative path), an ACL entry is not understood, or something cannot
+  be checked or read (a script whose first line cannot be read, an
+  environment's settings). It never runs, and an approval of it is dropped.
 
 The walk returns the path to execute: absolute, every folder in it
 resolved, and its last name kept when that name is a link (a venv's
@@ -53,6 +55,7 @@ anyway.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import re
@@ -83,6 +86,12 @@ _MUTATING = frozenset(
         "chown",
     }
 )
+#: One entry as `ls -le` lists it, the principal's name whole.
+_ACL_ENTRY = re.compile(
+    r"^(?:\d+:\s*)?(user|group):(.+?)\s+(?:inherited\s+)?(allow|deny)\s+([a-z_]+(?:,[a-z_]+)*)$"
+)
+#: Programs that run whatever program PATH finds by the name they are given.
+_PATH_RUNNERS = frozenset({"env"})
 _LINK_HOPS = 40
 _INTERPRETER_DEPTH = 4
 #: The largest program hashed for an approval.
@@ -133,6 +142,11 @@ class Verdict:
     kind: Kind
     given: str
     program: str | None = None
+    #: GIVEN made absolute, its links not followed: the path a setting
+    #: looks the program up by. An approval is shown, made and kept by it,
+    #: so a link in it (`current -> /opt/real`) stays part of what was
+    #: approved (8c review).
+    lookup: str | None = None
     account: str | None = None
     account_uid: int | None = None
     sha256: str | None = None
@@ -201,12 +215,11 @@ def _head(path: PurePosixPath | Path) -> bytes:
         os.close(fd)
 
 
-#: SHA-256 answers, by what identifies a file's bytes: a write changes its
-#: ctime, which its owner cannot set back.
-_hashes: dict[tuple[str, int, int, int, int, int], str] = {}
-
-
 def _sha256(path: PurePosixPath | Path) -> str:
+    """The file's SHA-256, read every time it is asked (8c review): no
+    answer is kept by size and times, because a file's change time moves on
+    a coarse clock (a second on HFS+, a jiffy on Linux), so two writes can
+    share one. Only a program that needs an approval is hashed."""
     fd = os.open(str(path), _OPEN_FLAGS)
     try:
         info = os.fstat(fd)
@@ -214,24 +227,10 @@ def _sha256(path: PurePosixPath | Path) -> str:
             raise OSError(f"{path} is not a file")
         if info.st_size > _HASH_LIMIT:
             raise OSError(f"{path} is larger than {_HASH_LIMIT >> 30} GiB")
-        key = (
-            str(path),
-            info.st_dev,
-            info.st_ino,
-            info.st_size,
-            info.st_mtime_ns,
-            info.st_ctime_ns,
-        )
-        found = _hashes.get(key)
-        if found is None:
-            digest = hashlib.sha256()
-            while chunk := os.read(fd, 1 << 20):
-                digest.update(chunk)
-            found = digest.hexdigest()
-            if len(_hashes) > 256:
-                _hashes.clear()
-            _hashes[key] = found
-        return found
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, 1 << 20):
+            digest.update(chunk)
+        return digest.hexdigest()
     finally:
         os.close(fd)
 
@@ -427,10 +426,21 @@ def _check(w: _Walk, path: PurePosixPath, info: os.stat_result, role: str, final
         w.find("unknown", path, said(f"has an ACL that cannot be read ({e})"), fix="check")
         return
     for entry in entries:
-        found = re.match(r"^(?:\d+:\s*)?(user|group):(\S+)\s+(?:inherited\s+)?allow\s+(\S+)", entry)
+        # `N: user:<name> [inherited] allow|deny <rights>`; a name may hold
+        # spaces (`group:Domain Users`). An entry not in that form is not
+        # understood, so it is refused rather than passed over (8c review).
+        found = _ACL_ENTRY.match(entry)
         if not found:
+            w.find(
+                "others",
+                path,
+                said(f"carries an ACL entry Eugene cannot read ({entry})"),
+                uid=info.st_uid,
+            )
             continue
-        kind, who, rights = found.groups()
+        kind, who, verdict, rights = found.groups()
+        if verdict == "deny":
+            continue
         # Root, Eugene's account, and the item's own owner, who can change
         # it anyway (and was found above when it is someone else).
         if kind == "user" and who in ("root", w.me, owner):
@@ -452,11 +462,13 @@ def _absolute(given: str) -> str:
     return spelled
 
 
-def _walk(w: _Walk, given: str, role: str) -> tuple[PurePosixPath, os.stat_result] | None:
+def _walk(
+    w: _Walk, given: str, role: str
+) -> tuple[PurePosixPath, PurePosixPath, os.stat_result] | None:
     """GIVEN walked by hand from `/`: every link followed, every folder
     stepped into on every hop checked, and the last item. Returns the path
-    to execute and what the last item is, or None when the walk could not
-    finish (a finding says why)."""
+    to execute, the file it reaches with no link left, and what that file
+    is; or None when the walk could not finish (a finding says why)."""
     pending = list(PurePosixPath(_absolute(given)).parts[1:])
     # The names still to walk from the path as given; those a link's
     # target adds go in front of them.
@@ -514,16 +526,25 @@ def _walk(w: _Walk, given: str, role: str) -> tuple[PurePosixPath, os.stat_resul
             continue
         _check(w, step, found, role, final=not pending)
         current, info = step, found
-    return run_as or current, info
+    return run_as or current, current, info
 
 
 def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
-    """What runs a script, or nothing for a binary: the program `#!` names
-    (refused when it is `env`), and under `#!/bin/sh` the python uv's
-    `'''exec' "<python>" "$0" "$@"` line names."""
+    """What runs a script, or nothing for a binary: the program `#!` names,
+    and under `#!/bin/sh` the python uv's `'''exec' "<python>" "$0" "$@"`
+    line names. Each must be an absolute path (a bare name is found from
+    the folder the script starts in, or by PATH, not where this looks), and
+    `env` is refused (PATH would choose). A file it cannot read is refused:
+    what runs it is not known (8c review)."""
     try:
         head = _head(path)
-    except OSError:
+    except OSError as e:
+        w.find(
+            "unknown",
+            path,
+            f"{role} cannot be read to find what runs it ({e.strerror or e})",
+            fix="check",
+        )
         return []
     if not head.startswith(b"#!"):
         return []
@@ -531,7 +552,7 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
     words = lines[0][2:].split()
     if not words:
         return []
-    if PurePosixPath(words[0]).name == "env":
+    if PurePosixPath(words[0]).name in _PATH_RUNNERS:
         w.find(
             "unknown",
             path,
@@ -545,7 +566,20 @@ def _interpreters(w: _Walk, path: PurePosixPath, role: str) -> list[str]:
         trampoline = re.match(r"""^'''exec' "(.+?)" "\$0" "\$@"$""", lines[1].strip())
         if trampoline:
             found.append(trampoline.group(1))
-    return found
+    absolute = []
+    for interpreter in found:
+        if interpreter.startswith("/"):
+            absolute.append(interpreter)
+            continue
+        shown = f"#!{' '.join(words)}" if interpreter == words[0] else interpreter
+        w.find(
+            "unknown",
+            path,
+            f"{role} names its interpreter by a relative path ({shown}), which the folder it "
+            "starts in or PATH would choose",
+            fix="shebang",
+        )
+    return absolute
 
 
 def _exists(path: PurePosixPath) -> bool:
@@ -566,14 +600,21 @@ def _environment(w: _Walk, root: PurePosixPath) -> None:
     """The Python environment at ROOT (it has a `pyvenv.cfg`): the root,
     its site-packages, and the interpreter it was made from with its
     standard library."""
-    walked = _walk(w, str(root), f"its Python environment {root}")
+    role = f"its Python environment {root}"
+    walked = _walk(w, str(root), role)
     if walked is None:
         return
     root = walked[0]
     for lib in ("lib", "lib64"):
         try:
             names = sorted(_listdir(root / lib))
-        except OSError:
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            # What is in it cannot be known (8c review): refused.
+            w.find(
+                "unknown", root / lib, f"{role}: {root / lib} cannot be listed ({e})", fix="check"
+            )
             continue
         for name in names:
             packages = root / lib / name / "site-packages"
@@ -581,7 +622,13 @@ def _environment(w: _Walk, root: PurePosixPath) -> None:
                 _walk(w, str(packages), f"its packages {packages}")
     try:
         text = _head(root / "pyvenv.cfg").decode("utf-8", errors="replace")
-    except OSError:
+    except OSError as e:
+        w.find(
+            "unknown",
+            root / "pyvenv.cfg",
+            f"{role}: {root / 'pyvenv.cfg'} cannot be read ({e})",
+            fix="check",
+        )
         return
     home = re.search(r"(?m)^home\s*=\s*(.+?)\s*$", text)
     if home:
@@ -595,9 +642,18 @@ def _program(w: _Walk, given: str, depth: int, role: str) -> PurePosixPath | Non
     walked = _walk(w, given, role)
     if walked is None:
         return None
-    resolved, info = walked
+    resolved, real, info = walked
     if not stat.S_ISREG(info.st_mode):
         w.find("unknown", resolved, f"{role} is not a file", fix="check")
+        return None
+    if real.name in _PATH_RUNNERS:
+        # `env` by another name runs whatever PATH finds (8c review).
+        w.find(
+            "unknown",
+            resolved,
+            f"{role} is {real.name}, which lets PATH choose the program",
+            fix="shebang" if depth else "check",
+        )
         return None
     for interpreter in _interpreters(w, resolved, role):
         if depth >= _INTERPRETER_DEPTH:
@@ -662,7 +718,8 @@ def assess(path: Path | str) -> Verdict:
     uid = _euid()
     assert uid is not None
     w = _Walk(uid)
-    return _decide(w, given, _program(w, given, 0, "it"), hashed=True)
+    verdict = _decide(w, given, _program(w, given, 0, "it"), hashed=True)
+    return dataclasses.replace(verdict, lookup=_absolute(given))
 
 
 def assess_path(path: Path | str) -> Verdict:
@@ -680,13 +737,16 @@ def assess_path(path: Path | str) -> Verdict:
 
 def runs(verdict: Verdict) -> bool:
     """The rule: `ok` runs; `needs_approval` runs while an owner's approval
-    of exactly this holds; `refused` never runs."""
+    of exactly this holds; `refused` never runs, and drops any approval of
+    the program, so putting things back afterwards does not revive it (8c
+    review)."""
     if verdict.kind is Kind.ok:
         return True
-    if verdict.kind is Kind.needs_approval:
-        from . import exec_approvals
+    from . import exec_approvals
 
+    if verdict.kind is Kind.needs_approval:
         return exec_approvals.holds(verdict)
+    exec_approvals.forget(verdict)
     return False
 
 

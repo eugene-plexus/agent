@@ -102,10 +102,38 @@ def test_each_thing_an_approval_binds_is_compared_on_its_own(disk: Disk, store: 
 
 
 def test_an_approval_does_not_carry_over_to_a_refused_program(disk: Disk, store: Path) -> None:  # noqa: F811
+    """Refused once, the approval is gone: its folder opened to anyone and
+    closed again, the program asks again (8c review, 5)."""
     path = _troy_s(disk)
     _approve(path)
     disk.dir("/Users/troy/llama", uid=501, mode=0o777)
     refused(path, "will not run", "mode 0777: anyone")
+    assert exec_approvals.listed() == []
+    disk.dir("/Users/troy/llama", uid=501, mode=0o755)
+    refused(path, "only once an owner approves it")
+
+
+def test_a_program_reached_through_a_linked_folder_is_approved_by_the_path_it_is_named_by(
+    disk: Disk,  # noqa: F811
+    store: Path,
+) -> None:
+    """`/Users/troy/current/llama-server`, with `current` a link to
+    `/opt/real`: troy can point the link elsewhere, so it asks. It is shown,
+    approved and kept by the path a setting names, and that path runs
+    afterwards; the file that runs is the one the link reaches (8c review,
+    6)."""
+    disk.dir("/Users/troy", uid=501).dir("/opt/real").file("/opt/real/llama-server")
+    disk.link("/Users/troy/current", "/opt/real")
+    named = "/Users/troy/current/llama-server"
+    shown = exec_trust.assess(named)
+    assert shown.kind is exec_trust.Kind.needs_approval and shown.lookup == named
+    view = exec_approvals.view(shown)
+    assert view is not None and view.path == named
+    assert shown.sha256 is not None
+    approval = exec_approvals.approve(view.path, shown.sha256, by="operator")
+    assert approval.path == named
+    assert ran(named) == "/opt/real/llama-server"
+    assert [a.id for a in exec_approvals.listed()] == [approval.id]
 
 
 def test_a_refused_or_changed_or_trusted_program_is_not_approved(disk: Disk, store: Path) -> None:  # noqa: F811

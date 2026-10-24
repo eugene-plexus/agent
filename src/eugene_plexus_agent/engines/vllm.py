@@ -29,7 +29,7 @@ import os
 import re
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 
@@ -584,6 +584,15 @@ def interpreter_from_shebang(script: Path) -> str | None:
     if not line:
         return None
     parts = line.split()
+    from .. import exec_trust
+
+    if exec_trust.own_account():
+        # Run as Eugene's own account (row 8c), only the absolute
+        # interpreter the check walked: never a bare name PATH or the
+        # folder the probe starts in would choose, never `env`.
+        if not parts[0].startswith("/") or PurePosixPath(parts[0]).name == "env":
+            return None
+        return parts[0]
     if parts[0].endswith("/env") and len(parts) > 1:
         return shutil.which(parts[1])
     return parts[0]

@@ -43,6 +43,8 @@ class Disk:
     def __init__(self) -> None:
         self.nodes: dict[str, dict[str, Any]] = {}
         self.noowners: set[str] = set()
+        self.unreadable: set[str] = set()
+        self.unlistable: set[str] = set()
         self.hashed: list[str] = []
         self.dir("/")
 
@@ -130,9 +132,12 @@ class Disk:
         raise OSError("too many links")
 
     def head(self, path: Any) -> bytes:
-        node = self.nodes.get(self.resolve(path))
+        key = self.resolve(path)
+        node = self.nodes.get(key)
         if node is None or node["kind"] != stat.S_IFREG:
             raise FileNotFoundError(2, "No such file")
+        if key in self.unreadable:
+            raise PermissionError(13, "Permission denied")
         return bytes(node["content"])
 
     def sha256(self, path: Any) -> str:
@@ -141,6 +146,10 @@ class Disk:
 
     def listdir(self, path: Any) -> list[str]:
         key = self.resolve(path)
+        if key not in self.nodes:
+            raise FileNotFoundError(2, "No such file or directory")
+        if key in self.unlistable:
+            raise PermissionError(13, "Permission denied")
         return [
             PurePosixPath(k).name
             for k in self.nodes
@@ -389,6 +398,69 @@ def test_a_script_that_finds_its_interpreter_on_path_is_refused(disk: Disk) -> N
     )
 
 
+def test_a_script_naming_a_relative_interpreter_is_refused(disk: Disk) -> None:
+    """`#!python` is found from the folder the script starts in, or by PATH
+    for a probe, not from the agent's folder the check would read: refused
+    even with a trusted `python` there (8c review, 3)."""
+    disk.dir("/usr/local/eugene-plexus", uid=400).file("/usr/local/eugene-plexus/python", uid=400)
+    disk.file("/usr/local/bin/vllm", content=b"#!python\nimport vllm\n")
+    found = exec_trust.assess("/usr/local/bin/vllm")
+    assert found.kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/vllm", "names its interpreter by a relative path (#!python)")
+
+
+def test_uv_s_exec_line_naming_a_relative_python_is_refused(disk: Disk) -> None:
+    disk.file("/bin/sh")
+    disk.file(
+        "/usr/local/bin/vllm",
+        content=b"#!/bin/sh\n'''exec' \"python3\" \"$0\" \"$@\"\n' '''\n",
+    )
+    assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/vllm", "names its interpreter by a relative path (python3)")
+
+
+def test_an_interpreter_that_is_env_under_another_name_is_refused(disk: Disk) -> None:
+    """`#!/usr/local/bin/run python3`, with `run` a link to `env`: PATH
+    chooses the program all the same (8c review, 3)."""
+    disk.file("/usr/bin/env")
+    disk.link("/usr/local/bin/run", "/usr/bin/env")
+    disk.file("/usr/local/bin/vllm", content=b"#!/usr/local/bin/run python3\nimport vllm\n")
+    assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/vllm", "is env, which lets PATH choose the program")
+
+
+def test_a_program_that_is_env_under_another_name_is_refused(disk: Disk) -> None:
+    disk.file("/usr/bin/env")
+    disk.link("/usr/local/bin/llama-server", "/usr/bin/env")
+    assert exec_trust.assess("/usr/local/bin/llama-server").kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/llama-server", "is env, which lets PATH choose the program")
+
+
+def test_a_script_it_cannot_read_is_refused_naming_the_cause(disk: Disk) -> None:
+    """Root's execute-only script: what runs it cannot be known, so it is
+    refused, not taken for a binary (8c review, 4)."""
+    disk.file("/usr/local/bin/vllm", mode=0o111, content=b"#!/Users/alice/python\n")
+    disk.unreadable.add("/usr/local/bin/vllm")
+    assert exec_trust.assess("/usr/local/bin/vllm").kind is exec_trust.Kind.refused
+    refused("/usr/local/bin/vllm", "cannot be read to find what runs it (Permission denied)")
+
+
+def test_an_environment_whose_settings_or_packages_cannot_be_read_is_refused(
+    disk: Disk,
+) -> None:
+    disk.dir("/opt/py").dir("/opt/py/bin").file("/opt/py/bin/python3.12").dir("/opt/py/lib")
+    _venv(disk, "/usr/local/eugene-plexus/vllm-env", home="/opt/py/bin")
+    disk.unreadable.add("/usr/local/eugene-plexus/vllm-env/pyvenv.cfg")
+    assert (
+        exec_trust.assess("/usr/local/eugene-plexus/vllm-env/bin/vllm").kind
+        is exec_trust.Kind.refused
+    )
+    refused("/usr/local/eugene-plexus/vllm-env/bin/vllm", "pyvenv.cfg cannot be read")
+    disk.unreadable.clear()
+    disk.unlistable.add("/usr/local/eugene-plexus/vllm-env/lib")
+    refused("/usr/local/eugene-plexus/vllm-env/bin/vllm", "cannot be listed")
+
+
 def test_a_person_s_script_is_not_read_when_it_is_not_a_plain_file(
     disk: Disk, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -464,14 +536,51 @@ def test_macos_an_acl_entry_that_lets_someone_write_is_refused(
     refused("/usr/local/row8/llama-server", "ACL entry that lets user alice write")
 
 
+def test_macos_an_acl_entry_naming_a_group_with_a_space_is_refused(
+    disk: Disk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`group:Domain Users allow add_file,delete_child` on troy's own 0755
+    folder: the group's members can replace the program, so it is refused,
+    not offered as troy's alone (8c review, 2)."""
+    monkeypatch.setattr(exec_trust, "_platform", lambda: "darwin")
+    disk.dir("/Users/troy", uid=501).dir(
+        "/Users/troy/llama", uid=501, acl=["group:Domain Users allow add_file,delete_child"]
+    )
+    disk.file("/Users/troy/llama/llama-server", uid=501)
+    assert exec_trust.assess("/Users/troy/llama/llama-server").kind is exec_trust.Kind.refused
+    refused(
+        "/Users/troy/llama/llama-server",
+        "carries an ACL entry that lets group Domain Users add_file, delete_child",
+    )
+
+
+def test_macos_an_acl_entry_it_cannot_understand_is_refused(
+    disk: Disk, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(exec_trust, "_platform", lambda: "darwin")
+    disk.dir("/usr/local/row8").file(
+        "/usr/local/row8/llama-server", acl=["ABCDEFAB-0000-1111-2222-333344445555 allow write"]
+    )
+    assert exec_trust.assess("/usr/local/row8/llama-server").kind is exec_trust.Kind.refused
+    refused("/usr/local/row8/llama-server", "carries an ACL entry Eugene cannot read")
+
+
 def test_macos_deny_entries_and_its_own_entries_are_not_refused(
     disk: Disk, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(exec_trust, "_platform", lambda: "darwin")
     disk.dir(
-        "/usr/local/row8", acl=["group:everyone deny delete", "user:_eugeneplexus allow add_file"]
+        "/usr/local/row8",
+        acl=[
+            "group:everyone deny delete",
+            "user:_eugeneplexus allow add_file",
+            "group:Domain Users inherited deny write,delete",
+        ],
     )
-    disk.file("/usr/local/row8/llama-server", acl=["user:alice allow read,execute"])
+    disk.file(
+        "/usr/local/row8/llama-server",
+        acl=["user:alice allow read,execute", "group:Domain Users allow read"],
+    )
     assert ran("/usr/local/row8/llama-server") == "/usr/local/row8/llama-server"
 
 
@@ -485,6 +594,58 @@ def test_macos_a_volume_that_ignores_ownership_is_refused(
 
 
 # --- the real disk ---------------------------------------------------------------
+
+
+def test_the_real_hash_sees_one_byte_changed_with_its_size_and_time_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An approval names the file's SHA-256: one byte changed, the size the
+    same and the modification time put back, it differs, every time it is
+    asked (8c review). No answer is kept between checks: a file's change
+    time moves on a coarse clock (a second on HFS+, a jiffy on Linux), so
+    two writes can share it. Here the clock does not move at all."""
+    program = tmp_path / "llama-server"
+    program.write_bytes(b"\x7fELF build one")
+    before = os.stat(program)
+    real_fstat = os.fstat
+
+    def same_clock(fd: int) -> Any:
+        found = real_fstat(fd)
+        return SimpleNamespace(
+            **{name: getattr(found, name) for name in dir(found) if name.startswith("st_")}
+            | {"st_mtime_ns": before.st_mtime_ns, "st_ctime_ns": before.st_ctime_ns}
+        )
+
+    monkeypatch.setattr(exec_trust.os, "fstat", same_clock)
+    first = exec_trust._sha256(program)
+    assert first == hashlib.sha256(b"\x7fELF build one").hexdigest()
+    program.write_bytes(b"\x7fELF build two")
+    os.utime(program, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(program)
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    assert exec_trust._sha256(program) == hashlib.sha256(b"\x7fELF build two").hexdigest()
+
+
+def test_vllm_s_environment_probe_runs_only_the_interpreter_that_was_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In Eugene's own account the probe runs the absolute interpreter the
+    script names, which the check walked; never a bare name PATH would
+    choose, never `env` (8c review, 3)."""
+    from eugene_plexus_agent.engines import vllm
+
+    script = tmp_path / "vllm"
+    monkeypatch.setattr(exec_trust, "own_account", lambda: True)
+    monkeypatch.setattr(vllm.shutil, "which", lambda name: "/home/alice/bin/python3")
+    for first_line in (b"#!python\n", b"#!/usr/bin/env python3\n"):
+        script.write_bytes(first_line)
+        assert vllm.interpreter_from_shebang(script) is None, first_line
+    script.write_bytes(b"#!/opt/venv/bin/python\n")
+    assert vllm.interpreter_from_shebang(script) == "/opt/venv/bin/python"
+    # A person's own install keeps what it did: `env` through PATH.
+    monkeypatch.setattr(exec_trust, "own_account", lambda: False)
+    script.write_bytes(b"#!/usr/bin/env python3\n")
+    assert vllm.interpreter_from_shebang(script) == "/home/alice/bin/python3"
 
 
 @pytest.mark.skipif(

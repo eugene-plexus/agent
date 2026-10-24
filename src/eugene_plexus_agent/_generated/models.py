@@ -3242,7 +3242,7 @@ class ExecTrust(BaseModel):
     kind: ExecTrustKind
     path: str = Field(
         ...,
-        description='The path that would run: absolute, every folder resolved. What\n`POST /v1/exec-approvals` takes.\n',
+        description="The path the program is looked up by: the setting's path made\nabsolute, its links kept (`/Users/troy/current/llama-server`,\nnot where `current` points). What `POST /v1/exec-approvals`\ntakes and what an approval is kept by, so the folders and links\napproved are the ones every later check walks.\n",
     )
     account: str | None = Field(
         None,
@@ -3283,7 +3283,8 @@ class ExecApproval(BaseModel):
 
     id: str
     path: str = Field(
-        ..., description='The program approved, as `ExecTrust.path` named it.'
+        ...,
+        description='The program approved, by the path it is looked up by (`ExecTrust.path`).',
     )
     account: str = Field(..., description='The other account that can change it.')
     accountUid: int

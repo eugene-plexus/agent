@@ -44,6 +44,7 @@ __all__ = [
     "NotApprovable",
     "approve",
     "configure",
+    "forget",
     "holds",
     "listed",
     "remove",
@@ -120,6 +121,13 @@ def _write(approvals: list[ExecApproval]) -> None:
     write_private(path, body)
 
 
+def _key(verdict: exec_trust.Verdict) -> str:
+    """What an approval is kept by: the path a setting looks the program up
+    by, made absolute with its links kept, so the chain approved is the one
+    every later check walks (8c review)."""
+    return verdict.lookup or verdict.program or verdict.given
+
+
 def _chain(verdict: exec_trust.Verdict) -> list[tuple[str, int, int]]:
     return [(c.path, c.uid, c.mode) for c in verdict.chain]
 
@@ -142,7 +150,7 @@ def holds(verdict: exec_trust.Verdict) -> bool:
         return False
     with _lock:
         approvals = _read()
-        match = next((a for a in approvals if a.path == verdict.program), None)
+        match = next((a for a in approvals if a.path == _key(verdict)), None)
         if match is None:
             return False
         why = _lapsed(match, verdict)
@@ -156,6 +164,22 @@ def holds(verdict: exec_trust.Verdict) -> bool:
         return False
 
 
+def forget(verdict: exec_trust.Verdict) -> None:
+    """Drop any approval of a program the check refused now: putting back
+    what made it refused does not bring the approval back (8c review)."""
+    key = _key(verdict)
+    with _lock:
+        approvals = _read()
+        kept = [a for a in approvals if a.path != key]
+        if len(kept) == len(approvals):
+            return
+        log.warning("the approval to run %s lapsed (it is refused now); it asks again", key)
+        try:
+            _write(kept)
+        except (OSError, NotApprovable) as e:
+            log.warning("the lapsed approval of %s could not be removed: %s", key, e)
+
+
 def approve(path: str, sha256: str, *, by: str | None) -> ExecApproval:
     """Approve PATH as it is now, when the check says `needs_approval` and
     its SHA-256 is SHA256, the one the owner was shown. Replaces an earlier
@@ -166,16 +190,17 @@ def approve(path: str, sha256: str, *, by: str | None) -> ExecApproval:
             f"Eugene's own account runs {path} already, so there is nothing to approve."
         )
     if verdict.kind is exec_trust.Kind.refused or verdict.program is None:
+        forget(verdict)
         raise NotApprovable(verdict.message() or f"{path} cannot be approved.")
     if verdict.sha256 != sha256:
         raise NotApprovable(
-            f"{verdict.program} changed since it was shown (its SHA-256 is now "
+            f"{_key(verdict)} changed since it was shown (its SHA-256 is now "
             f"{verdict.sha256}). Look at it again before approving it."
         )
     assert verdict.account is not None and verdict.account_uid is not None
     approval = ExecApproval(
         id=secrets.token_urlsafe(9),
-        path=verdict.program,
+        path=_key(verdict),
         account=verdict.account,
         accountUid=verdict.account_uid,
         sha256=sha256,
@@ -217,7 +242,7 @@ def view(verdict: exec_trust.Verdict | None) -> ExecTrust | None:
         return None
     return ExecTrust(
         kind=ExecTrustKind(verdict.kind.value),
-        path=verdict.program or verdict.given,
+        path=_key(verdict),
         account=verdict.account if verdict.kind is exec_trust.Kind.needs_approval else None,
         sha256=verdict.sha256 if verdict.kind is exec_trust.Kind.needs_approval else None,
     )
