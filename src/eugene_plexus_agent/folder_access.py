@@ -168,6 +168,34 @@ class Refused(ValueError):
         )
 
 
+@contextlib.contextmanager
+def _privileges(ws: Any, *names: str) -> Iterator[bool]:
+    """Enable privileges for this thread alone; yield whether all were granted.
+
+    The thread takes a copy of the process token (ImpersonateSelf), so no other
+    thread of the agent ever runs with them, and gives it back afterwards.
+    """
+    import win32api
+
+    ws.ImpersonateSelf(ws.SecurityImpersonation)
+    try:
+        token = ws.OpenThreadToken(
+            win32api.GetCurrentThread(), ws.TOKEN_ADJUST_PRIVILEGES | ws.TOKEN_QUERY, True
+        )
+        try:
+            ws.AdjustTokenPrivileges(
+                token,
+                False,
+                [(ws.LookupPrivilegeValue(None, name), ws.SE_PRIVILEGE_ENABLED) for name in names],
+            )
+            granted = win32api.GetLastError() != 1300  # ERROR_NOT_ALL_ASSIGNED
+            yield granted
+        finally:
+            token.Close()
+    finally:
+        ws.RevertToSelf()
+
+
 class RemovalIncomplete(OSError):
     """Removal changed some permissions and named the items it could not change."""
 
@@ -529,7 +557,13 @@ class WindowsPermissions:
 
     @contextlib.contextmanager
     def _open(
-        self, path: str, *, change: bool = False, _single: bool = False, revoke: bool = False
+        self,
+        path: str,
+        *,
+        change: bool = False,
+        _single: bool = False,
+        revoke: bool = False,
+        owner: bool = False,
     ) -> Iterator[tuple[int, Facts, list[int]]]:
         if sys.platform != "win32":
             raise OSError("Windows folder permissions need Windows.")
@@ -574,6 +608,8 @@ class WindowsPermissions:
                 if index or _single:
                     current /= part
                 access = 0x60000 if change and index == len(components) - 1 else 0x20080
+                if owner and index == len(components) - 1:
+                    access |= 0x80000  # WRITE_OWNER
                 # Files need no data access and share read, write and delete.
                 # Retained directory handles keep the traversal parents in place.
                 directory = stat.S_ISDIR(os.lstat(current).st_mode)
@@ -778,6 +814,81 @@ class WindowsPermissions:
             and ws.ConvertSidToStringSid(ace[-1]) == sid_text
         ]
 
+    @staticmethod
+    def _unrecorded(acl: Any, matches: list[int], recorded: list[list[int]]) -> list[int]:
+        """`matches` less the entries the grant found already there (by hand)."""
+        left = [list(ace) for ace in recorded]
+        result = []
+        for index in matches:
+            entry = [acl.GetAce(index)[0][1], acl.GetAce(index)[1]]
+            if entry in left:
+                left.remove(entry)
+            else:
+                result.append(index)
+        return result
+
+    @staticmethod
+    def _owner(ws: Any, handle: int) -> str:
+        descriptor = ws.GetSecurityInfo(handle, ws.SE_FILE_OBJECT, ws.OWNER_SECURITY_INFORMATION)
+        return str(ws.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner()))
+
+    def _give(
+        self, ws: Any, path: str, names: tuple[str, ...], ident: list[int], owner: str | None
+    ) -> None:
+        """Make the granted folder's owner the owner of an item the app owns.
+
+        An owner can always change an item's DACL, so the app could give itself
+        its access back. Needs SeRestorePrivilege (LocalSystem has it).
+        """
+        if owner is None:
+            raise PermissionError("the granted folder itself belongs to the app's account")
+        with (
+            _privileges(ws, "SeRestorePrivilege", "SeTakeOwnershipPrivilege"),
+            self._open(
+                str(Path(path).joinpath(*names)),
+                change=True,
+                owner=True,
+                _single=True,
+                revoke=True,
+            ) as (held, _, current),
+        ):
+            if current != ident:
+                raise ValueError("The folder item was replaced.")
+            ws.SetSecurityInfo(
+                held,
+                ws.SE_FILE_OBJECT,
+                ws.OWNER_SECURITY_INFORMATION,
+                ws.ConvertStringSidToSid(owner),
+                None,
+                None,
+                None,
+            )
+
+    def _inherit(self, ws: Any, path: str, names: tuple[str, ...], ident: list[int]) -> Any:
+        """Replace a null DACL with what the item inherits from its parent.
+
+        Done through the item's own handle; the parents are held open, so the
+        item cannot be swapped and its parent cannot move meanwhile.
+        """
+        with self._open(
+            str(Path(path).joinpath(*names)), change=True, _single=True, revoke=True
+        ) as (held, _, current):
+            if current != ident:
+                raise ValueError("The folder item was replaced.")
+            ws.SetSecurityInfo(
+                held,
+                ws.SE_FILE_OBJECT,
+                ws.DACL_SECURITY_INFORMATION | ws.UNPROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                ws.ACL(),
+                None,
+            )
+            acl = self._acl(ws, held)
+            if acl is None:
+                raise PermissionError("its DACL is still null")
+            return acl
+
     def grant(self, path: str, mode: str, save: Callable[[dict], None]) -> tuple[dict, int, bool]:
         import win32security as ws
 
@@ -797,11 +908,19 @@ class WindowsPermissions:
             # before this grant, and the folders already closed to inheritance.
             manual: list[list[Any]] = []
             protected_names: list[list[str]] = []
-            for names, _, ident, acl, directory, protected in self._tree(
+            # Items the account already owned, and null DACLs: both already
+            # gave it everything, so removal leaves them as they are.
+            owners: list[list[str]] = []
+            open_dacls: list[list[str]] = []
+            for names, held, ident, acl, directory, protected in self._tree(
                 ws, path, handle, identity
             ):
                 if own := self._explicit(ws, acl, sid_text):
                     manual.append([list(names), own])
+                if self._owner(ws, held) == sid_text:
+                    owners.append(list(names))
+                if acl is None:
+                    open_dacls.append(list(names))
                 if protected:
                     count += 1
                     protected_names.append(list(names))
@@ -835,6 +954,8 @@ class WindowsPermissions:
                 items=list(plans.values()),
                 manual=manual,
                 protected=protected_names,
+                owners=owners,
+                open=open_dacls,
             )
             save(delta)  # One complete write-ahead plan, independent of tree size.
             selected = {names[:i] for names in plans for i in range(len(names) + 1)}
@@ -852,6 +973,7 @@ class WindowsPermissions:
             return delta, count, False
 
     def revoke(self, path: str, delta: dict) -> bool:
+        import pywintypes
         import win32security as ws
 
         if not delta["added"]:
@@ -863,6 +985,13 @@ class WindowsPermissions:
                 return True
             if identity != delta["identity"]:
                 return False
+            # The person the granted folder belongs to receives what the app
+            # owns, since an owner can always rewrite an item's DACL.
+            person: str | None = self._owner(ws, handle)
+            if person == delta["sid"]:
+                person = None
+            owners_before = {tuple(names) for names in delta.get("owners", [])}
+            open_before = {tuple(names) for names in delta.get("open", [])}
             recorded = {tuple(item["names"]): item for item in delta["items"]}
             manual = {
                 tuple(names): [list(ace) for ace in aces] for names, aces in delta.get("manual", [])
@@ -879,9 +1008,19 @@ class WindowsPermissions:
             owned: set[tuple[str, ...]] = set()
             kept: list[tuple[str, ...]] = []
             unreadable: list[tuple[str, ...]] = []
-            for names, _held, ident, acl, directory, protected in self._tree(
+            for names, held, ident, acl, directory, protected in self._tree(
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
+                try:
+                    if acl is None and names not in open_before:
+                        # A null DACL lets everyone do everything; it inherits again.
+                        acl = self._inherit(ws, path, names, ident)
+                    if names not in owners_before and self._owner(ws, held) == delta["sid"]:
+                        self._give(ws, path, names, ident, person)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, pywintypes.error):
+                    kept.append(names)
                 item = recorded.get(names)
                 # Protected since the grant: its inherited copy of Eugene's ACE
                 # became an explicit one with the same rights.
@@ -900,7 +1039,9 @@ class WindowsPermissions:
                     flags = {3 if directory else 0}
                 else:
                     continue
-                matches = self._matches(ws, acl, delta, flags)
+                # An entry the grant found already there is left as it is.
+                aces = manual.get(names, [])
+                matches = self._unrecorded(acl, self._matches(ws, acl, delta, flags), aces)
                 if len(matches) > 1:
                     return False
                 if matches:
@@ -913,7 +1054,9 @@ class WindowsPermissions:
                             if current_id != ident:
                                 continue
                             acl = self._acl(ws, change)
-                            matches = self._matches(ws, acl, delta, flags)
+                            matches = self._unrecorded(
+                                acl, self._matches(ws, acl, delta, flags), aces
+                            )
                             if len(matches) > 1:
                                 return False
                             if matches:
@@ -933,9 +1076,14 @@ class WindowsPermissions:
             # Detect files created in the narrow interval before a parent's
             # ACE was removed, and any entry for the account that was not
             # there before the grant. A retry uses the same recorded plan.
-            for names, _, _, acl, directory, _ in self._tree(
+            for names, held, _, acl, directory, _ in self._tree(
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
+                if names not in kept and (
+                    (acl is None and names not in open_before)
+                    or (names not in owners_before and self._owner(ws, held) == delta["sid"])
+                ):
+                    kept.append(names)
                 if (
                     names
                     and names[:-1] in owned

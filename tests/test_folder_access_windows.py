@@ -404,6 +404,131 @@ def test_revoke_keeps_a_by_hand_entry_in_a_folder_protected_before_the_grant(
     assert sid_aces(closed) == [(3, backend.READ)]
 
 
+def null_dacl(path: Path) -> None:
+    import win32security as ws
+
+    ws.SetNamedSecurityInfo(
+        str(path), ws.SE_FILE_OBJECT, ws.DACL_SECURITY_INFORMATION, None, None, None, None
+    )
+
+
+def dacl(path: Path):
+    import win32security as ws
+
+    return ws.GetFileSecurity(str(path), 4).GetSecurityDescriptorDacl()
+
+
+def test_revoke_repairs_a_null_dacl_the_app_set_after_the_grant(tmp_path: Path) -> None:
+    """Re-review blocker: a null DACL gives everyone everything, and removal read
+    it as "no entries" and reported success."""
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    keep = root / "keep"
+    keep.mkdir()
+    (keep / "secret.txt").write_text("app data")
+    null_dacl(keep)
+    assert dacl(keep) is None
+    assert backend.revoke(str(root), delta)
+    # It inherits the folder's entries again, which no longer name the account.
+    assert dacl(keep) is not None
+    assert sid_aces(keep) == [] and sid_aces(keep / "secret.txt") == []
+    assert owner(root) in {
+        __import__("win32security").ConvertSidToStringSid(dacl(keep).GetAce(i)[-1])
+        for i in range(dacl(keep).GetAceCount())
+    }
+
+
+def test_revoke_keeps_a_null_dacl_that_was_there_before_the_grant(tmp_path: Path) -> None:
+    root = tmp_path / "shared"
+    (root / "open").mkdir(parents=True)
+    private_acl(root)
+    null_dacl(root / "open")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    assert backend.revoke(str(root), delta)
+    assert dacl(root / "open") is None
+
+
+def test_revoke_reports_an_app_owned_item_it_cannot_give_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner keeps WRITE_DAC, so an item the app owns could get its access back."""
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    made = root / "made.txt"
+    made.write_text("app data")
+    import win32file
+
+    real_owner = fa.WindowsPermissions._owner
+
+    def owned_by_app(ws, handle):
+        found = real_owner(ws, handle)
+        path = win32file.GetFinalPathNameByHandle(handle, 0)
+        return USERS if path.endswith("made.txt") else found
+
+    def cannot(*_args, **_kwargs):
+        raise PermissionError(1307, "This security ID may not be assigned as the owner")
+
+    monkeypatch.setattr(fa.WindowsPermissions, "_owner", staticmethod(owned_by_app))
+    monkeypatch.setattr(backend, "_give", cannot)
+    with pytest.raises(fa.RemovalIncomplete, match=r"made\.txt.*changed outside Eugene"):
+        backend.revoke(str(root), delta)
+
+
+@pytest.mark.skipif(
+    not __import__("ctypes").windll.shell32.IsUserAnAdmin(),
+    reason="Giving an item to another owner needs SeRestorePrivilege (CI runs as admin)",
+)
+def test_revoke_gives_app_owned_items_to_the_folders_owner(tmp_path: Path) -> None:
+    import win32security as ws
+
+    root = tmp_path / "shared"
+    root.mkdir()
+    private_acl(root)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    keep = root / "keep"
+    keep.mkdir()
+    (keep / "secret.txt").write_text("app data")
+    with fa._privileges(ws, "SeRestorePrivilege"):
+        for item in (keep, keep / "secret.txt"):
+            ws.SetNamedSecurityInfo(
+                str(item),
+                ws.SE_FILE_OBJECT,
+                ws.OWNER_SECURITY_INFORMATION,
+                ws.ConvertStringSidToSid(USERS),
+                None,
+                None,
+                None,
+            )
+    assert owner(keep) == USERS
+    assert backend.revoke(str(root), delta)
+    assert owner(keep) == owner(root) and owner(keep / "secret.txt") == owner(root)
+
+
+def test_revoke_keeps_a_by_hand_entry_on_a_folder_protected_after_the_grant(
+    tmp_path: Path,
+) -> None:
+    """Re-review: an explicit by-hand entry for the account on a folder that is
+    protected after the grant matched the copy rule and was deleted."""
+    root = tmp_path / "shared"
+    keep = root / "keep"
+    keep.mkdir(parents=True)
+    private_acl(root)
+    icacls(keep, "/grant", f"*{USERS}:(OI)(CI)(RX)")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    icacls(keep, "/inheritance:d")
+    assert backend.revoke(str(root), delta)
+    assert sid_aces(keep) == [(3, backend.READ)]
+
+
 def test_windows_refuses_a_grant_inside_or_around_another(tmp_path: Path) -> None:
     """Review: a child grant found the parent's inherited rights and recorded nothing,
     so removing the parent took the child's access while its record said ready."""
