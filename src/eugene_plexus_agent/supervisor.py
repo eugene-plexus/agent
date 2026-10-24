@@ -272,6 +272,9 @@ class SpawnPlan:
     answer to that is a crash-backoff cycle that names neither the port
     nor what is holding it. Optional because not every plan has one."""
 
+    on_spawn: Callable[[], None] | None = None
+    """Record observations only after a process was successfully created."""
+
 
 class SpawnPlanner(Protocol):
     """Knows what to launch, and what to do when launching keeps failing.
@@ -1023,6 +1026,8 @@ class SupervisedProcess:
         self.last_restart = datetime.now(UTC)
         self.spawns += 1
         self.last_error = None
+        if plan.on_spawn is not None:
+            plan.on_spawn()
 
         # Background reader: drains the child's stdout pipe and re-emits
         # each line with a `[<name>]` prefix on the agent's own stdout.

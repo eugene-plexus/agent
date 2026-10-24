@@ -18,6 +18,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +45,7 @@ from .._generated.models import (
     AppManifest,
     AppOrigin,
     AppRestartRequest,
+    ClientKeyCreated,
     ClientKeyCreateRequest,
     ClientKeyLimits,
 )
@@ -58,7 +63,7 @@ from ..apps import (
 )
 from ..client_key_registry import registry
 from ..dependencies import require_operator_session
-from .auth import mint_client_key, revoke_client_key_at_authority
+from .auth import key_lineage_ids, mint_client_key, revoke_client_key_at_authority
 
 log = logging.getLogger(__name__)
 
@@ -232,13 +237,14 @@ async def _revoke_key(request: Request, manager: AppManager, app_id: str) -> Non
     key = manager.store.key(app_id)
     if key is None:
         return
-    try:
-        await revoke_client_key_at_authority(
-            request, key.key_id, authorization=request.headers.get("authorization")
-        )
-    except HTTPException as exc:
-        if exc.status_code != status.HTTP_404_NOT_FOUND:
-            raise
+    authorization = request.headers.get("authorization")
+    # Every key of the app's lineage: a rotated app's old key is still in its overlap.
+    for key_id in await key_lineage_ids(request, key.key_id, authorization=authorization):
+        try:
+            await revoke_client_key_at_authority(request, key_id, authorization=authorization)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
     manager.store.drop_key(app_id)
     log.info("revoked key %r (id %s) for app %s", key.key_name, key.key_id, app_id)
 
@@ -392,6 +398,102 @@ async def _ensure_key(request: Request, manager: AppManager, app_id: str) -> Non
     write_private(key_file, created.token)
     store.put_key(app_id, AppKey(key_id=created.key.id, key_name=created.key.name))
     log.info("minted key %r (id %s) for app %s", created.key.name, created.key.id, app_id)
+
+
+_APP_KEY_NAME = re.compile(r"^app:([^@]+)@(.+)$")
+
+
+@dataclass(frozen=True)
+class PreparedAppKeyRotation:
+    manager: AppManager
+    app_id: str
+    name: str
+
+
+def _until(overlap: int) -> str:
+    return datetime.fromtimestamp(time.time() + overlap).strftime("%d %b %H:%M")
+
+
+def prepare_app_key_rotation(
+    request: Request, key_name: str, key_id: str, *, overlap: int
+) -> PreparedAppKeyRotation | None:
+    """Before the root rotates an app's key: is it this machine's to rotate?
+
+    None for a key that is not an app's key here, which the root rotates alone.
+    A key of an app on another machine gets a 409 naming it, because only that
+    machine's agent can write the app's key file (the console sends the request
+    to that agent). A key file this agent cannot write is refused now, while
+    nothing has changed and the old key keeps working.
+    """
+    match = _APP_KEY_NAME.match(key_name)
+    manager: AppManager | None = getattr(request.app.state, "apps", None)
+    if match is None or manager is None:
+        return None
+    app_id, node = match.groups()
+    if node != (manager.node_name() or "this-node"):
+        raise _problem(
+            status.HTTP_409_CONFLICT,
+            "Rotate it on its own machine",
+            f"This key belongs to {app_id} on {node}. Rotate it from {node}.",
+        )
+    held = manager.store.key(app_id)
+    if held is None or held.key_id != key_id:
+        return None
+    installed = manager.store.get(app_id)
+    name = installed.manifest.name if installed is not None else app_id
+    key_file = manager.store.key_file(app_id)
+    try:
+        if key_file.is_file():
+            write_private(key_file, key_file.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Could not write the key file",
+            f"Could not write {name}'s key file ({type(exc).__name__}). Nothing was changed; "
+            "the old key keeps working.",
+        ) from exc
+    return PreparedAppKeyRotation(manager=manager, app_id=app_id, name=name)
+
+
+async def finish_app_key_rotation(
+    request: Request, prepared: PreparedAppKeyRotation, created: ClientKeyCreated, *, overlap: int
+) -> None:
+    """After the root rotated: write the new token, and restart an app that
+    reads its key only at start (the manifest fills `{clientKey}`)."""
+    manager, app_id = prepared.manager, prepared.app_id
+    key_file = manager.store.key_file(app_id)
+    try:
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        write_private(key_file, created.token)
+        manager.store.put_key(app_id, AppKey(key_id=created.key.id, key_name=created.key.name))
+    except OSError as exc:
+        # Nobody holds the new token, so it must not stay valid.
+        try:
+            await revoke_client_key_at_authority(
+                request, created.key.id, authorization=request.headers.get("authorization")
+            )
+            turned_off = " The new key was turned off."
+        except HTTPException:
+            turned_off = (
+                " The new key could not be turned off; turn it off under Use it from your apps."
+            )
+        raise _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Could not write the key file",
+            f"Could not write {prepared.name}'s key file ({type(exc).__name__}).{turned_off} "
+            f"The old key works until {_until(overlap)}.",
+        ) from exc
+    record = manager.store.get(app_id)
+    if record is not None and record.enabled and "{clientKey}" in record.manifest.model_dump_json():
+        try:
+            await manager.restart(record)
+        except Exception as exc:
+            raise _problem(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "Could not restart it",
+                f"{prepared.name} has its new key but did not restart: {exc}",
+            ) from exc
+    log.info("wrote the rotated key (id %s) for app %s", created.key.id, app_id)
 
 
 @router.post(
