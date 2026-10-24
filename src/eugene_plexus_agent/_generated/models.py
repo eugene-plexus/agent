@@ -2061,6 +2061,19 @@ class RevokedSession(BaseModel):
     exp: int = Field(..., description="The session's own `exp`, unix seconds.")
 
 
+class TokenEpochs(BaseModel):
+    """
+    Since when every token the control root signs carries `ep`
+    (row 4): the time in unix seconds, and the epoch it was then.
+    Absent from a root older than row 4, and every root token
+    without `ep` is then accepted as before.
+
+    """
+
+    since: int
+    epoch: int
+
+
 class TrustBundle(BaseModel):
     """
     The set of keys every verifier in the install trusts, and what
@@ -2100,7 +2113,20 @@ class TrustBundle(BaseModel):
        the issuer's own, 14 days for a session, 10 minutes for an
        exchanged token, and 400 days for a client key;
     5. refuses a session that is listed in `revokedSessions`, or
-       whose `aud` names a node no longer in the bundle.
+       whose `aud` names a node no longer in the bundle;
+    6. refuses a token the control root signed, other than a client
+       key, whose `ep` claim (the epoch of the root that minted it,
+       row 4) is below this bundle's `epoch`: "This command came from a
+       root this machine no longer follows (epoch 2; it follows epoch
+       3)." A promotion keeps the root's token key, so this is what
+       stops the root it replaced. A root token without `ep` (from a
+       root older than row 4) is refused once `tokenEpochs` says roots
+       mark theirs, if it was minted after `tokenEpochs.since` or the
+       epoch has risen past `tokenEpochs.epoch`.
+
+    **Bundles are ordered by epoch first** (row 4): a higher `epoch`
+    replaces whatever its `version`, a lower one never does, and at
+    one epoch the version decides.
 
     No hard expiry, deliberately. A bundle that stopped verifying
     when the root was dead would end the data path's guarantee to
@@ -2111,11 +2137,15 @@ class TrustBundle(BaseModel):
 
     version: int = Field(
         ...,
-        description="The control root's replicated log index when this bundle was\nbuilt, so it only grows, including across a promotion. A\nverifier refuses a lower version than it holds (rollback)\nand replaces its bundle with an equal or higher one.\n",
+        description="The control root's replicated log index when this bundle was\nbuilt. At one epoch a verifier refuses a lower version than it\nholds (rollback) and replaces its bundle with an equal or\nhigher one. A root promoted from a copy that was behind may\nnumber below the root it replaced, so a higher `epoch` wins\nwhatever the version.\n",
         ge=0,
     )
     epoch: int = Field(
         ..., description="The control root's epoch; an agent refuses a lower one.", ge=0
+    )
+    tokenEpochs: TokenEpochs | None = Field(
+        None,
+        description='Since when every token the control root signs carries `ep`\n(row 4): the time in unix seconds, and the epoch it was then.\nAbsent from a root older than row 4, and every root token\nwithout `ep` is then accepted as before.\n',
     )
     iat: int = Field(
         ...,
@@ -2353,6 +2383,13 @@ class ComponentStatus(StrEnum):
     exited = 'exited'
     crashed = 'crashed'
     unreachable = 'unreachable'
+
+
+class SignedMachineList(BaseModel):
+    jws: str = Field(
+        ...,
+        description='A JWS compact serialization with header\n`{"alg": "EdDSA", "typ": "ep-machines+jwt"}` whose payload is a\n`MachineList` (`control.yaml`), signed with the root identity\nthis node pinned at enrolment.\n',
+    )
 
 
 class LocalStandby(BaseModel):
@@ -6756,7 +6793,16 @@ class NodeIdentity(BaseModel):
     controlUrl: AnyUrl | None = Field(
         None, description='The control root this node answers to.'
     )
+    controlUrlEpoch: int | None = Field(
+        None,
+        description='The epoch `controlUrl` came with (row 4): the epoch at\nenrolment, or of the promoted root this node moved to. A node\nmoves only for a signed machine list at a higher epoch. Set to\nthe epoch held when a node updated to row 4 first starts, so an\nupdate never moves a node. Absent until enrolled.\n',
+        ge=0,
+    )
     standby: LocalStandby | None = None
+    rootLocked: bool | None = Field(
+        None,
+        description="This machine runs the install's control root, and it is locked:\nnothing can be signed until the owner signs in with the\npassphrase (row 4). Home says so. Common after a restart under\n`prompt_on_startup`, and after a promoted copy restarts before\nany other machine heard of the promotion. Absent when this\nmachine runs no root, or its state is not known yet.\n",
+    )
     hostsControl: bool | None = Field(
         None,
         description="This agent supervises the install's active control root. The\nroot reads it from its probe of each node to know its own\nmachine, which can never be its standby\n(`docs/design/warm-standby.md`). A standby this agent runs does\nnot count.\n",
