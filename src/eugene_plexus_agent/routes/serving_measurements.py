@@ -41,7 +41,13 @@ from .._http import internal_client
 from ..dependencies import require_operator_session
 from ..measurement_node import active_measurement, restart_stopped, stop_agreed
 from ..node_work import launch_lock
-from ..serving_sweep import ServingMeasurements, Sweep, effective_request, people_levels
+from ..serving_sweep import (
+    MEASUREMENT_KEY_CONCURRENCY,
+    ServingMeasurements,
+    Sweep,
+    effective_request,
+    people_levels,
+)
 from .auth import mint_client_key, revoke_client_key_at_authority
 from .node import _devices
 from .proxy import _translate, resolve_target
@@ -378,7 +384,7 @@ async def start(body: ServingMeasurementRequest, request: Request) -> ServingMea
                         limits=ClientKeyLimits(
                             localOnly=True,
                             allowedModels=[AllowedModel(alias)],
-                            maxConcurrentRequests=64,
+                            maxConcurrentRequests=MEASUREMENT_KEY_CONCURRENCY,
                             requestsPerMinute=10000,
                         ),
                     ),
@@ -455,6 +461,7 @@ async def start(body: ServingMeasurementRequest, request: Request) -> ServingMea
                 alias,
                 context,
                 random.Random(effective.seed),
+                limit=MEASUREMENT_KEY_CONCURRENCY,
             )
             before: float | None = None
             began = 0.0

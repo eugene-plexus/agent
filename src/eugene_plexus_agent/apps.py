@@ -45,6 +45,7 @@ import contextlib
 import importlib.resources
 import json
 import logging
+import os
 import re
 import secrets
 import shutil
@@ -71,8 +72,11 @@ from ._generated.models import (
     AppIsolation,
     AppManifest,
     AppOrigin,
+    AppSettings,
+    AppSettingsUpdate,
     AppUpdateBackup,
     ComponentStatus,
+    Provides1,
     State1,
 )
 from ._http import internal_client
@@ -126,6 +130,26 @@ _EXACT_RELEASE = re.compile(r"\d+(\.\d+)*((a|b|rc)\d+)?(\.post\d+)?(\.dev\d+)?")
 
 _HEALTH_POLL_SECONDS = 1.5
 _OUTPUT_TAIL_LINES = 40
+CHOOSE_MEMORY_MODEL = "Choose the model Hindsight reads your chats with"
+
+
+def claims_link(manifest: AppManifest) -> bool:
+    return bool(
+        manifest.provides
+        or manifest.providesPath
+        or AppHubSurface.memory_server in (manifest.uses or [])
+        or any(
+            "linkSecret" in app_launcher.placeholders(t)
+            for t in [
+                *(manifest.environment or {}).values(),
+                *(a.root for a in manifest.args or []),
+            ]
+        )
+    )
+
+
+def memory_provider(record: InstalledApp) -> bool:
+    return record.origin is AppOrigin.catalogue and record.manifest.provides is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +260,8 @@ def validate_manifest(manifest: AppManifest) -> None:
       app's own, which could point it at another app's key or override
       what the agent hands it.
     """
+    if bool(manifest.provides) != bool(manifest.providesPath):
+        raise ValueError("provides and providesPath must be paired")
     if manifest.source.strip() == PYPI:
         pip_requirement(manifest)
     app_backups.validate_paths([p.root for p in manifest.updateBackup or []])
@@ -323,6 +349,8 @@ class InstalledApp:
     installed_at: datetime
     enabled: bool = True
     previous_version: str | None = None
+    aux_port: int | None = None
+    settings: AppSettings = field(default_factory=lambda: AppSettings(memoryModel=None))
 
     @property
     def id(self) -> str:
@@ -339,9 +367,12 @@ class InstalledApp:
             "port": self.port,
             "installedAt": self.installed_at.isoformat(),
             "enabled": self.enabled,
+            "settings": self.settings.model_dump(mode="json"),
         }
         if self.previous_version:
             out["previousVersion"] = self.previous_version
+        if self.aux_port is not None:
+            out["auxPort"] = self.aux_port
         return out
 
     @classmethod
@@ -353,6 +384,8 @@ class InstalledApp:
             installed_at=datetime.fromisoformat(raw["installedAt"]),
             enabled=bool(raw.get("enabled", True)),
             previous_version=raw.get("previousVersion"),
+            aux_port=raw.get("auxPort"),
+            settings=AppSettings.model_validate(raw.get("settings", {"memoryModel": None})),
         )
 
 
@@ -476,7 +509,7 @@ class AppStore:
         self._write()
 
     def taken_ports(self) -> set[int]:
-        return {r.port for r in self._installed.values()}
+        return {p for r in self._installed.values() for p in (r.port, r.aux_port) if p is not None}
 
     # --- keys -----------------------------------------------------------
 
@@ -511,6 +544,10 @@ class AppStore:
         return list(self._custom.values())
 
     def add_custom(self, manifest: AppManifest) -> None:
+        if claims_link(manifest):
+            raise ValueError(
+                "Only shipped catalogue entries may provide or use the memory-server link"
+            )
         self._custom[manifest.id] = normalized(manifest)
         self._write()
 
@@ -534,6 +571,12 @@ class AppStore:
 
     def oidc_secret_file(self, app_id: str) -> Path:
         return self.data_dir(app_id) / OIDC_SECRET_FILE
+
+    def link_secret_file(self, app_id: str) -> Path:
+        return self.app_dir(app_id) / "memory_server_token"
+
+    def link_model_file(self, app_id: str) -> Path:
+        return self.app_dir(app_id) / "memory_server_model.json"
 
     def sign_in_stamp_file(self, app_id: str) -> Path:
         """The return addresses last registered for this app's sign-in."""
@@ -634,7 +677,9 @@ async def _run_tool(argv: list[str], *, env: dict[str, str]) -> tuple[int, str]:
             line = await proc.stdout.readline()
             if not line:
                 break
-            tail.append(line.decode("utf-8", errors="replace").rstrip())
+            tail.append(
+                app_launcher.redact_database(line.decode("utf-8", errors="replace").rstrip())
+            )
         code = await proc.wait()
     except asyncio.CancelledError:
         with contextlib.suppress(ProcessLookupError):
@@ -825,8 +870,11 @@ class AppInstaller:
         python = venv_python(venv)
         progress.state = State1.installing
         progress.message = f"installing {manifest.package}"
+        requirements = [requirement]
+        if manifest.id == "hindsight" and manifest.package == "hindsight-api-slim[embedded-db]":
+            requirements.append(app_launcher.PG0_REQUIREMENT)
         code, out = await _run_tool(
-            [str(uv), "pip", "install", "--python", str(python), requirement], env=env
+            [str(uv), "pip", "install", "--python", str(python), *requirements], env=env
         )
         if code != 0:
             raise AppInstallError(f"installing {manifest.package} failed:\n{out}")
@@ -884,6 +932,7 @@ class _AppPlanner:
         gateway_detail: Callable[[], str | None] = lambda: None,
         door_ports: tuple[int, int] | None = None,
         ca_bundle: Path | None = None,
+        memory_link: dict[str, str] | None = None,
     ) -> None:
         self.record = record
         self._ca_bundle = ca_bundle
@@ -901,6 +950,7 @@ class _AppPlanner:
         self._public_origin = public_origin
         self._oidc_backchannel = oidc_backchannel
         self.admin_token: str | None = None
+        self._memory_link = memory_link or {}
 
     @property
     def name(self) -> str:
@@ -914,6 +964,10 @@ class _AppPlanner:
         return None
 
     def explain_exit(self, return_code: int, output_tail: str) -> str | None:
+        if memory_provider(self.record):
+            for line in output_tail.splitlines():
+                if "Hindsight was not started: database port" in line:
+                    return app_launcher.redact_database(line)
         return None
 
     def on_crash_threshold(self) -> bool:
@@ -948,6 +1002,11 @@ class _AppPlanner:
         base = self.base_plan()
         spec = self._render_spec(base)
         try:
+            if memory_provider(self.record):
+                python = venv_python(
+                    self._store.version_dir(self.record.id, self.record.version) / "venv"
+                )
+                app_launcher.pg0_cleanup(str(python), "stop", base.env)
             argv, env, notes = app_launcher.render_start(spec, base.env)
         except (OSError, ValueError) as exc:
             raise self._unfillable(exc) from exc
@@ -961,7 +1020,7 @@ class _AppPlanner:
         `render_start` may spend asking the gateway is one task's wait and
         not every task's in the agent.
 
-        **What runs in the thread is `render_start` and nothing else.** All
+        The render and named pg0 cleanup run off the event loop. All
         that reads the agent's own state -- `base_plan`, the callables behind
         `launch()` (gateway, bind host, sign-in), the store -- runs here on
         the loop, as it always did, and the thread is handed plain data: the
@@ -975,6 +1034,11 @@ class _AppPlanner:
         base = self.base_plan()
         spec = self._render_spec(base)
         try:
+            if memory_provider(self.record):
+                python = venv_python(
+                    self._store.version_dir(self.record.id, self.record.version) / "venv"
+                )
+                await asyncio.to_thread(app_launcher.pg0_cleanup, str(python), "stop", base.env)
             argv, env, notes = await asyncio.to_thread(app_launcher.render_start, spec, base.env)
         except (OSError, ValueError) as exc:
             raise self._unfillable(exc) from exc
@@ -990,14 +1054,20 @@ class _AppPlanner:
             "dataDir": str(self._store.data_dir(record.id)),
             "keyFile": str(self._store.key_file(record.id)),
             "oidcSecretFile": str(self._store.oidc_secret_file(record.id)),
+            "linkSecretFile": str(self._store.link_secret_file(record.id)),
+            "providerPython": str(
+                venv_python(self._store.version_dir(record.id, record.version) / "venv")
+            ),
         }
 
     def _unfillable(self, exc: Exception) -> SpawnPlanError:
         if isinstance(exc, app_launcher.GatewayUnknown):
             # The launcher's own words, whichever way the app runs. They say "this
             # app", and they are shown on the app's own card: no name before them.
-            return SpawnPlanError(str(exc))
-        return SpawnPlanError(f"could not fill in how {self.record.id} starts: {exc}")
+            return SpawnPlanError(app_launcher.redact_database(str(exc)))
+        return SpawnPlanError(
+            app_launcher.redact_database(f"could not fill in how {self.record.id} starts: {exc}")
+        )
 
     def _planned(
         self, base: SpawnPlan, argv: list[str], env: dict[str, str], notes: list[str]
@@ -1025,6 +1095,12 @@ class _AppPlanner:
             "bindHost": "127.0.0.1" if door else (self._bind_host() or "127.0.0.1"),
             "port": str(door[0] if door else self.record.port),
         }
+        if memory_provider(self.record):
+            values["bindHost"] = "127.0.0.1"
+        if self.record.aux_port is not None:
+            values["auxPort"] = str(self.record.aux_port)
+        if self.record.settings.memoryModel is not None:
+            values["memoryModel"] = self.record.settings.memoryModel
         gateway = self._gateway_url()
         if gateway:
             values["gatewayUrl"] = gateway
@@ -1041,6 +1117,7 @@ class _AppPlanner:
             "environment": dict(manifest.environment or {}),
             "values": values,
             "resetOnConnectionChange": manifest.resetOnConnectionChange,
+            "linkProvider": memory_provider(self.record),
         }
         # No address, and the agent's own words for why: an app that names
         # `{gatewayUrl}` is not started without one, and says so with them.
@@ -1072,6 +1149,9 @@ class _AppPlanner:
         # the app learns it from its environment, so nothing has to persist.
         self.admin_token = secrets.token_urlsafe(32)
         env = child_environment()
+        env.update(self._memory_link)
+        if memory_provider(record):
+            env["HOME"] = str(data)
         env[f"{ENV_PREFIX}_ID"] = record.id
         env[f"{ENV_PREFIX}_BIND_PORT"] = str(record.port)
         if self._door_ports is not None:
@@ -1093,6 +1173,8 @@ class _AppPlanner:
         if self._oidc_backchannel:
             env[f"{ENV_PREFIX}_OIDC_BACKCHANNEL"] = self._oidc_backchannel
         host = "127.0.0.1" if self._door_ports is not None else self._bind_host()
+        if memory_provider(record):
+            host = "127.0.0.1"
         if host:
             env[f"{ENV_PREFIX}_BIND_HOST"] = host
         gateway = self._gateway_url()
@@ -1159,12 +1241,13 @@ class AppSupervisor:
             self._health_task = asyncio.create_task(self._health_loop(), name="app-health")
 
     async def stop(self, app_id: str) -> None:
-        process = self._processes.pop(app_id, None)
+        process = self._processes.get(app_id)
+        if process is not None:
+            await process.stop()
+        self._processes.pop(app_id, None)
         self._planners.pop(app_id, None)
         self._health.pop(app_id, None)
         self._reachable.pop(app_id, None)
-        if process is not None:
-            await process.stop()
 
     def is_running(self, app_id: str) -> bool:
         return app_id in self._processes
@@ -1311,6 +1394,7 @@ class AppManager:
         self._gateway: dict[str, str | None] = {}
         self._detail: dict[str, str | None] = {}
         self._image_offers: dict[str, str | None] = {}
+        self._errors: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
     def node_name(self) -> str | None:
@@ -1383,6 +1467,8 @@ class AppManager:
                     AppCatalogueEntry(
                         manifest=manifest,
                         origin=origin,
+                        installable=self.entry_refusal(manifest, enrolled=enrolled) is None,
+                        reason=self.entry_refusal(manifest, enrolled=enrolled),
                         installedVersion=record.version if record else None,
                         resetsSettings=bool(
                             record
@@ -1399,6 +1485,20 @@ class AppManager:
             ownAccounts=self.accounts.available,
             ownAccountsReason=self.accounts.reason,
         )
+
+    def entry_refusal(self, manifest: AppManifest, *, enrolled: bool) -> str | None:
+        reason = self.installable(enrolled=enrolled)
+        if reason:
+            return reason
+        # MV5b-C1 allows Linux only for now: elsewhere pg0 keeps its data outside
+        # the app's folder, where uninstall cannot be shown to delete it.
+        if manifest.id == "hindsight" and sys.platform != "linux":
+            return (
+                "Hindsight runs on Linux machines only for now: elsewhere its database "
+                "would keep memories outside the app's folder, where removing the app "
+                "cannot delete them. Install it on a Linux machine."
+            )
+        return self.local_actions_refusal(manifest)
 
     def local_actions_refusal(self, manifest: AppManifest) -> str | None:
         """Why `manifest` may not be installed on this node, or None (C1).
@@ -1484,8 +1584,16 @@ class AppManager:
             installedAt=record.installed_at,
             pid=pid,
             lastRestart=restarted,
-            lastError=error,
-            detail=detail,
+            lastError=app_launcher.redact_database(self._errors.get(record.id, error) or "")
+            or None,
+            detail=app_launcher.redact_database(detail) if detail else detail,
+            experimental=bool(record.manifest.experimental),
+            provides=Provides1(record.manifest.provides.value)
+            if record.manifest.provides
+            else None,
+            providesPath=record.manifest.providesPath,
+            auxPort=record.aux_port,
+            settings=record.settings,
         )
 
     def given_settings(self, record: InstalledApp) -> AppGivenSettings | None:
@@ -1631,6 +1739,17 @@ class AppManager:
         """Resolve the gateway now, then spawn. Resolved per start rather
         than once, because the gateway can move and a restart is when an
         operator expects an app to notice."""
+        if record.origin is AppOrigin.custom and claims_link(record.manifest):
+            raise AppInstallError("Only shipped catalogue entries may use the memory-server link")
+        if memory_provider(record):
+            self.ensure_memory_secret(record)
+        if memory_provider(record) and record.settings.memoryModel is None:
+            self._detail[record.id] = CHOOSE_MEMORY_MODEL
+            return
+        if self.supervisor.is_running(record.id):
+            return
+        if memory_provider(record):
+            await self.pg0(record, "stop")
         url, detail = await self._resolve_gateway() if record.manifest.uses else (None, None)
         self._gateway[record.id] = url
         self._detail[record.id] = detail
@@ -1647,8 +1766,10 @@ class AppManager:
             app_url=lambda: self.app_url(record.id),
             public_origin=self._public_origin(record.id),
             oidc_backchannel=self._oidc_backchannel if record.id == "workbench" else None,
+            memory_link=self.prepare_memory_link(record),
         )
         self.supervisor.start(planner)
+        self._errors.pop(record.id, None)
         if self.after_start:
             self.after_start(record.id)
 
@@ -1656,6 +1777,11 @@ class AppManager:
         if self.before_stop:
             await self.before_stop(app_id)
         await self.supervisor.stop(app_id)
+        if self.supervisor.is_running(app_id):
+            raise AppInstallError("The old app process was not confirmed stopped")
+        record = self.store.get(app_id)
+        if record is not None and memory_provider(record):
+            await self.pg0(record, "stop")
         doors = self._doors()
         if doors is not None:
             await doors.close(f"app:{app_id}")
@@ -1668,7 +1794,7 @@ class AppManager:
         from .client_tls import free_loopback_port
 
         doors = self._doors()
-        if doors is None or record.id in SITE_HOST_IDS:
+        if doors is None or record.id in SITE_HOST_IDS or memory_provider(record):
             return None
         plain, tls = free_loopback_port(), free_loopback_port()
         try:
@@ -1797,6 +1923,9 @@ class AppManager:
         manifest = normalized(manifest)
         async with self._lock:
             existing = self.store.get(manifest.id)
+            # Stop using the old environment before an update replaces its record.
+            if existing and memory_provider(existing):
+                await self.stop(existing.id)
             if existing and existing.version != manifest.version and manifest.updateBackup:
                 self.require_settings_access(manifest.name, "updated")
                 paths = [p.root for p in manifest.updateBackup]
@@ -1848,14 +1977,29 @@ class AppManager:
                         if existing.version != manifest.version
                         else existing.previous_version
                     ),
+                    aux_port=existing.aux_port,
+                    settings=existing.settings,
                 )
             self.store.put(record)
+            if record.aux_port is None and any(
+                "{auxPort}" in v for v in (manifest.environment or {}).values()
+            ):
+                record.aux_port = self.allocate_port()
+                self.store.put(record)
+            if memory_provider(record):
+                if record.aux_port is None:
+                    record.aux_port = self.allocate_port()
+                    self.store.put(record)
+                self.ensure_memory_secret(record)
+                self.publish_memory_model(record)
             keep = {record.version}
             if record.previous_version:
                 keep.add(record.previous_version)
             if record.enabled:
                 await self.restart(record)
             prune_versions(self.store, record.id, keep)
+        if memory_provider(record):
+            await self.refresh_memory_consumers()
 
     async def rollback(self, record: InstalledApp) -> None:
         self.require_settings_access(record.manifest.name, "put back to its earlier version")
@@ -1918,21 +2062,33 @@ class AppManager:
             )
 
     async def uninstall(self, app_id: str, *, purge: bool) -> None:
+        async with self._lock:
+            await self._uninstall(app_id, purge=purge)
+
+    async def _uninstall(self, app_id: str, *, purge: bool) -> None:
         await self.installer.cancel(app_id)
-        if self.before_stop:
-            await self.before_stop(app_id)
+        record = self.store.get(app_id)
+        if record is not None and memory_provider(record):
+            record.enabled = False
+            self.store.put(record)
+        await self.stop(app_id)
+        if record is not None and memory_provider(record) and purge:
+            await self.pg0(record, "drop")
         if isinstance(self.supervisor, app_accounts.OwnAccountSupervisor):
             # Its service and its account go with it.
             await self.supervisor.remove(app_id, purge=purge)
-        else:
-            await self.supervisor.stop(app_id)
-        # Its door goes with it: nothing listens on its port once it is gone.
-        doors = self._doors()
-        if doors is not None:
-            await doors.close(f"app:{app_id}")
+        if (
+            purge
+            and record is not None
+            and memory_provider(record)
+            and self.store.app_dir(app_id).exists()
+        ):
+            # Keep a failed purge listed for retry, and report the actual filesystem error.
+            await asyncio.to_thread(shutil.rmtree, self.store.app_dir(app_id))
         self.store.remove(app_id)
         self._gateway.pop(app_id, None)
         self._detail.pop(app_id, None)
+        self._errors.pop(app_id, None)
         if purge:
             _remove_quietly(self.store.app_dir(app_id))
         else:
@@ -1941,7 +2097,152 @@ class AppManager:
             _remove_quietly(self.store.app_dir(app_id) / "versions")
             with contextlib.suppress(OSError):
                 self.store.key_file(app_id).unlink(missing_ok=True)
+        if record is not None and memory_provider(record):
+            await self.refresh_memory_consumers()
 
     async def aclose(self) -> None:
         await self.installer.aclose()
-        await self.supervisor.stop_all()
+        try:
+            if isinstance(self.supervisor, AppSupervisor):
+                for record in self.store.installed():
+                    if memory_provider(record):
+                        try:
+                            await self.stop(record.id)
+                        except Exception as exc:
+                            log.warning(
+                                "Hindsight shutdown cleanup failed: %s",
+                                app_launcher.redact_database(str(exc)),
+                            )
+        finally:
+            await self.supervisor.stop_all()
+
+    def memory_link(self, consumer: InstalledApp) -> dict[str, str]:
+        if (
+            consumer.origin is not AppOrigin.catalogue
+            or consumer.id not in self.catalogue
+            or AppHubSurface.memory_server not in (consumer.manifest.uses or [])
+        ):
+            return {}
+        provider = next((r for r in self.store.installed() if memory_provider(r)), None)
+        if provider is None:
+            return {}
+        return {
+            f"{ENV_PREFIX}_MEMORY_SERVER_URL": f"http://127.0.0.1:{provider.port}{provider.manifest.providesPath}",
+            f"{ENV_PREFIX}_MEMORY_SERVER_TOKEN_FILE": str(self.store.link_secret_file(provider.id)),
+            f"{ENV_PREFIX}_MEMORY_SERVER_MODEL_FILE": str(self.store.link_model_file(provider.id)),
+        }
+
+    def ensure_memory_secret(self, record: InstalledApp) -> None:
+        secret = self.store.link_secret_file(record.id)
+        if not secret.exists() or not secret.read_text(encoding="utf-8").strip():
+            write_private(secret, secrets.token_urlsafe(32))
+
+    def publish_memory_model(self, record: InstalledApp) -> None:
+        write_private(self.store.link_model_file(record.id), record.settings.model_dump_json())
+        if self.accounts.kind == "systemd":
+            for consumer in self.store.installed():
+                if (
+                    consumer.origin is AppOrigin.catalogue
+                    and consumer.id in self.catalogue
+                    and AppHubSurface.memory_server in (consumer.manifest.uses or [])
+                ):
+                    path = self.store.link_model_file(consumer.id)
+                    write_private(path, record.settings.model_dump_json())
+                    # The app folder is bound read-only in its namespace. This non-secret
+                    # file must stay live; systemd credentials are snapshots from unit start.
+                    os.chmod(path, 0o644)
+
+    def prepare_memory_link(self, consumer: InstalledApp) -> dict[str, str]:
+        if memory_provider(consumer):
+            return {}
+        link = self.memory_link(consumer)
+        if not self.accounts.available:
+            return link
+        if not link:
+            write_private(self.store.link_secret_file(consumer.id), "")
+            write_private(self.store.link_model_file(consumer.id), "{}")
+            return {}
+        for suffix, target in (
+            ("TOKEN_FILE", self.store.link_secret_file(consumer.id)),
+            ("MODEL_FILE", self.store.link_model_file(consumer.id)),
+        ):
+            name = f"{ENV_PREFIX}_MEMORY_SERVER_{suffix}"
+            write_private(target, Path(link[name]).read_bytes())
+            if suffix == "MODEL_FILE" and self.accounts.kind == "systemd":
+                os.chmod(target, 0o644)
+            link[name] = str(target)
+        return link
+
+    async def refresh_memory_consumers(self) -> None:
+        for consumer in self.store.installed():
+            if (
+                consumer.origin is AppOrigin.catalogue
+                and consumer.id in self.catalogue
+                and AppHubSurface.memory_server in (consumer.manifest.uses or [])
+            ):
+                if self.supervisor.is_running(consumer.id):
+                    await self.restart(consumer)
+                if not self.memory_link(consumer) and not self.accounts.available:
+                    self.store.link_secret_file(consumer.id).unlink(missing_ok=True)
+                    self.store.link_model_file(consumer.id).unlink(missing_ok=True)
+
+    async def update_settings(self, record: InstalledApp, update: AppSettingsUpdate) -> AppSettings:
+        if self.installer.running(record.id):
+            raise AppInstallError("An install is running; wait before changing Model")
+        async with self._lock:
+            if self.store.get(record.id) is None:
+                raise AppInstallError("This app was uninstalled before its settings could change")
+            if (
+                "memoryModel" not in update.model_fields_set
+                or update.memoryModel == record.settings.memoryModel
+            ):
+                return record.settings
+            try:
+                await self.stop(record.id)
+            except Exception as exc:
+                self._errors[record.id] = f"Model was not changed: {exc}"
+                raise AppInstallError(self._errors[record.id]) from exc
+            old_settings = record.settings
+            record.settings = AppSettings(memoryModel=update.memoryModel)
+            try:
+                self.publish_memory_model(record)
+                self.store.put(record)
+            except OSError as exc:
+                record.settings = old_settings
+                try:
+                    self.publish_memory_model(record)
+                except OSError:
+                    # An unreadable model is treated as outside. Do not keep stale locality.
+                    self.store.link_model_file(record.id).unlink(missing_ok=True)
+                self._errors[record.id] = f"Model was not saved: {exc}"
+                raise AppInstallError(self._errors[record.id]) from exc
+            self._errors.pop(record.id, None)
+            if record.enabled:
+                try:
+                    await self.start(record)
+                except Exception as exc:
+                    self._errors[record.id] = (
+                        f"The app did not restart with the selected model: {exc}"
+                    )
+                    raise AppInstallError(self._errors[record.id]) from exc
+            await self.refresh_memory_consumers()
+            return record.settings
+
+    async def pg0(self, record: InstalledApp, action: str) -> None:
+        python = venv_python(self.store.version_dir(record.id, record.version) / "venv")
+        if not python.exists():
+            # No environment was installed, so this app has never created an instance.
+            return
+        if isinstance(self.supervisor, app_accounts.OwnAccountSupervisor):
+            planner = _AppPlanner(
+                record, store=self.store, gateway_url=lambda: None, bind_host=lambda: "127.0.0.1"
+            )
+            await self.supervisor.cleanup_pg0(planner, action)
+            return
+        env = child_environment()
+        env["HOME"] = str(self.store.data_dir(record.id))
+        try:
+            await asyncio.to_thread(app_launcher.pg0_cleanup, str(python), action, env)
+        except (OSError, ValueError) as exc:
+            self._errors[record.id] = str(exc)
+            raise AppInstallError(str(exc)) from exc
