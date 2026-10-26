@@ -1,5 +1,6 @@
 """Standalone limits use the same atomic registry and survive restart."""
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -309,3 +310,32 @@ def test_a_standalone_check_with_a_model_applies_allowed_models(tmp_path):
         store.admit(key_id="abc", action="check", request_id="c2", model="excluded")
     assert caught.value.status == 403
     store.admit(key_id="abc", action="check", request_id="c3", model=None)
+
+
+def test_an_enrolled_agent_forwards_only_the_limits_it_was_given(app, client):
+    """Row 11 gave `ClientKeyLimits` a band and a queue bound. Forwarded with
+    every default filled in, a key made through a newer agent was refused by a
+    root a release behind (`extra='forbid'`: Workbench's install stopped at
+    its key). What the caller set is what goes, and the root fills the rest."""
+    import httpx
+
+    from tests.test_acting_for_operator import _created, _enrolled, _root
+
+    root = _enrolled(app)
+    seen = _root(app, lambda request: httpx.Response(201, json=_created("App")))
+    session = {"Authorization": f"Bearer {root.session('node:gpu-box', 'control')}"}
+    made = client.post(
+        "/v1/auth/client-keys",
+        json={"name": "App", "limits": {"maxConcurrentRequests": 4}},
+        headers=session,
+    )
+    assert made.status_code == 201, made.text
+    sent = json.loads(seen[-1].content)
+    assert sent == {"name": "App", "limits": {"maxConcurrentRequests": 4}}
+    _root(app, lambda request: httpx.Response(200, json=_created("App")["key"]))
+    edited = client.put(
+        "/v1/auth/client-keys/k1/limits",
+        json={"limits": {"band": "background"}},
+        headers=session,
+    )
+    assert edited.status_code == 200, edited.text
