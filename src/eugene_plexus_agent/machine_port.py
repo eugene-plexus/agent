@@ -509,8 +509,8 @@ class MachinePort:
             )
             if error != self.status.error:
                 log.warning(
-                    "the machine port is not listening: %s. Other machines reach this one in "
-                    "plain HTTP until it is; trying again every %d s",
+                    "the machine port is not listening: %s. Other machines cannot reach this "
+                    "one until it is; trying again every %d s",
                     error,
                     int(RETRY_BIND_SECONDS),
                 )
@@ -715,29 +715,22 @@ def bind_host_for(app: Any) -> str:
     return "127.0.0.1"
 
 
-def machine_url(app: Any) -> str | None:
-    """Where other machines reach this one's machine port, or None while it
-    is not listening or the node advertises no address.
+def door_url(*, configured: Any, advertise: str | None, bind_port: int, port: int) -> str | None:
+    """Where other machines reach a machine port on `port`, or None when the
+    node advertises no address they could use.
 
-    The `machineUrl` config field wins. Otherwise the advertise host, on the
-    machine port shifted by the same offset as the advertised agent port: a
-    container that publishes 8079 as 8279 publishes 8083 as 8283, the same
-    guess the console's join command makes (`installPorts`).
+    The `machineUrl` config field (`configured`) wins. Otherwise the advertise
+    host, on the machine port shifted by the same offset as the advertised
+    agent port: a container that publishes 8079 as 8279 publishes 8083 as
+    8283, the same guess the console's join command makes (`installPorts`).
+    One derivation for the agent and for `join`, which runs with no agent.
     """
     from urllib.parse import urlsplit
 
     from . import node_identity
 
-    door: MachinePort | None = getattr(app.state, "machine_port", None)
-    if door is None or not door.status.listening:
-        return None
-    configured = app.state.agent_state.get_config("machineUrl")
     if isinstance(configured, str) and configured.strip():
         return configured.strip().rstrip("/")
-    advertise = node_identity.effective_advertise_url(
-        app.state.agent_state.get_config("advertiseUrl"),
-        app.state.node_identity.record.advertise_url,
-    )
     host = node_identity.advertise_host(advertise)
     if not host or node_identity.is_loopback_host(host):
         return None
@@ -746,14 +739,59 @@ def machine_url(app: Any) -> str | None:
         # would name a door nothing answers at. Set `machineUrl` to override.
         return None
     advertised_port = urlsplit(advertise or "").port
-    offset = (advertised_port - int(app.state.settings.bind_port)) if advertised_port else 0
-    return node_identity.format_url(host, door.status.port + offset, scheme="https")
+    offset = (advertised_port - int(bind_port)) if advertised_port else 0
+    return node_identity.format_url(host, port + offset, scheme="https")
 
 
-def announced(app: Any) -> dict[str, str] | None:
+def _door_url(app: Any, door: MachinePort, advertise: str | None = None) -> str | None:
+    from . import node_identity
+
+    return door_url(
+        configured=app.state.agent_state.get_config("machineUrl"),
+        advertise=advertise
+        or node_identity.effective_advertise_url(
+            app.state.agent_state.get_config("advertiseUrl"),
+            app.state.node_identity.record.advertise_url,
+        ),
+        bind_port=int(app.state.settings.bind_port),
+        port=door.status.port,
+    )
+
+
+def machine_url(app: Any) -> str | None:
+    """Where other machines reach this one's machine port, or None while it
+    is not listening or the node advertises no address (`door_url`)."""
+    door: MachinePort | None = getattr(app.state, "machine_port", None)
+    if door is None or not door.status.listening:
+        return None
+    return _door_url(app, door)
+
+
+def intended_url(app: Any, advertise: str | None = None) -> str | None:
+    """Where other machines will reach this one's machine port: whenever this
+    node has one, listening or still binding (agent#38).
+
+    **The intent, not the listener.** A machine port that is still binding
+    (another process held 8083 a moment longer, at a restart) is no reason
+    to tell the root this machine takes plain HTTP only: the root would
+    record it as an older version, and in `automatic` every machine would
+    then send it tokens in clear until the port opened and it announced
+    again. So enrolment and the announcement carry the door this node
+    serves TLS on, and the others wait for it to listen. Only a node that
+    opens no machine port at all (the setting is off, control kept the port,
+    the key does not load) announces none. `advertise` is the address an
+    enrolment is about to register, which the record does not hold yet."""
+    door: MachinePort | None = getattr(app.state, "machine_port", None)
+    if door is None:
+        return None
+    return _door_url(app, door, advertise)
+
+
+def announced(app: Any, advertise: str | None = None) -> dict[str, str] | None:
     """`machineUrl` and `tlsPin` for an announcement or an enrolment, or None.
-    While the machine key changes, `tlsNextPin` too (row 3)."""
-    url = machine_url(app)
+    While the machine key changes, `tlsNextPin` too (row 3). From the door
+    this node intends (`intended_url`), listening or not."""
+    url = intended_url(app, advertise)
     door: MachinePort | None = getattr(app.state, "machine_port", None)
     if url is None or door is None:
         return None

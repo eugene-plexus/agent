@@ -496,9 +496,10 @@ async def keep_address_announced(
     switch) is announced once more at the next check; the root answers
     *unchanged* and appends nothing.
 
-    `machine` is this node's machine port and key when it is listening
-    (LT1). It settles with the address: a port that starts listening, or a
-    key that changes, is announced at the next check like a new address.
+    `machine` is this node's machine port and key whenever it has one,
+    listening or still binding (LT1, agent#38). It settles with the address:
+    a port this node opens, or a key that changes, is announced at the next
+    check like a new address.
     And it is checked against what the root says it recorded (`recorded`,
     from the root's signed machine list): a record that differs, however it
     came to differ, is announced again.

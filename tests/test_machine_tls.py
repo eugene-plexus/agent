@@ -290,6 +290,109 @@ async def test_a_port_another_process_holds_is_reported_and_retried(tmp_path: Pa
         holder.close()
 
 
+async def test_a_machine_port_still_binding_is_announced_all_the_same(tmp_path: Path) -> None:
+    """agent#38: the root must know this machine takes TLS before its port
+    listens. Announced without its door (8083 held a moment longer at a
+    restart, say), the root recorded it as an older version, and in
+    `automatic` every machine sent it tokens in plain HTTP until it was."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent.settings import Settings
+    from eugene_plexus_agent.state import AgentState
+
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen()
+    port = int(holder.getsockname()[1])
+    store = _store(tmp_path)
+    record = store.record
+    pin = node_identity.machine_pin(record.tls_certificate or "")
+    door = machine_port.MachinePort(
+        routes=machine_port.Routes(
+            control=lambda: None, driver=lambda n: None, agent_app=_Echo(), required=lambda: False
+        ),
+        context=machine_port.server_context(
+            record.tls_certificate or "", record.tls_private_key or "", tmp_path
+        ),
+        bind_host="127.0.0.1",
+        port=port,
+        pin=pin,
+    )
+    state = AgentState(tmp_path / "agent.yaml")
+    state.load()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            machine_port=door,
+            agent_state=state,
+            node_identity=store,
+            settings=Settings(config_file=tmp_path / "agent.yaml", bind_port=8079),
+        )
+    )
+    try:
+        await door.start()
+        assert not door.status.listening
+        # Without an address others could use, no door is announced.
+        assert machine_port.announced(app) is None  # type: ignore[arg-type]
+        from eugene_plexus_agent._generated.common_models import ConfigUpdateRequest
+
+        state.apply_config_patch(
+            ConfigUpdateRequest.model_validate({"advertiseUrl": "http://10.0.0.6:8079"})
+        )
+        want = {"machineUrl": f"https://10.0.0.6:{port}", "tlsPin": pin}
+        assert machine_port.announced(app) == want  # type: ignore[arg-type]
+        assert machine_port.machine_url(app) is None, "what listens is still reported as it is"
+        # The address an enrolment is about to register wins over the one held.
+        fields = machine_port.announced(app, "http://10.0.0.7:8079")  # type: ignore[arg-type]
+        assert fields == {"machineUrl": f"https://10.0.0.7:{port}", "tlsPin": pin}
+        # And a node that opens no machine port announces none.
+        app.state.machine_port = None
+        assert machine_port.announced(app) is None  # type: ignore[arg-type]
+    finally:
+        await door.stop()
+        holder.close()
+
+
+async def test_no_token_goes_in_plain_to_a_machine_the_table_does_not_name_yet() -> None:
+    """agent#38, in the agent's own copy of `_http` (its console hops, Update
+    all and Library calls reach other machines' agents): in `automatic`, a
+    machine missing from this process's table is not sent a token in plain
+    HTTP; one the table says runs an older version still is."""
+
+    def token() -> str:
+        def part(value: dict[str, str]) -> str:
+            return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+        return f"{part({'alg': 'EdDSA', 'typ': 'ep-session+jwt'})}.{part({'sub': 'p'})}.c2ln"
+
+    sent: list[str] = []
+
+    def plain(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    _http.set_machine_table(
+        _http.parse_machine_table(
+            {"routes": {"http://10.9.9.8:8079": None}, "local": ["http://10.9.9.2:8079"]}
+        )
+    )
+    headers = {"Authorization": f"Bearer {token()}"}
+    async with _http.internal_client(timeout=2) as client:
+        transport = client._transport
+        assert isinstance(transport, _http.MachineTransport)
+        transport._plain = httpx.MockTransport(plain)  # type: ignore[assignment]
+        with pytest.raises(_http.MachineRefused) as caught:
+            await client.get("http://10.9.9.7:8079/api/proxy/library/v1/folders", headers=headers)
+        assert "does not know yet whether 10.9.9.7 takes TLS" in str(caught.value)
+        await client.get("http://10.9.9.8:8079/v1/node", headers=headers)
+        await client.get("http://10.9.9.2:8079/v1/node", headers=headers)
+        await client.get("http://10.9.9.7:8079/healthz")
+    assert sent == [
+        "http://10.9.9.8:8079/v1/node",
+        "http://10.9.9.2:8079/v1/node",
+        "http://10.9.9.7:8079/healthz",
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Control leaves the machine port on the root
 # --------------------------------------------------------------------------- #
