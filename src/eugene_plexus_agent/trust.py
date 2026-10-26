@@ -22,6 +22,16 @@ tokens for other machines and the root, and `gateway` tokens for other
 machines only with the grant the operator's join token gave it. The
 verifier on the far side checks the same thing again, so this is a
 courtesy, not the boundary.
+
+**A limit on frozen trust** (row 46, `specs/docs/design/rows/row-46.md`).
+A node cut off from the root keeps its last bundle, so a machine removed
+since then still verifies here. Past `maxTrustBundleAgeHours` (default
+24, 0 for none) without word from the root, the agent refuses a token
+signed by another machine's key on every route that changes something
+(`dependencies.refuse_when_frozen`). Word from the root is a bundle this
+node pulled from the root, or a newer bundle pushed to it, counted from
+when the root signed it: the push door takes no bearer, so a copy of the
+bundle already held, posted again by anybody, is not word.
 """
 
 from __future__ import annotations
@@ -45,6 +55,43 @@ STANDALONE_RECIPIENT = tokens.node_recipient(tokens.STANDALONE_NODE)
 #: and every component this agent runs reads that file.
 SAVE_RETRY_DELAYS_SECONDS = (0.05, 0.15)
 
+#: Row 46: the agent setting that limits frozen trust, its default, and its
+#: ceiling (a year). 0 is no limit.
+MAX_AGE_HOURS_KEY = "maxTrustBundleAgeHours"
+DEFAULT_MAX_AGE_HOURS = 24
+MOST_MAX_AGE_HOURS = 8760
+
+
+def max_age_hours(value: object) -> int:
+    """The limit in effect for a saved value: the value when it is a whole
+    number of hours in range, else the default. The state drops a bad value
+    at load with a warning, so this is only the last guard."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return DEFAULT_MAX_AGE_HOURS
+    if value < 0 or value > MOST_MAX_AGE_HOURS:
+        return DEFAULT_MAX_AGE_HOURS
+    return value
+
+
+def silence_words(seconds: int) -> str:
+    """`31 hours`, `3 days`: how long the root has been silent, in the words
+    the console's own warning uses."""
+    hours = seconds / 3600
+    if hours < 1.5:
+        minutes = max(1, round(seconds / 60))
+        return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+    if hours < 36:
+        return f"{round(hours)} hours"
+    return f"{round(hours / 24)} days"
+
+
+def frozen_refusal(seconds: int) -> str:
+    """The one sentence a refused change carries (row 46)."""
+    return (
+        f"This machine has not heard from the root for {silence_words(seconds)}, so it takes "
+        "no changes from other machines. Check its network to the root."
+    )
+
 
 class BundleRollback(Exception):
     """An authentic bundle older than the one held. The caller answers 409."""
@@ -66,6 +113,10 @@ class NodeTrust:
         # `iat`: a pull returns the same signed bundle until something
         # changes, so on a quiet install that grows without bound.
         self._heard_at: float | None = None
+        # The same moment on this process's own clock (row 46): a wall
+        # clock set back cannot make the root's silence shorter while
+        # the process runs. `perf_counter`, never `monotonic`.
+        self._heard_perf: float | None = None
         # The bundle held in memory but not yet on disk. The components
         # read the file, so it is written again until it is there.
         self._unsaved: tokens.TrustBundle | None = None
@@ -138,12 +189,16 @@ class NodeTrust:
         try:
             heard = self._path.stat().st_mtime
         except OSError:
-            heard = None
+            # Row 46: never fresher than its signature. Taken at or after
+            # `iat`, so this can only make the silence look longer.
+            heard = float(bundle.iat)
+        now = time.time()
         with self._lock:
             self._bundle = bundle
             # The kept file is rewritten every time a bundle is taken, so
             # its time is when this node last heard, across a restart.
             self._heard_at = heard
+            self._heard_perf = time.perf_counter() - max(0.0, now - heard)
         log.info(
             "trust bundle %d loaded (epoch %d, %d keys)",
             bundle.version,
@@ -166,25 +221,45 @@ class NodeTrust:
         self._install(bundle)
         return bundle
 
-    def accept(self, jws: str) -> tokens.TrustBundle:
+    def accept(self, jws: str, *, pulled: bool = False) -> tokens.TrustBundle:
         """A bundle from the control root, by push or pull.
 
         Raises `tokens.BundleError` for a bad signature, `BundleRollback`
         for a bundle older than the one held (by epoch or version), and
         `FencedError` for an epoch below the one this node recorded --
         the fence that still holds when the kept bundle has been lost.
-        Each leaves the held bundle alone.
+        Each leaves the held bundle alone, and the time last heard too.
+
+        **What counts as word from the root** (row 46). `pulled`: this
+        node asked the root at its own address (the minute's pull), so
+        the answer is word now, whatever bundle it holds. Otherwise the
+        bundle was pushed through a door that takes no bearer: anybody
+        who can reach this machine can post a signed bundle they saw
+        once. So a pushed bundle counts only when it is newer than the
+        one held, and only from the time the root signed it.
         """
         if not self.enrolled:
             raise tokens.BundleError("this node is not enrolled, so it trusts no control root")
         offered = tokens.parse_bundle(jws, authority=self.authority)
-        why = tokens.accepts_replacement(self.bundle, offered)
+        held = self.bundle
+        why = tokens.accepts_replacement(held, offered)
         if why is not None:
             raise BundleRollback(why)
+        newer = held is None or (offered.epoch, offered.version) > (held.epoch, held.version)
         self._identity.accept_epoch(offered.epoch)
         self._install(offered)
+        now = time.time()
         with self._lock:
-            self._heard_at = time.time()
+            if pulled:
+                # Unconditionally: after a clock set back, `now` is below
+                # the time kept, and the root still answered just now.
+                self._heard_at = now
+                self._heard_perf = time.perf_counter()
+            elif newer:
+                signed = min(now, float(offered.iat))
+                if self._heard_at is None or signed > self._heard_at:
+                    self._heard_at = signed
+                    self._heard_perf = time.perf_counter() - (now - signed)
         return offered
 
     def _install(self, bundle: tokens.TrustBundle) -> None:
@@ -240,15 +315,41 @@ class NodeTrust:
         with self._lock:
             self._bundle = None
             self._heard_at = None
+            self._heard_perf = None
 
     def heard_age_seconds(self, *, now: float | None = None) -> int | None:
         """Seconds since this node last took the root's bundle; None if never,
-        or when it has joined nothing and has no root to hear from."""
+        or when it has joined nothing and has no root to hear from.
+
+        The longer of the wall clock's count and this process's own (row
+        46): a clock set back cannot shorten the silence while the process
+        runs, and a suspended Linux machine, whose process clock stops,
+        still counts the days it slept."""
         with self._lock:
-            heard = self._heard_at
+            heard, heard_perf = self._heard_at, self._heard_perf
         if heard is None or not self.enrolled:
             return None
-        return max(0, int((time.time() if now is None else now) - heard))
+        wall = (time.time() if now is None else now) - heard
+        held = time.perf_counter() - heard_perf if heard_perf is not None else 0.0
+        return max(0, int(max(wall, held)))
+
+    def frozen_age(self, limit_hours: int, *, now: float | None = None) -> int | None:
+        """The root's silence in seconds when it is past `limit_hours`, else
+        None: no limit (0), joined nothing, or heard from in time (row 46)."""
+        if limit_hours <= 0:
+            return None
+        age = self.heard_age_seconds(now=now)
+        if age is None or age <= limit_hours * 3600:
+            return None
+        return age
+
+    def minted_elsewhere(self, claims: tokens.Claims) -> bool:
+        """A token another machine's key signed: not the control root's, not
+        this machine's own. `verify` already bound `iss` to the key that
+        signed it, so neither can be claimed by a third key. Anything else
+        a future bundle names (a site's key, a key nobody planned for) is
+        another machine's too."""
+        return claims.iss not in (tokens.ISSUER_CONTROL, self.recipient)
 
     # ----- verifying ------------------------------------------------------
 

@@ -11,19 +11,31 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from eugene_plexus_agent import tokens
 from eugene_plexus_agent import trust as trust_module
 from eugene_plexus_agent.node_identity import FencedError, NodeIdentityStore
 from eugene_plexus_agent.trust import BUNDLE_FILE, MintRefused, NodeTrust
 
-from .conftest import FakeRoot, enroll_store, standalone_trust
+from .conftest import (
+    TEST_PASSPHRASE,
+    FakeRoot,
+    enroll_app,
+    enroll_store,
+    local_service_token,
+    standalone_trust,
+)
 
 
 def _enrolled(tmp_path: Path, *, grants: tuple[str, ...] = ()) -> tuple[NodeTrust, FakeRoot]:
@@ -134,7 +146,8 @@ def test_the_age_is_since_the_bundle_was_taken_not_since_it_was_signed(tmp_path:
         keys=[root.token.trust_key(["authority"]), *root.members.values()],
         now=int(time.time()) - 5 * 86400,
     )
-    trust.accept(old.jws)
+    # The minute's pull: asked of the root, so word now (row 46).
+    trust.accept(old.jws, pulled=True)
     age = trust.heard_age_seconds()
     assert age is not None and age < 5
     assert trust.heard_age_seconds(now=time.time() + 700) in (699, 700, 701)
@@ -273,3 +286,379 @@ def test_the_trust_pull_writes_a_held_bundle_while_the_root_does_not_answer(
 
     asyncio.run(run())
     assert _kept_version(tmp_path, root) == taken.version
+
+
+# --------------------------------------------------------------------------- #
+# A limit on frozen trust (row 46)
+# --------------------------------------------------------------------------- #
+
+_DAY = 24 * 3600
+_REFUSED_25_HOURS = (
+    "This machine has not heard from the root for 25 hours, so it takes no changes "
+    "from other machines. Check its network to the root."
+)
+
+
+@pytest.fixture
+def _any_model_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    import eugene_plexus_agent.admission as admission_module
+
+    monkeypatch.setattr(admission_module, "model_size_bytes", lambda path: 1024**3)
+
+
+def _install(client: TestClient) -> tuple[FakeRoot, tokens.Signer]:
+    """This agent joined as `gpu-box`; `attic` is another member, joined with
+    the gateway grant, whose gateway may start and stop runtimes here."""
+    initialized = client.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE})
+    assert initialized.status_code == 200, initialized.text
+    root = FakeRoot()
+    attic = tokens.Signer(key=tokens.generate_private_key(), issuer="node:attic")
+    root.register("attic", attic.key.public_key(), ("gateway",))
+    enroll_app(_app_of(client), root, "gpu-box")
+    return root, attic
+
+
+def _app_of(client: TestClient) -> FastAPI:
+    app = client.app
+    assert isinstance(app, FastAPI)
+    return app
+
+
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _from(signer: tokens.Signer, sub: str = "gateway") -> dict[str, str]:
+    token, _ = signer.mint(typ=tokens.TYP_SERVICE, sub=sub, aud=["node:gpu-box"], ttl_seconds=300)
+    return _bearer(token)
+
+
+def _silent_for(client: TestClient, seconds: float) -> None:
+    """The root last heard from `seconds` ago, as the kept file says."""
+    trust = _app_of(client).state.auth_state.trust
+    then = time.time() - seconds
+    os.utime(trust.bundle_path, (then, then))
+    trust.load()
+
+
+def _declare(client: TestClient, root: FakeRoot) -> None:
+    declared = client.post(
+        "/v1/runtimes",
+        json={"name": "big", "engine": "llama_cpp", "modelPath": "/models/big.gguf"},
+        headers=_bearer(root.session("node:gpu-box")),
+    )
+    assert declared.status_code == 201, declared.text
+
+
+@pytest.mark.usefixtures("_any_model_fits")
+def test_a_stale_bundle_refuses_another_machines_mutation(client: TestClient) -> None:
+    """The residual risk TOK-RES named: a node cut off from the root trusts its
+    last bundle forever, so a machine removed since keeps working there. Past
+    the limit, another machine's key changes nothing here, and says why."""
+    root, attic = _install(client)
+    _declare(client, root)
+    other = _from(attic)
+    # In time, the gateway on another machine stops and starts a runtime here.
+    assert client.post("/v1/runtimes/big/stop", headers=other).status_code == 202
+    assert client.post("/v1/runtimes/big/start", headers=other).status_code == 202
+
+    _silent_for(client, 25 * 3600)
+    for path in ("/v1/runtimes/big/stop", "/v1/runtimes/big/start"):
+        refused = client.post(path, headers=other)
+        assert refused.status_code == 403, (path, refused.text)
+        problem = refused.json()["detail"]
+        assert problem["title"] == "Root not heard"
+        assert problem["detail"] == _REFUSED_25_HOURS
+    # The same machine's reads still answer.
+    assert client.get("/v1/runtimes", headers=other).status_code == 200
+
+    # The limit is a setting, read at every request: 0 is none, and 48 hours
+    # is more than 25.
+    session = _bearer(root.session("node:gpu-box"))
+    for hours, status in ((0, 202), (48, 202), (24, 403)):
+        patched = client.patch(
+            "/v1/config", json={"maxTrustBundleAgeHours": hours}, headers=session
+        )
+        assert patched.json()["applied"] == ["maxTrustBundleAgeHours"], patched.text
+        assert client.post("/v1/runtimes/big/stop", headers=other).status_code == status, hours
+
+    # Word from the root lifts it: the minute's pull, even of the same bundle.
+    trust = _app_of(client).state.auth_state.trust
+    trust.accept(trust.bundle.jws, pulled=True)
+    assert client.post("/v1/runtimes/big/stop", headers=other).status_code == 202
+
+
+@pytest.mark.usefixtures("_any_model_fits")
+def test_inference_and_the_roots_tokens_still_pass(client: TestClient) -> None:
+    """A dead root never stops answers (M5): past the limit the root's own
+    tokens, this machine's own tokens for its children, every read and the
+    questions on an answer's path all still pass."""
+    root, attic = _install(client)
+    _silent_for(client, 25 * 3600)
+
+    # The root's control token declares; its session stops.
+    declared = client.post(
+        "/v1/runtimes",
+        json={"name": "big", "engine": "llama_cpp", "modelPath": "/models/big.gguf"},
+        headers=_bearer(root.service("node:gpu-box")),
+    )
+    assert declared.status_code == 201, declared.text
+    session = _bearer(root.session("node:gpu-box"))
+    assert client.post("/v1/runtimes/big/stop", headers=session).status_code == 202
+    # This machine's own gateway wakes and unloads it.
+    own = _bearer(local_service_token(_app_of(client), "gateway"))
+    assert client.post("/v1/runtimes/big/start", headers=own).status_code == 202
+    assert client.post("/v1/runtimes/big/stop", headers=own).status_code == 202
+
+    # Another machine still reads, and still asks the questions an answer needs.
+    other = _from(attic)
+    assert client.get("/v1/runtimes", headers=other).status_code == 200
+    # The runtime's companion driver is in the topology now; the stub
+    # supervisor runs none of it.
+    _app_of(client).state.supervisor.is_supervised = lambda _name: False
+    assert client.get("/v1/node", headers=other).status_code == 200
+    admission = client.post(
+        "/v1/runtimes/admission",
+        json={"name": "q", "engine": "llama_cpp", "modelPath": "/models/q.gguf"},
+        headers=other,
+    )
+    assert admission.status_code == 200, admission.text
+    _root_answers_admission(client)
+    asked = client.post(
+        "/v1/auth/client-keys/admission",
+        json={"keyId": "k1", "action": "acquire", "requestId": "r1", "model": "m"},
+        headers=other,
+    )
+    assert asked.status_code == 200, asked.text
+    # And still cannot change anything.
+    refused = client.post("/v1/runtimes/big/start", headers=other)
+    assert refused.status_code == 403, refused.text
+
+
+def _root_answers_admission(client: TestClient) -> None:
+    """Client-key admission is forwarded to the root; here it answers."""
+    from eugene_plexus_agent.client_key_registry import ClientKeyRegistry
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"keyId": "k1", "keyName": "app"})
+
+    app = _app_of(client)
+    registry = ClientKeyRegistry(app)
+    registry.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app.state.client_key_registry = registry
+
+
+def test_a_route_nobody_named_is_refused_as_a_change(client: TestClient) -> None:
+    """A route added without a line in either list does not slip through."""
+    from fastapi import Depends
+
+    from eugene_plexus_agent.dependencies import require_operator_or_gateway
+
+    app = _app_of(client)
+
+    @app.post("/v1/row46-new-door", dependencies=[Depends(require_operator_or_gateway)])
+    async def new_door() -> dict[str, bool]:
+        return {"done": True}
+
+    # Ahead of the proxy and the console's own pages, which answer the rest.
+    routes = app.router.routes
+    routes.insert(0, routes.pop())
+    _, attic = _install(client)
+    assert client.post("/v1/row46-new-door", headers=_from(attic)).status_code == 200
+    _silent_for(client, 25 * 3600)
+    refused = client.post("/v1/row46-new-door", headers=_from(attic))
+    assert refused.status_code == 403, refused.text
+
+
+def _every_route(app: FastAPI) -> set[tuple[str, str]]:
+    """(method, path template) of every route, through included routers
+    whether FastAPI flattens them (older) or keeps them (0.16x)."""
+    from fastapi.routing import APIWebSocketRoute
+
+    found: set[tuple[str, str]] = set()
+
+    def walk(routes: list[Any], prefix: str) -> None:
+        for route in routes:
+            included = getattr(route, "original_router", None)
+            if included is not None:
+                walk(included.routes, prefix + (route.include_context.prefix or ""))
+                continue
+            if isinstance(route, APIWebSocketRoute):
+                found.add(("WEBSOCKET", prefix + route.path))
+            for method in getattr(route, "methods", None) or ():
+                found.add((method, prefix + route.path))
+
+    walk(app.router.routes, "")
+    return found
+
+
+def test_every_route_that_changes_something_is_named_for_the_freeze(app: FastAPI) -> None:
+    """Every route on a method other than GET, HEAD and OPTIONS is in exactly
+    one of the two lists, and neither list names a route that is gone. A new
+    route fails here until someone says whether it changes something."""
+    from eugene_plexus_agent.dependencies import (
+        FROZEN_TRUST_CHANGES,
+        FROZEN_TRUST_QUESTIONS,
+        READ_METHODS,
+    )
+
+    found = {(m, p) for m, p in _every_route(app) if m not in READ_METHODS}
+    named = FROZEN_TRUST_CHANGES | FROZEN_TRUST_QUESTIONS
+    assert not found - named, (
+        "name each in dependencies.FROZEN_TRUST_CHANGES or FROZEN_TRUST_QUESTIONS: "
+        f"{sorted(found - named)}"
+    )
+    assert not FROZEN_TRUST_CHANGES & FROZEN_TRUST_QUESTIONS
+    assert not named - found, f"named but not served: {sorted(named - found)}"
+    # The design's list (row-46.md section 2), each a change.
+    for change in (
+        ("POST", "/v1/runtimes/{name}/start"),
+        ("POST", "/v1/runtimes/{name}/stop"),
+        ("POST", "/v1/runtimes"),
+        ("PATCH", "/v1/runtimes/{name}"),
+        ("POST", "/v1/components"),
+        ("PATCH", "/v1/components/{name}"),
+        ("DELETE", "/v1/components/{name}"),
+        ("PATCH", "/v1/config"),
+        ("POST", "/v1/engines/{engine}/install"),
+    ):
+        assert change in FROZEN_TRUST_CHANGES, change
+
+
+def test_a_pushed_copy_of_the_held_bundle_is_not_word_from_the_root(tmp_path: Path) -> None:
+    """The push door takes no bearer: anybody who can reach this machine can
+    post a bundle they saw once. Only a newer one counts, from when the root
+    signed it; a bundle that does not verify changes nothing."""
+    trust, root = _enrolled(tmp_path)
+    then = time.time() - 25 * 3600
+    os.utime(tmp_path / BUNDLE_FILE, (then, then))
+    trust.load()
+    held = trust.bundle
+    assert held is not None
+
+    trust.accept(held.jws)
+    assert (trust.heard_age_seconds() or 0) >= 25 * 3600 - 5
+    assert trust.frozen_age(24) is not None
+
+    forged = tokens.build_bundle(
+        authority=tokens.generate_private_key(),
+        version=held.version + 5,
+        epoch=held.epoch,
+        keys=list(held.keys.values()),
+    )
+    with pytest.raises(tokens.BundleError):
+        trust.accept(forged.jws)
+    assert trust.frozen_age(24) is not None
+
+    def signed(version: int, seconds_ago: int) -> str:
+        return tokens.build_bundle(
+            authority=root.identity,
+            version=version,
+            epoch=root.epoch,
+            keys=[root.token.trust_key(["authority"]), *root.members.values()],
+            now=int(time.time()) - seconds_ago,
+        ).jws
+
+    # Newer, but signed before this node last heard: still silent that long.
+    trust.accept(signed(held.version + 1, 30 * 3600))
+    assert (trust.heard_age_seconds() or 0) >= 25 * 3600 - 5
+    # Newer, signed an hour ago: the root was there an hour ago.
+    trust.accept(signed(held.version + 2, 3600))
+    age = trust.heard_age_seconds()
+    assert age is not None and 3595 <= age <= 3605
+    assert trust.frozen_age(24) is None
+    # A pull is word now, whatever it holds.
+    trust.accept(signed(held.version + 2, 3600), pulled=True)
+    assert (trust.heard_age_seconds() or 0) < 5
+
+
+def test_a_clock_set_back_does_not_shorten_the_silence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wall clock can be moved; this process's own count cannot. A pull
+    after the clock moved back still counts as word."""
+    trust, _ = _enrolled(tmp_path)
+    held = trust.bundle
+    assert held is not None
+    trust.accept(held.jws, pulled=True)
+    start_wall, start_perf = time.time(), time.perf_counter()
+    clock = {"wall": start_wall, "perf": start_perf}
+    monkeypatch.setattr(
+        trust_module,
+        "time",
+        SimpleNamespace(
+            time=lambda: clock["wall"],
+            perf_counter=lambda: clock["perf"],
+            sleep=time.sleep,
+        ),
+    )
+    # A day and an hour pass, and the wall clock is set back two days.
+    clock["perf"] = start_perf + _DAY + 3600
+    clock["wall"] = start_wall - 2 * _DAY
+    assert (trust.heard_age_seconds() or 0) >= _DAY + 3600 - 5
+    assert trust.frozen_age(24) is not None
+    trust.accept(held.jws, pulled=True)
+    assert trust.frozen_age(24) is None
+    assert (trust.heard_age_seconds() or 0) < 5
+
+
+def test_the_limit_is_the_setting_and_a_bad_value_is_the_default(tmp_path: Path) -> None:
+    import yaml
+
+    from eugene_plexus_agent.state import CONFIG_FIELDS, AgentState
+    from eugene_plexus_agent.trust import (
+        DEFAULT_MAX_AGE_HOURS,
+        MAX_AGE_HOURS_KEY,
+        MOST_MAX_AGE_HOURS,
+        max_age_hours,
+    )
+
+    field = next(f for f in CONFIG_FIELDS if f.key == MAX_AGE_HOURS_KEY)
+    assert field.default == DEFAULT_MAX_AGE_HOURS == 24
+    assert (field.minimum, field.maximum) == (0, MOST_MAX_AGE_HOURS)
+    for bad in (-1, MOST_MAX_AGE_HOURS + 1, "a day", 1.5, True, None):
+        assert max_age_hours(bad) == 24, bad
+    assert max_age_hours(0) == 0 and max_age_hours(6) == 6
+
+    path = tmp_path / "agent.yaml"
+    path.write_text(yaml.safe_dump({MAX_AGE_HOURS_KEY: "a day"}), encoding="utf-8")
+    state = AgentState(path)
+    state.load()
+    assert state.as_config_document().model_dump()[MAX_AGE_HOURS_KEY] == 24
+
+
+def test_the_agent_says_the_limit_and_whether_it_refuses_now(client: TestClient) -> None:
+    """Settings never lie: the limit in effect, on `GET /v1/node` and on the
+    setting itself, and whether it is refusing changes now."""
+    root, _ = _install(client)
+    session = _bearer(root.session("node:gpu-box"))
+
+    def said() -> tuple[dict[str, Any], dict[str, Any]]:
+        node = client.get("/v1/node", headers=session).json()
+        schema = client.get("/v1/config/schema", headers=session).json()
+        field = next(f for f in schema["fields"] if f["key"] == "maxTrustBundleAgeHours")
+        return node, field
+
+    node, field = said()
+    assert node["trustBundleMaxAgeSeconds"] == 24 * 3600
+    assert node["trustBundleFrozen"] is False
+    assert field["default"] == 24 and field.get("status") is None
+
+    _silent_for(client, 25 * 3600)
+    node, field = said()
+    assert node["trustBundleFrozen"] is True
+    assert field["status"] == {"level": "warning", "text": _REFUSED_25_HOURS}
+
+    client.patch("/v1/config", json={"maxTrustBundleAgeHours": 0}, headers=session)
+    node, field = said()
+    assert node["trustBundleMaxAgeSeconds"] == 0
+    assert node["trustBundleFrozen"] is False
+    assert field.get("status") is None
+
+
+def test_a_machine_that_joined_nothing_has_no_limit_to_report(authed_client: TestClient) -> None:
+    node = authed_client.get("/v1/node").json()
+    assert "trustBundleFrozen" not in node and "trustBundleMaxAgeSeconds" not in node
+    schema = authed_client.get("/v1/config/schema").json()
+    field = next(f for f in schema["fields"] if f["key"] == "maxTrustBundleAgeHours")
+    assert field["status"]["level"] == "info"

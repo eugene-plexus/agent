@@ -31,6 +31,7 @@ from .._generated.common_models import (
 from .._generated.models import LibraryFolderCheckRequest, LibraryFolderReach
 from ..admission import model_size_bytes
 from ..state import AgentState
+from ..trust import MAX_AGE_HOURS_KEY, frozen_refusal, max_age_hours
 from .runtimes import folder_cache_for, library_client_for, refresh_library_folders
 
 log = logging.getLogger(__name__)
@@ -100,7 +101,10 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
     except Exception:  # pragma: no cover - a status line is never a reason to fail the schema
         restart = False
     uv = apps.find_uv(None)
+    trust = request.app.state.auth_state.trust
     return {
+        "enrolled": record.enrolled,
+        "trust_frozen": trust.frozen_age(max_age_hours(state.get_config(MAX_AGE_HOURS_KEY))),
         "derived_advertise": (
             node_identity.effective_advertise_url(None, record.advertise_url)
             if record.advertise_url
@@ -207,6 +211,18 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
         status = _security_mode_status(live)
         if status is not None:
             update["status"] = status
+    elif key == MAX_AGE_HOURS_KEY:
+        # Row 46: whether the limit is refusing changes now, said where it is set.
+        if not live["enrolled"]:
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.info,
+                text="This machine has joined no install, so there is no root to hear from.",
+            )
+        elif live["trust_frozen"] is not None:
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning,
+                text=frozen_refusal(live["trust_frozen"]),
+            )
     return field.model_copy(update=update) if update else field
 
 

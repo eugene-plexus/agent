@@ -427,7 +427,9 @@ async def _pull_once(app: Any, client: httpx.AsyncClient) -> Heard:
                 log.warning("the control root answered its bundle with no bundle: %s", exc)
                 return Heard.UNTRUSTED
             held = trust.bundle
-            taken = trust.accept(jws)
+            # Asked of the root at its own address: word from it now, even
+            # when nothing changed (row 46's limit counts from here).
+            taken = trust.accept(jws, pulled=True)
             if held is None or taken.version != held.version:
                 log.info("pulled trust bundle %d", taken.version)
             # Row 4: who to ask if this root goes quiet. A promotion takes

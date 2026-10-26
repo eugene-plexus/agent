@@ -7405,7 +7405,16 @@ class NodeIdentity(BaseModel):
     )
     trustBundleAgeSeconds: int | None = Field(
         None,
-        description="Seconds since this agent last took the control root's bundle\n-- a push, or the pull it makes every minute. Not the\nbundle's signing time: a quiet install's bundle can be days\nold and current. Reported, never enforced: a bundle keeps\nworking while the root is dead, so this is what tells an\noperator the node has not heard from the root. Past ten\nminutes the console lists it as an issue.\n",
+        description="Seconds since this agent last heard from the control root:\nthe pull it makes every minute, or a newer bundle the root\npushed, counted from when the root signed it. Not the held\nbundle's signing time: a quiet install's bundle can be days\nold and current. A clock set back does not shorten it while\nthe agent runs. Past ten minutes the console lists it as an\nissue; past `trustBundleMaxAgeSeconds` the agent refuses\nchanges from other machines (`trustBundleFrozen`).\n",
+    )
+    trustBundleMaxAgeSeconds: int | None = Field(
+        None,
+        description='The limit in effect on `trustBundleAgeSeconds`, from the\n`maxTrustBundleAgeHours` setting, in seconds; `0` when there\nis none. Absent when this agent has joined no install, or\nruns a version older than row 46.\n',
+        ge=0,
+    )
+    trustBundleFrozen: bool | None = Field(
+        None,
+        description="True while `trustBundleAgeSeconds` is past\n`trustBundleMaxAgeSeconds`: this agent refuses changes\nsigned by other machines' keys (the `RootNotHeard` 403) until\nit hears from the root again. Answers, reads and the root's\nown tokens keep working. Absent when this agent has joined\nno install, or runs a version older than row 46.\n",
     )
     tokenPublicKey: str | None = Field(
         None,
@@ -7529,7 +7538,7 @@ class MessageContent1(
         TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
     ] = Field(
         ...,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
         min_length=1,
     )
 
@@ -7588,7 +7597,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -7596,7 +7605,7 @@ class Message(BaseModel):
     )
     toolCallId: str | None = Field(
         None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+        description="On a **tool** message: which call this is the result of.\nFor inference-driver requests, `content` carries text; the gateway\nmoves a tool's pictures to the next user message, labelled with\nthis id.\n",
     )
     reasoning: str | None = Field(
         None,
