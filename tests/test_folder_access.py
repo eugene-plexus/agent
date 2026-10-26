@@ -874,6 +874,27 @@ def test_a_stale_answer_is_not_applied_and_the_owner_is_asked_again(tmp_path: Pa
     assert backend.rights == {"manual", "write"}  # nothing was removed on the old answer
 
 
+def test_linux_decide_turns_a_stale_helper_answer_into_a_new_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-review 3: the helper declines an answer the file no longer matches (it
+    gained another name, or its entry changed); the agent asks again."""
+    backend = fa.LinuxPermissions("workbench", tmp_path / "apps", eugene=())
+    monkeypatch.setattr(
+        backend,
+        "_ask",
+        lambda *_: {
+            "decided": False,
+            "stale": True,
+            "message": "The file has another name outside the folder now, so the entry "
+            "was left as it is.",
+        },
+    )
+    with pytest.raises(fa.StaleEntry, match="another name"):
+        backend.decide("/srv/acme", {"id": "a" * 32}, {"kind": "entry"}, "remove")
+    assert not list(backend.ctl.glob("*.entry"))
+
+
 def test_decide_route_needs_an_operator_session(
     authed_client: TestClient, monkeypatch, tmp_path: Path
 ) -> None:

@@ -889,3 +889,72 @@ def test_a_stale_owner_decision_is_not_applied(
     with pytest.raises(fa.StaleEntry, match="changed since"):
         backend.decide(str(root), delta, found["fingerprint"], "remove")
     assert changed == []
+
+
+# --- Re-review 3: the link count and the state are read when Remove is applied ------
+
+
+def test_remove_on_an_entry_never_changes_a_file_that_gained_another_name(
+    tmp_path: Path,
+) -> None:
+    """Re-review 3 (blocker): an ordinary entry prompt, then an outside hard link,
+    then Remove: the ACE went through both names. The link count is read on the
+    handle that would change it; such a file is asked about again as a hard link."""
+    root = shared_root(tmp_path)
+    (root / "seed.txt").write_text("x")
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "read", lambda _: None)
+    icacls(root / "seed.txt", "/inheritance:r", "/grant:r", f"*{owner(root)}:(F)", f"*{USERS}:(F)")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    assert found["kind"] == "entry"
+    alias = tmp_path / "alias.txt"
+    os.link(root / "seed.txt", alias)
+    with pytest.raises(fa.StaleEntry, match="another name"):
+        backend.decide(str(root), delta, found["fingerprint"], "remove")
+    assert sid_aces(root / "seed.txt") == [(0, 0x1F01FF)] == sid_aces(alias)
+    with pytest.raises(fa.UnknownAccess) as again:
+        backend.revoke(str(root), delta)
+    assert [(e["kind"], e["fingerprint"]["links"]) for e in again.value.entries] == [
+        ("hardlink", 2)
+    ]
+
+
+def test_a_hard_link_prompt_carries_the_files_state(tmp_path: Path) -> None:
+    """Re-review 3: a hard-link prompt had no owner/DACL fingerprint, so an answer
+    given after the file changed still let removal change it."""
+    root = shared_root(tmp_path)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    made = root / "made.txt"
+    made.write_text("app data")
+    os.link(made, tmp_path / "alias.txt")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    (found,) = asked.value.entries
+    assert found["fingerprint"]["state"] and found["fingerprint"]["links"] == 2
+    icacls(made, "/grant", f"*{USERS}:(RX)")  # changed after the prompt
+    with pytest.raises(fa.StaleEntry, match="changed since"):
+        backend.decide(str(root), delta, found["fingerprint"], "remove")
+    assert not delta.get("allowed")
+
+
+def test_an_allowed_file_is_asked_again_when_it_gains_another_name(tmp_path: Path) -> None:
+    root = shared_root(tmp_path)
+    backend = fa.WindowsPermissions(USERS, eugene=(), homes=())
+    delta, _, _ = backend.grant(str(root), "write", lambda _: None)
+    made = root / "made.txt"
+    made.write_text("app data")
+    os.link(made, tmp_path / "alias.txt")
+    with pytest.raises(fa.UnknownAccess) as asked:
+        backend.revoke(str(root), delta)
+    backend.decide(str(root), delta, asked.value.entries[0]["fingerprint"], "remove")
+    granted = sid_aces(made)
+    os.link(made, tmp_path / "second-alias.txt")  # one name more than the owner allowed
+    with pytest.raises(fa.UnknownAccess) as again:
+        backend.revoke(str(root), delta)
+    assert [(e["kind"], e["fingerprint"]["links"]) for e in again.value.entries] == [
+        ("hardlink", 3)
+    ]
+    assert sid_aces(made) == granted

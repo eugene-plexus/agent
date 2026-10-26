@@ -48,6 +48,7 @@ NULL_DACL = "it has no permission list (a null DACL), so every account can open 
 OWNED = "{account} owns it, so it can change its permissions"
 UNREADABLE = "Eugene cannot read its permissions"
 HARDLINK = "it has another name outside the folder, so changing it here changes it there too"
+SPECIAL = "it is a pipe, socket or device, which Eugene never changes on its own"
 WINDOWS_HOMES = ("Users",)
 LINUX_SYSTEM = tuple(
     "/" + p
@@ -219,11 +220,12 @@ class UnknownAccess(RemovalIncomplete):
         self.entries = entries
         paths = list(dict.fromkeys(str(e["path"]) for e in entries))
         shown = ", ".join(paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
-        what = (
-            "a file with another name outside the folder"
-            if all(e["kind"] == "hardlink" for e in entries)
-            else f"{'an entry' if len(entries) == 1 else 'entries'} Eugene did not add"
-        )
+        if all(e["kind"] == "hardlink" for e in entries):
+            what = "a file with another name outside the folder"
+        elif all(e["kind"] in ("hardlink", "special") for e in entries):
+            what = "files Eugene never changes on its own"
+        else:
+            what = f"{'an entry' if len(entries) == 1 else 'entries'} Eugene did not add"
         super().__init__(
             f"Workbench's account can still open {shown} through {what}. "
             "Choose Remove this entry too or Keep it."
@@ -239,6 +241,19 @@ class StaleEntry(ValueError):
 
     Nothing is applied on an old answer: the removal runs again and asks about
     what is there now."""
+
+
+class SharedFile(StaleEntry):
+    """The file has more names than removal may change it through.
+
+    Read on the handle that would change it: a link made after the prompt, or
+    after the owner allowed one name less, stops the change there."""
+
+    def __init__(self, links: int) -> None:
+        self.links = links
+        super().__init__(
+            "The file has another name outside the folder now, so it was left as it is."
+        )
 
 
 def _file_key(identity: list[int]) -> str:
@@ -720,6 +735,7 @@ class WindowsPermissions:
         owner: bool = False,
         names: tuple[str, ...] = (),
         root_identity: list[int] | None = None,
+        max_links: int | None = None,
     ) -> Iterator[tuple[int, Facts, list[int]]]:
         """Open `path`, or the item `names` below it, one component at a time.
 
@@ -805,6 +821,13 @@ class WindowsPermissions:
                     and [info.st_dev, info.st_ino, info.st_birthtime_ns] != root_identity
                 ):
                     raise ValueError("The folder was replaced.")
+                if (
+                    last
+                    and max_links is not None
+                    and not stat.S_ISDIR(info.st_mode)
+                    and info.st_nlink > max_links
+                ):
+                    raise SharedFile(info.st_nlink)
             buffer = ctypes.create_unicode_buffer(32768)
             length = kernel.GetFinalPathNameByHandleW(
                 msvcrt.get_osfhandle(held[-1]), buffer, len(buffer), 0
@@ -1053,6 +1076,7 @@ class WindowsPermissions:
         *,
         root: list[int] | None = None,
         state: str | None = None,
+        max_links: int = 1,
     ) -> None:
         """Make the granted folder's owner the owner of an item the app owns.
 
@@ -1064,7 +1088,13 @@ class WindowsPermissions:
         with (
             _privileges(ws, "SeRestorePrivilege", "SeTakeOwnershipPrivilege"),
             self._open(
-                path, change=True, owner=True, revoke=True, names=names, root_identity=root
+                path,
+                change=True,
+                owner=True,
+                revoke=True,
+                names=names,
+                root_identity=root,
+                max_links=max_links,
             ) as (held, _, current),
         ):
             if current != ident:
@@ -1089,6 +1119,7 @@ class WindowsPermissions:
         *,
         root: list[int] | None = None,
         state: str | None = None,
+        max_links: int = 1,
     ) -> Any:
         """Replace a null DACL with what the item inherits from its parent.
 
@@ -1096,11 +1127,9 @@ class WindowsPermissions:
         the grant's folder; the parents are held open, so the item cannot be
         swapped and its parent cannot move meanwhile.
         """
-        with self._open(path, change=True, revoke=True, names=names, root_identity=root) as (
-            held,
-            _,
-            current,
-        ):
+        with self._open(
+            path, change=True, revoke=True, names=names, root_identity=root, max_links=max_links
+        ) as (held, _, current):
             if current != ident:
                 raise ValueError("The folder item was replaced.")
             self._unchanged(ws, held, state)
@@ -1230,8 +1259,12 @@ class WindowsPermissions:
             # Records from before protected folders were listed keep the old
             # walk, which never entered a protected folder.
             closed = set(delta["protected"]) if "protected" in delta else None
-            # Files with another name that the owner let removal change.
-            allowed = set(delta.get("allowed", []))
+            # Files with another name that the owner let removal change, each
+            # at no more names than it had when the owner chose Remove.
+            allowed: dict[str, int] = {key: int(links) for key, links in delta.get("allowed", [])}
+
+            def limit(key: str) -> int:
+                return max(1, allowed.get(key, 1))
 
             def descend(names: tuple[str, ...], ident: list[int]) -> bool:
                 return closed is not None and _file_key(ident) not in closed
@@ -1278,10 +1311,10 @@ class WindowsPermissions:
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
                 key = _file_key(ident)
-                if not directory and links > 1 and key not in allowed:
+                if not directory and links > limit(key):
                     # One rule, on both systems: a file with another name is never
                     # changed here, since the change would reach that name too.
-                    ask("hardlink", names, ident, HARDLINK)
+                    ask("hardlink", names, ident, HARDLINK, held, links=links)
                     continue
                 null = acl is None and key not in open_before
                 if (
@@ -1290,8 +1323,13 @@ class WindowsPermissions:
                 ):
                     try:
                         # A null DACL lets everyone do everything; it inherits again.
-                        acl = self._inherit(ws, path, names, ident, root=identity)
+                        acl = self._inherit(
+                            ws, path, names, ident, root=identity, max_links=limit(key)
+                        )
                     except FileNotFoundError:
+                        continue
+                    except SharedFile as exc:
+                        ask("hardlink", names, ident, HARDLINK, held, links=exc.links)
                         continue
                     except (OSError, ValueError, pywintypes.error):
                         ask("null_dacl", names, ident, NULL_DACL, held)
@@ -1301,8 +1339,13 @@ class WindowsPermissions:
                     and _answer_key(dict(kind="owner", identity=list(ident))) not in accepted
                 ):
                     try:
-                        self._give(ws, path, names, ident, person, root=identity)
+                        self._give(
+                            ws, path, names, ident, person, root=identity, max_links=limit(key)
+                        )
                     except FileNotFoundError:
+                        continue
+                    except SharedFile as exc:
+                        ask("hardlink", names, ident, HARDLINK, held, links=exc.links)
                         continue
                     except (OSError, ValueError, pywintypes.error):
                         ask("owner", names, ident, OWNED.format(account=self.account), held)
@@ -1335,7 +1378,12 @@ class WindowsPermissions:
                     # below the grant, never by its full path.
                     try:
                         with self._open(
-                            path, change=True, revoke=True, names=names, root_identity=identity
+                            path,
+                            change=True,
+                            revoke=True,
+                            names=names,
+                            root_identity=identity,
+                            max_links=limit(key),
                         ) as (change, _, current_id):
                             if current_id != ident:
                                 continue
@@ -1349,6 +1397,9 @@ class WindowsPermissions:
                                 acl.DeleteAce(matches[0])
                                 self._set_acl(ws, change, acl)
                     except FileNotFoundError:
+                        continue
+                    except SharedFile as exc:
+                        ask("hardlink", names, ident, HARDLINK, held, links=exc.links)
                         continue
                     except (PermissionError, Refused):
                         kept.append(names)
@@ -1366,8 +1417,8 @@ class WindowsPermissions:
                 ws, path, handle, identity, revoke=True, descend=descend, unreadable=unreadable
             ):
                 key = _file_key(ident)
-                if not directory and links > 1 and key not in allowed:
-                    ask("hardlink", names, ident, HARDLINK)
+                if not directory and links > limit(key):
+                    ask("hardlink", names, ident, HARDLINK, held, links=links)
                     continue
                 if acl is None and key not in open_before:
                     ask("null_dacl", names, ident, NULL_DACL, held)
@@ -1453,16 +1504,29 @@ class WindowsPermissions:
             "Eugene asks again about what is there now."
         )
         try:
+            allowed = {key: links for key, links in delta.get("allowed", [])}
+            most = max(1, allowed.get(_file_key(ident), 1)) if ident else 1
             if kind == "hardlink":
-                with self._open(path, revoke=True, names=names, root_identity=root) as (_, _, now):
+                with self._open(path, revoke=True, names=names, root_identity=root) as (
+                    held,
+                    facts,
+                    now,
+                ):
                     if now != ident:
                         raise replaced
-                allowed = delta.setdefault("allowed", [])
-                if _file_key(ident) not in allowed:
-                    allowed.append(_file_key(ident))  # the removal that follows changes it
+                    self._unchanged(ws, held, state)
+                    if facts.links > fingerprint.get("links", facts.links):
+                        raise SharedFile(facts.links)
+                    links = facts.links
+                # The removal that follows changes it, at no more names than now.
+                delta["allowed"] = [
+                    [key, count]
+                    for key, count in delta.get("allowed", [])
+                    if key != _file_key(ident)
+                ] + [[_file_key(ident), links]]
                 return
             if kind == "null_dacl":
-                self._inherit(ws, path, names, ident, root=root, state=state)
+                self._inherit(ws, path, names, ident, root=root, state=state, max_links=most)
                 return
             if kind == "owner":
                 with self._open(path, root_identity=root) as (handle, _, _):
@@ -1475,13 +1539,17 @@ class WindowsPermissions:
                     None if person == delta["sid"] else person,
                     root=root,
                     state=state,
+                    max_links=most,
                 )
                 return
-            with self._open(path, change=True, revoke=True, names=names, root_identity=root) as (
-                held,
-                _,
-                current,
-            ):
+            with self._open(
+                path,
+                change=True,
+                revoke=True,
+                names=names,
+                root_identity=root,
+                max_links=most,
+            ) as (held, _, current):
                 if current != ident:
                     raise replaced
                 self._unchanged(ws, held, state)
@@ -1667,8 +1735,12 @@ class LinuxPermissions:
         request = self.ctl / f"{delta['id']}.entry"
         write_private(request, json.dumps(fingerprint))
         try:
-            self._ask("folder-decide", delta["id"], action)
+            result = self._ask("folder-decide", delta["id"], action)
         except OSError as exc:
             raise ValueError(str(exc).rstrip(".") + ".") from exc
         finally:
             request.unlink(missing_ok=True)
+        if result.get("stale"):
+            # The helper applied nothing: the file gained another name, or its
+            # entry changed. The removal runs again and asks about what is there.
+            raise StaleEntry(str(result.get("message") or "The item changed since Eugene asked."))
