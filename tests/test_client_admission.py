@@ -339,3 +339,25 @@ def test_an_enrolled_agent_forwards_only_the_limits_it_was_given(app, client):
         headers=session,
     )
     assert edited.status_code == 200, edited.text
+
+
+def test_a_default_key_is_answered_without_the_queue_fields(authed_client):
+    """Row 11: a gateway a release behind refuses an admission answer with a field
+    it does not know (`extra='forbid'`), and refused, every request on the key is
+    a 503. A key nobody gave a band or a queue bound is answered as it was before;
+    one that has them carries them."""
+    c = authed_client
+    plain = c.post("/v1/auth/client-keys", json={"name": "plain"}).json()["key"]["id"]
+    payload = {"action": "acquire", "keyId": plain, "requestId": "one", "model": "m"}
+    answered = c.post("/v1/auth/client-keys/admission", json=payload)
+    assert answered.status_code == 200, answered.text
+    assert not {"band", "maxQueuedRequests"} & answered.json()["limits"].keys()
+    shaped = c.post(
+        "/v1/auth/client-keys",
+        json={"name": "shaped", "limits": {"band": "background", "maxQueuedRequests": 3}},
+    ).json()["key"]["id"]
+    answer = c.post(
+        "/v1/auth/client-keys/admission",
+        json={"action": "check", "keyId": shaped, "requestId": "two", "model": "m"},
+    ).json()["limits"]
+    assert answer["band"] == "background" and answer["maxQueuedRequests"] == 3
