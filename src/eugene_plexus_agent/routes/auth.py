@@ -1461,10 +1461,6 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
             )
         )
     except AdmissionRefusal as exc:
-        raise HTTPException(
-            exc.status,
-            detail=exc.detail,
-            headers={"Retry-After": str(exc.retry)} if exc.retry else None,
-        ) from exc
+        raise HTTPException(exc.status, detail=exc.detail, headers=exc.headers) from exc
     except (OSError, ValueError) as exc:
         raise owner.local_unavailable() from exc

@@ -223,3 +223,89 @@ def test_an_enrolled_agent_passes_on_the_roots_queue_band(app, client):
     assert forwarded.status_code == 200, forwarded.text
     assert forwarded.json()["queueBand"] == "background"
     assert seen[0].url.path == "/v1/auth/client-keys/admission"
+
+
+def test_an_enrolled_agent_passes_on_why_the_root_refused(app, client):
+    """Row 11: the gateway keeps a request refused for `concurrency` in its
+    queue and refuses one refused for `rate`, so the forward passes the root's
+    `X-Eugene-Refusal-Reason` on beside `Retry-After`."""
+    import httpx
+
+    from tests.test_acting_for_operator import _enrolled, _root
+
+    root = _enrolled(app)
+    reasons = iter(["concurrency", "rate"])
+    _root(
+        app,
+        lambda request: httpx.Response(
+            429,
+            json={"detail": "This key's shared concurrent request limit is reached."},
+            headers={"Retry-After": "3", "X-Eugene-Refusal-Reason": next(reasons)},
+        ),
+    )
+    session = root.session("node:gpu-box", "control")
+    for expected in ("concurrency", "rate"):
+        refused = client.post(
+            "/v1/auth/client-keys/admission",
+            json={"action": "acquire", "keyId": "k1", "requestId": expected, "model": "m"},
+            headers={"Authorization": f"Bearer {session}"},
+        )
+        assert refused.status_code == 429
+        assert refused.headers["Retry-After"] == "3"
+        assert refused.headers["X-Eugene-Refusal-Reason"] == expected
+
+
+def test_a_standalone_agent_names_why_it_refused(authed_client):
+    c = authed_client
+    made = c.post(
+        "/v1/auth/client-keys",
+        json={"name": "busy", "limits": {"maxConcurrentRequests": 1, "requestsPerMinute": 2}},
+    ).json()
+    key = made["key"]["id"]
+
+    def call(action, request_id):
+        return c.post(
+            "/v1/auth/client-keys/admission",
+            json={"action": action, "keyId": key, "requestId": request_id, "model": "m"},
+        )
+
+    assert call("acquire", "one").status_code == 200
+    busy = call("acquire", "two")
+    assert busy.status_code == 429 and busy.headers["X-Eugene-Refusal-Reason"] == "concurrency"
+    assert call("release", "one").status_code == 200
+    assert call("acquire", "two").status_code == 200
+    assert call("release", "two").status_code == 200
+    used = call("acquire", "three")
+    assert used.status_code == 429 and used.headers["X-Eugene-Refusal-Reason"] == "rate"
+
+
+def test_a_standalone_band_change_does_not_cut_a_renewal(tmp_path):
+    store = ClientKeyStore(tmp_path / "keys.json")
+    store.add(replace(_record(), limits={"maxConcurrentRequests": 2, "requestsPerMinute": 60}))
+    store.admit(key_id="abc", action="acquire", request_id="one", model="m")
+    store.set_limits(
+        "abc",
+        {
+            "maxConcurrentRequests": 2,
+            "requestsPerMinute": 60,
+            "band": "background",
+            "maxQueuedRequests": 0,
+        },
+    )
+    renewed = store.admit(key_id="abc", action="renew", request_id="one", model="m")
+    assert renewed["limits"]["band"] == "background"
+    assert renewed["limits"]["maxQueuedRequests"] == 0
+    with pytest.raises(ValueError):
+        validate_limits({"band": "urgent"})
+    with pytest.raises(ValueError):
+        validate_limits({"maxQueuedRequests": 65})
+
+
+def test_a_standalone_check_with_a_model_applies_allowed_models(tmp_path):
+    store = ClientKeyStore(tmp_path / "keys.json")
+    store.add(replace(_record(), limits={"allowedModels": ["allowed"]}))
+    store.admit(key_id="abc", action="check", request_id="c1", model="allowed")
+    with pytest.raises(AdmissionRefusal) as caught:
+        store.admit(key_id="abc", action="check", request_id="c2", model="excluded")
+    assert caught.value.status == 403
+    store.admit(key_id="abc", action="check", request_id="c3", model=None)
