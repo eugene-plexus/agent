@@ -993,10 +993,14 @@ class Forwarder:
 # --------------------------------------------------------------------------- #
 
 
-def _spawn(spec: dict, argv: list[str], env: dict[str, str]) -> subprocess.Popen:
+def _spawn(
+    spec: dict, argv: list[str], env: dict[str, str], *, suspended: bool = False
+) -> subprocess.Popen:
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.CREATE_NEW_PROCESS_GROUP
+        if suspended:
+            flags |= 0x00000004  # CREATE_SUSPENDED: it runs once `_Job` holds it
     return subprocess.Popen(
         argv,
         env=env,
@@ -1014,7 +1018,7 @@ def _pump(proc: subprocess.Popen, forwarder: Forwarder) -> None:
         forwarder.add(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
 
 
-def _ask_to_stop(proc: subprocess.Popen) -> None:
+def _ask_to_stop(proc: subprocess.Popen) -> str | None:
     if sys.platform == "win32":
         import ctypes
 
@@ -1023,23 +1027,199 @@ def _ask_to_stop(proc: subprocess.Popen) -> None:
         # engine answers by shutting down cleanly. A service has no
         # console to send it through until `run` allocates one.
         if not ctypes.windll.kernel32.GenerateConsoleCtrlEvent(1, proc.pid):
-            _force(proc)
+            return _force(proc)
     else:
         proc.send_signal(signal.SIGTERM)
+    return None
 
 
-def _force(proc: subprocess.Popen) -> None:
+def _force(proc: subprocess.Popen) -> str | None:
+    """End the app by force. What went wrong, in words, or None."""
     if WINDOWS:
         # The app's interpreter may be a launcher with the real one as its
         # child; end the whole tree.
-        subprocess.run(
+        out = subprocess.run(
             ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
             check=False,
         )
-    else:
+        if out.returncode != 0 and proc.poll() is None:
+            said = " ".join((out.stdout + out.stderr).split())[-300:]
+            return f"taskkill could not end the app (code {out.returncode}): {said}"
+        return None
+    proc.kill()
+    return None
+
+
+class _Job:
+    """A Windows job object that holds the app's process and every process
+    it starts (agent#34).
+
+    Its handle is this launcher's alone, and it is made to end what it holds
+    when that handle closes -- when the launcher exits, however it exits. So
+    the agent's wait for the service's process is a wait for the app's whole
+    tree, and nothing the app started still holds its database or its port
+    when Go back or an update goes on. `end` ends a straggler while the
+    launcher can still say so.
+    """
+
+    _KILL_ON_JOB_CLOSE = 0x2000
+    _EXTENDED_LIMITS = 9
+    _ACCOUNTING = 1
+    _ctypes: Any
+    _kernel: Any
+    _accounting: Any
+    _handle: Any
+
+    def __init__(self) -> None:
+        if sys.platform != "win32":
+            raise OSError("a job object is Windows' own")
+        import ctypes
+        from ctypes import wintypes
+
+        class Basic(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_int64),
+                ("PerJobUserTimeLimit", ctypes.c_int64),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", Basic),
+                ("IoInfo", ctypes.c_uint64 * 6),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        class Accounting(ctypes.Structure):
+            _fields_ = [
+                ("TotalUserTime", ctypes.c_int64),
+                ("TotalKernelTime", ctypes.c_int64),
+                ("ThisPeriodTotalUserTime", ctypes.c_int64),
+                ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                ("TotalPageFaultCount", wintypes.DWORD),
+                ("TotalProcesses", wintypes.DWORD),
+                ("ActiveProcesses", wintypes.DWORD),
+                ("TotalTerminatedProcesses", wintypes.DWORD),
+            ]
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        kernel.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+        ]
+        kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._ctypes, self._kernel = ctypes, kernel
+        self._accounting = Accounting
+        self._handle = kernel.CreateJobObjectW(None, None)
+        if not self._handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = Extended()
+        limits.BasicLimitInformation.LimitFlags = self._KILL_ON_JOB_CLOSE
+        if not kernel.SetInformationJobObject(
+            self._handle, self._EXTENDED_LIMITS, ctypes.byref(limits), ctypes.sizeof(limits)
+        ):
+            error = ctypes.get_last_error()
+            self.close()
+            raise ctypes.WinError(error)
+
+    def hold(self, proc: subprocess.Popen) -> None:
+        """Put `proc`, created suspended, in the job; then let it run."""
+        handle = int(proc._handle)  # type: ignore[attr-defined,unused-ignore]
+        if not self._kernel.AssignProcessToJobObject(self._handle, handle):
+            raise self._ctypes.WinError(self._ctypes.get_last_error())
+
+    def active(self) -> int:
+        info = self._accounting()
+        ctypes = self._ctypes
+        if not self._kernel.QueryInformationJobObject(
+            self._handle, self._ACCOUNTING, ctypes.byref(info), ctypes.sizeof(info), None
+        ):
+            return 0
+        return int(info.ActiveProcesses)
+
+    def end(self, seconds: float = 10.0) -> int:
+        """End whatever is still in the job; how many processes that was."""
+        left = self.active()
+        if left:
+            self._kernel.TerminateJobObject(self._handle, 1)
+            deadline = time.perf_counter() + seconds
+            while self.active() and time.perf_counter() < deadline:
+                time.sleep(0.05)
+        return left
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _resume(proc: subprocess.Popen) -> None:
+    """Let a process created suspended run."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtResumeProcess.restype = ctypes.c_long
+    status = ntdll.NtResumeProcess(ctypes.c_void_p(int(proc._handle)))  # type: ignore[attr-defined,unused-ignore]
+    if status != 0:
+        raise OSError(f"the app's process could not be let run (NTSTATUS {status & 0xFFFFFFFF:#x})")
+
+
+def _spawn_contained(
+    spec: dict, argv: list[str], env: dict[str, str]
+) -> tuple[subprocess.Popen, _Job | None, str | None]:
+    """The app's process, and on Windows the job that ends its tree with
+    this launcher. A job that cannot be made is said, and the app runs as
+    before; a process that cannot be let run is ended, and raises."""
+    if not WINDOWS:
+        return _spawn(spec, argv, env), None, None
+    proc = _spawn(spec, argv, env, suspended=True)
+    job: _Job | None = None
+    note = None
+    try:
+        job = _Job()
+        job.hold(proc)
+    except OSError as exc:
+        if job is not None:
+            job.close()
+        job = None
+        note = (
+            f"the app's processes are not tied to this launcher ({exc}); one it starts "
+            "may outlive a stop"
+        )
+    try:
+        _resume(proc)
+    except OSError:
         proc.kill()
+        if job is not None:
+            job.close()
+        raise
+    return proc, job, note
 
 
 def watch_memory_provider(argv: list[str]) -> int:
@@ -1123,43 +1303,79 @@ def run(spec: dict) -> int:
         ctypes.windll.kernel32.AllocConsole()
     forwarder = Forwarder(spec.get("ingress"), spec.get("keyFile"), spec.get("app", "app"))
     forwarder.start()
+    if spec.get("generation"):
+        # Which start this is, so the Logs page tells one launch from another.
+        forwarder.add(
+            f"[launcher] starting {spec.get('app', 'app')} {spec.get('version') or ''} "
+            f"(launch {str(spec['generation'])[:8]})".replace("  ", " ")
+        )
+    try:
+        return _run(spec, forwarder)
+    except Exception as exc:
+        # Said, never a bare exit code 1 that names nothing (agent#34).
+        forwarder.add(f"[launcher] stopped on an unexpected error: {exc!r}")
+        return 1
+    finally:
+        forwarder.close()
+
+
+def _run(spec: dict, forwarder: Forwarder) -> int:
     try:
         argv, env, notes = render_start(spec, child_environment(spec))
         if spec.get("linkProvider"):
             pg0_cleanup(spec["argv"][0], "stop", env)
         for note in notes:
             forwarder.add(f"[launcher] {note}")
-        proc = _spawn(spec, argv, env)
+        proc, job, held = _spawn_contained(spec, argv, env)
     except (OSError, ValueError) as exc:
         forwarder.add(f"[launcher] could not start the app: {exc}")
-        forwarder.close()
         return 1
-    pump = threading.Thread(target=_pump, args=(proc, forwarder), daemon=True)
-    pump.start()
-    while proc.poll() is None:
-        if _STOP.wait(0.5):
-            _ask_to_stop(proc)
-            try:
-                proc.wait(STOP_GRACE_SECONDS)
-            except subprocess.TimeoutExpired:
+    if held:
+        forwarder.add(f"[launcher] {held}")
+    try:
+        pump = threading.Thread(target=_pump, args=(proc, forwarder), daemon=True)
+        pump.start()
+        while proc.poll() is None:
+            if _STOP.wait(0.5):
+                said = _ask_to_stop(proc)
+                if said:
+                    forwarder.add(f"[launcher] {said}")
+                try:
+                    proc.wait(STOP_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    forwarder.add(
+                        f"[launcher] the app did not stop within {int(STOP_GRACE_SECONDS)} s; "
+                        "ending it"
+                    )
+                    said = _force(proc)
+                    if said:
+                        forwarder.add(f"[launcher] {said}")
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        forwarder.add(f"[launcher] the app's process {proc.pid} is still running")
+                break
+        pump.join(5)
+    finally:
+        if job is not None:
+            # Whatever the app started and left running ends here, while
+            # this launcher can still say so.
+            left = job.end()
+            if left:
                 forwarder.add(
-                    f"[launcher] the app did not stop within {int(STOP_GRACE_SECONDS)} s; ending it"
+                    f"[launcher] {left} process{'es' if left > 1 else ''} the app started "
+                    f"{'were' if left > 1 else 'was'} still running after it; ended"
                 )
-                _force(proc)
-                proc.wait(10)
-            break
-    pump.join(5)
+            job.close()
     if spec.get("linkProvider"):
         try:
             pg0_cleanup(spec["argv"][0], "stop", env)
         except (OSError, ValueError) as exc:
             forwarder.add(f"[launcher] {exc}")
-            forwarder.close()
             return 1
     code = proc.returncode if proc.returncode is not None else 1
     if not _STOP.is_set() and code != 0:
         forwarder.add(f"[launcher] the app exited with code {code}")
-    forwarder.close()
     # A stop that was asked for is not a failure, whatever the app's code.
     return 0 if _STOP.is_set() else code
 

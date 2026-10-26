@@ -304,6 +304,9 @@ class FakeRunner:
         self.apps_root = apps_root
         self.calls: list[str] = []
         self.current = app_accounts.ServiceState("running" if running else "stopped")
+        #: The spec the running service started from (`launched`).
+        self.running_spec: dict | None = None
+        self.held: list[str] = []
 
     def prepare(self, plan: app_accounts.LaunchPlan, spec: dict) -> None:
         self.calls.append("prepare")
@@ -315,6 +318,10 @@ class FakeRunner:
     def start(self, app_id: str) -> None:
         self.calls.append("start")
         self.current = app_accounts.ServiceState("running", pid=4242)
+        self.running_spec = getattr(self, "spec", None)
+
+    def hold(self, app_id: str) -> None:
+        self.held.append(app_id)
 
     def stop(self, app_id: str) -> None:
         self.calls.append("stop")
@@ -322,6 +329,9 @@ class FakeRunner:
 
     def state(self, app_id: str) -> app_accounts.ServiceState:
         return self.current
+
+    def launched(self, app_id: str) -> dict | None:
+        return self.running_spec
 
     def remove(self, app_id: str, *, purge: bool) -> None:
         self.calls.append(f"remove purge={purge}")
@@ -383,20 +393,67 @@ def test_a_start_goes_through_the_service_manager_with_the_ingress_in_the_spec(
     asyncio.run(scenario())
 
 
+def _running_as_planned(planner: apps._AppPlanner) -> dict:
+    """The spec a service started for this planner's version and port holds."""
+    port = str(planner.record.port)
+    return {
+        "argv": planner.base_plan().argv,
+        "version": planner.record.version,
+        "env": {"EUGENE_PLEXUS_APP_BIND_PORT": port},
+        "values": {"port": port, "bindHost": "127.0.0.1"},
+    }
+
+
 def test_an_app_running_before_the_agent_started_is_kept_not_restarted(tmp_path: Path) -> None:
     async def scenario() -> None:
         runner = FakeRunner(tmp_path / "apps", running=True)
         token = runner.token_file("tiny", tmp_path)
         token.parent.mkdir(parents=True)
         token.write_text("the-token-it-was-started-with")
+        planner = _planner(tmp_path)
+        runner.running_spec = _running_as_planned(planner)
         supervisor = _supervisor(runner, tmp_path)
-        supervisor.start(_planner(tmp_path))
+        supervisor.start(planner)
         await supervisor._starting["tiny"]
         assert runner.calls == []
         assert supervisor.admin_token("tiny") == "the-token-it-was-started-with"
         await supervisor.stop_all()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "change,why",
+    [
+        ({"argv": ["python", "-m", "tiny_app", "--old"]}, "another version"),
+        ({"env": {"EUGENE_PLEXUS_APP_BIND_PORT": "1"}}, "does not look"),
+        (None, "spec it was started with is missing"),
+    ],
+)
+def test_a_running_service_unlike_this_start_is_replaced_not_kept(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, change: dict | None, why: str
+) -> None:
+    """agent#32/#34: keeping a service that runs another version, or listens
+    where the door and the health poll do not look, is an app that never
+    reads running."""
+
+    async def scenario() -> None:
+        runner = FakeRunner(tmp_path / "apps", running=True)
+        token = runner.token_file("tiny", tmp_path)
+        token.parent.mkdir(parents=True)
+        token.write_text("the-token-it-was-started-with")
+        planner = _planner(tmp_path)
+        runner.running_spec = None if change is None else {**_running_as_planned(planner), **change}
+        supervisor = _supervisor(runner, tmp_path)
+        supervisor.start(planner)
+        await supervisor._starting["tiny"]
+        assert runner.calls == ["stop", "prepare", "start"]
+        assert supervisor.admin_token("tiny") != "the-token-it-was-started-with"
+        await supervisor.stop_all()
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(scenario())
+    assert why in caplog.text
 
 
 def test_the_agent_stopping_does_not_stop_the_apps_but_a_stop_does(tmp_path: Path) -> None:

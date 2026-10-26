@@ -233,6 +233,8 @@ class LaunchPlan:
     #: The manifest's own start, not filled in (`_AppPlanner.launch`): what
     #: the launcher fills in inside the account. Holds no secret.
     launch: dict = field(default_factory=dict)
+    #: The app's version, for the spec and the launcher's first line.
+    version: str | None = None
 
 
 #: Variables the launcher is given in `launch.json`. Everything else comes
@@ -241,7 +243,21 @@ class LaunchPlan:
 _PASSED = ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy")
 
 
-def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
+#: The variables that say where an app listens. A running service whose spec
+#: differs in one of them is not the one the agent's door and health poll
+#: expect (agent#32, agent#34).
+_PLACE = (
+    "EUGENE_PLEXUS_APP_BIND_PORT",
+    "EUGENE_PLEXUS_APP_TLS_PORT",
+    "EUGENE_PLEXUS_APP_BIND_HOST",
+)
+
+
+def launch_spec(
+    plan: LaunchPlan, *, kind: str, ingress: str, generation: str | None = None
+) -> dict:
+    """What `launch.json` holds. `generation` names this one launch: the
+    launcher's first line says it, so the Logs page tells two starts apart."""
     env = {k: v for k, v in plan.env.items() if k.startswith("EUGENE_PLEXUS_APP_") or k in _PASSED}
     # A fixed local transport for app-only release calls; never inferred from
     # the control root's gateway or a browser's address.
@@ -264,6 +280,10 @@ def launch_spec(plan: LaunchPlan, *, kind: str, ingress: str) -> dict:
         "env": env,
         "ingress": ingress,
     }
+    if plan.version:
+        spec["version"] = plan.version
+    if generation:
+        spec["generation"] = generation
     link_url = env.pop("EUGENE_PLEXUS_APP_MEMORY_SERVER_URL", None)
     if link_url:
         token_path = env.pop("EUGENE_PLEXUS_APP_MEMORY_SERVER_TOKEN_FILE")
@@ -302,10 +322,28 @@ class Runner(Protocol):
 
     def prepare(self, plan: LaunchPlan, spec: dict) -> None: ...
     def start(self, app_id: str) -> None: ...
+    def hold(self, app_id: str) -> None: ...
     def stop(self, app_id: str) -> None: ...
     def state(self, app_id: str) -> ServiceState: ...
+    def launched(self, app_id: str) -> dict | None: ...
     def remove(self, app_id: str, *, purge: bool) -> None: ...
     def token_file(self, app_id: str, data_dir: Path) -> Path: ...
+
+
+def _read_spec(path: Path) -> dict | None:
+    """The `launch.json` a service starts from, or None when there is none."""
+    try:
+        spec = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
+def _why(exc: Exception) -> str:
+    """A pywin32 error in words: its message and its Windows error number."""
+    words = getattr(exc, "strerror", None) or str(exc)
+    number = getattr(exc, "winerror", None)
+    return f"{words} (error {number})" if number is not None else words
 
 
 def _icacls(path: Path, *args: str) -> None:
@@ -346,6 +384,9 @@ class WindowsServiceRunner:
         write_private(plan.data_dir / ADMIN_TOKEN_FILE, plan.admin_token)
         _ensure_secret_file(plan.data_dir)
 
+        # Disabled until the end of this, so nothing starts the service --
+        # Windows' recovery included -- before its spec, its account and its
+        # grants are all in place for this start (agent#34).
         manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
         try:
             try:
@@ -355,7 +396,7 @@ class WindowsServiceRunner:
                     f"Eugene Plexus app: {plan.app_id}",
                     win32service.SERVICE_ALL_ACCESS,
                     win32service.SERVICE_WIN32_OWN_PROCESS,
-                    win32service.SERVICE_DEMAND_START,
+                    win32service.SERVICE_DISABLED,
                     win32service.SERVICE_ERROR_NORMAL,
                     command,
                     None,
@@ -371,7 +412,7 @@ class WindowsServiceRunner:
                 win32service.ChangeServiceConfig(
                     handle,
                     win32service.SERVICE_NO_CHANGE,
-                    win32service.SERVICE_DEMAND_START,
+                    win32service.SERVICE_DISABLED,
                     win32service.SERVICE_NO_CHANGE,
                     command,
                     None,
@@ -387,8 +428,10 @@ class WindowsServiceRunner:
                     win32service.SERVICE_CONFIG_DESCRIPTION,
                     "An optional app Eugene Plexus installed, run in an account of its own.",
                 )
-                # Restart a crash after 5 s, three times a day; the
-                # agent's page says when it has given up.
+                # Restart a crash after 5 s. Windows repeats the last action
+                # for every later failure, so an app that keeps crashing is
+                # started again every few seconds until the agent holds it
+                # (`hold`); the app's page shows it crashed meanwhile.
                 win32service.ChangeServiceConfig2(
                     handle,
                     win32service.SERVICE_CONFIG_FAILURE_ACTIONS,
@@ -422,6 +465,64 @@ class WindowsServiceRunner:
         pythons = self._apps / APP_PYTHONS
         if pythons.is_dir():
             _icacls(pythons, "/grant", f"{account}:(OI)(CI)(RX)")
+        # Prepared: from here a start, Windows' recovery's too, starts this.
+        self._set_start_type(plan.app_id, win32service.SERVICE_DEMAND_START)
+
+    def _set_start_type(self, app_id: str, start_type: int) -> bool:
+        """Change only how the service may be started. False when there is
+        no such service."""
+        import pywintypes
+        import win32service
+
+        manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+        try:
+            try:
+                handle = win32service.OpenService(
+                    manager, self._name(app_id), win32service.SERVICE_CHANGE_CONFIG
+                )
+            except pywintypes.error as exc:
+                if exc.winerror == 1060:  # ERROR_SERVICE_DOES_NOT_EXIST
+                    return False
+                raise
+            try:
+                win32service.ChangeServiceConfig(
+                    handle,
+                    win32service.SERVICE_NO_CHANGE,
+                    start_type,
+                    win32service.SERVICE_NO_CHANGE,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            finally:
+                win32service.CloseServiceHandle(handle)
+        finally:
+            win32service.CloseServiceHandle(manager)
+        return True
+
+    def hold(self, app_id: str) -> None:
+        """Keep the service from starting until the next `prepare`.
+
+        Windows starts a crashed app's service again 5 s after it stops (the
+        failure actions above), from whatever `launch.json` says by then. A
+        stop does not cancel that: the stop of a service that has already
+        stopped is refused (error 1062) and the restart comes anyway. During
+        an update or Go back it started the version being replaced, and the
+        agent kept it (agent#34). A disabled service is one nothing starts.
+        """
+        import pywintypes
+        import win32service
+
+        try:
+            self._set_start_type(app_id, win32service.SERVICE_DISABLED)
+        except pywintypes.error as exc:
+            raise OSError(
+                f"Windows would not keep {self._name(app_id)} from starting: {_why(exc)}"
+            ) from exc
 
     def start(self, app_id: str) -> None:
         import pywintypes
@@ -431,25 +532,90 @@ class WindowsServiceRunner:
             win32serviceutil.StartService(self._name(app_id))
         except pywintypes.error as exc:
             if exc.winerror != 1056:  # ERROR_SERVICE_ALREADY_RUNNING
-                raise
+                raise OSError(f"Windows would not start {self._name(app_id)}: {_why(exc)}") from exc
 
     def stop(self, app_id: str) -> None:
+        """Stop the service; return only when it and its process are gone.
+
+        Held first, so nothing starts it again meanwhile. Raises when it is
+        not gone within `_STOP_TIMEOUT_SECONDS`: what comes next -- Go back's
+        restore, an update's backup, the next version's start -- must not
+        work over the files and ports of a process that still runs.
+        """
         import pywintypes
         import win32service
         import win32serviceutil
 
         name = self._name(app_id)
-        try:
-            win32serviceutil.ControlService(name, win32service.SERVICE_CONTROL_STOP)
-        except pywintypes.error as exc:
-            if exc.winerror in (1062, 1060):  # not started; does not exist
-                return
-            raise
+        self.hold(app_id)
         deadline = time.perf_counter() + _STOP_TIMEOUT_SECONDS
-        while time.perf_counter() < deadline:
-            if self.state(app_id).state in ("stopped", "failed", "missing"):
-                return
-            time.sleep(0.5)
+        processes: dict[int, object | None] = {}
+        try:
+            while True:
+                current = self.state(app_id)
+                if current.pid and current.pid not in processes:
+                    # Held open from here, so the wait below is for this
+                    # process and never for another that takes its number.
+                    processes[current.pid] = self._open_process(current.pid)
+                if current.state in ("stopped", "failed", "missing"):
+                    break
+                if current.state in ("running", "starting"):
+                    try:
+                        win32serviceutil.ControlService(name, win32service.SERVICE_CONTROL_STOP)
+                    except pywintypes.error as exc:
+                        if exc.winerror == 1060:  # deleted meanwhile
+                            return
+                        # 1061: still starting, not taking a stop yet; asked
+                        # again next time round. 1062: it has just stopped.
+                        if exc.winerror not in (1061, 1062):
+                            raise OSError(f"Windows would not stop {name}: {_why(exc)}") from exc
+                if time.perf_counter() >= deadline:
+                    which = f", process {current.pid}" if current.pid else ""
+                    raise OSError(
+                        f"{name} did not stop within {_STOP_TIMEOUT_SECONDS:g} s "
+                        f"(Windows says {current.state}{which})"
+                    )
+                time.sleep(0.5)
+            for pid, process in processes.items():
+                remaining = max(0.0, deadline - time.perf_counter())
+                if process is not None and not self._wait_process(process, remaining):
+                    raise OSError(
+                        f"{name} stopped, but its process {pid} was still running "
+                        f"{_STOP_TIMEOUT_SECONDS:g} s after the stop was asked for"
+                    )
+        finally:
+            for process in processes.values():
+                self._close_process(process)
+
+    @staticmethod
+    def _open_process(pid: int) -> object | None:
+        """A handle to wait on `pid` with, or None when it has gone already."""
+        import pywintypes
+        import win32api
+        import win32con
+
+        try:
+            handle: object = win32api.OpenProcess(win32con.SYNCHRONIZE, False, pid)
+        except pywintypes.error:
+            return None
+        return handle
+
+    @staticmethod
+    def _wait_process(process: object, seconds: float) -> bool:
+        """True once the process has ended; False if it still runs after `seconds`."""
+        import win32event
+
+        waited = win32event.WaitForSingleObject(process, int(seconds * 1000))
+        return bool(waited == win32event.WAIT_OBJECT_0)
+
+    @staticmethod
+    def _close_process(process: object | None) -> None:
+        if process is not None:
+            with contextlib.suppress(Exception):
+                process.Close()  # type: ignore[attr-defined]
+
+    def launched(self, app_id: str) -> dict | None:
+        return _read_spec(self._apps / app_id / SPEC_FILE)
 
     def state(self, app_id: str) -> ServiceState:
         import pywintypes
@@ -597,8 +763,18 @@ class SystemdRunner:
     def start(self, app_id: str) -> None:
         self._ask("start", app_id)
 
+    def hold(self, app_id: str) -> None:
+        """Nothing to do: `systemctl stop` cancels a restart `Restart=` has
+        queued, and nothing but the agent starts the unit."""
+        return None
+
     def stop(self, app_id: str) -> None:
+        # `systemctl stop` returns when the unit has stopped, and systemd
+        # ends the rest of its cgroup with it (KillMode=mixed).
         self._ask("stop", app_id)
+
+    def launched(self, app_id: str) -> dict | None:
+        return _read_spec(self._apps / app_id / SPEC_FILE)
 
     def state(self, app_id: str) -> ServiceState:
         out = subprocess.run(
@@ -700,6 +876,12 @@ class OwnAccountSupervisor:
         self._starting: dict[str, asyncio.Task[None]] = {}
         self._poll_task: asyncio.Task[None] | None = None
         self._client: httpx.AsyncClient | None = None
+        #: Apps this agent stopped and has not started since: an update, Go
+        #: back, a restore, a restart or a person's Stop. What runs of one of
+        #: them was not started by the agent, so a start never keeps it.
+        self._held: set[str] = set()
+        #: The `generation` of the spec each app was last started or kept with.
+        self._generations: dict[str, str | None] = {}
 
     @property
     def kind(self) -> str:
@@ -717,6 +899,8 @@ class OwnAccountSupervisor:
         self._planners[app_id] = planner
         self._reachable[app_id] = False
         self._errors[app_id] = None
+        # What the service manager said of the last run is not this start's.
+        self._state.pop(app_id, None)
         self._starting[app_id] = asyncio.create_task(
             self._start(planner), name=f"app-start-{app_id}"
         )
@@ -740,24 +924,43 @@ class OwnAccountSupervisor:
                 port=planner.record.port,
                 bind_host=spawn.env.get("EUGENE_PLEXUS_APP_BIND_HOST"),
                 launch=planner.launch(),
+                version=planner.record.version,
             )
             self._hosts[app_id] = plan.bind_host or "127.0.0.1"
+            generation = uuid.uuid4().hex
+            spec = launch_spec(
+                plan, kind=self.runner.kind, ingress=self._ingress(), generation=generation
+            )
             current = await asyncio.to_thread(self.runner.state, app_id)
-            if current.state in ("running", "starting"):
-                # Running since before this agent started: keep it, and
-                # take back the admin token it was started with.
-                token_file = self.runner.token_file(app_id, plan.data_dir)
-                with contextlib.suppress(OSError):
-                    planner.admin_token = token_file.read_text(encoding="utf-8").strip() or None
-                if planner.admin_token:
-                    self._tokens[app_id] = planner.admin_token
-                    self._started_at.setdefault(app_id, datetime.now(UTC))
-                    return
-            spec = launch_spec(plan, kind=self.runner.kind, ingress=self._ingress())
+            if current.state in ("running", "starting", "stopping"):
+                running = await asyncio.to_thread(self.runner.launched, app_id)
+                why = self._why_not_keep(app_id, running, spec)
+                if why is None:
+                    # Running since before this agent started, as this start
+                    # would run it: keep it, and take back its admin token.
+                    token_file = self.runner.token_file(app_id, plan.data_dir)
+                    with contextlib.suppress(OSError):
+                        planner.admin_token = token_file.read_text(encoding="utf-8").strip() or None
+                    if planner.admin_token:
+                        self._tokens[app_id] = planner.admin_token
+                        self._started_at.setdefault(app_id, datetime.now(UTC))
+                        self._generations[app_id] = (running or {}).get("generation")
+                        return
+                    why = "its admin token could not be read"
+                log.warning(
+                    "app %s: the service that runs is not the one to keep (%s); stopping it "
+                    "before starting %s",
+                    app_id,
+                    why,
+                    planner.record.version,
+                )
+                await asyncio.to_thread(self.runner.stop, app_id)
             planner.admin_token = plan.admin_token
             self._tokens[app_id] = plan.admin_token
             await asyncio.to_thread(self.runner.prepare, plan, spec)
             await asyncio.to_thread(self.runner.start, app_id)
+            self._held.discard(app_id)
+            self._generations[app_id] = generation
             self._started_at[app_id] = datetime.now(UTC)
             log.info("app %s started in its own account (%s)", app_id, self.account(app_id))
         except Exception as exc:
@@ -766,6 +969,57 @@ class OwnAccountSupervisor:
             cause = redact_database(str(exc))
             self._errors[app_id] = f"could not start in an account of its own: {cause}"
             log.error("app %s could not start in its own account: %s", app_id, cause)
+
+    def _why_not_keep(self, app_id: str, running: dict | None, expected: dict) -> str | None:
+        """Why a service found running is not the start the agent wants, or
+        None to keep it. Kept only when the agent did not stop the app since
+        it started, and the spec the service started from runs this version
+        where the agent's door and health poll look for it."""
+        if app_id in self._held:
+            return (
+                "the agent stopped this app, so what runs now was started by the service "
+                "manager's own restart"
+            )
+        if running is None:
+            return "the spec it was started with is missing"
+        known = self._generations.get(app_id)
+        if known and running.get("generation") != known:
+            return "it was started from another launch"
+        if running.get("argv") != expected.get("argv"):
+            if running.get("version") and running.get("version") != expected.get("version"):
+                return f"it runs version {running['version']}"
+            return "it runs another version or command"
+        now_env, want_env = running.get("env") or {}, expected.get("env") or {}
+        now_values, want_values = running.get("values") or {}, expected.get("values") or {}
+        if any(now_env.get(name) != want_env.get(name) for name in _PLACE) or any(
+            now_values.get(name) != want_values.get(name) for name in ("port", "bindHost")
+        ):
+            return "it listens where the agent does not look for it"
+        return None
+
+    async def ports_in_use(self, app_id: str) -> tuple[int, int] | None:
+        """The two loopback ports behind the app's door that a service of it
+        found running listens on, from the spec it started with.
+
+        The agent opens the door before the start that keeps such a service.
+        With fresh ports, the door led nowhere and the app read `starting`
+        for good after an agent restart (agent#32). None when nothing runs,
+        when the agent stopped the app since (that start keeps nothing), or
+        when the app listens without a door.
+        """
+        if app_id in self._held or app_id in self._planners:
+            return None
+        try:
+            current = await asyncio.to_thread(self.runner.state, app_id)
+        except Exception:
+            return None
+        if current.state not in ("running", "starting"):
+            return None
+        env = (await asyncio.to_thread(self.runner.launched, app_id) or {}).get("env") or {}
+        try:
+            return int(env["EUGENE_PLEXUS_APP_BIND_PORT"]), int(env["EUGENE_PLEXUS_APP_TLS_PORT"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     async def _settle_start(self, app_id: str) -> None:
         task = self._starting.pop(app_id, None)
@@ -778,19 +1032,31 @@ class OwnAccountSupervisor:
         self._planners.pop(app_id, None)
         self._reachable.pop(app_id, None)
         self._tokens.pop(app_id, None)
+        self._state.pop(app_id, None)
+
+    async def _alive(self, app_id: str) -> bool:
+        try:
+            current = await asyncio.to_thread(self.runner.state, app_id)
+        except Exception:
+            return False
+        return current.state in ("running", "starting", "stopping")
 
     async def stop(self, app_id: str) -> None:
-        """Stop the app's service. Raises when the service manager will
-        not, and keeps reporting the app as it is: a stop that failed is
-        not an app that stopped."""
+        """Stop the app's service, and hold it stopped until the agent starts
+        it: the service manager's own restart of a crash does not count.
+        Raises when the service manager will not, and keeps reporting the app
+        as it is: a stop that failed is not an app that stopped."""
         await self._settle_start(app_id)
-        if app_id in self._planners:
+        self._held.add(app_id)
+        await asyncio.to_thread(self.runner.hold, app_id)
+        if app_id in self._planners or await self._alive(app_id):
             await asyncio.to_thread(self.runner.stop, app_id)
         self._forget(app_id)
 
     async def cleanup_pg0(self, planner: _AppPlanner, action: str) -> None:
         """Run named cleanup inside the same service account and private state directory."""
         app_id = planner.record.id
+        self._held.add(app_id)
         await asyncio.to_thread(self.runner.stop, app_id)
         spawn = planner.base_plan()
         plan = LaunchPlan(
@@ -832,6 +1098,7 @@ class OwnAccountSupervisor:
         that reported success while the service lived on is what C1's first
         Windows run found."""
         await self._settle_start(app_id)
+        self._held.add(app_id)
         await asyncio.to_thread(self.runner.remove, app_id, purge=purge)
         self._forget(app_id)
 
