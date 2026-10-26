@@ -20,14 +20,14 @@
     for approved file operations. Signs people in with Eugene:
     the owner with the passphrase, a small business with an account for each person.
   homepage: https://github.com/eugene-plexus/workbench
-  source: https://github.com/eugene-plexus/workbench/archive/46fa91b579b014161ab5fdf46687ec6231efb161.tar.gz
-  version: 46fa91b579b014161ab5fdf46687ec6231efb161
+  source: https://github.com/eugene-plexus/workbench/archive/6f07f1f051fc7decda0e9f7349322f1137a19813.tar.gz
+  version: 6f07f1f051fc7decda0e9f7349322f1137a19813
   package: eugene-plexus-workbench
   entry: eugene_plexus_workbench
   python: "3.12"
   ui: true
   configTrio: true
-  uses: [inference]
+  uses: [inference, memory-server]
   signIn: true
   signInCallbackPath: /oidc/callback
   # Central Workbench can run without local actions. Its local MCP/file paths
@@ -187,3 +187,45 @@
     OAUTH_ROLES_CLAIM: eugene_role
     OAUTH_ADMIN_ROLES: operator
     OAUTH_ALLOWED_ROLES: operator,member
+
+- id: hindsight
+  name: Hindsight
+  summary: >-
+    Long-term memory for Workbench. Reads your chats with a model you choose.
+    For 20B+ models with reliable tool calls.
+  homepage: https://hindsight.vectorize.io
+  source: pypi
+  package: hindsight-api-slim[embedded-db]
+  version: 1.0.0
+  entry: hindsight_api.main:main
+  python: "3.12"
+  ui: false
+  experimental: true
+  configTrio: false
+  uses: [inference]
+  provides: memory-server
+  providesPath: /mcp/
+  localActions: false
+  healthPath: /health
+  environment:
+    HINDSIGHT_API_HOST: "{bindHost}"
+    HINDSIGHT_API_PORT: "{port}"
+    HINDSIGHT_API_DATABASE_URL: "pg0://hindsight:{databaseSecret}@eugene-plexus-hindsight:{auxPort}"
+    HINDSIGHT_API_LLM_PROVIDER: openai
+    HINDSIGHT_API_LLM_BASE_URL: "{gatewayUrl}/v1"
+    HINDSIGHT_API_LLM_API_KEY: "{clientKey}"
+    HINDSIGHT_API_LLM_MODEL: "{memoryModel}"
+    HINDSIGHT_API_LLM_REASONING_EFFORT: none
+    HINDSIGHT_API_EMBEDDINGS_PROVIDER: openai
+    HINDSIGHT_API_EMBEDDINGS_OPENAI_BASE_URL: "{gatewayUrl}/v1"
+    HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY: "{clientKey}"
+    HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL: "{embeddingModel}"
+    HINDSIGHT_API_RERANKER_PROVIDER: cohere
+    HINDSIGHT_API_RERANKER_COHERE_BASE_URL: "{gatewayUrl}/v1/rerank"
+    HINDSIGHT_API_RERANKER_COHERE_API_KEY: "{clientKey}"
+    HINDSIGHT_API_RERANKER_COHERE_MODEL: "{rerankModel}"
+    HINDSIGHT_API_TENANT_EXTENSION: hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension
+    HINDSIGHT_API_TENANT_API_KEY: "{appSecret}"
+    HINDSIGHT_API_MCP_ENABLED: "true"
+    HINDSIGHT_API_MCP_AUTH_TOKEN: "{linkSecret}"
+    HINDSIGHT_API_OTEL_TRACES_ENABLED: "false"

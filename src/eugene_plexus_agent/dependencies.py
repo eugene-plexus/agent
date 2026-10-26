@@ -203,6 +203,19 @@ def require_operator_or_service(
     raise _refuse(claims, "read this agent")
 
 
+def require_local_store(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """This machine's own store, and nothing else (row 53): it asks which
+    people the root still has, through `POST /v1/people/known`."""
+    claims = verify_bearer(request, _bearer(creds), classes=(tokens.TYP_SERVICE,))
+    recipient = request.app.state.auth_state.trust.recipient
+    if claims.sub == "store" and claims.is_local_service(recipient):
+        return claims
+    raise _refuse(claims, "ask about people here; only this machine's store may")
+
+
 def require_operator_or_gateway(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),

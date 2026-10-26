@@ -157,6 +157,13 @@ _COMPONENT_SPECS: dict[ComponentKind, _ComponentSpec] = {
         env_prefix="EUGENE_PLEXUS_LIBRARY",
         log_label="library",
     ),
+    # Row 53: what the gateway's platform doors keep. One per install, on
+    # the root by default; the gateway is its only client.
+    ComponentKind.store: _ComponentSpec(
+        module="eugene_plexus_store",
+        env_prefix="EUGENE_PLEXUS_STORE",
+        log_label="store",
+    ),
     # A search account (P8): one per provider account, like a driver per
     # backend. Its own prefix, not the driver's: a child inherits only the
     # variables carrying its own prefix, so a shared one would hand each
@@ -862,7 +869,9 @@ class SupervisedProcess:
                 line = await stream.readline()
                 if not line:
                     return
-                text = line.decode("utf-8", errors="replace")
+                from .app_launcher import redact_database
+
+                text = redact_database(line.decode("utf-8", errors="replace"))
                 # Suppress successful /healthz access logs — every spawned
                 # component answers a probe every ~1.5s, dwarfing the rest
                 # of the log. Non-2xx healthz still passes through so a

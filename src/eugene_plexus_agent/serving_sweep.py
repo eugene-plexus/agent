@@ -35,6 +35,17 @@ from ._generated.models import (
     ServingWorkload,
 )
 
+# The measurement key's concurrency allowance. The route mints the key with this
+# number and the load generator never has more requests in flight than this.
+MEASUREMENT_KEY_CONCURRENCY = 64
+# A request that finds every slot busy waits this long. If it waits longer, the
+# engine is not clearing requests as fast as the load makes them: it is saturated.
+SLOT_WAIT_SECONDS = 5.0
+
+
+class Saturated(Exception):
+    """More requests were waiting than the key allows. This ends a level; it is no error."""
+
 
 def percentile(values: list[float], q: float) -> float | None:
     if not values:
@@ -206,6 +217,7 @@ class Observation:
     error: str | None = None
     answer: str = ""
     reuse: float | None = None
+    dropped: bool = False
 
 
 class Sweep:
@@ -219,7 +231,14 @@ class Sweep:
         model: str,
         context: int,
         rng: random.Random,
+        *,
+        limit: int = MEASUREMENT_KEY_CONCURRENCY,
+        slot_wait: float = SLOT_WAIT_SECONDS,
     ) -> None:
+        self.limit, self.slot_wait = limit, slot_wait
+        self.slots = asyncio.Semaphore(limit)
+        self.saturated = False
+        self.stopped = asyncio.Event()
         self.client, self.gateway, self.token = client, gateway.rstrip("/"), token
         self.runtime, self.node, self.model = runtime, node, model
         self.context, self.rng = context, rng
@@ -252,7 +271,36 @@ class Sweep:
             )
             raise ValueError(self.fatal)
 
+    def saturate(self) -> None:
+        self.saturated = True
+        self.stopped.set()
+
+    async def nap(self, seconds: float) -> None:
+        """Sleep, but wake at once when the level ends as saturated."""
+        if seconds <= 0:
+            await asyncio.sleep(0)
+            return
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self.stopped.wait(), seconds)
+
     async def turn(self, session: Session, *, counted: bool = True) -> str:
+        """Send one request, never with more in flight than the key allows."""
+        if counted and self.saturated:
+            raise Saturated
+        if not counted or not self.slots.locked():
+            await self.slots.acquire()
+        else:
+            try:
+                await asyncio.wait_for(self.slots.acquire(), self.slot_wait)
+            except TimeoutError:
+                self.saturate()
+                raise Saturated from None
+        try:
+            return await self.send(session, counted=counted)
+        finally:
+            self.slots.release()
+
+    async def send(self, session: Session, *, counted: bool = True) -> str:
         observation = Observation(reuse=session.reuse if session.workload == "agents" else None)
         if counted:
             self.observations.append(observation)
@@ -275,6 +323,12 @@ class Sweep:
                     "prompt_cache_key": session.identity,
                 },
             ) as response:
+                if response.status_code == 429:
+                    # The key's own limit. The gateway has the same view of "too many
+                    # at once" as the cap above, so this is saturation, not a failure.
+                    observation.dropped = True
+                    self.saturate()
+                    raise Saturated
                 if response.status_code != 200:
                     raw = (await response.aread()).decode(errors="replace")
                     raise ValueError(f"Gateway returned {response.status_code}: {raw[:600]}")
@@ -356,6 +410,8 @@ class Sweep:
         self.inflight = self.peak = 0
         self.area = self.lag = 0.0
         self.fatal = None
+        self.saturated = False
+        self.stopped.clear()
         self.warmups = 0
         self.started = self.changed = time.perf_counter()
         deadline = self.started + seconds
@@ -367,10 +423,13 @@ class Sweep:
             rng = random.Random(self.rng.randrange(2**63))
             session = session or Session(rng, identity, workload, self.context, warm=not sub)
             turns = rng.randint(3, 8) if sub else None
-            while time.perf_counter() < deadline and not self.fatal:
-                answer = await self.turn(session)
+            while time.perf_counter() < deadline and not self.fatal and not self.saturated:
+                try:
+                    answer = await self.turn(session)
+                except Saturated:
+                    return
                 session.advance(answer)
-                if self.fatal:
+                if self.fatal or self.saturated:
                     return
                 if turns is not None:
                     turns -= 1
@@ -390,7 +449,7 @@ class Sweep:
                 pause = (
                     pause_seconds(rng) if workload == "agents" else 40 if workload == "chat" else 0
                 )
-                await asyncio.sleep(min(pause, max(0, deadline - time.perf_counter())))
+                await self.nap(min(pause, max(0, deadline - time.perf_counter())))
 
         async def monitor() -> None:
             while True:
@@ -414,7 +473,8 @@ class Sweep:
             if workload == "agents":
 
                 async def warm(session: Session) -> None:
-                    session.advance(await self.turn(session, counted=False))
+                    with contextlib.suppress(Saturated):
+                        session.advance(await self.turn(session, counted=False))
 
                 tasks = [asyncio.create_task(warm(session)) for session in sessions]
                 await asyncio.gather(*tasks)
@@ -439,7 +499,7 @@ class Sweep:
 
     def summarize(self, people: int) -> ServingLevel:
         duration = time.perf_counter() - self.started
-        observations = self.observations
+        observations = [o for o in self.observations if not o.dropped]
         ttft = [o.ttft for o in observations if o.ttft is not None]
         intervals = [
             (b - a) * 1000 for o in observations for a, b in zip(o.times, o.times[1:], strict=False)
@@ -598,6 +658,7 @@ class ServingMeasurements:
             job.levels = [old for old in job.levels if old.people != level.people] + [level]
 
         last_checkpoint = 0.0
+        saturation = ""
         final, detail = BenchmarkState.failed, "The measurement stopped unexpectedly."
         try:
             for index, people in enumerate(levels):
@@ -620,11 +681,22 @@ class ServingMeasurements:
                 )
                 await observe(level)
                 keep(level)
-                job.knee = knee_for(
-                    job.levels,
-                    job.request.ttftThresholdMs or 1000,
-                    job.request.speedRatioThreshold or 2 / 3,
-                )
+                ttft = job.request.ttftThresholdMs or 1000
+                ratio = job.request.speedRatioThreshold or 2 / 3
+                if sweep.saturated:
+                    # More requests waiting than the key allows: the engine is
+                    # saturated at this level. The knee is the last level before it.
+                    earlier = knee_for(
+                        [old for old in job.levels if old.people != people], ttft, ratio
+                    )
+                    job.knee = earlier and earlier.model_copy(update={"found": True})
+                    saturation = (
+                        f" Stopped at {people} people: more than {sweep.limit} requests "
+                        "were waiting at once, so the engine is saturated."
+                    )
+                    self.save()
+                    break
+                job.knee = knee_for(job.levels, ttft, ratio)
                 self.save()
                 if level.requests and level.errors / level.requests >= 0.05:
                     causes = "; ".join(level.errorCauses)
@@ -641,7 +713,7 @@ class ServingMeasurements:
                     break
             final = BenchmarkState.completed
             job.progress = 1
-            detail = "Measurement completed. " + " ".join(sorted(sweep.notes))
+            detail = "Measurement completed." + saturation + " " + " ".join(sorted(sweep.notes))
         except asyncio.CancelledError:
             final = BenchmarkState.cancelled
             detail = "Measurement cancelled. Partial results were kept."

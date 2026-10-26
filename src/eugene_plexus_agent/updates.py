@@ -75,7 +75,8 @@ FIRST_CHECK_DELAY_SECONDS = 60.0
 _TIMEOUT_SECONDS = 10.0
 _MAX_BYTES = 4 * 1024 * 1024
 _PIN = re.compile(
-    r"^PIN_(AGENT|CONTROL|GATEWAY|DRIVER|LIBRARY|TOOL_DRIVER|UI)=([0-9a-f]{40})\b", re.MULTILINE
+    r"^PIN_(AGENT|CONTROL|GATEWAY|DRIVER|LIBRARY|STORE|TOOL_DRIVER|UI)=([0-9a-f]{40})\b",
+    re.MULTILINE,
 )
 _PIN_NAMES = {
     "AGENT": "agent",
@@ -83,16 +84,18 @@ _PIN_NAMES = {
     "GATEWAY": "gateway",
     "DRIVER": "inference-driver",
     "LIBRARY": "library",
+    "STORE": "store",
     "TOOL_DRIVER": "tool-driver",
     "UI": "ui",
 }
 COMPONENT_NAMES = tuple(_PIN_NAMES.values())
 #: Components an installer or a release from before they existed does not
 #: pin. **Optional in a target, never in an install**: every release up to
-#: v0.1.0-alpha.5 predates the tool-driver (P8), and requiring its pin would
-#: make every one of them unreadable -- no release channel at all -- while
-#: an install that lacks it is simply behind a target that has it.
-ADDED_LATER = frozenset({"tool-driver"})
+#: v0.1.0-alpha.5 predates the tool-driver (P8), and every one up to v0.3
+#: the store (row 53); requiring their pins would make every one of them
+#: unreadable -- no release channel at all -- while an install that lacks
+#: one is simply behind a target that has it.
+ADDED_LATER = frozenset({"tool-driver", "store"})
 REQUIRED_NAMES = tuple(n for n in COMPONENT_NAMES if n not in ADDED_LATER)
 _TAG = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$")
 _FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
