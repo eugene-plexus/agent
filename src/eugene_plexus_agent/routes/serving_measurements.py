@@ -385,6 +385,11 @@ async def start(body: ServingMeasurementRequest, request: Request) -> ServingMea
                             localOnly=True,
                             allowedModels=[AllowedModel(alias)],
                             maxConcurrentRequests=MEASUREMENT_KEY_CONCURRENCY,
+                            # Row 11: past the runtime's slots its requests wait in
+                            # the gateway's line, which holds the whole sweep, as the
+                            # engine's own queue did; refused past 8, a burst's turns
+                            # read as failures rather than as waiting.
+                            maxQueuedRequests=MEASUREMENT_KEY_CONCURRENCY,
                             requestsPerMinute=10000,
                         ),
                     ),

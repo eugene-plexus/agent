@@ -116,6 +116,9 @@ def test_the_key_is_local_only_and_one_model_and_revoked_at_finish(authed_client
     assert key["limits"]["localOnly"]
     assert key["limits"]["allowedModels"] == ["m"]
     assert key["limits"]["maxConcurrentRequests"] == 64
+    # Row 11: the gateway's line holds what the engine's own queue held, so the
+    # sweep's bursts wait their turn there instead of being refused past 8.
+    assert key["limits"]["maxQueuedRequests"] == 64
     assert key["limits"]["requestsPerMinute"] == 10000
     assert (
         datetime.fromisoformat(key["expiresAt"].replace("Z", "+00:00"))
