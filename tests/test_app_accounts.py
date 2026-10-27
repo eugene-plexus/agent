@@ -323,6 +323,13 @@ class FakeRunner:
     def hold(self, app_id: str) -> None:
         self.held.append(app_id)
 
+    def release(self, app_id: str) -> None:
+        if app_id in self.held:
+            self.held.remove(app_id)
+
+    def launched_at(self, app_id: str) -> float | None:
+        return None
+
     def stop(self, app_id: str) -> None:
         self.calls.append("stop")
         self.current = app_accounts.ServiceState("stopped")

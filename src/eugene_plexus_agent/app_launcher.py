@@ -1192,26 +1192,27 @@ def _resume(proc: subprocess.Popen) -> None:
 
 def _spawn_contained(
     spec: dict, argv: list[str], env: dict[str, str]
-) -> tuple[subprocess.Popen, _Job | None, str | None]:
+) -> tuple[subprocess.Popen, _Job | None]:
     """The app's process, and on Windows the job that ends its tree with
-    this launcher. A job that cannot be made is said, and the app runs as
-    before; a process that cannot be let run is ended, and raises."""
+    this launcher. A process that cannot be held in the job, or let run, is
+    ended and the start fails with the cause: an app whose processes can
+    outlive a stop could hold its database while Go back restores it
+    (agent#34's review)."""
     if not WINDOWS:
-        return _spawn(spec, argv, env), None, None
+        return _spawn(spec, argv, env), None
     proc = _spawn(spec, argv, env, suspended=True)
     job: _Job | None = None
-    note = None
     try:
         job = _Job()
         job.hold(proc)
     except OSError as exc:
+        proc.kill()
         if job is not None:
             job.close()
-        job = None
-        note = (
-            f"the app's processes are not tied to this launcher ({exc}); one it starts "
-            "may outlive a stop"
-        )
+        raise OSError(
+            f"its processes could not be tied to this launcher, so a stop could not be "
+            f"sure to end them: {exc}"
+        ) from exc
     try:
         _resume(proc)
     except OSError:
@@ -1219,7 +1220,7 @@ def _spawn_contained(
         if job is not None:
             job.close()
         raise
-    return proc, job, note
+    return proc, job
 
 
 def watch_memory_provider(argv: list[str]) -> int:
@@ -1326,12 +1327,10 @@ def _run(spec: dict, forwarder: Forwarder) -> int:
             pg0_cleanup(spec["argv"][0], "stop", env)
         for note in notes:
             forwarder.add(f"[launcher] {note}")
-        proc, job, held = _spawn_contained(spec, argv, env)
+        proc, job = _spawn_contained(spec, argv, env)
     except (OSError, ValueError) as exc:
         forwarder.add(f"[launcher] could not start the app: {exc}")
         return 1
-    if held:
-        forwarder.add(f"[launcher] {held}")
     try:
         pump = threading.Thread(target=_pump, args=(proc, forwarder), daemon=True)
         pump.start()

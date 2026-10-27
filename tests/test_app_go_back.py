@@ -697,3 +697,377 @@ def test_the_launchers_first_line_names_the_launch(tmp_path: Path) -> None:
     finally:
         ingress.server.shutdown()
     assert ingress.lines[0] == "[launcher] starting tiny 0.11.4 (launch abcdef01)", ingress.lines
+
+
+# --------------------------------------------------------------------- #
+# the review of agent#34: schedules for the two races, and adoption
+# --------------------------------------------------------------------- #
+
+
+class WindowsLike:
+    """A runner with Windows' rules, for the schedules the review named.
+
+    A disabled service is one nothing starts. A crash queues a restart that
+    fires at a chosen moment (`recover_at`: "hold", "state" or "prepare", as
+    that call begins), from the spec on disk then. Start of a service that
+    runs does nothing (1056). `prepare` writes the spec first and enables the
+    service last; `prepare_gate` holds it in the middle.
+    """
+
+    kind = "windows_service"
+
+    def __init__(self, apps_root: Path) -> None:
+        self.apps_root = apps_root
+        self.events: list[str] = []
+        self.enabled = True
+        self.current = app_accounts.ServiceState("stopped")
+        self.loaded: dict[str, Any] | None = None
+        self.pending_recovery = False
+        self.recover_at: str | None = None
+        self.prepare_gate: threading.Event | None = None
+        self.prepare_entered = threading.Event()
+
+    def _spec_file(self, app_id: str) -> Path:
+        return self.apps_root / app_id / app_accounts.SPEC_FILE
+
+    def _moment(self, name: str, app_id: str) -> None:
+        if self.pending_recovery and self.recover_at == name:
+            self.pending_recovery = False
+            if self.enabled and self.current.state not in ("running", "starting"):
+                self.events.append("recovery start")
+                self._run(app_id)
+            else:
+                self.events.append("recovery refused")
+
+    def _run(self, app_id: str) -> None:
+        self.loaded = json.loads(self._spec_file(app_id).read_text(encoding="utf-8"))
+        self.current = app_accounts.ServiceState("running", pid=4242)
+
+    def crash(self) -> None:
+        self.current = app_accounts.ServiceState("failed", exit_code=1)
+        self.loaded = None
+        self.pending_recovery = True
+
+    def hold(self, app_id: str) -> None:
+        self._moment("hold", app_id)
+        self.enabled = False
+        self.events.append("disabled")
+
+    def release(self, app_id: str) -> None:
+        self.enabled = True
+        self.events.append("enabled")
+
+    def state(self, app_id: str) -> app_accounts.ServiceState:
+        self._moment("state", app_id)
+        return self.current
+
+    def launched(self, app_id: str) -> dict | None:
+        try:
+            return json.loads(self._spec_file(app_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def launched_at(self, app_id: str) -> float | None:
+        try:
+            return self._spec_file(app_id).stat().st_mtime
+        except OSError:
+            return None
+
+    def prepare(self, plan: app_accounts.LaunchPlan, spec: dict) -> None:
+        self._moment("prepare", plan.app_id)
+        self.events.append("prepare begins")
+        self.prepare_entered.set()
+        if self.prepare_gate is not None:
+            self.prepare_gate.wait(10)
+        path = self._spec_file(plan.app_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        self.token_file(plan.app_id, plan.data_dir).write_text(plan.admin_token)
+        self.enabled = True
+        self.events.append("prepare ends, enabled")
+
+    def start(self, app_id: str) -> None:
+        if self.current.state in ("running", "starting"):
+            self.events.append("start: it runs already")
+            return
+        if not self.enabled:
+            raise OSError("Windows would not start it: the service is disabled (error 1058)")
+        self.events.append("start")
+        self._run(app_id)
+
+    def stop(self, app_id: str) -> None:
+        self.hold(app_id)
+        self.events.append("stop")
+        self.current = app_accounts.ServiceState("stopped")
+        self.loaded = None
+
+    def remove(self, app_id: str, *, purge: bool) -> None:
+        self.stop(app_id)
+        self.events.append("remove")
+
+    def token_file(self, app_id: str, data_dir: Path) -> Path:
+        return self.apps_root / app_id / app_accounts.ADMIN_TOKEN_FILE
+
+
+def _two_versions(tmp_path: Path) -> tuple[apps.AppStore, apps.InstalledApp, apps.InstalledApp]:
+    store = apps.AppStore(tmp_path / apps.APPS_FILE)
+    old = _record(_manifest(), port=_free_port())
+    new = _record(_manifest(version="v2"), port=old.port)
+    _fake_python(store, old)
+    _fake_python(store, new)
+    return store, old, new
+
+
+def _windows_like(
+    tmp_path: Path, store: apps.AppStore
+) -> tuple[WindowsLike, app_accounts.OwnAccountSupervisor]:
+    scm = WindowsLike(store.root)
+    supervisor = app_accounts.OwnAccountSupervisor(
+        scm,  # type: ignore[arg-type]
+        ingress=lambda: "",
+        data_dir=store.data_dir,
+        key_file=store.key_file,
+    )
+    return scm, supervisor
+
+
+def _as_started(store: apps.AppStore, record: apps.InstalledApp, *, token: str = "kept") -> None:
+    """The spec and token an earlier start of `record` left, as that start wrote them."""
+    port = str(record.port)
+    spec = {
+        "argv": apps.entry_argv(
+            apps.venv_python(store.version_dir(record.id, record.version) / "venv"),
+            record.manifest,
+        ),
+        "version": record.version,
+        "env": {"EUGENE_PLEXUS_APP_BIND_PORT": port},
+        "values": {"port": port, "bindHost": "127.0.0.1"},
+    }
+    path = store.root / record.id / app_accounts.SPEC_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(spec), encoding="utf-8")
+    (store.root / record.id / app_accounts.ADMIN_TOKEN_FILE).write_text(token)
+
+
+def _planner_for(store: apps.AppStore, record: apps.InstalledApp) -> apps._AppPlanner:
+    return apps._AppPlanner(
+        record, store=store, gateway_url=lambda: "http://gw", bind_host=lambda: None
+    )
+
+
+@pytest.mark.parametrize("recover_at", ["hold", "state", "prepare"])
+def test_a_restart_windows_queued_before_a_start_never_runs_the_old_spec(
+    tmp_path: Path, recover_at: str
+) -> None:
+    """Review blocker 2a: an older agent left v1's spec and a crashed service
+    with a restart queued; this start is v2's. Wherever the restart lands --
+    before the agent looks, as it looks, or as preparation begins -- what runs
+    at the end is v2, started from v2's spec."""
+    store, old, new = _two_versions(tmp_path)
+    _as_started(store, old)
+    scm, supervisor = _windows_like(tmp_path, store)
+    scm.crash()
+    scm.recover_at = recover_at
+
+    async def scenario() -> None:
+        supervisor.start(_planner_for(store, new))
+        await supervisor._starting["tiny"]
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())
+    assert _version_of(scm.loaded) == "v2", scm.events
+    assert "start: it runs already" not in scm.events, scm.events
+
+
+@pytest.mark.parametrize("verb", ["stop", "remove"])
+def test_a_stop_during_preparation_waits_for_it_and_leaves_the_app_stopped(
+    tmp_path: Path, verb: str
+) -> None:
+    """Review blocker 2b: a stop (or an uninstall) that comes while a start is
+    preparing waits for that step, thread and all, and the start goes no
+    further. Before, the preparation finished after the stop and enabled the
+    service again."""
+    store, old, _new = _two_versions(tmp_path)
+    scm, supervisor = _windows_like(tmp_path, store)
+    gate = threading.Event()
+    scm.prepare_gate = gate
+
+    async def scenario() -> None:
+        supervisor.start(_planner_for(store, old))
+        await asyncio.to_thread(scm.prepare_entered.wait, 10)
+        stopping = asyncio.create_task(
+            supervisor.stop("tiny") if verb == "stop" else supervisor.remove("tiny", purge=False)
+        )
+        await asyncio.sleep(0.3)
+        waited = not stopping.done()
+        gate.set()
+        await stopping
+        await supervisor.stop_all()
+        assert waited, f"the {verb} did not wait for the preparation: {scm.events}"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        gate.set()
+    assert scm.events.index("prepare ends, enabled") < scm.events.index("stop"), scm.events
+    assert "start" not in scm.events, scm.events
+    assert not scm.enabled and scm.current.state == "stopped", scm.events
+
+
+def test_the_agents_own_stop_waits_for_a_start_in_flight_then_says_what_it_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(app_accounts, "_SHUTDOWN_WAIT_SECONDS", 0.3, raising=False)
+    store, old, _new = _two_versions(tmp_path)
+    scm, supervisor = _windows_like(tmp_path, store)
+    gate = threading.Event()
+    scm.prepare_gate = gate
+
+    async def scenario() -> None:
+        supervisor.start(_planner_for(store, old))
+        await asyncio.to_thread(scm.prepare_entered.wait, 10)
+        with caplog.at_level("WARNING"):
+            await supervisor.stop_all()
+        gate.set()
+        await asyncio.sleep(0.3)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        gate.set()
+    assert "still in prepare" in caplog.text, caplog.text
+    assert "start" not in scm.events, scm.events
+
+
+def test_a_service_still_stopping_is_never_kept(tmp_path: Path) -> None:
+    """Review should-fix 1: an agent killed in a stop left the service
+    stopping; the next start stops it and starts this one."""
+    store, old, _new = _two_versions(tmp_path)
+    _as_started(store, old)
+    scm, supervisor = _windows_like(tmp_path, store)
+    scm.current = app_accounts.ServiceState("stopping", pid=4242)
+
+    async def scenario() -> None:
+        supervisor.start(_planner_for(store, old))
+        await supervisor._starting["tiny"]
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())
+    assert "stop" in scm.events and "prepare begins" in scm.events and "start" in scm.events
+
+
+def test_a_kept_service_an_earlier_agent_held_is_released(tmp_path: Path) -> None:
+    """Review should-fix 1: an agent killed after holding a service that still
+    ran left it disabled. Kept, it is enabled again, so a crash of it is
+    restarted like any other app's."""
+    store, old, _new = _two_versions(tmp_path)
+    _as_started(store, old)
+    scm, supervisor = _windows_like(tmp_path, store)
+    scm.current = app_accounts.ServiceState("running", pid=4242)
+    scm.enabled = False
+
+    async def scenario() -> None:
+        supervisor.start(_planner_for(store, old))
+        await supervisor._starting["tiny"]
+        assert supervisor.admin_token("tiny") == "kept"
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())
+    assert "prepare begins" not in scm.events, "kept, not restarted"
+    assert scm.enabled, scm.events
+
+
+def test_start_starts_a_kept_app_whose_service_has_since_ended(tmp_path: Path) -> None:
+    """Review should-fix 1: Start was a no-op for an app the agent supervised
+    whose service had ended, since it asked only whether the agent had a
+    planner for it."""
+    store, old, _new = _two_versions(tmp_path)
+    _as_started(store, old)
+    scm, supervisor = _windows_like(tmp_path, store)
+    scm.current = app_accounts.ServiceState("running", pid=4242)
+
+    async def scenario() -> None:
+        planner = _planner_for(store, old)
+        supervisor.start(planner)
+        await supervisor._starting["tiny"]
+        scm.current = app_accounts.ServiceState("stopped")
+        await supervisor._poll("tiny")
+        assert not supervisor.is_running("tiny")
+        supervisor.start(planner)
+        await supervisor._starting["tiny"]
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())
+    assert scm.events[-2:] == ["prepare ends, enabled", "start"], scm.events
+
+
+@pytest.mark.parametrize(
+    "owners,started_before_spec,kept",
+    [
+        ({4243}, False, True),
+        ({99999}, False, False),
+        ({4243}, True, False),
+        (set(), False, True),
+    ],
+)
+def test_a_running_service_is_kept_only_if_it_is_what_listens_and_runs_this_spec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owners: set[int],
+    started_before_spec: bool,
+    kept: bool,
+) -> None:
+    """Review should-fix 3: the spec on disk is not proof of what runs. Kept
+    only if the service started after its spec was written, and no process
+    outside the service's own tree listens on its port (nothing listening yet
+    is an app still starting)."""
+    store, old, _new = _two_versions(tmp_path)
+    _as_started(store, old)
+    scm, supervisor = _windows_like(tmp_path, store)
+    scm.current = app_accounts.ServiceState("running", pid=4242)
+    written = scm.launched_at("tiny") or 0.0
+    monkeypatch.setattr(app_accounts, "_process_tree", lambda pid: {4242, 4243}, raising=False)
+    monkeypatch.setattr(app_accounts, "_listener_owners", lambda port: set(owners), raising=False)
+    monkeypatch.setattr(
+        app_accounts,
+        "_process_started",
+        lambda pid: written - 60 if started_before_spec else written + 1,
+        raising=False,
+    )
+
+    async def scenario() -> None:
+        supervisor.start(_planner_for(store, old))
+        await supervisor._starting["tiny"]
+        await supervisor.stop_all()
+
+    asyncio.run(scenario())
+    assert ("prepare begins" not in scm.events) is kept, scm.events
+
+
+def test_a_launcher_that_cannot_hold_the_app_in_a_job_does_not_start_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review should-fix 4: without the job, a process the app starts can
+    outlive a stop and hold its database while Go back restores it."""
+    from eugene_plexus_agent import app_launcher
+
+    class Suspended:
+        pid = 4242
+        killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    child = Suspended()
+
+    class NoJob:
+        def __init__(self) -> None:
+            raise OSError("CreateJobObjectW: access is denied")
+
+    monkeypatch.setattr(app_launcher, "WINDOWS", True)
+    monkeypatch.setattr(app_launcher, "_spawn", lambda *a, **k: child)
+    monkeypatch.setattr(app_launcher, "_resume", lambda proc: None)
+    monkeypatch.setattr(app_launcher, "_Job", NoJob)
+    with pytest.raises(OSError, match="access is denied"):
+        app_launcher._spawn_contained({}, ["x"], {})
+    assert child.killed
