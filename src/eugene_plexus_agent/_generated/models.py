@@ -2706,6 +2706,26 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
+class NodeVersionKind(StrEnum):
+    """
+    - `release`: every commit is the one a published release pins.
+    - `edge`: every commit is the one the Edge marker pins.
+    - `development`: a git checkout; it has no version to match.
+    - `unmatched`: the commits match no release and not Edge: "not a
+      published release".
+    - `unknown`: not matched yet (the first lookup has not run, GitHub
+      could not be read, or the install's commits changed since the
+      last match and the new ones are not matched yet).
+
+    """
+
+    release = 'release'
+    edge = 'edge'
+    development = 'development'
+    unmatched = 'unmatched'
+    unknown = 'unknown'
+
+
 class MachineKeyChangeState(StrEnum):
     """
     * `waiting`: the next key is made and announced beside the
@@ -5710,6 +5730,52 @@ class NodePassphraseResult(BaseModel):
     )
 
 
+class NodeVersion(BaseModel):
+    """
+    What a person calls the version this machine runs (row 75).
+
+    The agent works it out from the seven commits `install` reports,
+    matched against the published release manifests and the Edge
+    marker's pins. It is never a guess: **a version is named only when
+    every installed commit equals the one a release (or Edge) pins.**
+    An install that matches nothing says so (`unmatched`), and the
+    commits stay on `install` for whoever wants them.
+
+    The answer is kept on disk, keyed by the installed commits, so it
+    shows offline and after a restart, and is worked out again when the
+    commits change. `GET /v1/node` never calls GitHub for it: the lookup
+    runs with the update check (a minute after start, then every six
+    hours, and on `POST /v1/node/update/check`), and until the first
+    match the kind is `unknown`, with `error` naming the cause when the
+    lookup failed.
+
+    Absent on an agent from before this field. A reader treats absence
+    as `unknown`; nothing refuses it.
+
+    """
+
+    kind: NodeVersionKind
+    release: str | None = Field(
+        None, description='The release tag (`v0.4.0`). Only for kind `release`.'
+    )
+    publishedAt: AwareDatetime | None = Field(
+        None,
+        description='When the release was published, or, for `edge`, when the Edge\nbuild was made (the date of its specs commit).\n',
+    )
+    specsCommit: str | None = Field(
+        None,
+        description='The specs commit of the Edge build. Only for kind `edge`.',
+        pattern='^[0-9a-f]{40}$',
+    )
+    checkedAt: AwareDatetime | None = Field(
+        None, description='When the commits were last matched.'
+    )
+    error: str | None = Field(
+        None,
+        description='Why the lookup could not finish, and what it was trying to\nreach. For `unknown`, the reason no version is known yet; for\n`unmatched`, why the last recheck failed (the answer stands).\n',
+    )
+
+
 class MachinePort(BaseModel):
     """
     This node's machine port (LT1, `docs/design/tls-between-machines.md`):
@@ -7439,6 +7505,7 @@ class NodeIdentity(BaseModel):
     reach: NodeReach | None = None
     install: NodeInstall | None = None
     update: NodeUpdate | None = None
+    version: NodeVersion | None = None
 
 
 class UnenrollResult(BaseModel):
@@ -7529,7 +7596,7 @@ class MessageContent1(
         TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
     ] = Field(
         ...,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
         min_length=1,
     )
 
@@ -7588,7 +7655,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -7596,7 +7663,7 @@ class Message(BaseModel):
     )
     toolCallId: str | None = Field(
         None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+        description="On a **tool** message: which call this is the result of.\nFor inference-driver requests, `content` carries text; the gateway\nmoves a tool's pictures to the next user message, labelled with\nthis id.\n",
     )
     reasoning: str | None = Field(
         None,

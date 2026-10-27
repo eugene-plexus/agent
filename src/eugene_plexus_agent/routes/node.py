@@ -95,7 +95,7 @@ from ..node_identity import (
 )
 from ..state import AgentState
 from ..trust import BundleRollback
-from .updates import node_update_view
+from .updates import checker_for, node_update_view
 
 log = logging.getLogger(__name__)
 
@@ -304,7 +304,11 @@ async def get_node(request: Request) -> NodeIdentity:
     )
     # What is installed and whether it is behind: from the code itself and
     # the last check, never a network call here -- every console polls this.
-    identity.install, identity.update = await asyncio.to_thread(node_update_view, request)
+    install, identity.update = await asyncio.to_thread(node_update_view, request)
+    identity.install = install
+    # The version a person calls it, from what the update check matched:
+    # memory only, so no GitHub on this path either (row 75).
+    identity.version = checker_for(request.app).version(install)
     return identity
 
 

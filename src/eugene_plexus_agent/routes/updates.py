@@ -27,7 +27,7 @@ from .._generated.models import (
 )
 from ..dependencies import require_operator_session
 from ..state import default_update_channel
-from ..updates import UpdateChecker, valid_ref
+from ..updates import VERSION_FILE, UpdateChecker, valid_ref
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +43,11 @@ def checker_for(app: FastAPI) -> UpdateChecker:
         found = UpdateChecker(
             setting=state.get_config,
             default_channel=lambda: UpdateChannel(default_update_channel()),
+            # Kept beside the update records, so the version shows offline.
+            version_file=update_apply.update_dir(
+                install_info.install_prefix(app.state.settings.config_file)
+            )
+            / VERSION_FILE,
         )
         app.state.update_checker = found
     return found
