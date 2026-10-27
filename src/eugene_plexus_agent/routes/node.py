@@ -74,7 +74,11 @@ from .._generated.models import (
 )
 from .._http import internal_client
 from ..auth_state import AuthState
-from ..dependencies import require_operator_or_service, require_operator_session
+from ..dependencies import (
+    require_operator_or_service,
+    require_operator_session,
+    trust_limit_hours,
+)
 from ..engines.devices import DeviceSnapshot, detect_devices
 from ..enrollment import (
     EnrollmentError,
@@ -95,7 +99,7 @@ from ..node_identity import (
 )
 from ..state import AgentState
 from ..trust import BundleRollback
-from .updates import node_update_view
+from .updates import checker_for, node_update_view
 
 log = logging.getLogger(__name__)
 
@@ -210,6 +214,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
     bundle = trust.bundle if record.enrolled else None
     token_public = tokens.public_b64(trust.signer().key) if record.token_private_key else None
     entry = getattr(request.app.state, "entrypoint_config", None)
+    limit = trust_limit_hours(request)
     return NodeIdentity(
         entrypoint=entry.public_urls() if entry else None,
         enrolled=record.enrolled,
@@ -230,6 +235,9 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         clientTls=_client_tls(request),
         trustBundleVersion=bundle.version if bundle is not None else None,
         trustBundleAgeSeconds=trust.heard_age_seconds() if record.enrolled else None,
+        # Row 46: the limit in effect, and whether it refuses changes now.
+        trustBundleMaxAgeSeconds=trust.limit_in_effect(limit) * 3600 if record.enrolled else None,
+        trustBundleFrozen=trust.frozen_age(limit) is not None if record.enrolled else None,
         tokenPublicKey=token_public,
         controlPublicKey=record.control_public_key if record.enrolled else None,
         signingPublicKey=record.signing_public_key,
@@ -304,7 +312,11 @@ async def get_node(request: Request) -> NodeIdentity:
     )
     # What is installed and whether it is behind: from the code itself and
     # the last check, never a network call here -- every console polls this.
-    identity.install, identity.update = await asyncio.to_thread(node_update_view, request)
+    install, identity.update = await asyncio.to_thread(node_update_view, request)
+    identity.install = install
+    # The version a person calls it, from what the update check matched:
+    # memory only, so no GitHub on this path either (row 75).
+    identity.version = checker_for(request.app).version(install)
     return identity
 
 

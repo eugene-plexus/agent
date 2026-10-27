@@ -26,6 +26,7 @@ import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -52,6 +53,9 @@ from .._http import shared_internal_client
 from ..preparation import PreparationError, Recipe
 from .acquisition import ManagedStore, engine_root
 from .devices import DevicesReader
+
+if TYPE_CHECKING:
+    from ..exec_trust import Verdict
 
 
 def probe_client() -> httpx.AsyncClient:
@@ -151,6 +155,18 @@ class EngineUnavailableError(Exception):
     `SpawnPlanError` by the planner — a declared runtime whose engine is
     missing is a crash, not a silently-skipped entry.
     """
+
+
+class UntrustedBinaryError(EngineUnavailableError):
+    """A program Eugene's own account will not run (row 8, `exec_trust`).
+    `path` is the path as it was named, so a runtime can say which of its
+    settings to change; `verdict` is the check's, which says whether an
+    owner can approve it (part 8c)."""
+
+    def __init__(self, message: str, path: str, verdict: Verdict | None = None) -> None:
+        super().__init__(message)
+        self.path = path
+        self.verdict = verdict
 
 
 @dataclass(frozen=True)
@@ -433,8 +449,9 @@ class EngineAdapter(abc.ABC):
 
         managed = self.managed_store().current()
         if managed is not None:
+            binary = self.trusted(managed.binary)
             return DiscoveredBinary(
-                path=managed.binary,
+                path=binary,
                 origin=Origin.managed,
                 # The recorded build number, not a re-probe: it came off
                 # the release we installed, and spawning the binary on
@@ -453,8 +470,23 @@ class EngineAdapter(abc.ABC):
         The one place a found executable gets inspected, so an adapter
         that learns more than a version from it (a Python engine reads
         its whole environment) overrides this rather than every caller.
+        Every override starts with `path = self.trusted(path)`.
         """
+        path = self.trusted(path)
         return DiscoveredBinary(path=path, origin=origin, version=self.probe_version(path))
+
+    def trusted(self, path: Path) -> Path:
+        """In Eugene's own account, the path to execute: resolved, every
+        folder on the way and the interpreter of a script checked, so a
+        program anyone else can change is never run, not even for its
+        version, and nothing but the checked file runs (row 8,
+        `exec_trust`). Outside it, PATH as given."""
+        from .. import exec_trust
+
+        try:
+            return exec_trust.trusted_program(path)
+        except exec_trust.Untrusted as e:
+            raise UntrustedBinaryError(str(e), str(path), e.verdict) from e
 
     def probe_version(self, binary: Path) -> str | None:
         """Ask the binary what it is. None when it won't say.

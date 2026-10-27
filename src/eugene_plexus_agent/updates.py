@@ -22,6 +22,11 @@ installed from `main` that followed `releases` -- or one installed from a
 commit whose checks were still running -- was told an older build was an
 update.
 
+**The version a person calls it** (row 75) is matched from the same seven
+commits against every published release's manifest and the Edge marker, by
+`VersionResolver`, with the check and never on the node report's path. It
+is kept on disk, keyed by the commits, and never a guess.
+
 **The channel** is `updateChannel` on this agent's config, and when it is
 not saved, the default: `releases`, or what the environment names
 (`EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL`, `edge` in the `:edge`
@@ -38,18 +43,22 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from ._generated.models import (
     InstalledComponentState,
     NodeInstall,
     NodeUpdate,
+    NodeVersion,
+    NodeVersionKind,
     UpdateApply,
     UpdateChannel,
     UpdateChannelSource,
@@ -236,8 +245,15 @@ def newest_edge(get: Fetch = fetch) -> Target:
     )
 
 
-def recent_releases(get: Fetch = fetch, *, limit: int = 5) -> list[Target]:
-    """The newest releases, newest first, each read from its own manifest."""
+def recent_releases(
+    get: Fetch = fetch, *, limit: int = 5, known: dict[str, Target] | None = None
+) -> list[Target]:
+    """The newest releases, newest first, each read from its own manifest.
+
+    `known` holds releases already read, by tag. A published release never
+    changes, so a caller that asks again (the version lookup) reads only the
+    list, and a manifest only the first time it sees one.
+    """
     url = f"{API}/releases?per_page=20"
     body = _get_json(get, url)
     if not isinstance(body, list):
@@ -261,6 +277,9 @@ def recent_releases(get: Fetch = fetch, *, limit: int = 5) -> list[Target]:
         manifest_url = assets.get("manifest.json")
         if not isinstance(manifest_url, str):
             continue
+        if known is not None and release["tag_name"] in known:
+            targets.append(known[release["tag_name"]])
+            continue
         manifest = _get_json(get, manifest_url)
         components = manifest.get("components") if isinstance(manifest, dict) else None
         files = manifest.get("files") if isinstance(manifest, dict) else None
@@ -276,19 +295,20 @@ def recent_releases(get: Fetch = fetch, *, limit: int = 5) -> list[Target]:
                 installers[name] = Installer(asset, digest)
         tag = release["tag_name"]
         specs_commit = manifest.get("specsCommit")
-        targets.append(
-            Target(
-                channel=UpdateChannel.releases,
-                ref=tag,
-                release=tag,
-                specs_commit=specs_commit if isinstance(specs_commit, str) else None,
-                published_at=_timestamp(release.get("published_at")),
-                components={
-                    n: components[n] for n in COMPONENT_NAMES if isinstance(components.get(n), str)
-                },
-                installers=installers,
-            )
+        target = Target(
+            channel=UpdateChannel.releases,
+            ref=tag,
+            release=tag,
+            specs_commit=specs_commit if isinstance(specs_commit, str) else None,
+            published_at=_timestamp(release.get("published_at")),
+            components={
+                n: components[n] for n in COMPONENT_NAMES if isinstance(components.get(n), str)
+            },
+            installers=installers,
         )
+        if known is not None:
+            known[tag] = target
+        targets.append(target)
     return targets
 
 
@@ -399,6 +419,171 @@ def place(install: NodeInstall, target: Target, get: Fetch = fetch) -> Placement
 
 
 # --------------------------------------------------------------------------- #
+# The version a person calls it (row 75)
+# --------------------------------------------------------------------------- #
+
+VERSION_FILE = "version.json"
+#: How many releases a lookup reads. GitHub lists twenty on its first page.
+VERSION_RELEASES = 20
+
+
+def same_build(commits: dict[str, str | None], pins: dict[str, str]) -> bool:
+    """Every component is the commit the target pins, and none is a stray.
+
+    A part the target does not pin (the store, before row 53) must not be
+    installed: an install that has it is newer than that release, never it.
+    """
+    return all(commits.get(name) == pins.get(name) for name in COMPONENT_NAMES)
+
+
+@dataclass(frozen=True)
+class _Matched:
+    commits: dict[str, str | None]
+    version: NodeVersion
+
+
+class VersionResolver:
+    """Names the version this install runs, from its seven commits.
+
+    **A version is named only when every commit equals the one a published
+    release pins, or the Edge marker pins.** Anything else is `unmatched`
+    ("not a published release"), and the commits stay on `NodeInstall`.
+
+    **Never on the node report's path.** `view` reads memory; `resolve` is
+    the only code that reaches GitHub, and runs with the update check, in a
+    thread. Until the first match the answer is `unknown`, and a failed
+    lookup says what it was reading.
+
+    **Kept on disk**, keyed by the commits it was made for, so it shows
+    offline and after a restart. It is used only while the installed commits
+    are the same ones: after an update the answer is `unknown` until the new
+    commits are matched. A match to a release or Edge is final for those
+    commits; `unmatched` is tried again at every check, since a release or an
+    Edge build can be published later from the same commits.
+    """
+
+    def __init__(self, file: Path | None = None) -> None:
+        self._file = file
+        self._lock = threading.Lock()
+        self._loaded = file is None
+        self._matched: _Matched | None = None
+        #: Why the last lookup failed, and for which commits.
+        self._error: tuple[dict[str, str | None], str] | None = None
+        self._releases: dict[str, Target] = {}
+
+    # -- disk ------------------------------------------------------------
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        assert self._file is not None
+        try:
+            body = json.loads(self._file.read_text(encoding="utf-8"))
+            commits = body["commits"]
+            version = NodeVersion.model_validate(body["version"])
+            if isinstance(commits, dict) and all(
+                isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in commits.items()
+            ):
+                self._matched = _Matched(commits, version)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            log.warning("the kept version in %s could not be read: %s", self._file, exc)
+
+    def _save(self, matched: _Matched) -> None:
+        if self._file is None:
+            return
+        try:
+            self._file.parent.mkdir(parents=True, exist_ok=True)
+            body = {
+                "commits": matched.commits,
+                "version": json.loads(matched.version.model_dump_json(exclude_none=True)),
+            }
+            scratch = self._file.with_name(self._file.name + ".tmp")
+            scratch.write_text(json.dumps(body, indent=2), encoding="utf-8", newline="\n")
+            scratch.replace(self._file)
+        except OSError as exc:
+            log.warning("the version could not be kept in %s: %s", self._file, exc)
+
+    # -- what a console reads --------------------------------------------
+
+    def view(self, install: NodeInstall) -> NodeVersion:
+        """No network: what is known for these commits, else `unknown`."""
+        if install.development:
+            return NodeVersion(kind=NodeVersionKind.development)
+        commits = installed_commits(install)
+        with self._lock:
+            self._load()
+            matched, failed = self._matched, self._error
+        error = failed[1] if failed is not None and failed[0] == commits else None
+        if matched is not None and matched.commits == commits:
+            if error and matched.version.kind is NodeVersionKind.unmatched:
+                return matched.version.model_copy(update={"error": error})
+            return matched.version
+        return NodeVersion(kind=NodeVersionKind.unknown, error=error)
+
+    # -- the lookup ------------------------------------------------------
+
+    def resolve(self, install: NodeInstall, get: Fetch = fetch) -> None:
+        """Match the install's commits to a release or Edge. Blocking."""
+        if install.development:
+            return
+        commits = installed_commits(install)
+        with self._lock:
+            self._load()
+            current = self._matched
+        if (
+            current is not None
+            and current.commits == commits
+            and current.version.kind in (NodeVersionKind.release, NodeVersionKind.edge)
+        ):
+            return
+        now = datetime.now(UTC)
+        failures: list[str] = []
+        found: NodeVersion | None = None
+        try:
+            for target in recent_releases(get, limit=VERSION_RELEASES, known=self._releases):
+                if same_build(commits, target.components):
+                    found = NodeVersion(
+                        kind=NodeVersionKind.release,
+                        release=target.release,
+                        publishedAt=target.published_at,
+                        checkedAt=now,
+                    )
+                    break
+        except CheckFailed as exc:
+            failures.append(f"The published releases could not be read: {exc}")
+        if found is None:
+            try:
+                edge = newest_edge(get)
+                if same_build(commits, edge.components):
+                    found = NodeVersion(
+                        kind=NodeVersionKind.edge,
+                        publishedAt=edge.published_at,
+                        specsCommit=edge.specs_commit,
+                        checkedAt=now,
+                    )
+            except CheckFailed as exc:
+                failures.append(str(exc))
+        if found is None and not failures:
+            found = NodeVersion(kind=NodeVersionKind.unmatched, checkedAt=now)
+        with self._lock:
+            if found is not None:
+                self._matched = _Matched(commits, found)
+                self._error = None
+            else:
+                # Not everything could be read: say so, and keep what an
+                # earlier lookup found for these same commits.
+                self._error = (commits, " ".join(failures))
+        if found is not None:
+            self._save(_Matched(commits, found))
+            log.info("this install is %s", found.release or found.kind.value)
+        else:
+            log.warning("the version could not be matched: %s", " ".join(failures))
+
+
+# --------------------------------------------------------------------------- #
 # The checker a node runs
 # --------------------------------------------------------------------------- #
 
@@ -433,9 +618,11 @@ class UpdateChecker:
         setting: Callable[[str], Any],
         get: Fetch = fetch,
         default_channel: Callable[[], UpdateChannel] = lambda: UpdateChannel.releases,
+        version_file: Path | None = None,
     ) -> None:
         self._setting = setting
         self._get = get
+        self._versions = VersionResolver(version_file)
         self._default_channel = default_channel
         self._result: CheckResult | None = None
         self._lock = asyncio.Lock()
@@ -510,7 +697,17 @@ class UpdateChecker:
                         ", ".join(result.placement.ahead),
                     )
             self._result = result
+            # The version is matched on the same visit and never lets it
+            # fail: a lookup that cannot finish says so on the version.
+            try:
+                await asyncio.to_thread(self._versions.resolve, install, self._get)
+            except Exception:  # pragma: no cover - a lookup must never kill the check
+                log.exception("version lookup failed unexpectedly")
             return result
+
+    def version(self, install: NodeInstall) -> NodeVersion:
+        """What this install is called, from what is already known. No network."""
+        return self._versions.view(install)
 
     def result(self) -> CheckResult | None:
         return self._result

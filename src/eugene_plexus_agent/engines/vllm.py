@@ -29,7 +29,7 @@ import os
 import re
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import httpx
 
@@ -192,6 +192,7 @@ class VllmAdapter(EngineAdapter):
     def describe(self, path: Path, origin: Origin) -> DiscoveredBinary:
         """Inspect the console script's environment once, for both the
         version and the `python` block on the descriptor."""
+        path = self.trusted(path)
         env = inspect_python_environment(path)
         return DiscoveredBinary(
             path=path,
@@ -587,6 +588,15 @@ def interpreter_from_shebang(script: Path) -> str | None:
     if not line:
         return None
     parts = line.split()
+    from .. import exec_trust
+
+    if exec_trust.own_account():
+        # Run as Eugene's own account (row 8c), only the absolute
+        # interpreter the check walked: never a bare name PATH or the
+        # folder the probe starts in would choose, never `env`.
+        if not parts[0].startswith("/") or PurePosixPath(parts[0]).name == "env":
+            return None
+        return parts[0]
     if parts[0].endswith("/env") and len(parts) > 1:
         return shutil.which(parts[1])
     return parts[0]

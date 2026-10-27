@@ -64,6 +64,7 @@ from ._generated.models import (
     RuntimeSpec,
 )
 from ._private_files import write_private
+from .trust import DEFAULT_MAX_AGE_HOURS, MAX_AGE_HOURS_KEY, MOST_MAX_AGE_HOURS
 
 #: Written to `agent.yaml` by every write: the format this release writes.
 #: 3 (row 5): the `auth` block may hold `kekSalt` and `wrappedMasterKey`
@@ -159,6 +160,25 @@ CONFIG_FIELDS: list[ConfigField] = [
         # PATCH time (`routes/config.py`), and the mode is read at the next
         # start. The flag put "restart required" on a field no restart was
         # for.
+    ),
+    ConfigField(
+        # Row 46: a limit on frozen trust. Read at every request, so a
+        # change applies at once (`dependencies.refuse_when_frozen`).
+        key=MAX_AGE_HOURS_KEY,
+        label="Refuse other machines' changes after the root is silent for (hours)",
+        description=(
+            "After this long without word from the control root, this machine refuses "
+            "changes that other machines send.\n\n"
+            "Starting, stopping and adding runtimes, and other changes another machine "
+            "sends, are refused. Answers and console sign-ins are not affected. A machine "
+            "cut off from the root still trusts machines removed since then; this limits "
+            "how long. 0: no limit."
+        ),
+        category="security",
+        valueType=ConfigValueType.integer,
+        default=DEFAULT_MAX_AGE_HOURS,
+        minimum=0,
+        maximum=MOST_MAX_AGE_HOURS,
     ),
     ConfigField(
         key="engineBinaryRoots",
@@ -680,6 +700,7 @@ class AgentState:
                 self._auth = dict(raw.get("auth") or {})
                 self._standby_promoted = raw.get("standbyPromoted") is True
                 self._drop_invalid_update_channel_locked()
+                self._drop_invalid_trust_limit_locked()
             else:
                 self._config = _config_defaults()
                 self._components = {}
@@ -788,6 +809,25 @@ class AgentState:
         """
         with self._lock:
             return self._lost_passphrase
+
+    def _drop_invalid_trust_limit_locked(self) -> None:
+        """A saved `maxTrustBundleAgeHours` that is not a whole number of
+        hours in range is ignored, so `GET /v1/config` shows the default
+        that is in effect (row 46). A bad value never stops a start."""
+        field = _CONFIG_FIELDS_BY_KEY[MAX_AGE_HOURS_KEY]
+        saved = self._config.get(MAX_AGE_HOURS_KEY)
+        error = _validate(field, saved)
+        if error is None:
+            return
+        log.warning(
+            "%s %r in %s is ignored (%s); the default, %d hours, applies",
+            MAX_AGE_HOURS_KEY,
+            saved,
+            self._path,
+            error,
+            DEFAULT_MAX_AGE_HOURS,
+        )
+        self._config[MAX_AGE_HOURS_KEY] = DEFAULT_MAX_AGE_HOURS
 
     def _drop_invalid_update_channel_locked(self) -> None:
         """An unsaved channel is the default; a saved one that is not a

@@ -23,6 +23,7 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, FastAPI
 
@@ -32,6 +33,7 @@ from . import (
     companions,
     default_topology,
     enrollment,
+    exec_approvals,
     firewall_follow,
     host_allowlist,
     install_info,
@@ -63,6 +65,7 @@ from .routes import components as components_routes
 from .routes import config as config_routes
 from .routes import directories as directories_routes
 from .routes import entrypoint as entrypoint_routes
+from .routes import exec_approvals as exec_approval_routes
 from .routes import health as health_routes
 from .routes import log_ingress as log_ingress_routes
 from .routes import logs as logs_routes
@@ -82,6 +85,16 @@ from .supervisor import Supervisor
 from .trust import BUNDLE_FILE, NodeTrust
 
 log = logging.getLogger(__name__)
+
+
+async def _apps_boot(manager: Any) -> None:
+    """Rebuild what a move left without an environment, then start the
+    apps the operator left running (row 8)."""
+    try:
+        await manager.rebuild_moved()
+    except Exception:  # pragma: no cover - defensive: boot goes on
+        log.exception("could not rebuild the apps a move left")
+    await manager.start_enabled()
 
 
 @asynccontextmanager
@@ -113,6 +126,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # `AgentState.load_or_degrade` for what a failure preserves.
         config_error = state.load_or_degrade()
     app.state.agent_state = state
+    # The programs an owner approved for Eugene's own account (row 8, part
+    # 8c), kept beside the agent's own state, before anything is started.
+    exec_approvals.configure(settings.config_file.parent)
     app.state.safe_mode = settings.safe_mode
     # Strata's install says when this node's copy folder is on a slow drive
     # (LS7): its installer is one per engine, so it learns the config once.
@@ -607,7 +623,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # is down must not hold up supervision of the hub itself.
     apps_task: asyncio.Task[None] | None = None
     if app_manager is not None:
-        apps_task = asyncio.create_task(app_manager.start_enabled(), name="apps-boot")
+        apps_task = asyncio.create_task(_apps_boot(app_manager), name="apps-boot")
 
     # **Where this host is, said out loud on every boot.** Before M9 the
     # address was announced once, at enrollment, so a host that rebooted
@@ -656,6 +672,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         None
         if settings.safe_mode
         else asyncio.create_task(RunWorker(app).run_forever(), name="run-operations")
+    )
+    # Engine builds a move to the Mac's daemon could not check against
+    # their record, fetched again from upstream (row 8, R8-ENGINES-COPY).
+    from .runtimes import refetch_listed_builds
+
+    refetch_task = (
+        None
+        if settings.safe_mode
+        else asyncio.create_task(refetch_listed_builds(), name="engine-refetch")
     )
     from .site_host import SiteHostSupervisor
 
@@ -708,10 +733,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             update_all.manager(app).resume()
         yield
     finally:
+        exec_approvals.configure(None)
         all_updates = getattr(app.state, "update_all", None)
         if all_updates is not None:
             await all_updates.close()
-        for task in (approval_task, sign_in_task, firewall_task, history_task, ollama_task):
+        for task in (
+            approval_task,
+            sign_in_task,
+            firewall_task,
+            history_task,
+            ollama_task,
+            refetch_task,
+        ):
             if task is not None:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -1198,6 +1231,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # — or, from M6, the gateway's own token, because it is the one
     # component that sees demand.
     app.include_router(runtimes_routes.router)
+    # Programs an owner approved for Eugene's own account (row 8, part 8c).
+    # Operator-only on every route; declared on the router.
+    app.include_router(exec_approval_routes.router)
     app.include_router(benchmark_routes.router)
     app.include_router(profile_build_routes.router)
     app.include_router(serving_measurement_routes.router)

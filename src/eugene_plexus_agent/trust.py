@@ -22,28 +22,130 @@ tokens for other machines and the root, and `gateway` tokens for other
 machines only with the grant the operator's join token gave it. The
 verifier on the far side checks the same thing again, so this is a
 courtesy, not the boundary.
+
+**A limit on frozen trust** (row 46, `specs/docs/design/rows/row-46.md`).
+A node cut off from the root keeps its last bundle, so a machine removed
+since then still verifies here. Past `maxTrustBundleAgeHours` (default
+24, 0 for none) without word from the root, the agent refuses a token
+signed by another machine's key on every route that changes something
+(`dependencies.refuse_when_frozen`).
+
+**Word from the root** is a bundle this node pulled from the root over a
+channel only the root can answer (machine TLS pinned to the root's key,
+or loopback), or a newer bundle from anywhere, counted from when the root
+signed it. A signed bundle proves who signed it and when, never that the
+root is alive now: the push door takes no bearer, and a party in the
+middle of a plain HTTP pull can answer with the bundle it saw last. So a
+copy of the held bundle, pushed or pulled in plain HTTP, is not word.
+
+**The time of the last word is its own record** (`trust_heard.json`),
+written only when there is word, never read off the bundle file: that
+file is rewritten whenever any bundle is taken, a replay included.
+
+**With no authenticated channel to the root the limit is not enforced**:
+a live root reached in plain HTTP whose bundle does not change would
+otherwise freeze its machines after a day. The setting says so.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
-from . import tokens
+import httpx
+
+from . import _http, tokens
+from ._private_files import write_private
 from .node_identity import NodeIdentityStore
 
 log = logging.getLogger(__name__)
 
 BUNDLE_FILE = "trust_bundle.json"
+#: Row 46: when this node last had word from the root, and when its last
+#: pull was answered by whatever answers at the root's address.
+HEARD_FILE = "trust_heard.json"
 STANDALONE_RECIPIENT = tokens.node_recipient(tokens.STANDALONE_NODE)
 
 #: Pauses before writing the bundle file again when another process has it
 #: open: Windows refuses to replace a file anyone holds (WinError 5 or 32),
 #: and every component this agent runs reads that file.
 SAVE_RETRY_DELAYS_SECONDS = (0.05, 0.15)
+
+#: Row 46: the agent setting that limits frozen trust, its default, and its
+#: ceiling (a year). 0 is no limit.
+MAX_AGE_HOURS_KEY = "maxTrustBundleAgeHours"
+DEFAULT_MAX_AGE_HOURS = 24
+MOST_MAX_AGE_HOURS = 8760
+
+
+def max_age_hours(value: object) -> int:
+    """The limit in effect for a saved value: the value when it is a whole
+    number of hours in range, else the default. The state drops a bad value
+    at load with a warning, so this is only the last guard."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return DEFAULT_MAX_AGE_HOURS
+    if value < 0 or value > MOST_MAX_AGE_HOURS:
+        return DEFAULT_MAX_AGE_HOURS
+    return value
+
+
+def silence_words(seconds: int) -> str:
+    """`31 hours`, `3 days`: how long the root has been silent, in the words
+    the console's own warning uses."""
+    hours = seconds / 3600
+    if hours < 1.5:
+        minutes = max(1, round(seconds / 60))
+        return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+    if hours < 36:
+        return f"{round(hours)} hours"
+    return f"{round(hours / 24)} days"
+
+
+def frozen_refusal(seconds: int) -> str:
+    """The one sentence a refused change carries (row 46)."""
+    return (
+        f"This machine has not heard from the root for {silence_words(seconds)}, so it takes "
+        "no changes from other machines. Check its network to the root."
+    )
+
+
+#: What the setting says when the limit cannot be kept (row 46).
+NOT_ENFORCED = "Not enforced: this machine reaches the root without encryption."
+
+
+def channel_authenticated(url: str) -> bool:
+    """Whether an answer from `url` can only come from the root (row 46):
+    loopback, which never leaves this machine, or a machine port this node
+    holds the root's pins for, directly or by the route its machine table
+    carries a plain address on. Plain HTTP across a network is not."""
+    try:
+        parsed = httpx.URL(url)
+    except (httpx.InvalidURL, TypeError):
+        return False
+    host = (parsed.host or "").strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return True
+    except ValueError:
+        pass
+    return _http.machine_pinned(url) or _http.machine_route(url) is not None
+
+
+def _age(at: float | None, perf: float | None, now: float | None) -> int | None:
+    """Seconds since `at`: the longer of the wall clock's count and this
+    process's own, so a clock set back cannot shorten it while it runs."""
+    if at is None:
+        return None
+    wall = (time.time() if now is None else now) - at
+    held = time.perf_counter() - perf if perf is not None else 0.0
+    return max(0, int(max(wall, held)))
 
 
 class BundleRollback(Exception):
@@ -62,10 +164,18 @@ class NodeTrust:
         self._path = bundle_path
         self._lock = threading.Lock()
         self._bundle: tokens.TrustBundle | None = None
-        # When this node last took the root's bundle. Not the bundle's
-        # `iat`: a pull returns the same signed bundle until something
-        # changes, so on a quiet install that grows without bound.
-        self._heard_at: float | None = None
+        # Row 46. When this node last had word from the root (module
+        # docstring), and when its last pull was answered at all. Not the
+        # bundle's `iat`: a pull returns the same signed bundle until
+        # something changes, so on a quiet install that grows without
+        # bound. Each with the same moment on this process's own clock, so
+        # a wall clock set back cannot make the silence shorter while the
+        # process runs (`perf_counter`, never `monotonic`). Kept in
+        # `HEARD_FILE`, never derived from the bundle file.
+        self._word_at: float | None = None
+        self._word_perf: float | None = None
+        self._pulled_at: float | None = None
+        self._pulled_perf: float | None = None
         # The bundle held in memory but not yet on disk. The components
         # read the file, so it is written again until it is there.
         self._unsaved: tokens.TrustBundle | None = None
@@ -135,15 +245,22 @@ class NodeTrust:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             log.error("the kept trust bundle at %s was refused: %s", self._path, exc)
             return
-        try:
-            heard = self._path.stat().st_mtime
-        except OSError:
-            heard = None
+        word, pulled = self._read_heard()
+        now = time.time()
+        if word is None:
+            # No record: the first start after row 46, a node that has just
+            # joined (its bundle was signed for the join), or a record lost.
+            # The root's state is known as of its signature and no later;
+            # the bundle file's own time says only when something last wrote
+            # it, a replay included.
+            word = min(now, float(bundle.iat))
+        perf = time.perf_counter()
         with self._lock:
             self._bundle = bundle
-            # The kept file is rewritten every time a bundle is taken, so
-            # its time is when this node last heard, across a restart.
-            self._heard_at = heard
+            self._word_at = word
+            self._word_perf = perf - max(0.0, now - word)
+            self._pulled_at = pulled
+            self._pulled_perf = None if pulled is None else perf - max(0.0, now - pulled)
         log.info(
             "trust bundle %d loaded (epoch %d, %d keys)",
             bundle.version,
@@ -166,26 +283,101 @@ class NodeTrust:
         self._install(bundle)
         return bundle
 
-    def accept(self, jws: str) -> tokens.TrustBundle:
+    def accept(self, jws: str, *, pulled: bool = False) -> tokens.TrustBundle:
         """A bundle from the control root, by push or pull.
 
         Raises `tokens.BundleError` for a bad signature, `BundleRollback`
         for a bundle older than the one held (by epoch or version), and
         `FencedError` for an epoch below the one this node recorded --
         the fence that still holds when the kept bundle has been lost.
-        Each leaves the held bundle alone.
+        Each leaves the held bundle alone, and the time last heard too.
+
+        **What counts as word from the root** (row 46, module docstring).
+        `pulled`: this node asked at the root's own address (the minute's
+        pull). Over a channel only the root can answer
+        (`root_channel_authenticated`) that is word now, whatever bundle it
+        holds. Anything else -- a push, through a door that takes no
+        bearer, or a pull in plain HTTP, which a party in the middle can
+        answer -- counts only when the bundle is newer than the one held,
+        and only from the time the root signed it. A pull in plain HTTP
+        still says the root's address answered (`heard_age_seconds`).
         """
         if not self.enrolled:
             raise tokens.BundleError("this node is not enrolled, so it trusts no control root")
         offered = tokens.parse_bundle(jws, authority=self.authority)
-        why = tokens.accepts_replacement(self.bundle, offered)
+        held = self.bundle
+        why = tokens.accepts_replacement(held, offered)
         if why is not None:
             raise BundleRollback(why)
+        newer = held is None or (offered.epoch, offered.version) > (held.epoch, held.version)
+        authenticated = pulled and self.root_channel_authenticated()
         self._identity.accept_epoch(offered.epoch)
         self._install(offered)
+        now, perf = time.time(), time.perf_counter()
+        changed = False
         with self._lock:
-            self._heard_at = time.time()
+            if authenticated:
+                # Unconditionally: after a clock set back, `now` is below
+                # the time kept, and the root still answered just now.
+                self._word_at, self._word_perf = now, perf
+                changed = True
+            elif newer:
+                signed = min(now, float(offered.iat))
+                if self._word_at is None or signed > self._word_at:
+                    self._word_at, self._word_perf = signed, perf - (now - signed)
+                    changed = True
+            if pulled:
+                self._pulled_at, self._pulled_perf = now, perf
+                changed = True
+        if changed:
+            self._write_heard()
         return offered
+
+    def root_channel_authenticated(self) -> bool:
+        """Whether this node reaches its root on a channel only the root can
+        answer (`channel_authenticated`). Without one the limit is not
+        enforced: a pull cannot be told from a replay (row 46)."""
+        record = self._identity.record
+        if not record.enrolled or not record.control_url:
+            return False
+        return channel_authenticated(str(record.control_url))
+
+    # ----- the record of the last word (row 46) ---------------------------
+
+    @property
+    def heard_path(self) -> Path:
+        return self._path.with_name(HEARD_FILE)
+
+    def _read_heard(self) -> tuple[float | None, float | None]:
+        """`(word, pulled)` as kept; Nones when there is no usable record."""
+        try:
+            document: Any = json.loads(self.heard_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None, None
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "the record of the root's last word at %s is unreadable: %s", self.heard_path, exc
+            )
+            return None, None
+
+        def stamp(name: str) -> float | None:
+            value = document.get(name) if isinstance(document, dict) else None
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                return None
+            return float(value)
+
+        return stamp("wordAt"), stamp("pulledAt")
+
+    def _write_heard(self) -> None:
+        """Keep the times last heard. A write that fails leaves them in
+        memory only: a restart then counts from an older time, never a
+        newer one."""
+        with self._lock:
+            document = {"wordAt": self._word_at, "pulledAt": self._pulled_at}
+        try:
+            write_private(self.heard_path, json.dumps(document))
+        except OSError as exc:
+            log.warning("could not keep the root's last word at %s: %s", self.heard_path, exc)
 
     def _install(self, bundle: tokens.TrustBundle) -> None:
         with self._lock:
@@ -239,16 +431,71 @@ class NodeTrust:
         """Un-enrolled: drop the root's bundle; the caller becomes standalone."""
         with self._lock:
             self._bundle = None
-            self._heard_at = None
+            self._word_at = self._word_perf = None
+            self._pulled_at = self._pulled_perf = None
+        try:
+            self.heard_path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("could not remove %s: %s", self.heard_path, exc)
+
+    def word_age_seconds(self, *, now: float | None = None) -> int | None:
+        """Seconds since this node last had word from the root (row 46); None
+        when it has joined nothing and has no root to hear from."""
+        if not self.enrolled:
+            return None
+        with self._lock:
+            at, perf = self._word_at, self._word_perf
+        return _age(at, perf, now)
 
     def heard_age_seconds(self, *, now: float | None = None) -> int | None:
-        """Seconds since this node last took the root's bundle; None if never,
-        or when it has joined nothing and has no root to hear from."""
-        with self._lock:
-            heard = self._heard_at
-        if heard is None or not self.enrolled:
+        """Seconds since this node last heard from the root, as reported
+        (`trustBundleAgeSeconds`); None if never, or when it has joined
+        nothing and has no root to hear from.
+
+        With an authenticated channel to the root, the word's age: what the
+        limit counts. Without one, since the root's address last answered a
+        pull too, which is all plain HTTP can say, and the limit is not
+        enforced. The longer of the wall clock's count and this process's
+        own (`_age`): a suspended Linux machine, whose process clock stops,
+        still counts the days it slept."""
+        if not self.enrolled:
             return None
-        return max(0, int((time.time() if now is None else now) - heard))
+        if self.root_channel_authenticated():
+            return self.word_age_seconds(now=now)
+        with self._lock:
+            ages = [
+                _age(self._word_at, self._word_perf, now),
+                _age(self._pulled_at, self._pulled_perf, now),
+            ]
+        known = [age for age in ages if age is not None]
+        return min(known) if known else None
+
+    def limit_in_effect(self, limit_hours: int) -> int:
+        """The limit, in hours, this node keeps: none (0) when the setting is
+        0, or when no authenticated channel reaches the root (row 46)."""
+        if limit_hours <= 0 or not self.enrolled or not self.root_channel_authenticated():
+            return 0
+        return limit_hours
+
+    def frozen_age(self, limit_hours: int, *, now: float | None = None) -> int | None:
+        """The root's silence in seconds when it is past the limit in effect,
+        else None: no limit, joined nothing, no authenticated channel to the
+        root, or word from it in time (row 46)."""
+        limit = self.limit_in_effect(limit_hours)
+        if limit <= 0:
+            return None
+        age = self.word_age_seconds(now=now)
+        if age is None or age <= limit * 3600:
+            return None
+        return age
+
+    def minted_elsewhere(self, claims: tokens.Claims) -> bool:
+        """A token another machine's key signed: not the control root's, not
+        this machine's own. `verify` already bound `iss` to the key that
+        signed it, so neither can be claimed by a third key. Anything else
+        a future bundle names (a site's key, a key nobody planned for) is
+        another machine's too."""
+        return claims.iss not in (tokens.ISSUER_CONTROL, self.recipient)
 
     # ----- verifying ------------------------------------------------------
 

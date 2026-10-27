@@ -27,6 +27,17 @@ from eugene_plexus_agent._generated.models import AppOrigin
 from tests.test_apps import _commit, _fake_python, _manager, _manifest, _record
 
 
+@pytest.fixture(autouse=True)
+def _no_real_processes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake service manager's PIDs are not this machine's processes: the
+    keep check must not read a real process that happens to have one, or a
+    real listener on the app's port (agent#41). A test that is about that
+    check sets these itself."""
+    monkeypatch.setattr(app_accounts, "_process_started", lambda pid: None)
+    monkeypatch.setattr(app_accounts, "_process_tree", lambda pid: {pid})
+    monkeypatch.setattr(app_accounts, "_listener_owners", lambda port: set())
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

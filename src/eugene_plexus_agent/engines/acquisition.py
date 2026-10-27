@@ -710,6 +710,7 @@ class ManagedStore:
         )
 
     def write_metadata(self, directory: Path, *, version: str, variant: str, binary: Path) -> None:
+        files, links = build_record(directory, self.METADATA_NAME)
         payload = {
             "version": version,
             "variant": variant,
@@ -718,6 +719,13 @@ class ManagedStore:
             "binary": str(binary.relative_to(directory)),
             "installedAt": datetime.now(UTC).isoformat(),
             "sizeBytes": _directory_size(directory),
+            # What the verified archives unpacked to, file by file, so a
+            # copy of this build can be checked later: the move of a Mac's
+            # per-user install to its daemon keeps a copied build only
+            # when every file matches (row 8, R8-ENGINES-COPY). Paths are
+            # relative and `/`-separated; a link's value is its target.
+            "files": files,
+            "links": links,
         }
         (directory / self.METADATA_NAME).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -734,6 +742,33 @@ class ManagedStore:
                 # process that hasn't fully exited.
                 log.warning("could not prune %s: %s", build.directory, e)
         return removed
+
+
+def build_record(directory: Path, skip: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Every file under DIRECTORY with its `sha256:<hex>`, and every link
+    with its target, by `/`-separated path relative to DIRECTORY; SKIP (the
+    build's own install record) left out. Links are recorded, never
+    followed."""
+    files: dict[str, str] = {}
+    links: dict[str, str] = {}
+    for current, dirnames, filenames in os.walk(directory):
+        base = Path(current)
+        for name in list(dirnames):
+            if (base / name).is_symlink():
+                links[(base / name).relative_to(directory).as_posix()] = Path(
+                    os.readlink(base / name)
+                ).as_posix()
+                dirnames.remove(name)
+        for name in filenames:
+            path = base / name
+            relative = path.relative_to(directory).as_posix()
+            if relative == skip:
+                continue
+            if path.is_symlink():
+                links[relative] = Path(os.readlink(path)).as_posix()
+            elif path.is_file():
+                files[relative] = "sha256:" + _sha256(path)
+    return files, links
 
 
 def _directory_size(directory: Path) -> int:
@@ -811,6 +846,15 @@ class EngineInstaller:
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    async def wait(self) -> EngineInstall | None:
+        """Until the install in flight, if any, has ended; how it ended.
+        Cancelling the caller leaves the install running."""
+        task = self._task
+        if task is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+        return self.snapshot()
 
     def snapshot(self) -> EngineInstall | None:
         return self._progress.snapshot() if self._progress is not None else None

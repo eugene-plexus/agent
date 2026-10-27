@@ -890,3 +890,185 @@ def test_an_install_without_the_tool_driver_is_behind_a_target_that_pins_it() ->
     target = updates.Target(channel=UpdateChannel.edge, ref=SPECS_OK, components=NEW)
     older = dict(NEW) | {"tool-driver": None}
     assert updates.place(_install(older), target, Web({})).behind == ["tool-driver"]
+
+
+# --------------------------------------------------------------------------- #
+# Row 75: the version a person calls it
+# --------------------------------------------------------------------------- #
+
+KIND = updates.NodeVersionKind
+DOWNLOADS = "https://github.com/eugene-plexus/specs/releases/download"
+#: An Edge build that is neither release in `_releases_web`.
+EDGE = {name: f"{0xC0 + i:02x}" * 20 for i, name in enumerate(updates.COMPONENT_NAMES)}
+
+
+def _web_for_version() -> Web:
+    """Releases alpha.2 (the `SHA` commits) and alpha.3 (`NEW`), and an Edge
+    marker whose pins are `EDGE`."""
+    web = _releases_web()
+    web.pages |= _edge_web(EDGE).pages | _dates((EDGE, NEW_DATE))
+    return web
+
+
+def test_commits_that_a_release_pins_name_that_release(tmp_path: Path) -> None:
+    resolver = updates.VersionResolver(tmp_path / "version.json")
+    install = _install(NEW)
+    # Before any lookup nothing is claimed.
+    assert resolver.view(install).kind is KIND.unknown
+    resolver.resolve(install, _web_for_version())
+    found = resolver.view(install)
+    assert found.kind is KIND.release and found.release == "v0.1.0-alpha.3"
+    assert found.publishedAt is not None and found.checkedAt is not None
+
+
+def test_commits_that_the_edge_marker_pins_say_edge_and_when_it_was_built(tmp_path: Path) -> None:
+    resolver = updates.VersionResolver(tmp_path / "version.json")
+    install = _install(EDGE)
+    resolver.resolve(install, _web_for_version())
+    found = resolver.view(install)
+    assert found.kind is KIND.edge and found.release is None
+    assert found.specsCommit == SPECS_OK
+    assert found.publishedAt == datetime.fromisoformat(NEW_DATE)
+
+
+def test_commits_that_match_nothing_are_not_a_published_release(tmp_path: Path) -> None:
+    """One commit off a release is not that release: nothing is invented."""
+    resolver = updates.VersionResolver(tmp_path / "version.json")
+    install = _install(NEW | {"gateway": "e" * 40})
+    resolver.resolve(install, _web_for_version())
+    found = resolver.view(install)
+    assert found.kind is KIND.unmatched and found.release is None and found.error is None
+
+
+def test_a_development_checkout_is_named_without_a_lookup(tmp_path: Path) -> None:
+    web = Web({})
+    resolver = updates.VersionResolver(tmp_path / "version.json")
+    install = _install(development=True)
+    resolver.resolve(install, web)
+    assert resolver.view(install).kind is KIND.development and web.asked == []
+
+
+def test_a_match_is_kept_for_an_offline_restart(tmp_path: Path) -> None:
+    file = tmp_path / "update" / "version.json"
+    updates.VersionResolver(file).resolve(_install(NEW), _web_for_version())
+    assert file.is_file()
+    after_restart = updates.VersionResolver(file)
+    found = after_restart.view(_install(NEW))
+    assert found.kind is KIND.release and found.release == "v0.1.0-alpha.3"
+    # A release match is final for its commits: no lookup, offline or not.
+    offline = Web({RELEASES_URL: OSError("offline")})
+    after_restart.resolve(_install(NEW), offline)
+    assert offline.asked == []
+    assert after_restart.view(_install(NEW)).release == "v0.1.0-alpha.3"
+
+
+def test_a_kept_answer_is_never_shown_for_other_commits(tmp_path: Path) -> None:
+    file = tmp_path / "version.json"
+    updates.VersionResolver(file).resolve(_install(NEW), _web_for_version())
+    after_update = updates.VersionResolver(file)
+    # The install moved to other commits: the kept answer is not for them.
+    assert after_update.view(_install(SHA)).kind is KIND.unknown
+    after_update.resolve(_install(SHA), _web_for_version())
+    assert after_update.view(_install(SHA)).release == "v0.1.0-alpha.2"
+    assert after_update.view(_install(NEW)).kind is KIND.unknown
+
+
+def test_a_failed_lookup_is_unknown_and_names_the_cause(tmp_path: Path) -> None:
+    resolver = updates.VersionResolver(tmp_path / "version.json")
+    install = _install(NEW)
+    resolver.resolve(install, Web({RELEASES_URL: OSError("Connection refused")}))
+    found = resolver.view(install)
+    assert found.kind is KIND.unknown
+    assert found.error and "releases" in found.error and "Connection refused" in found.error
+    assert not (tmp_path / "version.json").exists()  # nothing was matched, nothing kept
+    # The next lookup that works clears it.
+    resolver.resolve(install, _web_for_version())
+    assert resolver.view(install).kind is KIND.release
+    assert resolver.view(install).error is None
+
+
+def test_an_unmatched_answer_stands_when_a_recheck_cannot_read_github(tmp_path: Path) -> None:
+    resolver = updates.VersionResolver(tmp_path / "version.json")
+    install = _install(NEW | {"gateway": "e" * 40})
+    resolver.resolve(install, _web_for_version())
+    resolver.resolve(install, Web({RELEASES_URL: OSError("timed out")}))
+    found = resolver.view(install)
+    assert found.kind is KIND.unmatched and found.error and "timed out" in found.error
+
+
+def test_unmatched_is_tried_again_and_matches_a_release_published_later(tmp_path: Path) -> None:
+    resolver = updates.VersionResolver(tmp_path / "version.json")
+    install = _install(NEW | {"ui": "d" * 40})
+    web = _web_for_version()
+    resolver.resolve(install, web)
+    assert resolver.view(install).kind is KIND.unmatched
+    # A release is published from exactly these commits.
+    web.pages[RELEASES_URL].append(
+        {
+            "tag_name": "v0.2.0",
+            "draft": False,
+            "published_at": "2026-10-01T00:00:00Z",
+            "assets": [
+                {
+                    "name": "manifest.json",
+                    "browser_download_url": f"{DOWNLOADS}/v0.2.0/manifest.json",
+                }
+            ],
+        }
+    )
+    web.pages[f"{DOWNLOADS}/v0.2.0/manifest.json"] = {
+        "components": NEW | {"ui": "d" * 40},
+        "files": {},
+    }
+    resolver.resolve(install, web)
+    assert resolver.view(install).release == "v0.2.0"
+
+
+def test_a_release_manifest_is_read_once() -> None:
+    resolver = updates.VersionResolver()
+    web = _web_for_version()
+    install = _install(NEW | {"ui": "d" * 40})
+    resolver.resolve(install, web)
+    resolver.resolve(install, web)
+    manifests = [u for u in web.asked if u.endswith("manifest.json")]
+    assert len(manifests) == 2 and len(set(manifests)) == 2
+
+
+def test_an_install_with_a_part_the_release_lacks_is_not_that_release() -> None:
+    """The store joined at row 53: an install that has it is newer than a
+    release that does not pin it, never that release."""
+    resolver = updates.VersionResolver()
+    web = _web_for_version()
+    older = {n: c for n, c in NEW.items() if n != "store"}
+    web.pages[f"{DOWNLOADS}/v0.1.0-alpha.3/manifest.json"] = {"components": older, "files": {}}
+    resolver.resolve(_install(older), web)
+    assert resolver.view(_install(older)).release == "v0.1.0-alpha.3"
+    resolver.resolve(_install(NEW), web)
+    assert resolver.view(_install(NEW)).kind is KIND.unmatched
+
+
+async def test_the_check_matches_the_version_and_a_new_install_rechecks(tmp_path: Path) -> None:
+    checker = updates.UpdateChecker(
+        setting={}.get, get=_web_for_version(), version_file=tmp_path / "v.json"
+    )
+    assert checker.version(_install(NEW)).kind is KIND.unknown
+    await checker.check(_install(NEW))
+    assert checker.version(_install(NEW)).release == "v0.1.0-alpha.3"
+    # The install's commits changed (an update): the old answer is not shown
+    # for them, and the next check names them.
+    assert checker.version(_install(SHA)).kind is KIND.unknown
+    await checker.check(_install(SHA))
+    assert checker.version(_install(SHA)).release == "v0.1.0-alpha.2"
+
+
+def test_get_node_reports_the_version_without_calling_github(
+    authed_client: TestClient, monkeypatch
+) -> None:
+    web = _web_for_version()
+    _checked(authed_client, _install(NEW), web, monkeypatch)
+    before = authed_client.get("/v1/node").json()
+    assert before["version"] == {"kind": "unknown"} and web.asked == []
+    authed_client.post("/v1/node/update/check")
+    after = authed_client.get("/v1/node").json()
+    assert after["version"]["kind"] == "release"
+    assert after["version"]["release"] == "v0.1.0-alpha.3"
