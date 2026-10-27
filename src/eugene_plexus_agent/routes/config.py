@@ -31,7 +31,7 @@ from .._generated.common_models import (
 from .._generated.models import LibraryFolderCheckRequest, LibraryFolderReach
 from ..admission import model_size_bytes
 from ..state import AgentState
-from ..trust import MAX_AGE_HOURS_KEY, frozen_refusal, max_age_hours
+from ..trust import MAX_AGE_HOURS_KEY, NOT_ENFORCED, frozen_refusal, max_age_hours
 from .runtimes import folder_cache_for, library_client_for, refresh_library_folders
 
 log = logging.getLogger(__name__)
@@ -104,6 +104,8 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
     trust = request.app.state.auth_state.trust
     return {
         "enrolled": record.enrolled,
+        "trust_limit": max_age_hours(state.get_config(MAX_AGE_HOURS_KEY)),
+        "trust_authenticated": trust.root_channel_authenticated(),
         "trust_frozen": trust.frozen_age(max_age_hours(state.get_config(MAX_AGE_HOURS_KEY))),
         "derived_advertise": (
             node_identity.effective_advertise_url(None, record.advertise_url)
@@ -217,6 +219,12 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
             update["status"] = ConfigFieldStatus(
                 level=ConfigFieldStatusLevel.info,
                 text="This machine has joined no install, so there is no root to hear from.",
+            )
+        elif live["trust_limit"] > 0 and not live["trust_authenticated"]:
+            # A pull in plain HTTP cannot be told from a replay, and a live
+            # root whose bundle does not change would freeze this machine.
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning, text=NOT_ENFORCED
             )
         elif live["trust_frozen"] is not None:
             update["status"] = ConfigFieldStatus(

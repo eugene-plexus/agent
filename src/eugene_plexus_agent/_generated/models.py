@@ -7405,11 +7405,11 @@ class NodeIdentity(BaseModel):
     )
     trustBundleAgeSeconds: int | None = Field(
         None,
-        description="Seconds since this agent last heard from the control root:\nthe pull it makes every minute, or a newer bundle the root\npushed, counted from when the root signed it. Not the held\nbundle's signing time: a quiet install's bundle can be days\nold and current. A clock set back does not shorten it while\nthe agent runs. Past ten minutes the console lists it as an\nissue; past `trustBundleMaxAgeSeconds` the agent refuses\nchanges from other machines (`trustBundleFrozen`).\n",
+        description="Seconds since this agent last heard from the control root:\nthe pull it makes every minute, or a newer bundle from\nanywhere, counted from when the root signed it. Over machine\nTLS to the root (or loopback) only an answer from the root\ncounts; in plain HTTP, any answer at the root's address,\nwhich is all plain HTTP can say. Not the held bundle's\nsigning time: a quiet install's bundle can be days old and\ncurrent. A clock set back does not shorten it while the\nagent runs. Past ten minutes the console lists it as an\nissue; past `trustBundleMaxAgeSeconds` the agent refuses\nchanges from other machines (`trustBundleFrozen`).\n",
     )
     trustBundleMaxAgeSeconds: int | None = Field(
         None,
-        description='The limit in effect on `trustBundleAgeSeconds`, from the\n`maxTrustBundleAgeHours` setting, in seconds; `0` when there\nis none. Absent when this agent has joined no install, or\nruns a version older than row 46.\n',
+        description='The limit in effect on `trustBundleAgeSeconds`, from the\n`maxTrustBundleAgeHours` setting, in seconds. `0` when there\nis none: the setting is 0, or this agent reaches the root\nwithout encryption, where a pull cannot be told from a\nreplay and the limit is not enforced. Absent when this agent\nhas joined no install, or runs a version older than row 46.\n',
         ge=0,
     )
     trustBundleFrozen: bool | None = Field(

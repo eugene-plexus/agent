@@ -236,7 +236,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         trustBundleVersion=bundle.version if bundle is not None else None,
         trustBundleAgeSeconds=trust.heard_age_seconds() if record.enrolled else None,
         # Row 46: the limit in effect, and whether it refuses changes now.
-        trustBundleMaxAgeSeconds=limit * 3600 if record.enrolled else None,
+        trustBundleMaxAgeSeconds=trust.limit_in_effect(limit) * 3600 if record.enrolled else None,
         trustBundleFrozen=trust.frozen_age(limit) is not None if record.enrolled else None,
         tokenPublicKey=token_public,
         controlPublicKey=record.control_public_key if record.enrolled else None,

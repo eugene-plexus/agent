@@ -34,6 +34,7 @@ is named.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request, status
@@ -157,6 +158,140 @@ FROZEN_TRUST_CHANGES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/updates/all"),
     }
 )
+
+#: Row 46: through `/api/proxy` to a component on this machine (another
+#: machine's components reach the browser proxy through this agent's
+#: machine port), the requests on methods other than GET, HEAD and OPTIONS
+#: that are answers or questions, by the kind of component the target
+#: names. Another machine's token still reaches these past the limit;
+#: anything else through the proxy -- a write to the Library or the store,
+#: a component's config -- is refused as a change here is, and so is
+#: anything sent to a kind not named. The agent's own API (`agent`,
+#: `node:<this machine>`) is guarded by its own routes.
+FROZEN_TRUST_PROXY_QUESTIONS: dict[str, frozenset[tuple[str, str]]] = {
+    "inference-driver": frozenset(
+        {
+            *(
+                ("POST", path)
+                for path in (
+                    "/v1/generate",
+                    "/v1/generate/stream",
+                    "/v1/generate/count",
+                    "/v1/moderate",
+                    "/v1/speak",
+                    "/v1/transcribe",
+                    "/v1/image",
+                    "/v1/image/stream",
+                    "/v1/video",
+                    "/v1/embed",
+                    "/v1/rerank",
+                    "/v1/decide",
+                )
+            ),
+            ("POST", "/v1/config/test"),
+        }
+    ),
+    "tool-driver": frozenset({("POST", "/v1/tools/web_search"), ("POST", "/v1/config/test")}),
+    # The doors. Another machine's service token is refused there anyway;
+    # named so the rule is the same for every kind.
+    "gateway": frozenset(
+        {
+            *(
+                ("POST", path)
+                for path in (
+                    "/v1/chat/completions",
+                    "/v1/completions",
+                    "/v1/messages",
+                    "/v1/messages/count_tokens",
+                    "/v1/responses",
+                    "/v1/responses/compact",
+                    "/v1/responses/input_tokens",
+                    "/v1/moderations",
+                    "/v1/audio/speech",
+                    "/v1/audio/transcriptions",
+                    "/v1/audio/translations",
+                    "/v1/web_search",
+                    "/v1/images/generations",
+                    "/v1/images/edits",
+                    "/v1/images/variations",
+                    "/v1/videos",
+                    "/v1/embeddings",
+                    "/v1/rerank",
+                    "/v1/systemone",
+                    "/v1beta/models/{model}:generateContent",
+                    "/v1beta/models/{model}:streamGenerateContent",
+                    "/v1beta/models/{model}:countTokens",
+                    "/v1/models/{model}:generateContent",
+                    "/v1/models/{model}:streamGenerateContent",
+                    "/v1/models/{model}:countTokens",
+                    "/v1/config/test",
+                )
+            ),
+        }
+    ),
+    "library": frozenset(
+        {
+            ("POST", "/v1/eligibility"),
+            ("POST", "/v1/catalogue/search"),
+            ("POST", "/v1/keep-jobs/{id}/files/state"),
+            ("POST", "/v1/config/test"),
+        }
+    ),
+    "store": frozenset(),
+    "control": frozenset(),
+}
+
+
+def _template(path: str) -> re.Pattern[str]:
+    """`/v1/models/{model}:countTokens` as a pattern: one segment per name."""
+    parts = re.split(r"\{[^/{}]+\}", path)
+    return re.compile("^" + "[^/]+".join(re.escape(part) for part in parts) + "$")
+
+
+_PROXY_QUESTIONS = {
+    kind: tuple((method, _template(path)) for method, path in named)
+    for kind, named in FROZEN_TRUST_PROXY_QUESTIONS.items()
+}
+
+
+def proxied_change(kind: str | None, method: str, path: str) -> bool:
+    """Whether a request through the proxy to a component of `kind` on this
+    machine changes something (row 46). A kind not named, and a request
+    in no list, count as changes."""
+    method = method.upper()
+    if method in READ_METHODS:
+        return False
+    return not any(
+        method == named and pattern.match(path)
+        for named, pattern in _PROXY_QUESTIONS.get(kind or "", ())
+    )
+
+
+_ANY_TOKEN = (tokens.TYP_SESSION, tokens.TYP_SERVICE, tokens.TYP_CLIENT, tokens.TYP_ADMINISTRATION)
+
+
+def refuse_proxied_when_frozen(
+    request: Request, kind: str | None, path: str, credentials: list[str]
+) -> None:
+    """The freeze for a request the proxy carries to a component on this
+    machine, which checks its token itself and knows nothing of the root's
+    silence (row 46). Refused when the limit is passed, a credential is
+    another machine's token addressed here, and the request is a change.
+    A credential that does not verify here is the component's to refuse."""
+    auth: AuthState | None = getattr(request.app.state, "auth_state", None)
+    if auth is None or request.method.upper() in READ_METHODS:
+        return
+    trust = auth.trust
+    age = trust.frozen_age(trust_limit_hours(request))
+    if age is None or not proxied_change(kind, request.method, path):
+        return
+    for token in credentials:
+        try:
+            claims = trust.verify(token, classes=_ANY_TOKEN)
+        except tokens.TokenError:
+            continue
+        if trust.minted_elsewhere(claims):
+            raise _problem(status.HTTP_403_FORBIDDEN, "Root not heard", frozen_refusal(age))
 
 
 def _problem(status_code: int, title: str, detail: str) -> HTTPException:

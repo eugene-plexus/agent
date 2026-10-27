@@ -47,6 +47,14 @@ def _enrolled(tmp_path: Path, *, grants: tuple[str, ...] = ()) -> tuple[NodeTrus
     return trust, root
 
 
+@pytest.fixture
+def _root_over_machine_tls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The root is reached over machine TLS pinned to its key, so only the
+    root can answer a pull, and the limit is kept (row 46). Without this
+    the test root's address is plain HTTP across a network."""
+    monkeypatch.setattr(trust_module, "channel_authenticated", lambda url: True, raising=False)
+
+
 def _claims_of(token: str) -> dict[str, object]:
     import jwt
 
@@ -125,18 +133,36 @@ def test_the_recorded_epoch_fences_even_with_no_bundle_held(tmp_path: Path) -> N
 # --------------------------------------------------------------------------- #
 
 
-def test_the_age_is_since_the_bundle_was_taken_not_since_it_was_signed(tmp_path: Path) -> None:
+def _heard(tmp_path: Path, word_ago: float, pulled_ago: float | None = None) -> None:
+    """The kept record of the root's last word (row 46), as of `word_ago`.
+
+    The bundle file's time is set back with it, which the agent before the
+    row 46 review read as the time last heard; it reads it no more."""
+    now = time.time()
+    bundle = tmp_path / BUNDLE_FILE
+    if bundle.exists():
+        os.utime(bundle, (now - word_ago, now - word_ago))
+    (tmp_path / getattr(trust_module, "HEARD_FILE", "trust_heard.json")).write_text(
+        json.dumps(
+            {
+                "wordAt": now - word_ago,
+                "pulledAt": None if pulled_ago is None else now - pulled_ago,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_the_age_is_since_the_bundle_was_taken_not_since_it_was_signed(
+    tmp_path: Path, _root_over_machine_tls: None
+) -> None:
     """A pull returns the same signed bundle until something changes, so
     the bundle's own `iat` is days old on a quiet install that heard from
     its root a minute ago. The age is when this node last took one."""
-    import os
-    import time
-
     trust, root = _enrolled(tmp_path)
-    # Heard fifteen minutes ago, as far as the kept file says; taking a
+    # Heard fifteen minutes ago, as far as the record says; taking a
     # bundle now is what must bring the age back to zero.
-    then = time.time() - 900
-    os.utime(tmp_path / BUNDLE_FILE, (then, then))
+    _heard(tmp_path, 900)
     trust.load()
     assert (trust.heard_age_seconds() or 0) >= 895
     old = tokens.build_bundle(
@@ -146,26 +172,42 @@ def test_the_age_is_since_the_bundle_was_taken_not_since_it_was_signed(tmp_path:
         keys=[root.token.trust_key(["authority"]), *root.members.values()],
         now=int(time.time()) - 5 * 86400,
     )
-    # The minute's pull: asked of the root, so word now (row 46).
+    # The minute's pull, from the root over its machine TLS: word now.
     trust.accept(old.jws, pulled=True)
     age = trust.heard_age_seconds()
     assert age is not None and age < 5
     assert trust.heard_age_seconds(now=time.time() + 700) in (699, 700, 701)
 
 
-def test_the_age_survives_a_restart_from_the_kept_file(tmp_path: Path) -> None:
-    import os
-    import time
-
+def test_the_age_survives_a_restart_from_its_own_record(
+    tmp_path: Path, _root_over_machine_tls: None
+) -> None:
     _enrolled(tmp_path)
+    _heard(tmp_path, 900)
     kept = tmp_path / BUNDLE_FILE
-    then = time.time() - 900
-    os.utime(kept, (then, then))
     again = NodeTrust(NodeIdentityStore(tmp_path / "node.yaml"), kept)
     again._identity.load()
     again.load()
     age = again.heard_age_seconds()
     assert age is not None and 895 <= age <= 905
+
+
+def test_with_no_record_the_age_is_the_bundles_signature_never_the_files_time(
+    tmp_path: Path, _root_over_machine_tls: None
+) -> None:
+    """The bundle file is rewritten whenever any bundle is taken, a replay
+    included, so its time says nothing about the root (row 46 review)."""
+    trust, root = _enrolled(tmp_path)
+    signed = tokens.build_bundle(
+        authority=root.identity,
+        version=root.version + 1,
+        epoch=root.epoch,
+        keys=[root.token.trust_key(["authority"]), *root.members.values()],
+        now=int(time.time()) - 30 * 3600,
+    )
+    tokens.write_bundle_file(tmp_path / BUNDLE_FILE, signed)  # written just now
+    trust.load()
+    assert (trust.word_age_seconds() or 0) >= 30 * 3600 - 5
 
 
 def test_a_standalone_node_has_no_root_to_hear_from(tmp_path: Path) -> None:
@@ -334,10 +376,9 @@ def _from(signer: tokens.Signer, sub: str = "gateway") -> dict[str, str]:
 
 
 def _silent_for(client: TestClient, seconds: float) -> None:
-    """The root last heard from `seconds` ago, as the kept file says."""
+    """The root last heard from `seconds` ago, as the record says."""
     trust = _app_of(client).state.auth_state.trust
-    then = time.time() - seconds
-    os.utime(trust.bundle_path, (then, then))
+    _heard(trust.bundle_path.parent, seconds, seconds)
     trust.load()
 
 
@@ -351,6 +392,7 @@ def _declare(client: TestClient, root: FakeRoot) -> None:
 
 
 @pytest.mark.usefixtures("_any_model_fits")
+@pytest.mark.usefixtures("_root_over_machine_tls")
 def test_a_stale_bundle_refuses_another_machines_mutation(client: TestClient) -> None:
     """The residual risk TOK-RES named: a node cut off from the root trusts its
     last bundle forever, so a machine removed since keeps working there. Past
@@ -389,6 +431,7 @@ def test_a_stale_bundle_refuses_another_machines_mutation(client: TestClient) ->
 
 
 @pytest.mark.usefixtures("_any_model_fits")
+@pytest.mark.usefixtures("_root_over_machine_tls")
 def test_inference_and_the_roots_tokens_still_pass(client: TestClient) -> None:
     """A dead root never stops answers (M5): past the limit the root's own
     tokens, this machine's own tokens for its children, every read and the
@@ -448,6 +491,7 @@ def _root_answers_admission(client: TestClient) -> None:
     app.state.client_key_registry = registry
 
 
+@pytest.mark.usefixtures("_root_over_machine_tls")
 def test_a_route_nobody_named_is_refused_as_a_change(client: TestClient) -> None:
     """A route added without a line in either list does not slip through."""
     from fastapi import Depends
@@ -525,19 +569,22 @@ def test_every_route_that_changes_something_is_named_for_the_freeze(app: FastAPI
         assert change in FROZEN_TRUST_CHANGES, change
 
 
+@pytest.mark.usefixtures("_root_over_machine_tls")
 def test_a_pushed_copy_of_the_held_bundle_is_not_word_from_the_root(tmp_path: Path) -> None:
     """The push door takes no bearer: anybody who can reach this machine can
     post a bundle they saw once. Only a newer one counts, from when the root
     signed it; a bundle that does not verify changes nothing."""
     trust, root = _enrolled(tmp_path)
-    then = time.time() - 25 * 3600
-    os.utime(tmp_path / BUNDLE_FILE, (then, then))
+    _heard(tmp_path, 25 * 3600)
     trust.load()
     held = trust.bundle
     assert held is not None
 
     trust.accept(held.jws)
     assert (trust.heard_age_seconds() or 0) >= 25 * 3600 - 5
+    assert trust.frozen_age(24) is not None
+    # And not across a restart either: the record was not touched.
+    trust.load()
     assert trust.frozen_age(24) is not None
 
     forged = tokens.build_bundle(
@@ -572,6 +619,7 @@ def test_a_pushed_copy_of_the_held_bundle_is_not_word_from_the_root(tmp_path: Pa
     assert (trust.heard_age_seconds() or 0) < 5
 
 
+@pytest.mark.usefixtures("_root_over_machine_tls")
 def test_a_clock_set_back_does_not_shorten_the_silence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -627,6 +675,7 @@ def test_the_limit_is_the_setting_and_a_bad_value_is_the_default(tmp_path: Path)
     assert state.as_config_document().model_dump()[MAX_AGE_HOURS_KEY] == 24
 
 
+@pytest.mark.usefixtures("_root_over_machine_tls")
 def test_the_agent_says_the_limit_and_whether_it_refuses_now(client: TestClient) -> None:
     """Settings never lie: the limit in effect, on `GET /v1/node` and on the
     setting itself, and whether it is refusing changes now."""
@@ -662,3 +711,203 @@ def test_a_machine_that_joined_nothing_has_no_limit_to_report(authed_client: Tes
     schema = authed_client.get("/v1/config/schema").json()
     field = next(f for f in schema["fields"] if f["key"] == "maxTrustBundleAgeHours")
     assert field["status"]["level"] == "info"
+
+
+# --------------------------------------------------------------------------- #
+# Row 46 review: a replay, a plain HTTP pull, and the browser proxy
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.usefixtures("_any_model_fits", "_root_over_machine_tls")
+def test_a_replayed_bundle_then_a_restart_still_refuses(client: TestClient) -> None:
+    """Review blocker 1: past the limit, the held bundle posted again to the
+    push door (which takes no bearer) and the agent restarted. The bundle
+    file is written again; the record of the root's last word is not."""
+    root, attic = _install(client)
+    _declare(client, root)
+    _silent_for(client, 25 * 3600)
+    other = _from(attic)
+    assert client.post("/v1/runtimes/big/stop", headers=other).status_code == 403
+    trust = _app_of(client).state.auth_state.trust
+    replayed = client.post("/v1/node/trust-bundle", json={"jws": trust.bundle.jws})
+    assert replayed.status_code == 200, replayed.text
+    assert client.post("/v1/runtimes/big/stop", headers=other).status_code == 403
+    # What the agent reads at its next start.
+    trust.load()
+    refused = client.post("/v1/runtimes/big/stop", headers=other)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["detail"] == _REFUSED_25_HOURS
+
+
+def test_a_pull_in_plain_http_is_not_word_from_the_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review blocker 2: a party in the middle of a plain HTTP pull answers
+    with the bundle it saw last. It cannot unfreeze anything: in plain HTTP
+    the limit is not kept, and when the root is reached over machine TLS
+    again, the silence counts from the last real word."""
+    trust, _ = _enrolled(tmp_path)
+    _heard(tmp_path, 25 * 3600, 25 * 3600)
+    trust.load()
+    held = trust.bundle
+    assert held is not None
+    tls = {"to the root": False}
+    monkeypatch.setattr(trust_module, "channel_authenticated", lambda url: tls["to the root"])
+
+    trust.accept(held.jws, pulled=True)
+    assert (trust.word_age_seconds() or 0) >= 25 * 3600 - 5
+    # The root's address answered, which is all plain HTTP can say.
+    assert (trust.heard_age_seconds() or 0) < 5
+    # And the limit is not kept: a live root whose bundle does not change
+    # would freeze its machines after a day.
+    assert trust.limit_in_effect(24) == 0
+    assert trust.frozen_age(24) is None
+
+    tls["to the root"] = True
+    assert trust.frozen_age(24) is not None
+    trust.load()
+    assert trust.frozen_age(24) is not None
+    # The root itself, over its machine TLS: word now.
+    trust.accept(held.jws, pulled=True)
+    assert trust.frozen_age(24) is None
+    assert (trust.word_age_seconds() or 0) < 5
+
+
+@pytest.mark.usefixtures("_any_model_fits")
+def test_without_an_authenticated_channel_the_limit_is_not_kept_and_says_so(
+    client: TestClient,
+) -> None:
+    """The test root is plain HTTP across a network: the limit is not kept,
+    nothing is refused, and the agent says why rather than a limit it does
+    not keep."""
+    root, attic = _install(client)
+    _declare(client, root)
+    _silent_for(client, 25 * 3600)
+    assert client.post("/v1/runtimes/big/stop", headers=_from(attic)).status_code == 202
+    # The runtime's companion driver is in the topology; the stub runs none.
+    _app_of(client).state.supervisor.is_supervised = lambda _name: False
+    session = _bearer(root.session("node:gpu-box"))
+    node = client.get("/v1/node", headers=session).json()
+    assert node["trustBundleFrozen"] is False
+    assert node["trustBundleMaxAgeSeconds"] == 0
+    schema = client.get("/v1/config/schema", headers=session).json()
+    field = next(f for f in schema["fields"] if f["key"] == "maxTrustBundleAgeHours")
+    assert field["status"] == {"level": "warning", "text": trust_module.NOT_ENFORCED}
+    assert field["status"]["text"] == (
+        "Not enforced: this machine reaches the root without encryption."
+    )
+
+
+def test_which_channels_only_the_root_can_answer() -> None:
+    from eugene_plexus_agent import _http
+    from eugene_plexus_agent.trust import channel_authenticated
+
+    assert channel_authenticated("http://127.0.0.1:8283")
+    assert channel_authenticated("http://localhost:8283/")
+    assert channel_authenticated("http://[::1]:8283")
+    assert not channel_authenticated("http://10.0.0.5:8283")
+    assert not channel_authenticated("not a url")
+    try:
+        _http.set_machine_table(
+            _http.parse_machine_table(
+                {
+                    "machines": {"10.0.0.5:9443": ["pin"]},
+                    "routes": {"http://10.0.0.5:8283": "https://10.0.0.5:9443/control"},
+                }
+            )
+        )
+        assert channel_authenticated("http://10.0.0.5:8283")
+        assert channel_authenticated("https://10.0.0.5:9443/control")
+        assert not channel_authenticated("http://10.0.0.6:8283")
+        assert not channel_authenticated("https://10.0.0.6:9443/control")
+    finally:
+        _http.set_machine_table(None)
+
+
+def _components(client: TestClient) -> list[httpx.Request]:
+    """A Library and an inference-driver on this machine, behind a stub."""
+    from eugene_plexus_agent._generated.models import ComponentEntry, ComponentKind
+
+    app = _app_of(client)
+    for name, kind in (("library", "library"), ("llama", "inference-driver")):
+        app.state.agent_state.add_topology_entry(
+            ComponentEntry(name=name, kind=ComponentKind(kind), url="http://127.0.0.1:9/")  # type: ignore[arg-type]
+        )
+    seen: list[httpx.Request] = []
+
+    class Body(httpx.AsyncByteStream):
+        """The proxy streams what it gets back; a mock body must be a stream."""
+
+        def __init__(self, data: bytes) -> None:
+            self.data = data
+
+        async def __aiter__(self):  # type: ignore[no-untyped-def]
+            yield self.data
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.method == "PUT":
+            return httpx.Response(204, stream=Body(b""))
+        return httpx.Response(
+            200, headers={"content-type": "application/json"}, stream=Body(b'{"ok": true}')
+        )
+
+    app.state.ui_proxy_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return seen
+
+
+@pytest.mark.usefixtures("_root_over_machine_tls")
+def test_a_change_through_the_proxy_from_another_machine_is_refused_past_the_limit(
+    client: TestClient,
+) -> None:
+    """Review should-fix 3: a component checks its token itself and knows
+    nothing of the root's silence, so a write through this agent's proxy
+    is refused here; answers and reads go on."""
+    root, attic = _install(client)
+    seen = _components(client)
+    report = "/api/proxy/library/v1/nodes/attic/ollama"
+    as_agent = _from(attic, "agent")
+    assert client.put(report, json={}, headers=as_agent).status_code == 204
+
+    _silent_for(client, 25 * 3600)
+    reached = len(seen)
+    refused = client.put(report, json={}, headers=as_agent)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["title"] == "Root not heard"
+    assert refused.json()["detail"]["detail"] == _REFUSED_25_HOURS
+    for method, path in (
+        ("POST", "/api/proxy/llama/v1/row46-new-door"),
+        ("PATCH", "/api/proxy/llama/v1/config"),
+        ("POST", "/api/proxy/library/v1/downloads"),
+    ):
+        answer = client.request(method, path, json={}, headers=_from(attic))
+        assert answer.status_code == 403, (method, path, answer.text)
+    assert len(seen) == reached, "a refused change reached the component"
+
+    # Answers, questions and reads go on, from the same machine.
+    assert (
+        client.post("/api/proxy/llama/v1/generate", json={}, headers=_from(attic)).status_code
+        == 200
+    )
+    assert (
+        client.post("/api/proxy/library/v1/eligibility", json={}, headers=as_agent).status_code
+        == 200
+    )
+    assert client.get("/api/proxy/library/v1/models", headers=as_agent).status_code == 200
+    # The root's own session still changes it.
+    session = _bearer(root.session("node:gpu-box"))
+    assert client.put(report, json={}, headers=session).status_code == 204
+
+
+def test_a_proxied_request_to_a_kind_nobody_named_is_a_change() -> None:
+    from eugene_plexus_agent.dependencies import proxied_change
+
+    assert proxied_change("inference-driver", "POST", "/v1/generate/stream") is False
+    assert proxied_change("gateway", "POST", "/v1/models/qwen:countTokens") is False
+    assert proxied_change("gateway", "POST", "/v1/models/a/b:countTokens") is True
+    assert proxied_change("library", "POST", "/v1/keep-jobs/j1/files/state") is False
+    assert proxied_change("library", "PUT", "/v1/keep-jobs/j1/files") is True
+    assert proxied_change("store", "POST", "/v1/files") is True
+    assert proxied_change(None, "POST", "/v1/generate") is True
+    assert proxied_change("something-new", "POST", "/v1/generate") is True
+    assert proxied_change("store", "GET", "/v1/files") is False

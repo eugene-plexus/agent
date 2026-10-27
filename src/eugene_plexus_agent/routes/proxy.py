@@ -100,7 +100,7 @@ from .. import install_proxy, peer, tokens
 from .._generated.common_models import Problem
 from .._http import internal_client
 from ..auth_state import AuthState
-from ..dependencies import revoked_session_problem
+from ..dependencies import refuse_proxied_when_frozen, revoked_session_problem
 from ..node_identity import local_agent_url
 from ..runtime_context import RuntimeContext
 from ..settings import Settings
@@ -269,6 +269,21 @@ def resolve_local(request: Request, target: str) -> str | None:
     for entry in entries:
         if str(entry.kind) in _NAMED_KINDS and entry.name == target and str(entry.url):
             return str(entry.url)
+    return None
+
+
+def _local_kind(request: Request, target: str) -> str | None:
+    """The kind of component a target names on this machine: `agent` for
+    this agent's own API (by name, or `node:<this machine>`), the kind for a
+    singleton or a named driver, None when there is none."""
+    if target == "agent" or target.startswith(NODE_PREFIX):
+        return "agent"
+    if target in _SINGLETON_KINDS:
+        return _SINGLETON_KINDS[target]
+    state: AgentState = request.app.state.agent_state
+    for entry in state.list_topology_entries():
+        if entry.name == target and str(entry.kind) in _NAMED_KINDS:
+            return str(entry.kind)
     return None
 
 
@@ -686,6 +701,15 @@ async def proxy(target: str, path: str, request: Request) -> StreamingResponse:
     body = b"" if request.method in ("GET", "HEAD") else await read_capped_body(request)
 
     route = await resolve_target(request, target)
+    if route.recipient is None:
+        # Row 46: a component here checks the token itself and knows nothing
+        # of the root's silence. Another machine's token goes no further:
+        # `_credential_headers` strips it on the way out.
+        kind = _local_kind(request, target)
+        if kind != "agent":
+            refuse_proxied_when_frozen(
+                request, kind, "/" + path.lstrip("/"), presented_credentials(request)
+            )
     url = _upstream_url(route.base, route.prefix + "/" + path.lstrip("/"), request.url.query)
 
     headers = _request_headers(request, route)
