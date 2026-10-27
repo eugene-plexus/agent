@@ -444,7 +444,12 @@ def get_client(request: Request) -> httpx.AsyncClient:
         # this install, on this host or another node, and a user's
         # `HTTP_PROXY` (which the Windows logon task inherits) would
         # otherwise swallow every call the browser makes.
-        client = internal_client(timeout=_TIMEOUT, follow_redirects=False)
+        #
+        # `machine_hop`: a request for another machine carries what a person
+        # sent, a passphrase in a body or a session cookie, not only tokens;
+        # it goes in plain HTTP only to a machine the table says has no
+        # machine port, never to one it does not know yet (agent#38 review).
+        client = internal_client(timeout=_TIMEOUT, follow_redirects=False, machine_hop=True)
         request.app.state.ui_proxy_client = client
     return client
 

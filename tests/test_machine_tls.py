@@ -290,6 +290,114 @@ async def test_a_port_another_process_holds_is_reported_and_retried(tmp_path: Pa
         holder.close()
 
 
+async def test_a_machine_port_still_binding_is_announced_all_the_same(tmp_path: Path) -> None:
+    """agent#38: the root must know this machine takes TLS before its port
+    listens. Announced without its door (8083 held a moment longer at a
+    restart, say), the root recorded it as an older version, and in
+    `automatic` every machine sent it tokens in plain HTTP until it was."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent.settings import Settings
+    from eugene_plexus_agent.state import AgentState
+
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    holder.listen()
+    port = int(holder.getsockname()[1])
+    store = _store(tmp_path)
+    record = store.record
+    pin = node_identity.machine_pin(record.tls_certificate or "")
+    door = machine_port.MachinePort(
+        routes=machine_port.Routes(
+            control=lambda: None, driver=lambda n: None, agent_app=_Echo(), required=lambda: False
+        ),
+        context=machine_port.server_context(
+            record.tls_certificate or "", record.tls_private_key or "", tmp_path
+        ),
+        bind_host="127.0.0.1",
+        port=port,
+        pin=pin,
+    )
+    state = AgentState(tmp_path / "agent.yaml")
+    state.load()
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            machine_port=door,
+            agent_state=state,
+            node_identity=store,
+            settings=Settings(config_file=tmp_path / "agent.yaml", bind_port=8079),
+        )
+    )
+    try:
+        await door.start()
+        assert not door.status.listening
+        # Without an address others could use, no door is announced.
+        assert machine_port.announced(app) is None  # type: ignore[arg-type]
+        from eugene_plexus_agent._generated.common_models import ConfigUpdateRequest
+
+        state.apply_config_patch(
+            ConfigUpdateRequest.model_validate({"advertiseUrl": "http://10.0.0.6:8079"})
+        )
+        fields = machine_port.announced(app)  # type: ignore[arg-type]
+        assert fields is not None
+        # agent#38 review: and why it does not answer, for the root's card.
+        held = fields.pop("machineError")
+        assert held.startswith(f"port {port} is held by"), held
+        assert fields == {"machineUrl": f"https://10.0.0.6:{port}", "tlsPin": pin}
+        assert machine_port.machine_url(app) is None, "what listens is still reported as it is"
+        # The address an enrolment is about to register wins over the one held.
+        fields = machine_port.announced(app, "http://10.0.0.7:8079")  # type: ignore[arg-type]
+        assert fields is not None
+        assert fields["machineUrl"] == f"https://10.0.0.7:{port}" and fields["tlsPin"] == pin
+        # And a node that opens no machine port announces none.
+        app.state.machine_port = None
+        assert machine_port.announced(app) is None  # type: ignore[arg-type]
+    finally:
+        await door.stop()
+        holder.close()
+
+
+async def test_no_token_goes_in_plain_to_a_machine_the_table_does_not_name_yet() -> None:
+    """agent#38, in the agent's own copy of `_http` (its console hops, Update
+    all and Library calls reach other machines' agents): in `automatic`, a
+    machine missing from this process's table is not sent a token in plain
+    HTTP; one the table says runs an older version still is."""
+
+    def token() -> str:
+        def part(value: dict[str, str]) -> str:
+            return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+        return f"{part({'alg': 'EdDSA', 'typ': 'ep-session+jwt'})}.{part({'sub': 'p'})}.c2ln"
+
+    sent: list[str] = []
+
+    def plain(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    _http.set_machine_table(
+        _http.parse_machine_table(
+            {"routes": {"http://10.9.9.8:8079": None}, "local": ["http://10.9.9.2:8079"]}
+        )
+    )
+    headers = {"Authorization": f"Bearer {token()}"}
+    async with _http.internal_client(timeout=2) as client:
+        transport = client._transport
+        assert isinstance(transport, _http.MachineTransport)
+        transport._plain = httpx.MockTransport(plain)  # type: ignore[assignment]
+        with pytest.raises(_http.MachineRefused) as caught:
+            await client.get("http://10.9.9.7:8079/api/proxy/library/v1/folders", headers=headers)
+        assert "does not know yet whether 10.9.9.7 takes TLS" in str(caught.value)
+        await client.get("http://10.9.9.8:8079/v1/node", headers=headers)
+        await client.get("http://10.9.9.2:8079/v1/node", headers=headers)
+        await client.get("http://10.9.9.7:8079/healthz")
+    assert sent == [
+        "http://10.9.9.8:8079/v1/node",
+        "http://10.9.9.2:8079/v1/node",
+        "http://10.9.9.7:8079/healthz",
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Control leaves the machine port on the root
 # --------------------------------------------------------------------------- #
@@ -481,9 +589,13 @@ async def test_enrolment_to_the_root_s_key_goes_over_tls(tmp_path: Path) -> None
         assert sent["machineUrl"] == "https://10.0.0.6:8083" and sent["tlsPin"] == "M" * 43
 
 
-async def test_the_announcement_signs_the_machine_port_and_falls_back_for_an_old_root(
+async def test_the_announcement_signs_the_machine_port_and_never_says_less(
     tmp_path: Path,
 ) -> None:
+    """The machine port is under the node's signature, and a refusal never
+    makes the node announce its address alone (agent#38 review: a party in
+    the middle answers 401 too, and the address alone used to clear the key
+    at the root)."""
     root = FakeRoot()
     store = _store(tmp_path)
     enroll_store(store, root, "me", control_url="http://control.invalid:8083")
@@ -502,10 +614,9 @@ async def test_the_announcement_signs_the_machine_port_and_falls_back_for_an_old
         url="http://10.0.0.6:8079",
         transport=httpx.MockTransport(answer),
         machine=machine,
-        old_root=lambda: True,  # it serves no machine list
     )
-    assert outcome.announced
-    first, second = bodies
+    assert not outcome.announced
+    (first,) = bodies
     verify_key = nacl.signing.VerifyKey(base64.b64decode(store.record.signing_public_key or ""))
 
     def verifies(body: dict[str, Any], fields: dict[str, str]) -> bool:
@@ -518,9 +629,141 @@ async def test_the_announcement_signs_the_machine_port_and_falls_back_for_an_old
             return False
         return True
 
-    # The machine port and key are under the node's signature...
     assert first["tlsPin"] == "M" * 43 and verifies(first, machine)
     assert not verifies(first, {}), "a signature over the address alone would let a key be added"
-    # ...and an older root, which refuses them, hears the address alone.
-    assert "machineUrl" not in second and verifies(second, {})
-    assert second["sequence"] > first["sequence"]
+
+
+# --------------------------------------------------------------------------- #
+# agent#38, the second model's review
+# --------------------------------------------------------------------------- #
+
+
+def _door_app(tmp_path: Path, store: NodeIdentityStore, door: Any = None) -> Any:
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent.settings import Settings
+    from eugene_plexus_agent.state import AgentState
+
+    state = AgentState(tmp_path / "agent.yaml")
+    state.load()
+    settings = Settings(
+        config_file=tmp_path / "agent.yaml", bind_port=8079, machine_port_enabled=True
+    )
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            machine_port=door, agent_state=state, node_identity=store, settings=settings
+        )
+    )
+
+
+async def test_a_machine_key_that_does_not_load_still_announces_its_door(tmp_path: Path) -> None:
+    """Review 7b: a key that does not load opened no door, and the node was
+    announced with none, so the root took it for an older version. It
+    announces the door its certificate names, and says why it does not
+    answer."""
+    store = _store(tmp_path)
+    record = store.record
+    pin = node_identity.machine_pin(record.tls_certificate or "")
+    # Another key under the same certificate: OpenSSL refuses the pair.
+    other, _ = node_identity.generate_machine_key()
+    import dataclasses
+
+    store._record = dataclasses.replace(record, tls_private_key=other)
+    app = _door_app(tmp_path, store)
+    assert await machine_port.start(app) is None
+    assert app.state.machine_port is None, "nothing takes the failure for a running port"
+    fields = machine_port.announced(app, "http://10.0.0.6:8079")
+    assert fields is not None
+    assert (fields["machineUrl"], fields["tlsPin"]) == ("https://10.0.0.6:8083", pin)
+    assert fields["machineError"].startswith("its machine key does not load")
+
+
+def test_an_ipv6_address_announces_its_door_and_why_it_does_not_answer(tmp_path: Path) -> None:
+    """Review 7b: an IPv6 advertise address named no door (the port listens
+    on IPv4), so the node was taken for an older version. It announces the
+    door, and that the port does not answer there."""
+    from types import SimpleNamespace
+
+    store = _store(tmp_path)
+    door = SimpleNamespace(status=machine_port.Status(port=8083, pin="P" * 43, listening=True))
+    app = _door_app(tmp_path, store, door)
+    fields = machine_port.announced(app, "http://[fd00::6]:8079")
+    assert fields is not None
+    assert fields["machineUrl"] == "https://[fd00::6]:8083"
+    assert "IPv4 only" in fields["machineError"]
+    plain = machine_port.announced(app, "http://10.0.0.6:8079")
+    assert plain == {"machineUrl": "https://10.0.0.6:8083", "tlsPin": "P" * 43}
+    assert machine_port.machine_url(app) is None or ":" not in str(machine_port.machine_url(app))
+
+
+def test_the_console_s_hops_go_by_their_route_alone() -> None:
+    """Review 1b: the console's proxy and the forwarded sign-in carry what a
+    person sent (a passphrase, a cookie), not only tokens; their clients are
+    machine-hop clients, which send nothing in plain HTTP to a machine the
+    table does not name."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent.routes import oidc_forward, proxy
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    for client in (
+        proxy.get_client(request),  # type: ignore[arg-type]
+        oidc_forward._client(request, "http://root.lan:8083"),  # type: ignore[arg-type]
+    ):
+        transport = client._transport
+        assert isinstance(transport, _http.MachineTransport) and transport.hop
+
+
+async def test_the_site_host_s_report_to_the_root_takes_the_machine_transport() -> None:
+    """Review 1a: a root reached as `root.lan` (a dotted name, so not
+    "internal") got the egress client, and the report's Bearer went out with
+    no machine routing, under `required` too."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent.site_host import SiteHostSupervisor
+
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            node_identity=SimpleNamespace(
+                record=SimpleNamespace(
+                    enrolled=True, control_url="http://root.lan:8083", name="amish"
+                )
+            ),
+            auth_state=SimpleNamespace(trust=SimpleNamespace(agent_token=lambda audience: "t")),
+        )
+    )
+    _http.set_machine_table(
+        _http.parse_machine_table({"routes": {"http://root.lan:8083": None}, "required": True})
+    )
+    supervisor = SiteHostSupervisor(app)  # type: ignore[arg-type]
+    try:
+        supervisor.site = None
+        await supervisor._report()  # required, and no key for the root: refused, nothing sent
+        assert supervisor._root_client is not None
+        transport = supervisor._root_client._transport
+        assert isinstance(transport, _http.MachineTransport) and transport.hop
+    finally:
+        if supervisor._root_client is not None:
+            await supervisor._root_client.aclose()
+        await supervisor._host.aclose()
+
+
+async def test_a_hop_with_a_passphrase_goes_nowhere_unknown() -> None:
+    """Review 1b, behaviour: a sign-in through the console's proxy to a
+    machine the table does not name yet is not sent, though it carries no
+    token; to an older machine it still goes."""
+    sent: list[str] = []
+
+    def plain(request: httpx.Request) -> httpx.Response:
+        sent.append(str(request.url))
+        return httpx.Response(200, json={})
+
+    _http.set_machine_table(_http.parse_machine_table({"routes": {"http://10.9.9.8:8079": None}}))
+    async with _http.internal_client(timeout=2, machine_hop=True) as client:
+        transport = client._transport
+        assert isinstance(transport, _http.MachineTransport)
+        transport._plain = httpx.MockTransport(plain)  # type: ignore[assignment]
+        with pytest.raises(_http.MachineRefused):
+            await client.post("http://10.9.9.7:8079/v1/auth/login", json={"passphrase": "p"})
+        await client.post("http://10.9.9.8:8079/v1/auth/login", json={"passphrase": "p"})
+    assert sent == ["http://10.9.9.8:8079/v1/auth/login"]
