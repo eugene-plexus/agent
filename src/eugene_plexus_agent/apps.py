@@ -1728,7 +1728,12 @@ class AppManager:
         url, detail = await self._resolve_gateway() if record.manifest.uses else (None, None)
         self._gateway[record.id] = url
         self._detail[record.id] = detail
-        door_ports = await self._open_door(record)
+        # An app still running from before this agent started is kept only if
+        # it listens where its door leads (agent#32): the door leads there.
+        reuse = None
+        if isinstance(self.supervisor, app_accounts.OwnAccountSupervisor):
+            reuse = await self.supervisor.ports_in_use(record.id)
+        door_ports = await self._open_door(record, reuse)
         planner = _AppPlanner(
             record,
             store=self.store,
@@ -1761,9 +1766,12 @@ class AppManager:
         if doors is not None:
             await doors.close(f"app:{app_id}")
 
-    async def _open_door(self, record: InstalledApp) -> tuple[int, int] | None:
+    async def _open_door(
+        self, record: InstalledApp, reuse: tuple[int, int] | None = None
+    ) -> tuple[int, int] | None:
         """The app's door on its port (LT2): TLS beside plain HTTP, in front
-        of two loopback ports of the app's own. None when this agent fronts
+        of two loopback ports of the app's own -- `reuse` when the app already
+        listens on them, else two free ones. None when this agent fronts
         no apps, for the site hosts (loopback only), or when the port is held
         (the app then binds it itself, plain only, as before)."""
         from .client_tls import free_loopback_port
@@ -1771,7 +1779,7 @@ class AppManager:
         doors = self._doors()
         if doors is None or record.id in SITE_HOST_IDS or memory_provider(record):
             return None
-        plain, tls = free_loopback_port(), free_loopback_port()
+        plain, tls = reuse or (free_loopback_port(), free_loopback_port())
         try:
             await doors.open_pump(
                 f"app:{record.id}",
@@ -1927,11 +1935,18 @@ class AppManager:
                 )
                 self.store.put(restored)
                 await asyncio.to_thread(app_backups.consume, app_dir, manifest.version)
-            except (OSError, ValueError) as exc:
-                raise AppInstallError(
+            except (OSError, ValueError, AppInstallError) as exc:
+                # On the app's page too, not only in this request's answer: the
+                # page is where a person looks after Go back (agent#34).
+                self._errors[record.id] = (
                     f"The app was not restored: {exc}. Its backup is kept for retry."
-                ) from exc
-            await self.start(restored)
+                )
+                raise AppInstallError(self._errors[record.id]) from exc
+            try:
+                await self.start(restored)
+            except Exception as exc:
+                self._errors[record.id] = f"The app was restored, but did not start: {exc}"
+                raise AppInstallError(self._errors[record.id]) from exc
 
     def require_settings_access(self, name: str, action: str) -> None:
         """Refuse what needs the app's data folder, where the agent cannot reach it.
