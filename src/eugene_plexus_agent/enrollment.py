@@ -42,6 +42,7 @@ import random
 import re
 import socket
 import sys
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -77,6 +78,10 @@ ANNOUNCE_TIMEOUT_SECONDS = 8.0
 ANNOUNCE_RETRY_FIRST_SECONDS = 5.0
 ANNOUNCE_RETRY_MAX_SECONDS = 300.0
 ADDRESS_RECHECK_SECONDS = 60.0
+# Row 36: an address the root refused for good is announced again this
+# often. The root keeps why it refused only in memory, so a restarted root
+# or a promoted standby learns it from the machine's next attempt.
+REFUSED_RETRY_SECONDS = 900.0
 
 
 #: The slug for a join token the control root refused (401 or 409).
@@ -354,6 +359,7 @@ async def announce_address(
     url: str,
     transport: Any = None,
     machine: dict[str, str] | None = None,
+    refusals_logged: set[tuple[str, int, str]] | None = None,
 ) -> AnnounceOutcome:
     """Tell the control root this node's address. Never raises.
 
@@ -396,6 +402,7 @@ async def announce_address(
             sent=sent,
             signed=signed,
             transport=transport,
+            refusals_logged=refusals_logged,
         )
 
 
@@ -407,6 +414,7 @@ async def _announce_locked(
     sent: dict[str, str],
     signed: Callable[[dict[str, str]], dict[str, Any]],
     transport: Any,
+    refusals_logged: set[tuple[str, int, str]] | None = None,
 ) -> AnnounceOutcome:
     record = store.record
     try:
@@ -427,9 +435,22 @@ async def _announce_locked(
         # 409: another machine holds the address (LT2 review); it is let in
         # once that one announces where it moved, so ask again later.
         later = response.status_code >= 500 or response.status_code in (408, 409, 429)
+        # A refusal is logged once per address and reason (row 36): the same
+        # address is tried again every 15 minutes, and a log that repeats the
+        # same refusal all day hides the next one.
+        key = (url, response.status_code, detail)
+        repeated = refusals_logged is not None and key in refusals_logged
+        if refusals_logged is not None:
+            refusals_logged.add(key)
         # 401 here has one likely cause and it is worth naming, because
         # the symptom (a node nothing can reach) is far away from it.
-        if response.status_code == 401 and sent:
+        if repeated:
+            log.debug(
+                "the control root refused this node's address announcement again (%d): %s",
+                response.status_code,
+                detail,
+            )
+        elif response.status_code == 401 and sent:
             log.warning(
                 "the control root will not accept this node's announcement of its machine "
                 "port: %s. A root older than this machine refuses it; update the root.",
@@ -468,6 +489,7 @@ async def keep_address_announced(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     machine: Callable[[], dict[str, str] | None] = lambda: None,
     recorded: Callable[[], tuple[str | None, tuple[str, ...]] | None] = lambda: None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> None:
     """Tell the control root where this node is until it has heard, and
     again whenever the address moves (agent#8). Runs for the agent's life
@@ -480,8 +502,11 @@ async def keep_address_announced(
 
     - An attempt that may work later (no answer, 408, 429, 5xx) is tried
       again after 5 s, doubling to 5 minutes, with jitter.
-    - A definite refusal is logged once, by `announce_address`, and not
-      repeated for that address.
+    - A definite refusal is logged once per address and reason, by
+      `announce_address`, and announced again every 15 minutes (row 36): the
+      root keeps why it refused only in memory, so a restarted root or a
+      promoted standby learns it at the next attempt. The attempt sends no
+      new field, so a root that does not know row 36 answers as it did.
     - Once settled, the address is re-derived every minute and announced
       when it differs. `resolve(quiet)` is `resolve_advertise_url`, so an
       operator's `advertiseUrl` still wins and a root that cannot be
@@ -500,6 +525,8 @@ async def keep_address_announced(
     came to differ, is announced again.
     """
     settled: tuple[str, tuple[tuple[str, str], ...]] | None = None
+    refused_at: float | None = None
+    refusals_logged: set[tuple[str, int, str]] = set()
     warned = False
     delay = ANNOUNCE_RETRY_FIRST_SECONDS
     quiet = False
@@ -519,18 +546,26 @@ async def keep_address_announced(
                         store.record.control_url,
                     )
                     warned = True
-            elif (url, tuple(sorted((machine() or {}).items()))) != settled or (
-                _recorded_differs(machine() or {}, recorded())
+            elif (
+                (url, tuple(sorted((machine() or {}).items()))) != settled
+                or _recorded_differs(machine() or {}, recorded())
+                or (refused_at is not None and clock() - refused_at >= REFUSED_RETRY_SECONDS)
             ):
                 warned = False
                 store.record_advertise_url(url)
                 fields = machine() or {}
                 outcome = await announce_address(
-                    store=store, url=url, transport=transport, machine=fields
+                    store=store,
+                    url=url,
+                    transport=transport,
+                    machine=fields,
+                    refusals_logged=refusals_logged,
                 )
+                refused_at = None if outcome.announced else clock()
                 if outcome.announced or not outcome.retry:
                     # Settled on what was said: a root that refused it says
-                    # why in the log, and is asked again when it changes.
+                    # why, and is asked again when it changes or after
+                    # `REFUSED_RETRY_SECONDS` (row 36).
                     settled = (url, tuple(sorted(fields.items())))
                     delay = ANNOUNCE_RETRY_FIRST_SECONDS
                 else:
@@ -645,6 +680,7 @@ __all__ = [
     "ANNOUNCE_RETRY_MAX_SECONDS",
     "ANNOUNCE_TIMEOUT_SECONDS",
     "ENROLL_TIMEOUT_SECONDS",
+    "REFUSED_RETRY_SECONDS",
     "TOKEN_REFUSED",
     "AnnounceOutcome",
     "EnrollmentError",
