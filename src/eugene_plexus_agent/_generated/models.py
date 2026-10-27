@@ -7508,7 +7508,16 @@ class NodeIdentity(BaseModel):
     )
     trustBundleAgeSeconds: int | None = Field(
         None,
-        description="Seconds since this agent last took the control root's bundle\n-- a push, or the pull it makes every minute. Not the\nbundle's signing time: a quiet install's bundle can be days\nold and current. Reported, never enforced: a bundle keeps\nworking while the root is dead, so this is what tells an\noperator the node has not heard from the root. Past ten\nminutes the console lists it as an issue.\n",
+        description="Seconds since this agent last heard from the control root:\nthe pull it makes every minute, or a newer bundle from\nanywhere, counted from when the root signed it. Over machine\nTLS to the root (or loopback) only an answer from the root\ncounts; in plain HTTP, any answer at the root's address,\nwhich is all plain HTTP can say. Not the held bundle's\nsigning time: a quiet install's bundle can be days old and\ncurrent. A clock set back does not shorten it while the\nagent runs. Past ten minutes the console lists it as an\nissue; past `trustBundleMaxAgeSeconds` the agent refuses\nchanges from other machines (`trustBundleFrozen`).\n",
+    )
+    trustBundleMaxAgeSeconds: int | None = Field(
+        None,
+        description='The limit in effect on `trustBundleAgeSeconds`, from the\n`maxTrustBundleAgeHours` setting, in seconds. `0` when there\nis none: the setting is 0, or this agent reaches the root\nwithout encryption, where a pull cannot be told from a\nreplay and the limit is not enforced. Absent when this agent\nhas joined no install, or runs a version older than row 46.\n',
+        ge=0,
+    )
+    trustBundleFrozen: bool | None = Field(
+        None,
+        description="True while `trustBundleAgeSeconds` is past\n`trustBundleMaxAgeSeconds`: this agent refuses changes\nsigned by other machines' keys (the `RootNotHeard` 403) until\nit hears from the root again. Answers, reads and the root's\nown tokens keep working. Absent when this agent has joined\nno install, or runs a version older than row 46.\n",
     )
     tokenPublicKey: str | None = Field(
         None,
