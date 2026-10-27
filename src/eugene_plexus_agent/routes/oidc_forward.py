@@ -68,7 +68,10 @@ def _root_url(request: Request) -> str | None:
 def _client(request: Request, root: str) -> httpx.AsyncClient:
     client = getattr(request.app.state, "oidc_forward_client", None)
     if client is None or client.is_closed:
-        client = client_for(root, timeout=30.0, follow_redirects=False, trust_env=False)
+        # Sign-in steps, passphrases included: by the route alone (agent#38).
+        client = client_for(
+            root, timeout=30.0, follow_redirects=False, trust_env=False, machine_hop=True
+        )
         request.app.state.oidc_forward_client = client
     return client
 

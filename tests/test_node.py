@@ -493,6 +493,35 @@ def test_an_unreachable_root_is_a_502(authed_client: TestClient) -> None:
     assert "still unenrolled" in response.text
 
 
+def test_enrolment_registers_the_machine_port_at_the_address_it_registers(
+    authed_client: TestClient, control: FakeControl, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """agent#38: the root records this machine's door and key at the join,
+    so no machine ever takes it for an older version and sends it tokens in
+    plain HTTP. At the address derived for this join (the record holds none
+    yet), and while the port is still binding."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent import machine_port
+    from eugene_plexus_agent.routes import node as node_routes
+
+    async def derived(**_: Any) -> str:
+        return "http://10.0.0.6:8079"
+
+    monkeypatch.setattr(node_routes, "resolve_advertise_url", derived)
+    app = authed_client.app
+    store = app.state.node_identity  # type: ignore[attr-defined]
+    record = store.ensure_keypair()
+    pin = node_identity.machine_pin(record.tls_certificate or "")
+    app.state.machine_port = SimpleNamespace(  # type: ignore[attr-defined]
+        status=machine_port.Status(port=8083, pin=pin, listening=False, error="port 8083 is in use")
+    )
+    assert _enroll(authed_client, control).status_code == 200
+    sent = control.enroll_requests[-1]
+    assert sent["url"] == "http://10.0.0.6:8079"
+    assert (sent.get("machineUrl"), sent.get("tlsPin")) == ("https://10.0.0.6:8083", pin)
+
+
 def test_a_configured_advertise_url_wins_over_derivation(
     authed_client: TestClient, control: FakeControl
 ) -> None:
