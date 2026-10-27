@@ -30,7 +30,9 @@ def test_a_node_claiming_the_roots_address_or_anothers_is_carried_for_nobody() -
         claims, own_name="me", control_url="http://192.168.1.10:8083", token_pins=[]
     )
     assert table["routes"]["http://192.168.1.10:8083"] == "https://192.168.1.10:8083/control"
-    assert table["routes"]["http://192.168.1.20:8079"] is None
+    # Two records claim it: carried for nobody, and refused, not plain
+    # (`false`; agent#38 review: `null` read as an older version).
+    assert table["routes"]["http://192.168.1.20:8079"] is False
 
 
 def test_the_lan_cannot_shut_this_machine_out_and_an_ipv6_slash_64_is_one_address() -> None:

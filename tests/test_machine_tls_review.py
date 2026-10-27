@@ -59,9 +59,17 @@ def test_a_node_cannot_add_its_key_to_the_root_s_door_or_another_machine_s() -> 
     )
     assert table["machines"] == {"10.0.0.5:8083": [PIN_R]}, "no key was added to the root's door"
     assert table["routes"]["http://10.0.0.5:8079"] == "https://10.0.0.5:8083/agent"
-    assert table["routes"]["http://10.0.0.9:8079"] is None
-    assert table["routes"]["http://10.0.0.7:8079"] is None
-    assert table["routes"]["http://10.0.0.8:8079"] is None
+    # Untrusted is refused (`false`), never plain (agent#38 review): `null`
+    # would have read as an older version, reached in clear in `automatic`.
+    assert table["routes"]["http://10.0.0.9:8079"] is False
+    assert table["routes"]["http://10.0.0.7:8079"] is False
+    assert table["routes"]["http://10.0.0.8:8079"] is False
+    parsed = _http.parse_machine_table(table)
+    assert parsed.invalid == {
+        "http://10.0.0.9:8079",
+        "http://10.0.0.7:8079",
+        "http://10.0.0.8:8079",
+    }
 
 
 def test_the_join_token_s_key_gives_way_to_the_signed_list() -> None:
@@ -172,9 +180,10 @@ async def test_required_never_sends_an_install_token_in_plain_to_another_machine
     assert _http._route(own, table) is table
 
 
-async def test_the_announcement_falls_back_only_for_a_root_shown_to_be_old(
-    tmp_path: Path,
-) -> None:
+async def test_a_401_never_makes_the_node_announce_less(tmp_path: Path) -> None:
+    """agent#38 review: a 401 (or the 404 that once marked an older root) is
+    what a party in the middle answers too; the node never signs its address
+    alone because of one."""
     root = FakeRoot()
     store = _store(tmp_path)
     enroll_store(store, root, "me", control_url="http://control.invalid:8083")
@@ -184,16 +193,35 @@ async def test_the_announcement_falls_back_only_for_a_root_shown_to_be_old(
         bodies.append(json.loads(request.content))
         return httpx.Response(401, json={"detail": "Signature rejected"})
 
+    # The attack: the node has no key for the root yet (upgraded in place),
+    # so its list request goes in plain HTTP, and a party in the middle
+    # answers it 404 ("an older root"), unsigned.
+    trust = machine_trust.MachineTrust(tmp_path, store)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(404))
+    ) as client:
+        await machine_trust.pull(trust, client, "http://control.invalid:8083")
+    assert trust.root_has_list is False
+    # Then a 401 to the announcement. The agent's loop once handed the 404
+    # to `announce_address` (`old_root`), which then signed the address
+    # alone; there is no such hint now, and nothing says less.
+    import inspect
+
+    hint = (
+        {"old_root": lambda: trust.root_has_list is False}
+        if "old_root" in inspect.signature(enrollment.announce_address).parameters
+        else {}
+    )
     machine = {"machineUrl": "https://10.0.0.6:8083", "tlsPin": "M" * 43}
     outcome = await enrollment.announce_address(
         store=store,
         url="http://10.0.0.6:8079",
         transport=httpx.MockTransport(answer),
         machine=machine,
-        old_root=lambda: False,
+        **hint,
     )
-    # A 401 alone is also what a party in the middle produces by stripping the key.
-    assert not outcome.announced and len(bodies) == 1
+    assert not outcome.announced
+    assert [b.get("tlsPin") for b in bodies] == ["M" * 43], "it announced its address alone"
 
 
 def test_a_record_the_root_holds_otherwise_is_announced_again() -> None:

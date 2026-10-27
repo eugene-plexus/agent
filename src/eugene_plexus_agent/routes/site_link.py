@@ -279,7 +279,10 @@ async def _root(request: Request, method: str, path: str, **kwargs: Any) -> http
     headers[NODE_TOKEN_HEADER] = request.app.state.auth_state.trust.agent_token("control")
     client = getattr(request.app.state, "site_link_client", None)
     if client is None or client.is_closed:
-        client = client_for(root, timeout=20.0, follow_redirects=False, trust_env=False)
+        # A person's link steps: by the route alone (agent#38 review).
+        client = client_for(
+            root, timeout=20.0, follow_redirects=False, trust_env=False, machine_hop=True
+        )
         request.app.state.site_link_client = client
     try:
         return await client.request(method, f"{root}{path}", headers=headers, **kwargs)

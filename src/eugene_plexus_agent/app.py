@@ -930,7 +930,6 @@ async def _announce_address(
             transport=getattr(app.state, "control_transport", None),
             machine=lambda: machine_port.announced(app),
             recorded=trust.own_record,
-            old_root=lambda: trust.root_has_list is False,
         )
     except asyncio.CancelledError:
         raise

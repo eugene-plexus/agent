@@ -204,7 +204,12 @@ def build_table(
     middle there.
     """
     machines: dict[str, set[str]] = {}
-    routes: dict[str, str | None] = {}
+    # A TLS address, None for a machine with no machine port (an older
+    # version, reached in plain HTTP where allowed), or False for one whose
+    # door is claimed but not trusted here: two machines claim it, or it is
+    # the root's with other keys. False is refused outright (agent#38 review);
+    # "neither is trusted" never meant "plain".
+    routes: dict[str, str | bool | None] = {}
     names: dict[str, str] = {}
     contested: set[str] = set()
     control_door: str | None = None
@@ -238,7 +243,7 @@ def build_table(
         pins = {p for p in node.get("pins") or [] if isinstance(p, str)}
         machine_url = node.get("machineUrl")
         door = _origin(machine_url) if isinstance(machine_url, str) and pins else None
-        carried: str | None = None
+        carried: str | bool | None = False if door is not None else None
         if door is not None and door.startswith("https://"):
             hostport = door.removeprefix("https://")
             if hostport == control_door:
@@ -273,16 +278,16 @@ def build_table(
                 # Two records claim one address: neither is carried there.
                 log.warning("%s and %s both claim %s; neither is trusted there",
                             names.get(agent), name, agent)  # fmt: skip
-                routes[agent] = None
+                routes[agent] = False
                 continue
-            routes[agent] = (carried + "/agent") if carried else None
+            routes[agent] = (carried + "/agent") if isinstance(carried, str) else carried
             names[agent] = name
     # Routes through a door that turned out contested carry nothing.
     for key, target in list(routes.items()):
-        if target is not None:
+        if isinstance(target, str):
             door_of = _origin(target)
             if door_of is None or door_of.removeprefix("https://") not in machines:
-                routes[key] = None
+                routes[key] = False
 
     local = sorted({o for o in (_origin(u or "") for u in own_urls) if o})
     return {
@@ -320,7 +325,9 @@ class MachineTrust:
         self._unfollowed: tuple[int, str] | None = None
         self.own_urls: Any = lambda: ()
         #: Whether the root serves a machine list: False once it answered 404
-        #: (a root older than LT1), None until it has answered at all.
+        #: (a root older than LT1), None until it has answered at all. Said,
+        #: never acted on: a 404 is what a party in the middle answers too
+        #: (agent#38 review), so nothing this node sends depends on it.
         self.root_has_list: bool | None = None
 
     @property
