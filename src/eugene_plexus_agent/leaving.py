@@ -391,13 +391,11 @@ async def after_root_moved(app: Any) -> None:
             app.state.agent_state.get_config("advertiseUrl"), store.record.advertise_url
         )
         if advertise:
-            machines = app.state.machine_trust
             await enrollment.announce_address(
                 store=store,
                 url=advertise,
                 transport=getattr(app.state, "control_transport", None),
                 machine=machine_port.announced(app) or {},
-                old_root=lambda: machines.root_has_list is False,
             )
         await ask_now(app)
     except Exception:  # pragma: no cover - defensive

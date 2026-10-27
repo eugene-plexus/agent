@@ -359,7 +359,6 @@ async def announce_address(
     url: str,
     transport: Any = None,
     machine: dict[str, str] | None = None,
-    old_root: Callable[[], bool] = lambda: False,
     refusals_logged: set[tuple[str, int, str]] | None = None,
 ) -> AnnounceOutcome:
     """Tell the control root this node's address. Never raises.
@@ -403,7 +402,6 @@ async def announce_address(
             sent=sent,
             signed=signed,
             transport=transport,
-            old_root=old_root,
             refusals_logged=refusals_logged,
         )
 
@@ -416,26 +414,18 @@ async def _announce_locked(
     sent: dict[str, str],
     signed: Callable[[dict[str, str]], dict[str, Any]],
     transport: Any,
-    old_root: Callable[[], bool],
     refusals_logged: set[tuple[str, int, str]] | None = None,
 ) -> AnnounceOutcome:
     record = store.record
     try:
         async with internal_client(timeout=ANNOUNCE_TIMEOUT_SECONDS, transport=transport) as client:
+            # **Never the address alone because of an answer** (agent#38
+            # review). A 401, and the 404 that once marked "an older root",
+            # are what a party in the middle answers too, and a signed
+            # address-only announcement it so obtained was what cleared this
+            # machine's key at the root. The root is updated first; one that
+            # refuses the machine port is reported, never told less.
             response = await client.patch(target, json=signed(sent))
-            if sent and response.status_code == 401 and old_root():
-                # A root older than LT1 checks a signature over three fields
-                # and refuses five. Only a root shown to be older (it serves
-                # no machine list) gets the address alone: a 401 by itself is
-                # also what a party in the middle produces by stripping the
-                # key, and falling back then would let it clear the key at a
-                # root that would have taken it (adversarial review).
-                log.info(
-                    "the control root does not take machine ports (it runs an older "
-                    "version); announcing the address alone"
-                )
-                sent = {}
-                response = await client.patch(target, json=signed(sent))
     except httpx.HTTPError as exc:
         log.warning("could not announce this node's address to %s: %s", record.control_url, exc)
         return AnnounceOutcome(False, False, url, str(exc), retry=True)
@@ -458,6 +448,12 @@ async def _announce_locked(
             log.debug(
                 "the control root refused this node's address announcement again (%d): %s",
                 response.status_code,
+                detail,
+            )
+        elif response.status_code == 401 and sent:
+            log.warning(
+                "the control root will not accept this node's announcement of its machine "
+                "port: %s. A root older than this machine refuses it; update the root.",
                 detail,
             )
         elif response.status_code == 401:
@@ -493,7 +489,6 @@ async def keep_address_announced(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     machine: Callable[[], dict[str, str] | None] = lambda: None,
     recorded: Callable[[], tuple[str | None, tuple[str, ...]] | None] = lambda: None,
-    old_root: Callable[[], bool] = lambda: False,
     clock: Callable[[], float] = time.perf_counter,
 ) -> None:
     """Tell the control root where this node is until it has heard, and
@@ -521,9 +516,10 @@ async def keep_address_announced(
     switch) is announced once more at the next check; the root answers
     *unchanged* and appends nothing.
 
-    `machine` is this node's machine port and key when it is listening
-    (LT1). It settles with the address: a port that starts listening, or a
-    key that changes, is announced at the next check like a new address.
+    `machine` is this node's machine port and key whenever it has one,
+    listening or still binding (LT1, agent#38). It settles with the address:
+    a port this node opens, or a key that changes, is announced at the next
+    check like a new address.
     And it is checked against what the root says it recorded (`recorded`,
     from the root's signed machine list): a record that differs, however it
     came to differ, is announced again.
@@ -551,7 +547,7 @@ async def keep_address_announced(
                     )
                     warned = True
             elif (
-                (want := (url, tuple(sorted((machine() or {}).items())))) != settled
+                (url, tuple(sorted((machine() or {}).items()))) != settled
                 or _recorded_differs(machine() or {}, recorded())
                 or (refused_at is not None and clock() - refused_at >= REFUSED_RETRY_SECONDS)
             ):
@@ -563,20 +559,14 @@ async def keep_address_announced(
                     url=url,
                     transport=transport,
                     machine=fields,
-                    old_root=old_root,
                     refusals_logged=refusals_logged,
                 )
                 refused_at = None if outcome.announced else clock()
                 if outcome.announced or not outcome.retry:
-                    # Settled on what the root took. An older root took the
-                    # address alone, and that is all it can take until it is
-                    # updated, so this node does not keep asking.
-                    sent = outcome.sent if outcome.announced else None
-                    settled = (
-                        want
-                        if sent == {} and old_root()
-                        else (url, tuple(sorted((sent or fields).items())))
-                    )
+                    # Settled on what was said: a root that refused it says
+                    # why, and is asked again when it changes or after
+                    # `REFUSED_RETRY_SECONDS` (row 36).
+                    settled = (url, tuple(sorted(fields.items())))
                     delay = ANNOUNCE_RETRY_FIRST_SECONDS
                 else:
                     await sleep(delay * random.uniform(0.8, 1.2))

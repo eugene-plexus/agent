@@ -436,6 +436,53 @@ def test_an_explicit_advertise_address_is_used_verbatim(
     assert root.requests[0]["url"] == "http://100.64.0.7:8079"
 
 
+def test_join_registers_the_machine_port_the_agent_will_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_devices: None
+) -> None:
+    """agent#38: `join` sends this machine's door and key, as the console's
+    join does. Without them the root recorded an older version with no
+    machine port, and in `automatic` the other machines sent this one tokens
+    in plain HTTP until its agent started and announced the port. Shifted
+    with the advertised agent port, as the agent derives it."""
+    root = FakeRoot()
+    root.install(monkeypatch)
+    code = onboarding.run_join(
+        JoinRequest(
+            control_url=ROOT_URL,
+            token="t",
+            name="worker-1",
+            advertise_url="http://100.64.0.7:8279",
+        ),
+        settings_for(tmp_path),
+    )
+    assert code == 0
+    store = node_identity.NodeIdentityStore(tmp_path / node_identity.NODE_FILE)
+    store.load()
+    pin = node_identity.machine_pin(store.record.tls_certificate or "")
+    sent = root.requests[0]
+    assert (sent.get("machineUrl"), sent.get("tlsPin")) == ("https://100.64.0.7:8283", pin)
+
+
+def test_join_registers_no_machine_port_where_the_agent_opens_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_devices: None
+) -> None:
+    root = FakeRoot()
+    root.install(monkeypatch)
+    (tmp_path / "loopback").mkdir()
+    onboarding.run_join(
+        JoinRequest(control_url=ROOT_URL, token="t", advertise_url="http://100.64.0.7:8079"),
+        settings_for(tmp_path, machine_port_enabled=False),
+    )
+    onboarding.run_join(
+        JoinRequest(control_url=ROOT_URL, token="t", advertise_url="http://127.0.0.1:8079"),
+        settings_for(tmp_path / "loopback"),
+    )
+    assert [("machineUrl" in sent, "tlsPin" in sent) for sent in root.requests] == [
+        (False, False),
+        (False, False),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # The prompt itself
 # --------------------------------------------------------------------------- #

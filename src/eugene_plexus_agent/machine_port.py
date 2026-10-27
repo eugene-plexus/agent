@@ -503,14 +503,14 @@ class MachinePort:
 
             holder = ports.describe_holder(self.status.port)
             error = (
-                f"port {self.status.port} is in use{f' by {holder}' if holder else ''}"
+                f"port {self.status.port} is held by {holder or 'another program'}"
                 if exc.errno in (98, 10048, 48)
                 else f"could not listen on {self._bind_host}:{self.status.port}: {exc}"
             )
             if error != self.status.error:
                 log.warning(
-                    "the machine port is not listening: %s. Other machines reach this one in "
-                    "plain HTTP until it is; trying again every %d s",
+                    "the machine port is not listening: %s. Other machines cannot reach this "
+                    "one until it is; trying again every %d s",
                     error,
                     int(RETRY_BIND_SECONDS),
                 )
@@ -715,51 +715,144 @@ def bind_host_for(app: Any) -> str:
     return "127.0.0.1"
 
 
-def machine_url(app: Any) -> str | None:
-    """Where other machines reach this one's machine port, or None while it
-    is not listening or the node advertises no address.
+def door_url(
+    *,
+    configured: Any,
+    advertise: str | None,
+    bind_port: int,
+    port: int,
+    ipv6: bool = False,
+) -> str | None:
+    """Where other machines reach a machine port on `port`, or None when the
+    node advertises no address they could use.
 
-    The `machineUrl` config field wins. Otherwise the advertise host, on the
-    machine port shifted by the same offset as the advertised agent port: a
-    container that publishes 8079 as 8279 publishes 8083 as 8283, the same
-    guess the console's join command makes (`installPorts`).
+    `ipv6=True` (the door a node announces, agent#38 review): an IPv6
+    advertise address names a door too, which the port does not answer at
+    (`ipv6_problem`). Announced all the same, so the node is never taken for
+    an older version; the root shows why it cannot reach it.
+
+    The `machineUrl` config field (`configured`) wins. Otherwise the advertise
+    host, on the machine port shifted by the same offset as the advertised
+    agent port: a container that publishes 8079 as 8279 publishes 8083 as
+    8283, the same guess the console's join command makes (`installPorts`).
+    One derivation for the agent and for `join`, which runs with no agent.
     """
     from urllib.parse import urlsplit
 
     from . import node_identity
 
-    door: MachinePort | None = getattr(app.state, "machine_port", None)
-    if door is None or not door.status.listening:
-        return None
-    configured = app.state.agent_state.get_config("machineUrl")
     if isinstance(configured, str) and configured.strip():
         return configured.strip().rstrip("/")
-    advertise = node_identity.effective_advertise_url(
-        app.state.agent_state.get_config("advertiseUrl"),
-        app.state.node_identity.record.advertise_url,
-    )
     host = node_identity.advertise_host(advertise)
     if not host or node_identity.is_loopback_host(host):
         return None
-    if ":" in host:
+    if ":" in host and not ipv6:
         # The machine port listens on IPv4 (`bind_host_for`): an IPv6 address
         # would name a door nothing answers at. Set `machineUrl` to override.
         return None
     advertised_port = urlsplit(advertise or "").port
-    offset = (advertised_port - int(app.state.settings.bind_port)) if advertised_port else 0
-    return node_identity.format_url(host, door.status.port + offset, scheme="https")
+    offset = (advertised_port - int(bind_port)) if advertised_port else 0
+    return node_identity.format_url(host, port + offset, scheme="https")
 
 
-def announced(app: Any) -> dict[str, str] | None:
-    """`machineUrl` and `tlsPin` for an announcement or an enrolment, or None.
-    While the machine key changes, `tlsNextPin` too (row 3)."""
-    url = machine_url(app)
+def ipv6_problem(url: str, configured: Any) -> str | None:
+    """Why a door derived from an IPv6 advertise address does not answer."""
+    from urllib.parse import urlsplit
+
+    if isinstance(configured, str) and configured.strip():
+        return None  # the operator named the door
+    host = urlsplit(url).hostname or ""
+    if ":" not in host:
+        return None
+    return (
+        f"the machine port listens on IPv4 only, and this machine advertises an IPv6 "
+        f"address ({host}); set its machine URL to an IPv4 address or a name"
+    )
+
+
+def _door_url(
+    app: Any, port: int, advertise: str | None = None, *, ipv6: bool = False
+) -> str | None:
+    from . import node_identity
+
+    return door_url(
+        configured=app.state.agent_state.get_config("machineUrl"),
+        advertise=advertise
+        or node_identity.effective_advertise_url(
+            app.state.agent_state.get_config("advertiseUrl"),
+            app.state.node_identity.record.advertise_url,
+        ),
+        bind_port=int(app.state.settings.bind_port),
+        port=port,
+        ipv6=ipv6,
+    )
+
+
+def machine_url(app: Any) -> str | None:
+    """Where other machines reach this one's machine port, or None while it
+    is not listening or the node advertises no address (`door_url`)."""
     door: MachinePort | None = getattr(app.state, "machine_port", None)
-    if url is None or door is None:
+    if door is None or not door.status.listening:
+        return None
+    return _door_url(app, door.status.port)
+
+
+def door_status(app: Any) -> Status | None:
+    """This node's machine port as it stands: the running one, or the one it
+    could not open (`start`: the machine key does not load, agent#38 review).
+    None when this node opens none at all."""
+    door: MachinePort | None = getattr(app.state, "machine_port", None)
+    if door is not None:
+        return door.status
+    failed: Status | None = getattr(app.state, "machine_port_failure", None)
+    return failed
+
+
+def intended_url(app: Any, advertise: str | None = None) -> str | None:
+    """Where other machines will reach this one's machine port: whenever this
+    node has one, listening or still binding (agent#38).
+
+    **The intent, not the listener.** A machine port that is still binding
+    (another process held 8083 a moment longer, at a restart) is no reason
+    to tell the root this machine takes plain HTTP only: the root would
+    record it as an older version, and in `automatic` every machine would
+    then send it tokens in clear until the port opened and it announced
+    again. So enrolment and the announcement carry the door this node
+    serves TLS on, and the others wait for it to listen. Only a node that
+    opens no machine port at all (the setting is off, or control kept the
+    port) announces none; one whose key does not load, or
+    that advertises an IPv6 address, announces its door all the same and says
+    why it does not answer (`announced`, agent#38 review). `advertise` is the
+    address an enrolment is about to register, which the record does not
+    hold yet."""
+    status = door_status(app)
+    if status is None:
+        return None
+    return _door_url(app, status.port, advertise, ipv6=True)
+
+
+#: `NodeAddressAnnouncement.machineError`'s length limit.
+MACHINE_ERROR_MAX = 300
+
+
+def announced(app: Any, advertise: str | None = None) -> dict[str, str] | None:
+    """`machineUrl` and `tlsPin` for an announcement or an enrolment, or None.
+    While the machine key changes, `tlsNextPin` too (row 3). From the door
+    this node intends (`intended_url`), listening or not; while it does not
+    answer, `machineError` says why, so the root's card can (agent#38
+    review: "port 8083 is held by ...")."""
+    url = intended_url(app, advertise)
+    status = door_status(app)
+    if url is None or status is None or not status.pin:
         return None
     from . import machine_key_change
 
-    return machine_key_change.machine_fields(app.state.node_identity.record, url, door.status.pin)
+    fields = machine_key_change.machine_fields(app.state.node_identity.record, url, status.pin)
+    problem = None if status.listening else status.error
+    problem = problem or ipv6_problem(url, app.state.agent_state.get_config("machineUrl"))
+    if problem:
+        fields["machineError"] = problem[:MACHINE_ERROR_MAX]
+    return fields
 
 
 def component_machine_url(app: Any, entry: Any) -> str | None:
@@ -783,6 +876,7 @@ async def start(app: Any) -> MachinePort | None:
     record = app.state.node_identity.record
     if not (record.tls_private_key and record.tls_certificate):
         log.error("this node has no machine key, so it opens no machine port")
+        _failed(app, record, "this machine has no machine key")
         return None
     state = app.state.agent_state
     directory = settings.config_file.resolve().parent
@@ -790,6 +884,7 @@ async def start(app: Any) -> MachinePort | None:
         context = server_context(record.tls_certificate, record.tls_private_key, directory)
     except (OSError, ssl.SSLError, ValueError) as exc:
         log.error("the machine key could not be loaded, so no machine port: %s", exc)
+        _failed(app, record, f"its machine key does not load ({exc})")
         return None
 
     def control() -> str | None:
@@ -817,3 +912,44 @@ async def start(app: Any) -> MachinePort | None:
     app.state.machine_port = door
     await door.start()
     return door
+
+
+def _failed(app: Any, record: Any, error: str) -> None:
+    """A machine port this node meant to open and could not (agent#38 review):
+    kept beside `app.state.machine_port`, which stays None, so nothing takes
+    it for a running port. The node still announces the door, with the key
+    its certificate names, and says why it does not answer; never "an older
+    version". Without even a key to name, there is no door to announce."""
+    pin = _pin_of(record)
+    app.state.machine_port_failure = Status(
+        port=int(app.state.settings.machine_port), pin=pin or "", listening=False, error=error
+    )
+
+
+def _pin_of(record: Any) -> str | None:
+    """The machine key's pin from its certificate, else from the key itself."""
+    from . import node_identity
+
+    try:
+        if record.tls_certificate:
+            return node_identity.machine_pin(record.tls_certificate)
+    except (ValueError, TypeError):
+        pass
+    try:
+        if record.tls_private_key:
+            import base64
+            import hashlib
+
+            from cryptography.hazmat.primitives import serialization
+
+            key = serialization.load_pem_private_key(
+                record.tls_private_key.encode("ascii"), password=None
+            )
+            spki = key.public_key().public_bytes(
+                serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+            )
+            digest = hashlib.sha256(spki).digest()
+            return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    except (ValueError, TypeError):
+        pass
+    return None

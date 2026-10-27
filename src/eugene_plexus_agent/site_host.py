@@ -538,7 +538,12 @@ class SiteHostSupervisor:
         if root != self._root:
             if self._root_client is not None:
                 await self._root_client.aclose()
-            self._root_client = client_for(root, timeout=15.0, follow_redirects=False)
+            # Another machine of this install, whatever its name looks like:
+            # the machine transport and its rules, never the egress client
+            # (agent#38 review), and judged by its route alone.
+            self._root_client = client_for(
+                root, timeout=15.0, follow_redirects=False, trust_env=False, machine_hop=True
+            )
             self._root = root
         assert self._root_client is not None
         token = self.app.state.auth_state.trust.agent_token("control")

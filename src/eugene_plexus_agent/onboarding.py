@@ -346,7 +346,41 @@ async def _join(
         label=request.label,
         advertise_url=advertise,
         devices=[d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
+        machine=_machine_fields(settings, state, identity, advertise),
     )
+
+
+def _machine_fields(
+    settings: Settings,
+    state: AgentState,
+    identity: node_identity.NodeIdentityStore,
+    advertise: str | None,
+) -> dict[str, str] | None:
+    """The machine port this node's agent will open, and its key, for the
+    root to record at the join (agent#38), as the console's join does.
+
+    `join` runs with no agent, so no port listens yet. Without these the root
+    recorded the node as an older version with no machine port, and in
+    `automatic` the other machines sent it tokens in plain HTTP until its
+    agent started and announced the port. The agent opens one unless the
+    environment turned it off (`machine_port_enabled`)."""
+    from . import machine_key_change, machine_port
+
+    if "machine_port_enabled" in settings.model_fields_set and not settings.machine_port_enabled:
+        return None
+    record = identity.ensure_keypair()
+    if not record.tls_certificate:  # pragma: no cover - ensure_keypair makes one
+        return None
+    url = machine_port.door_url(
+        configured=state.get_config("machineUrl"),
+        advertise=advertise,
+        bind_port=int(settings.bind_port),
+        port=int(settings.machine_port),
+    )
+    if url is None:
+        return None
+    pin = node_identity.machine_pin(record.tls_certificate)
+    return machine_key_change.machine_fields(record, url, pin)
 
 
 def _default_name() -> str:

@@ -367,7 +367,9 @@ async def enroll_with_control(request: Request, body: EnrollRequest) -> NodeIden
             advertise_url=advertise,
             devices=[d.model_dump(exclude_none=True, mode="json") for d in snapshot.devices],
             transport=getattr(request.app.state, "control_transport", None),
-            machine=machine_port.announced(request.app),
+            # The door at the address this enrolment registers, listening
+            # or still binding (agent#38).
+            machine=machine_port.announced(request.app, advertise),
         )
     except EnrollmentError as exc:
         raise _from_enrollment_error(exc) from exc
