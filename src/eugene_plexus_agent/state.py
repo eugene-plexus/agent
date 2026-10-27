@@ -638,6 +638,10 @@ class AgentState:
         # `autoStart` is what the person asked for at boot, and this is what
         # they did since.
         self._stopped: set[str] = set()
+        # Row 35: the models on this machine are paused, persisted under
+        # `pausedModels:` as `{since, by, runtimes}` so a pause outlives a
+        # reboot. None when they are not. `runtimes` is what Resume starts.
+        self._paused: dict[str, Any] | None = None
         # Row 4: the standby copy this agent runs was promoted and is the
         # install's root (`standby.promoted`). Persisted under
         # `standbyPromoted:` beside the components it is about.
@@ -697,6 +701,7 @@ class AgentState:
                     for name in raw.get("stoppedRuntimes") or []
                     if isinstance(name, str) and name in self._runtimes
                 }
+                self._paused = _pause_from_file(raw.get("pausedModels"), self._runtimes)
                 self._auth = dict(raw.get("auth") or {})
                 self._standby_promoted = raw.get("standbyPromoted") is True
                 self._drop_invalid_update_channel_locked()
@@ -706,6 +711,7 @@ class AgentState:
                 self._components = {}
                 self._runtimes = {}
                 self._stopped = set()
+                self._paused = None
                 self._auth = {}
                 self._standby_promoted = False
                 self._write_locked()
@@ -751,6 +757,7 @@ class AgentState:
                 self._components = {}
                 self._runtimes = {}
                 self._stopped = set()
+                self._paused = None
                 self._auth = {}
                 self._degraded_reason = reason
                 self._lost_passphrase = any(m.search(raw_text) for m in _AUTH_MARKERS)
@@ -1007,6 +1014,10 @@ class AgentState:
                     raise KeyError(f"runtime {spec.name!r} already exists")
                 del self._runtimes[name]
                 self._stopped.discard(name)
+                if self._paused is not None:
+                    self._paused["runtimes"] = [
+                        spec.name if held == name else held for held in self._paused["runtimes"]
+                    ]
             resolved = self._resolve_ports_locked(spec)
             self._runtimes[resolved.name] = resolved
             self._write_locked()
@@ -1018,6 +1029,9 @@ class AgentState:
                 return False
             del self._runtimes[name]
             self._stopped.discard(name)
+            # A runtime removed during a pause leaves its list (row 35).
+            if self._paused is not None:
+                self._paused["runtimes"] = [n for n in self._paused["runtimes"] if n != name]
             self._write_locked()
             return True
 
@@ -1047,8 +1061,54 @@ class AgentState:
     # The supervisor's `StopMemory` (agent#11).
 
     def remembered_stops(self) -> set[str]:
+        """A person's stops, and while paused what the pause holds (row 35):
+        the supervisor starts neither at boot."""
         with self._lock:
-            return set(self._stopped)
+            held = set(self._paused["runtimes"]) if self._paused is not None else set()
+            return set(self._stopped) | held
+
+    # Row 35: the pause (`pause.py`).
+
+    def pause_record(self) -> dict[str, Any] | None:
+        """`{since, by, runtimes}` while the models here are paused, else None."""
+        with self._lock:
+            if self._paused is None:
+                return None
+            return {**self._paused, "runtimes": list(self._paused["runtimes"])}
+
+    def set_pause(self, record: dict[str, Any] | None) -> None:
+        """Record a pause, change its list, or end it (None)."""
+        with self._lock:
+            if record is None:
+                self._paused = None
+            else:
+                self._paused = {
+                    "since": str(record["since"]),
+                    "by": str(record["by"]),
+                    "runtimes": _declared_once(record.get("runtimes") or [], self._runtimes),
+                }
+            self._write_locked()
+
+    def hold_paused_at_boot(self) -> list[str]:
+        """While paused, add to the pause every runtime a boot would start.
+
+        A runtime the gateway had unloaded before the pause (`idle`) is not
+        in its list, and at boot `autoStart` would start it. The pause holds
+        it instead, and Resume starts it, as the boot would have. Returns
+        the names added."""
+        with self._lock:
+            if self._paused is None:
+                return []
+            listed = self._paused["runtimes"]
+            added = [
+                name
+                for name, spec in self._runtimes.items()
+                if spec.autoStart is not False and name not in self._stopped and name not in listed
+            ]
+            if added:
+                self._paused["runtimes"] = [*listed, *added]
+                self._write_locked()
+            return added
 
     def remember_stop(self, name: str) -> None:
         with self._lock:
@@ -1261,6 +1321,12 @@ class AgentState:
         ]
         if self._stopped:
             out["stoppedRuntimes"] = sorted(self._stopped)
+        if self._paused is not None:
+            out["pausedModels"] = {
+                "since": self._paused["since"],
+                "by": self._paused["by"],
+                "runtimes": list(self._paused["runtimes"]),
+            }
         if self._standby_promoted:
             out["standbyPromoted"] = True
         if self._auth:
@@ -1269,6 +1335,60 @@ class AgentState:
         # Rendered before anything is opened, so a failure to render
         # (a value `safe_dump` refuses) touches no file at all.
         write_private(self._path, yaml.safe_dump(out, sort_keys=True, default_flow_style=False))
+
+
+_PAUSE_SOURCES = ("tray", "console")
+
+
+def _declared_once(names: Any, runtimes: dict[str, RuntimeSpec]) -> list[str]:
+    """`names`, in order, each declared here and listed once."""
+    kept: list[str] = []
+    for name in names if isinstance(names, list) else []:
+        if isinstance(name, str) and name in runtimes and name not in kept:
+            kept.append(name)
+    return kept
+
+
+def _pause_from_file(raw: Any, runtimes: dict[str, RuntimeSpec]) -> dict[str, Any] | None:
+    """The pause `agent.yaml` holds (row 35), or None.
+
+    **A damaged record keeps the machine paused**: the person asked for
+    the graphics card, and a hand edit or a half-understood file must not
+    load it again. What cannot be read is replaced, and the log says so;
+    the boot then holds every runtime it would start (`hold_paused_at_boot`).
+    """
+    from datetime import UTC, datetime
+
+    if raw is None or raw is False:
+        return None
+    record = raw if isinstance(raw, dict) else {}
+    since = record.get("since")
+    if isinstance(since, datetime):
+        # An unquoted time in a hand-edited file reaches us parsed.
+        since = since.isoformat()
+    problem: str | None = None
+    try:
+        datetime.fromisoformat(str(since))
+    except ValueError:
+        problem = "since"
+    if not isinstance(since, str):
+        problem = "since"
+    by = record.get("by")
+    if by not in _PAUSE_SOURCES:
+        problem = problem or "by"
+    if not isinstance(record.get("runtimes"), list):
+        problem = problem or "runtimes"
+    if problem is not None:
+        log.warning(
+            "pausedModels in agent.yaml has an unreadable %s; the models on this machine "
+            "stay paused. Resume them from the console or the tray icon.",
+            problem,
+        )
+    return {
+        "since": since if problem != "since" else datetime.now(UTC).isoformat(),
+        "by": by if by in _PAUSE_SOURCES else "console",
+        "runtimes": _declared_once(record.get("runtimes"), runtimes),
+    }
 
 
 def _to_component(entry: ComponentEntry) -> Component:

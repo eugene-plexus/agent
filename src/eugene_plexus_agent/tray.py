@@ -29,12 +29,12 @@ issues, held by a process anything in that session can read) or widening
 what an `aud: client` key may do, three slices after R2.4 spent itself
 narrowing exactly that.
 
-So the menu is deliberately coarse. **Stop Eugene frees the graphics
-card by stopping the engines with it**, which is the thing that was
-asked for. A finer *"unload the models but keep serving"* would be
-better on a machine somebody else is also using, and it needs a
-credential this process should not have; see the design doc's open
-questions rather than adding one here.
+**Stop Eugene frees the graphics card by stopping the engines with it**,
+and the console and this machine's place in the install go with it.
+**Pause models** (row 35) frees the card and keeps everything else
+serving. It still needs no credential: it asks the agent over a named
+pipe that admits only accounts that may stop the service (`tray_pipe`),
+the same rule as Stop, so it grants nothing Stop did not.
 
 ## What it never does
 
@@ -50,13 +50,16 @@ worse remote control.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import sys
 import time
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +75,8 @@ _ID_STOP = 1024
 _ID_START = 1025
 _ID_QUIT = 1026
 _ID_COMMANDS = 1027
+_ID_PAUSE = 1028
+_ID_RESUME = 1029
 #: How long the elevated `site consent` may take once Windows started it.
 CONSENT_SECONDS = 120
 
@@ -304,7 +309,85 @@ def allow_commands(config_file: str) -> tuple[bool, str]:  # pragma: no cover - 
     return True, "Commands from Workbench may run on this machine now, each signed by its person."
 
 
-def menu_for(state: str, job_site: bool = False) -> list[tuple[int, str, bool]]:
+# --- Pause models (row 35) -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelsState:
+    """What the agent's channel said about the models here.
+
+    `paused` is None when the tray could not ask (Eugene stopped, the
+    channel held by another program); `allowed` is False when Windows
+    refused this account, which then may not pause; `detail` says why.
+    """
+
+    paused: bool | None = None
+    allowed: bool = True
+    detail: str = ""
+
+
+PAUSE_LABEL = "Pause models (frees the graphics card)"
+PAUSE_DENIED_LABEL = "Pause models (this account may not)"
+
+
+def _ask(verb: str, port: int, service_name: str) -> Any:
+    from . import tray_pipe
+
+    timeout = (
+        tray_pipe.READ_TIMEOUT_SECONDS if verb == "state" else tray_pipe.ANSWER_TIMEOUT_SECONDS
+    )
+    return tray_pipe.call(verb, port=port, service_name=service_name, timeout=timeout)
+
+
+def models_state(port: int = DEFAULT_PORT, service_name: str = SERVICE_NAME) -> ModelsState:
+    """Ask the agent whether the models here are paused. Never raises."""
+    try:
+        answer = _ask("state", port, service_name)
+    except Exception as exc:  # pragma: no cover - defensive
+        return ModelsState(detail=str(exc))
+    if answer.status == "denied":
+        return ModelsState(allowed=False, detail=answer.why)
+    if answer.status != "ok":
+        return ModelsState(detail=answer.why)
+    return ModelsState(paused=bool((answer.body.get("pause") or {}).get("paused")))
+
+
+def resume_sentence(results: list[dict[str, Any]]) -> str:
+    """The balloon after Resume: how many started, and why each other did not."""
+    if not results:
+        return "Resumed. No models were stopped by the pause."
+    started = sum(1 for r in results if r.get("state") == "started")
+    text = f"Resumed {started} of {len(results)} models."
+    for result in results:
+        if result.get("state") != "started":
+            why = str(result.get("detail") or result.get("state") or "not started").rstrip(".")
+            text += f" {result.get('name')}: {why}."
+    return text
+
+
+def pause_models(port: int = DEFAULT_PORT, service_name: str = SERVICE_NAME) -> tuple[bool, str]:
+    """Pause the models here over the channel. `(ok, what to say)`."""
+    answer = _ask("pause", port, service_name)
+    if answer.status != "ok":
+        return False, answer.why
+    failed = [r for r in answer.body.get("results") or [] if r.get("state") == "failed"]
+    if failed:
+        return False, " ".join(f"{r.get('name')}: {r.get('detail')}" for r in failed)
+    return True, "Models paused. The graphics card is free; Eugene keeps serving."
+
+
+def resume_models(port: int = DEFAULT_PORT, service_name: str = SERVICE_NAME) -> tuple[bool, str]:
+    """Resume the models here over the channel. `(ok, what to say)`."""
+    answer = _ask("resume", port, service_name)
+    if answer.status != "ok":
+        return False, answer.why
+    results = list(answer.body.get("results") or [])
+    return all(r.get("state") == "started" for r in results), resume_sentence(results)
+
+
+def menu_for(
+    state: str, job_site: bool = False, models: ModelsState | None = None
+) -> list[tuple[int, str, bool]]:
     """`(command id, label, enabled)` for the current state.
 
     Pure, so the whole of what a person is offered can be asserted
@@ -316,11 +399,21 @@ def menu_for(state: str, job_site: bool = False) -> list[tuple[int, str, bool]]:
     move under the cursor is a menu that gets misclicked, and the two
     mistakes here are *turning Eugene off in the middle of an answer*
     and *turning the graphics card back on in the middle of a game*.
+    Pause and Resume follow the same rule (row 35).
     """
     running = state == ServiceState.running
     stopped = state == ServiceState.stopped
+    known = models if models is not None else ModelsState()
     return [
         (_ID_OPEN, "Open Eugene", True),
+        # Pause while the service runs and the models are not paused. A
+        # state the tray could not read leaves it on, so a click says why.
+        (
+            _ID_PAUSE,
+            PAUSE_LABEL if known.allowed else PAUSE_DENIED_LABEL,
+            running and known.allowed and known.paused is not True,
+        ),
+        (_ID_RESUME, "Resume models", running and known.allowed and known.paused is True),
         (_ID_STOP, "Stop Eugene (frees the graphics card)", running),
         (_ID_START, "Start Eugene", stopped),
         # J30: an administrator's consent later, for a person who did not
@@ -337,11 +430,13 @@ def menu_for(state: str, job_site: bool = False) -> list[tuple[int, str, bool]]:
     ]
 
 
-def tooltip_for(state: str) -> str:
+def tooltip_for(state: str, models: ModelsState | None = None) -> str:
     """What hovering says. Under 64 characters: `Shell_NotifyIcon`'s
     `szTip` is 128 wide and truncates without saying so, and a truncated
     status is a wrong status."""
     if state == ServiceState.running:
+        if models is not None and models.paused:
+            return "Eugene is running - models paused"
         return "Eugene is running"
     if state == ServiceState.stopped:
         return "Eugene is stopped - the graphics card is free"
@@ -357,6 +452,8 @@ def main(argv: list[str] | None = None) -> int:
     """
     args = list(sys.argv[1:] if argv is None else argv)
     port = DEFAULT_PORT
+    service_name = SERVICE_NAME
+    call: str | None = None
     for index, value in enumerate(args):
         if value == "--port" and index + 1 < len(args):
             try:
@@ -364,6 +461,14 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError:
                 print(f"--port needs a number, got {args[index + 1]!r}", file=sys.stderr)
                 return 2
+        # The service this tray belongs to: an install's own, unless a test
+        # installed one under another name.
+        if value == "--service" and index + 1 < len(args):
+            service_name = args[index + 1]
+        # `--call state|pause|resume`: ask the channel once, print the
+        # answer as JSON and leave. What the menu does, without a desktop.
+        if value == "--call" and index + 1 < len(args):
+            call = args[index + 1]
     # `--open`: start Eugene if it is stopped, wait for it, show it. What
     # the Start menu entry passes. `--no-icon`: do that and exit, for an
     # install that asked for no tray icon but still wants a way in.
@@ -376,6 +481,16 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if call is not None:
+        from . import tray_pipe
+
+        if call not in tray_pipe.VERBS:
+            print(f"--call takes one of {', '.join(tray_pipe.VERBS)}", file=sys.stderr)
+            return 2
+        answer = _ask(call, port, service_name)
+        print(json.dumps({"status": answer.status, "why": answer.why, "body": answer.body}))
+        return 0 if answer.status == "ok" else 1
+
     # **The open action runs before the single-instance check**, because
     # an icon already sitting in the tray is exactly the case where
     # somebody clicked the Start menu entry to get Eugene back. Refusing
@@ -405,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    return run_message_loop(port=port)
+    return run_message_loop(port=port, service_name=service_name)
 
 
 if __name__ == "__main__":  # pragma: no cover

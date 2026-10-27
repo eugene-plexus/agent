@@ -2706,6 +2706,60 @@ class Arch(StrEnum):
     arm64 = 'arm64'
 
 
+class NodePauseBy(StrEnum):
+    """
+    Where the pause came from: this machine's tray icon (the local
+    channel, which checks the caller's Windows account), or the
+    console (an operator session through the agent's API).
+
+    """
+
+    tray = 'tray'
+    console = 'console'
+
+
+class NodeTrayChannel(StrEnum):
+    """
+    The tray icon's local channel on Windows, the named pipe
+    `\\\\.\\pipe\\eugene-plexus-agent-<port>`. Present on Windows only.
+
+    * `serving` — the agent holds the pipe. It admits only accounts
+      that may stop the Eugene service (or, without the service, the
+      agent's own account), on this machine only.
+    * `taken` — another program held the pipe's name when the agent
+      tried to create it, so the tray cannot pause models. The
+      agent's log names the program's process. The agent tries again
+      every 30 seconds.
+    * `unavailable` — the agent could not serve the pipe (pywin32
+      missing, or an error the log names).
+
+    """
+
+    serving = 'serving'
+    taken = 'taken'
+    unavailable = 'unavailable'
+
+
+class NodePauseRuntimeState(StrEnum):
+    """
+    * `stopped` — Pause stopped it (or a measurement Pause cancelled
+      had stopped it).
+    * `started` — Resume started it again.
+    * `refused` — memory admission refused it at Resume; `detail`
+      carries admission's reason. It stays stopped.
+    * `gone` — it is no longer declared on this machine.
+    * `failed` — it could not be stopped or started; `detail` names
+      the observed cause.
+
+    """
+
+    stopped = 'stopped'
+    started = 'started'
+    refused = 'refused'
+    gone = 'gone'
+    failed = 'failed'
+
+
 class NodeVersionKind(StrEnum):
     """
     - `release`: every commit is the one a published release pins.
@@ -4495,6 +4549,14 @@ class StopReason(StrEnum):
       starts again when that job ends unless the request asked
       otherwise, and while the job runs a start or a gateway wake is
       refused with 409.
+    * `paused` — stopped by Pause, from this machine's tray icon or
+      the console (`POST /v1/node/pause`, row 35). A start, a
+      restart, a declaration, an edit, a gateway wake, a Run, a
+      benchmark and a settings build are refused with 409 until
+      Resume, and the refusal names the pause. The pause outlives a
+      restart and a reboot: the runtime stays stopped, and still
+      reports `paused`, until Resume starts it. Set by Pause only; a
+      stop request that names it is recorded as `operator`.
 
     A reason beside `status: stopped` rather than three new members
     of `RuntimeStatus`, because the state is the same state — the
@@ -4507,6 +4569,7 @@ class StopReason(StrEnum):
     idle = 'idle'
     autoStart = 'autoStart'
     measurement = 'measurement'
+    paused = 'paused'
 
 
 class AdmissionDecision(StrEnum):
@@ -5825,6 +5888,53 @@ class NodePassphraseResult(BaseModel):
     )
 
 
+class NodePause(BaseModel):
+    """
+    Whether the models on this machine are paused (row 35), and the
+    state of the tray icon's channel on Windows.
+
+    Pause stops every model on this machine and keeps everything
+    else serving: the console, the gateway, apps, cloud accounts and
+    the other machines. While paused, nothing starts a model here --
+    a request, Run, a benchmark, a settings build or a reboot -- and
+    a start is refused with 409 naming the pause. Resume
+    (`POST /v1/node/resume`) starts again what Pause stopped, through
+    memory admission.
+
+    Present on every agent from row 35 on, paused or not; absent on
+    an older agent, which cannot pause. A console offers Pause only
+    where it is present. `since`, `by` and `runtimes` are present
+    exactly when `paused` is true.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    paused: bool = Field(
+        ..., description='Whether the models on this machine are paused now.'
+    )
+    since: AwareDatetime | None = Field(None, description='When the pause began.')
+    by: NodePauseBy | None = None
+    runtimes: list[str] | None = Field(
+        None,
+        description='The runtimes Resume starts again: those Pause stopped,\nthose a measurement it cancelled had stopped, and those a\nrestart during the pause held back. A runtime removed during\nthe pause leaves the list.\n',
+    )
+    trayChannel: NodeTrayChannel | None = None
+
+
+class NodePauseRuntimeResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str
+    state: NodePauseRuntimeState
+    detail: str | None = Field(
+        None,
+        description='The cause in a sentence, for every state but `started` and `stopped`.',
+    )
+
+
 class NodeVersion(BaseModel):
     """
     What a person calls the version this machine runs (row 75).
@@ -7128,6 +7238,20 @@ class DirectoryListing(BaseModel):
     )
 
 
+class NodePauseResult(BaseModel):
+    """
+    What `POST /v1/node/pause` or `POST /v1/node/resume` did: the
+    pause as it now stands, and what happened to each runtime.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    pause: NodePause
+    results: list[NodePauseRuntimeResult]
+
+
 class NodeInstall(BaseModel):
     """
     What is installed on this machine, read from the code itself.
@@ -7618,6 +7742,7 @@ class NodeIdentity(BaseModel):
     install: NodeInstall | None = None
     update: NodeUpdate | None = None
     version: NodeVersion | None = None
+    pause: NodePause | None = None
 
 
 class UnenrollResult(BaseModel):

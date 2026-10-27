@@ -287,3 +287,90 @@ def test_no_icon_does_the_open_and_leaves(capsys, monkeypatch) -> None:
     monkeypatch.setattr(tray, "claim_single_instance", refuse)
     assert tray.main(["--open", "--no-icon"]) == 0
     assert acted == ["open"]
+
+
+# --------------------------------------------------------------------------- #
+# Pause models (row 35)
+# --------------------------------------------------------------------------- #
+
+
+def test_menu_offers_pause_and_resume() -> None:
+    """Pause while the models run, Resume while they are paused; both always
+    there, one greyed, in a fixed place."""
+    playing = tray.ModelsState(paused=False)
+    paused = tray.ModelsState(paused=True)
+    serving = {label: on for _, label, on in tray.menu_for("running", models=playing)}
+    assert serving[tray.PAUSE_LABEL] is True
+    assert serving["Resume models"] is False
+    held = {label: on for _, label, on in tray.menu_for("running", models=paused)}
+    assert held[tray.PAUSE_LABEL] is False
+    assert held["Resume models"] is True
+    # Eugene stopped: neither, since nothing is there to ask.
+    stopped = {label: on for _, label, on in tray.menu_for("stopped", models=paused)}
+    assert stopped[tray.PAUSE_LABEL] is False and stopped["Resume models"] is False
+    labels = [
+        [label for _, label, _ in tray.menu_for(state, models=models)]
+        for state in ("running", "stopped", "unknown")
+        for models in (playing, paused, tray.ModelsState())
+    ]
+    assert all(each == labels[0] for each in labels)
+    assert labels[0][:4] == [
+        "Open Eugene",
+        "Pause models (frees the graphics card)",
+        "Resume models",
+        "Stop Eugene (frees the graphics card)",
+    ]
+
+
+def test_an_account_that_may_not_pause_is_told_so_on_the_item() -> None:
+    refused = tray.ModelsState(allowed=False, detail="denied")
+    offered = {label: on for _, label, on in tray.menu_for("running", models=refused)}
+    assert offered["Pause models (this account may not)"] is False
+    assert offered["Resume models"] is False
+    assert tray.PAUSE_LABEL not in offered
+
+
+def test_a_state_the_tray_could_not_read_still_lets_a_click_say_why() -> None:
+    unknown = {label: on for _, label, on in tray.menu_for("running", models=tray.ModelsState())}
+    assert unknown[tray.PAUSE_LABEL] is True
+    assert unknown["Resume models"] is False
+
+
+def test_the_tooltip_says_the_models_are_paused() -> None:
+    text = tray.tooltip_for("running", tray.ModelsState(paused=True))
+    assert text == "Eugene is running - models paused"
+    assert len(text) < 64
+    assert tray.tooltip_for("running", tray.ModelsState(paused=False)) == "Eugene is running"
+
+
+def test_the_resume_balloon_names_each_model_it_could_not_start() -> None:
+    results = [
+        {"name": "small", "state": "started"},
+        {"name": "coder", "state": "started"},
+        {
+            "name": "qwen3-30b",
+            "state": "refused",
+            "detail": "not enough GPU memory (21.4 GB needed, 9.8 GB free).",
+        },
+    ]
+    assert tray.resume_sentence(results) == (
+        "Resumed 2 of 3 models. qwen3-30b: not enough GPU memory (21.4 GB needed, 9.8 GB free)."
+    )
+    assert tray.resume_sentence([]) == "Resumed. No models were stopped by the pause."
+
+
+def test_the_tray_asks_the_channel_for_the_state(monkeypatch) -> None:
+    from eugene_plexus_agent import tray_pipe
+
+    asked: list[tuple[str, int, str]] = []
+
+    def call(verb, *, port, service_name, timeout, expected_pid=None):
+        asked.append((verb, port, service_name))
+        if verb == "state":
+            return tray_pipe.Answer("ok", {"ok": True, "pause": {"paused": True}})
+        return tray_pipe.Answer("denied", {}, tray_pipe.DENIED)
+
+    monkeypatch.setattr(tray_pipe, "call", call)
+    assert tray.models_state(18379, "EPTest") == tray.ModelsState(paused=True)
+    assert tray.pause_models(18379, "EPTest") == (False, tray_pipe.DENIED)
+    assert asked == [("state", 18379, "EPTest"), ("pause", 18379, "EPTest")]

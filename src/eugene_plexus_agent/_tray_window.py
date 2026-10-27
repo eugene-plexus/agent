@@ -28,6 +28,8 @@ _ID_STOP = tray._ID_STOP
 _ID_START = tray._ID_START
 _ID_QUIT = tray._ID_QUIT
 _ID_COMMANDS = tray._ID_COMMANDS
+_ID_PAUSE = tray._ID_PAUSE
+_ID_RESUME = tray._ID_RESUME
 
 #: How often the icon re-reads the service state, in milliseconds. Slow
 #: on purpose: this is a person's own desktop, the state changes when
@@ -36,12 +38,26 @@ _ID_COMMANDS = tray._ID_COMMANDS
 _POLL_MS = 5000
 
 
-def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
+def run_message_loop(
+    *, port: int, service_name: str = tray.SERVICE_NAME
+) -> int:  # pragma: no cover - needs a desktop
     import win32api
     import win32con
     import win32gui
 
     state = {"value": tray.query_state()}
+    # Row 35: whether the models here are paused, from the agent's channel,
+    # read with the service state every five seconds.
+    models = {"value": tray.ModelsState()}
+
+    def read_models() -> None:
+        models["value"] = (
+            tray.models_state(port, service_name)
+            if state["value"] == tray.ServiceState.running
+            else tray.ModelsState()
+        )
+
+    read_models()
     taskbar_created = win32gui.RegisterWindowMessage("TaskbarCreated")
 
     def notify(flags: int, message: int) -> None:
@@ -54,7 +70,7 @@ def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
                     flags,
                     _WM_TRAYICON,
                     icon,
-                    tray.tooltip_for(state["value"]),
+                    tray.tooltip_for(state["value"], models["value"]),
                 ),
             )
         except Exception:
@@ -63,11 +79,31 @@ def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
             # must not take the process down with it.
             log.debug("Shell_NotifyIcon refused", exc_info=True)
 
+    def balloon(text: str, ok: bool) -> None:
+        # A balloon rather than a dialog: the person is on their way into a
+        # game and a modal box in front of it is worse than the problem.
+        win32gui.Shell_NotifyIcon(
+            win32gui.NIM_MODIFY,
+            (
+                hwnd,
+                0,
+                win32gui.NIF_INFO,
+                _WM_TRAYICON,
+                icon,
+                tray.tooltip_for(state["value"], models["value"]),
+                200,
+                "Eugene",
+                text[:200],
+                win32gui.NIIF_INFO if ok else win32gui.NIIF_WARNING,
+            ),
+        )
+
     def show_menu() -> None:
         state["value"] = tray.query_state()
+        read_models()
         menu = win32gui.CreatePopupMenu()
         for command, label, enabled in tray.menu_for(
-            state["value"], job_site=tray.job_site_config() is not None
+            state["value"], job_site=tray.job_site_config() is not None, models=models["value"]
         ):
             flags = win32con.MF_STRING
             if not enabled:
@@ -98,21 +134,18 @@ def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
                 return
             ok, why = tray.allow_commands(config)
             # Said either way: the person asked, and waited for Windows.
-            win32gui.Shell_NotifyIcon(
-                win32gui.NIM_MODIFY,
-                (
-                    hwnd,
-                    0,
-                    win32gui.NIF_INFO,
-                    _WM_TRAYICON,
-                    icon,
-                    tray.tooltip_for(state["value"]),
-                    200,
-                    "Eugene",
-                    why[:200],
-                    win32gui.NIIF_INFO if ok else win32gui.NIIF_WARNING,
-                ),
-            )
+            balloon(why, ok)
+            return
+        if command in (_ID_PAUSE, _ID_RESUME):
+            if command == _ID_PAUSE:
+                ok, why = tray.pause_models(port, service_name)
+            else:
+                ok, why = tray.resume_models(port, service_name)
+            read_models()
+            notify(win32gui.NIF_TIP, win32gui.NIM_MODIFY)
+            # Resume always says how many came back; Pause only when it failed.
+            if command == _ID_RESUME or not ok:
+                balloon(why, ok)
             return
         if command == _ID_STOP:
             ok, why = tray.stop_service()
@@ -121,26 +154,10 @@ def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
         else:
             return
         state["value"] = tray.query_state()
+        read_models()
         notify(win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP, win32gui.NIM_MODIFY)
         if not ok:
-            # A balloon rather than a dialog: the person is on their way
-            # into a game and a modal box in front of it is worse than
-            # the problem.
-            win32gui.Shell_NotifyIcon(
-                win32gui.NIM_MODIFY,
-                (
-                    hwnd,
-                    0,
-                    win32gui.NIF_INFO,
-                    _WM_TRAYICON,
-                    icon,
-                    tray.tooltip_for(state["value"]),
-                    200,
-                    "Eugene",
-                    why[:200],
-                    win32gui.NIIF_WARNING,
-                ),
-            )
+            balloon(why, False)
 
     def wndproc(hwnd_: int, msg: int, wparam: int, lparam: int) -> int:
         if msg == _WM_TRAYICON:
@@ -154,9 +171,10 @@ def run_message_loop(*, port: int) -> int:  # pragma: no cover - needs a desktop
             notify(win32gui.NIF_ICON | win32gui.NIF_MESSAGE | win32gui.NIF_TIP, win32gui.NIM_ADD)
             return 0
         if msg == win32con.WM_TIMER:
-            fresh = tray.query_state()
-            if fresh != state["value"]:
-                state["value"] = fresh
+            before = (state["value"], models["value"])
+            state["value"] = tray.query_state()
+            read_models()
+            if (state["value"], models["value"]) != before:
                 notify(win32gui.NIF_TIP, win32gui.NIM_MODIFY)
             return 0
         if msg == win32con.WM_DESTROY:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -583,9 +584,34 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         created = await companions.reconcile(state, supervisor)
         if created:
             log.info("declared %d companion driver(s) at boot: %s", len(created), created)
+        # Row 35: a pause outlives a reboot. What the boot would start the
+        # pause holds instead, and Resume starts it.
+        held = state.hold_paused_at_boot()
+        if state.pause_record() is not None:
+            log.info(
+                "The models on this machine are paused; none starts at boot%s",
+                f" (held as well: {', '.join(held)})" if held else "",
+            )
         for spec in state.list_runtime_specs():
             runtime_supervisor.start_at_boot(spec)
         await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
+
+    # Row 35: the tray icon's local channel, on Windows. A named pipe that
+    # admits only accounts that may stop this service; nothing another
+    # machine can reach, and no credential held by the tray.
+    tray_channel = None
+    if sys.platform == "win32" and settings.tray_channel_enabled and not settings.safe_mode:
+        from . import pause as pause_module
+        from .tray_pipe import TrayPipe
+
+        loop = asyncio.get_running_loop()
+        tray_channel = TrayPipe(
+            port=settings.bind_port,
+            answer=lambda verb: pause_module.answer_tray(app, verb),
+            loop=loop,
+        )
+        await asyncio.to_thread(tray_channel.start)
+    app.state.tray_pipe = tray_channel
 
     # Host history (specs docs/design/host-history.md): each agent records
     # its own host. The store is opened by the first sample, so a file that
@@ -734,6 +760,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         exec_approvals.configure(None)
+        if tray_channel is not None:
+            await asyncio.to_thread(tray_channel.stop)
         all_updates = getattr(app.state, "update_all", None)
         if all_updates is not None:
             await all_updates.close()
