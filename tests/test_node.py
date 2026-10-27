@@ -1713,6 +1713,61 @@ async def test_a_definite_refusal_is_not_repeated_for_the_same_address(
 
 
 @pytest.mark.asyncio
+async def test_a_refused_address_is_announced_again_after_15_minutes(
+    authed_client: TestClient,
+    control: FakeControl,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Row 36: the root keeps why it refused an address in memory only, so a
+    restarted root or a promoted standby learns it at the machine's next
+    attempt. A definite refusal is no longer announced once and then left:
+    the same address is tried again every 15 minutes, and logged once."""
+    _enroll(authed_client, control)
+    store: NodeIdentityStore = authed_client.app.state.node_identity  # type: ignore[attr-defined]
+    control.nodes["gpu-box"]["signingPublicKey"] = None  # the root answers 401
+    seen, transport = _patches(control)
+
+    now = 0.0
+
+    async def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+        if now > 2000:
+            raise _Stop
+
+    attempts_at: list[float] = []
+
+    def clock() -> float:
+        return now
+
+    real_announce = enrollment.announce_address
+
+    async def counting(**kwargs: Any) -> Any:
+        attempts_at.append(now)
+        return await real_announce(**kwargs)
+
+    caplog.set_level("DEBUG", logger=enrollment.log.name)
+    with (
+        mock.patch.object(enrollment, "announce_address", counting),
+        pytest.raises(_Stop),
+    ):
+        await enrollment.keep_address_announced(
+            store=store,
+            resolve=_resolving("http://10.0.0.9:8079"),
+            transport=transport,
+            sleep=sleep,
+            clock=clock,
+        )
+    # The same address, at 0 and then every 15 minutes (900 s, in 60 s checks).
+    assert seen == ["http://10.0.0.9:8079"] * 3, attempts_at
+    assert attempts_at == [0.0, 900.0, 1800.0]
+    warned = [
+        r for r in caplog.records if r.levelname == "WARNING" and "will not accept" in r.message
+    ]
+    assert len(warned) == 1, [r.message for r in warned]
+
+
+@pytest.mark.asyncio
 async def test_a_running_node_that_moves_says_so_at_the_next_check(
     authed_client: TestClient, control: FakeControl
 ) -> None:

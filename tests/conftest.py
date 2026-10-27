@@ -48,6 +48,16 @@ from eugene_plexus_agent.trust import BUNDLE_FILE, NodeTrust
 TEST_PASSPHRASE = "correct horse battery staple"
 
 
+@pytest.fixture
+def outside_windows_homes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Treat temporary ACL test trees as shared folders, wherever pytest puts them."""
+    from eugene_plexus_agent import folder_access
+
+    _, system = folder_access.windows_roots()
+    monkeypatch.setattr(folder_access, "windows_roots", lambda: ((), system))
+    monkeypatch.setattr(folder_access, "WINDOWS_HOMES", ())
+
+
 class StubSupervisor:
     """No-op stand-in for `Supervisor` used in unit tests.
 

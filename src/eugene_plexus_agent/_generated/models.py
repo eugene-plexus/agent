@@ -2619,6 +2619,82 @@ class HostHistory(BaseModel):
     series: list[HostSeries]
 
 
+class AgentLoginRequest(BaseModel):
+    """
+    `common.yaml`'s `AuthLoginRequest`, and (row 5) the old passphrase
+    once, for a machine that was off when the passphrase changed.
+
+    """
+
+    passphrase: str = Field(..., min_length=1)
+    previousPassphrase: str | None = Field(
+        None,
+        description='Only after a 409 of type `.../old-passphrase-needed`: the\npassphrase this machine had, which opens its master key so it\ncan wrap it under `passphrase`.\n',
+        min_length=1,
+    )
+
+
+class PassphraseChangeRequest(BaseModel):
+    """
+    The same shape as `control.yaml`'s.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    current: SecretStr = Field(..., min_length=1)
+    new: SecretStr = Field(..., min_length=12)
+
+
+class NodePassphraseRequest(BaseModel):
+    """
+    What the control root sends a machine that keeps its own passphrase.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    current: SecretStr = Field(..., min_length=1)
+    new: SecretStr = Field(..., min_length=12)
+
+
+class PassphraseMachineState(StrEnum):
+    """
+    The same values as `control.yaml`'s.
+    """
+
+    changed = 'changed'
+    pending = 'pending'
+    plain = 'plain'
+
+
+class PassphraseMachine(BaseModel):
+    node: str
+    state: PassphraseMachineState
+    detail: str | None = None
+
+
+class PassphraseFileState(StrEnum):
+    """
+    The same values as `control.yaml`'s.
+    """
+
+    matches = 'matches'
+    old = 'old'
+    none = 'none'
+
+
+class PassphraseChangeResult(BaseModel):
+    """
+    The same shape as `control.yaml`'s.
+    """
+
+    changedAt: AwareDatetime
+    machines: list[PassphraseMachine]
+    passphraseFile: PassphraseFileState
+    cleanup: str | None = Field(None, description="The same as `control.yaml`'s.")
+
+
 class Os(StrEnum):
     windows = 'windows'
     linux = 'linux'
@@ -4794,6 +4870,171 @@ class AppInstall(BaseModel):
     finishedAt: AwareDatetime | None = None
 
 
+class Mode(StrEnum):
+    """
+    Read only by default; write adds file creation and writing. On Windows the added ACE excludes delete permission.
+    """
+
+    read = 'read'
+    write = 'write'
+
+
+class FolderAccessRequest(BaseModel):
+    """
+    A shared project folder and the rights confirmed by the operator.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    path: str = Field(
+        ...,
+        description='An existing absolute folder path on this node; links are refused.',
+        max_length=4096,
+        min_length=1,
+    )
+    mode: Mode | None = Field(
+        'read',
+        description='Read only by default; write adds file creation and writing. On Windows the added ACE excludes delete permission.',
+    )
+
+
+class FolderAccessReleaseRequest(BaseModel):
+    """
+    Send path to look up covering records, or id to release one record. Exactly one is required. Never adds access.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    path: str | None = Field(
+        None,
+        description="Look up this app's covering access records without changing permissions.",
+        max_length=4096,
+        min_length=1,
+    )
+    id: str | None = Field(
+        None,
+        description="Release this app's access record by its stable id.",
+        max_length=128,
+        min_length=1,
+    )
+
+
+class Mode1(StrEnum):
+    """
+    The recorded rights; on Windows the write ACE excludes delete permission. Workbench never deletes files.
+    """
+
+    read = 'read'
+    write = 'write'
+
+
+class State2(StrEnum):
+    """
+    The effective access state. Applying and removing are in
+    progress; ready means propagation completed, subject to
+    notInheriting and restartNeeded. Removed means Eugene's
+    additions are gone, even if preexisting rights remain.
+    Changed_outside means the folder identity or recorded rights
+    differ, so nothing was changed. Failed names its cause in
+    message; it does not imply that all additions were removed.
+    Incomplete means removal found access for the app's account
+    that Eugene did not add; each such entry waits in unknown
+    for the owner's decision, and the app may still use it.
+
+    """
+
+    applying = 'applying'
+    ready = 'ready'
+    removing = 'removing'
+    removed = 'removed'
+    changed_outside = 'changed_outside'
+    failed = 'failed'
+    incomplete = 'incomplete'
+
+
+class FolderAccessUnknownKind(StrEnum):
+    """
+    entry is a permission entry for the app's account. null_dacl is
+    a Windows item with no permission list, which lets everyone
+    in. owner means the app's account owns the item, so it can
+    change the item's permissions. unreadable means Eugene cannot
+    read the item's permissions. hardlink is a file with another
+    name outside the folder: removal never changes such a file on
+    its own, since the change would reach that name too. special is
+    a pipe, socket or device holding an entry for the app's account
+    (Linux): removal never changes one on its own. Each file is its
+    own entry. For hardlink and special, Remove lets the removal
+    change that file, at no more names than it has when the owner
+    decides; Keep leaves it as it is.
+
+    """
+
+    entry = 'entry'
+    null_dacl = 'null_dacl'
+    owner = 'owner'
+    unreadable = 'unreadable'
+    hardlink = 'hardlink'
+    special = 'special'
+
+
+class FolderAccessUnknownDecision(StrEnum):
+    """
+    Pending waits for the owner; kept means the owner chose to keep it.
+    """
+
+    pending = 'pending'
+    kept = 'kept'
+
+
+class FolderAccessDecisionAction(StrEnum):
+    """
+    Remove deletes only this entry after checking it again; keep leaves it.
+    """
+
+    remove = 'remove'
+    keep = 'keep'
+
+
+class FolderAccessRefusal(StrEnum):
+    """
+    The observed reason for refusing access. not_a_folder covers
+    missing paths and files; link covers any symlink, junction or
+    reparse point in the path; drive_root includes mount roots;
+    network includes UNC paths and mapped network drives. System,
+    Eugene and home refusals also cover ancestors containing those
+    folders. unsafe_parent means a parent folder can be changed by
+    accounts other than root (Linux), and applies only when no other
+    refusal does. Unavailable means the app shares Eugene's own
+    account and is reported with 409; path refusals use 400.
+
+    """
+
+    not_a_folder = 'not_a_folder'
+    link = 'link'
+    drive_root = 'drive_root'
+    network = 'network'
+    system = 'system'
+    eugene = 'eugene'
+    home = 'home'
+    unsafe_parent = 'unsafe_parent'
+    unavailable = 'unavailable'
+
+
+class FolderAccessProblem(Problem):
+    """
+    A Problem with the observed folder-access refusal and its cause.
+    """
+
+    refusal: FolderAccessRefusal
+    detail: str = Field(
+        ...,
+        description='The observed cause, including the path where applicable, and the next action.',
+        min_length=1,
+    )
+
+
 class AppSettings(BaseModel):
     """
     Effective launcher settings for the installed app, persisted in
@@ -5554,6 +5795,14 @@ class ComponentEntry(BaseModel):
     url: AnyUrl
     spawn: SpawnConfig | None = None
     safeMode: bool | None = False
+
+
+class NodePassphraseResult(BaseModel):
+    passphraseFile: PassphraseFileState
+    detail: str | None = Field(
+        None,
+        description='When `passphraseFile` is `old`: why the file could not be\nwritten. After a restart this machine stays locked until\nsomeone signs in.\n',
+    )
 
 
 class MachinePort(BaseModel):
@@ -6414,6 +6663,32 @@ class AppCatalogue(BaseModel):
     )
 
 
+class FolderAccessUnknown(BaseModel):
+    """
+    One entry that lets the app's account in and that Eugene did not add.
+    """
+
+    id: str = Field(
+        ..., description='Stable id of this entry within its record.', min_length=1
+    )
+    path: str = Field(
+        ..., description='The file or folder that holds the entry.', min_length=1
+    )
+    kind: FolderAccessUnknownKind
+    entry: str = Field(
+        ..., description='The entry in words, as the console shows it.', min_length=1
+    )
+    decision: FolderAccessUnknownDecision
+
+
+class FolderAccessDecision(BaseModel):
+    """
+    The owner's decision about one unknown entry.
+    """
+
+    action: FolderAccessDecisionAction
+
+
 class AppList(BaseModel):
     apps: list[App]
 
@@ -7073,6 +7348,79 @@ class LibraryFolderReach(BaseModel):
     folders: list[LibraryFolderStatus]
 
 
+class FolderAccess(BaseModel):
+    """
+    One persisted access record. Internal folder identity and the
+    exact permission delta stay in the agent's private record,
+    rather than accepting them from a caller. Every status field
+    reports the observed state, not merely the requested change.
+
+    """
+
+    id: str = Field(
+        ...,
+        description='Stable access record id, scoped to this app on this node.',
+        min_length=1,
+    )
+    app: str = Field(..., description="The installed app's AppManifest.id.")
+    path: str = Field(
+        ...,
+        description='The final absolute folder path whose identity the agent recorded.',
+        max_length=4096,
+        min_length=1,
+    )
+    mode: Mode1 = Field(
+        ...,
+        description='The recorded rights; on Windows the write ACE excludes delete permission. Workbench never deletes files.',
+    )
+    account: str = Field(
+        ..., description="The app's own OS identity that receives these rights."
+    )
+    state: State2 = Field(
+        ...,
+        description="The effective access state. Applying and removing are in\nprogress; ready means propagation completed, subject to\nnotInheriting and restartNeeded. Removed means Eugene's\nadditions are gone, even if preexisting rights remain.\nChanged_outside means the folder identity or recorded rights\ndiffer, so nothing was changed. Failed names its cause in\nmessage; it does not imply that all additions were removed.\nIncomplete means removal found access for the app's account\nthat Eugene did not add; each such entry waits in unknown\nfor the owner's decision, and the app may still use it.\n",
+    )
+    preexisting: bool = Field(
+        ...,
+        description='The account already had the requested rights; nothing added and nothing to take back.',
+    )
+    notInheriting: int = Field(
+        ...,
+        description='Items inside the folder that keep their own permissions; their permissions are left as they are.',
+        ge=0,
+    )
+    restartNeeded: bool = Field(
+        ...,
+        description='Linux write access awaits a Workbench restart; never show write access as effective while true.',
+    )
+    message: str = Field(
+        ...,
+        description='The current outcome in words; a failure or changed_outside names its observed cause.',
+        min_length=1,
+    )
+    addedAt: AwareDatetime = Field(
+        ..., description="When the operator's access request was recorded."
+    )
+    addedBy: str = Field(
+        ...,
+        description='The operator identity that requested access, derived from the session.',
+    )
+    unknown: list[FolderAccessUnknown] | None = Field(
+        None,
+        description="Access for the app's account that removal found and Eugene did\nnot add. A pending entry waits for the owner's decision; a kept\nentry stays, and the app still has that access through it.\nAbsent or empty when there is none.\n",
+    )
+
+
+class FolderAccessList(BaseModel):
+    """
+    This app's recorded folder access on this node, including removal outcomes.
+    """
+
+    grants: list[FolderAccess] = Field(
+        ..., description='Empty when there is no matching recorded access.'
+    )
+
+
 class EngineFitModel(BaseModel):
     """
     How one engine uses memory, declared by its adapter beside `accepts`
@@ -7129,6 +7477,10 @@ class NodeIdentity(BaseModel):
         None,
         description='The epoch `controlUrl` came with (row 4): the epoch at\nenrolment, or of the promoted root this node moved to. A node\nmoves only for a signed machine list at a higher epoch. Set to\nthe epoch held when a node updated to row 4 first starts, so an\nupdate never moves a node. Absent until enrolled.\n',
         ge=0,
+    )
+    ownPassphrase: bool | None = Field(
+        None,
+        description="Whether this agent keeps a passphrase of its own (row 5): the\nroot machine's agent, and a machine set up on its own before\nit joined. The control root sends a changed passphrase only to\nthese. Absent from an agent older than row 5.\n",
     )
     standby: LocalStandby | None = None
     rootLocked: bool | None = Field(
@@ -7284,7 +7636,7 @@ class MessageContent1(
         TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
     ] = Field(
         ...,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
         min_length=1,
     )
 
@@ -7343,7 +7695,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -7351,7 +7703,7 @@ class Message(BaseModel):
     )
     toolCallId: str | None = Field(
         None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+        description="On a **tool** message: which call this is the result of.\nFor inference-driver requests, `content` carries text; the gateway\nmoves a tool's pictures to the next user message, labelled with\nthis id.\n",
     )
     reasoning: str | None = Field(
         None,

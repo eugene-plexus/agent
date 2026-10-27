@@ -34,6 +34,7 @@ the ConfigField machinery is flat; `category` is the UI's grouping hint.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import logging
 import os
@@ -65,7 +66,9 @@ from ._generated.models import (
 from ._private_files import write_private
 
 #: Written to `agent.yaml` by every write: the format this release writes.
-STATE_VERSION = 2
+#: 3 (row 5): the `auth` block may hold `kekSalt` and `wrappedMasterKey`
+#: after a passphrase change, and the master key then comes from those.
+STATE_VERSION = 3
 
 # Port range the agent assigns engine runtimes from when the operator
 # doesn't pick one. Above the component ports (8079-8083) and clear of the
@@ -623,6 +626,9 @@ class AgentState:
         # passphraseHash: Argon2id-PHC string (verifiable, not reversible)
         # masterSalt:     base64-encoded 16-byte salt used to derive the
         #                 master key from the passphrase via Argon2id raw.
+        # Row 5, after a passphrase change:
+        # kekSalt:          the salt of the key that wraps the master key
+        # wrappedMasterKey: the master key, sealed under that key
         self._auth: dict[str, Any] = {}
         # Why this agent is running on defaults, when it is (R1.5,
         # review §6.1 #6). None on the ordinary path.
@@ -1100,6 +1106,48 @@ class AgentState:
         with self._lock:
             value = self._auth.get("masterSalt")
             return value if isinstance(value, str) else None
+
+    def get_wrapped_master_key(self) -> tuple[str, str] | None:
+        """(`kekSalt`, `wrappedMasterKey`) after a passphrase change (row 5),
+        or None while the master key is still derived from the passphrase."""
+        with self._lock:
+            salt, wrapped = self._auth.get("kekSalt"), self._auth.get("wrappedMasterKey")
+        if isinstance(salt, str) and isinstance(wrapped, str) and salt and wrapped:
+            return salt, wrapped
+        return None
+
+    def master_key_for(self, passphrase: str) -> bytes:
+        """This install's master key, from its passphrase: unwrapped after a
+        passphrase change (row 5), else Argon2id(passphrase, masterSalt).
+        The one place that says which; raises ValueError when it cannot
+        (no salt, or a wrap the passphrase does not open)."""
+        from . import security
+
+        wrapped = self.get_wrapped_master_key()
+        if wrapped is not None:
+            return security.unwrap_master_key(wrapped[1], passphrase, wrapped[0])
+        salt_b64 = self.get_master_salt_b64()
+        if salt_b64 is None:
+            raise ValueError("this install has no master-key salt")
+        return security.derive_master_key(passphrase, base64.b64decode(salt_b64))
+
+    def change_passphrase(
+        self, *, passphrase_hash: str, kek_salt_b64: str, wrapped_master_key: str
+    ) -> None:
+        """Row 5: a new passphrase over the same master key. `masterSalt`
+        stays, so the keyring entry's install id stays too."""
+        if not passphrase_hash or not kek_salt_b64 or not wrapped_master_key:
+            raise ValueError("a passphrase change needs a hash and a wrapped key")
+        with self._lock:
+            if not self._auth.get("masterSalt"):
+                raise ValueError("this install has no master-key salt")
+            self._auth = {
+                **self._auth,
+                "passphraseHash": passphrase_hash,
+                "kekSalt": kek_salt_b64,
+                "wrappedMasterKey": wrapped_master_key,
+            }
+            self._write_locked()
 
     def require_setup_here(self) -> None:
         """Accept the first-run passphrase only from this machine (agent#22).

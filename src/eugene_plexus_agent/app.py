@@ -19,7 +19,6 @@ spawned in this same lifespan get MASTER_KEY in their env immediately
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -260,19 +259,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         state.has_passphrase()
         and state.get_config("securityMode") == "passphrase_file"
         and not app.state.auth_state.has_master_key()
+        and state.get_master_salt_b64()
     ):
-        salt_b64 = state.get_master_salt_b64()
-        stored_hash = state.get_passphrase_hash()
-        if salt_b64 and stored_hash:
-            key = await asyncio.to_thread(
-                passphrase_file.unlock_key,
-                settings.passphrase_file,
-                passphrase_hash=stored_hash,
-                salt=base64.b64decode(salt_b64),
-            )
-            if key is not None:
-                app.state.auth_state.set_master_key(key)
-                log.info("master key recovered from the passphrase file; children will auto-unlock")
+        # Row 5: `master_key_for` unwraps a key wrapped after a change.
+        key = await asyncio.to_thread(passphrase_file.unlock_key, settings.passphrase_file, state)
+        if key is not None:
+            app.state.auth_state.set_master_key(key)
+            log.info("master key recovered from the passphrase file; children will auto-unlock")
 
     # **Log in to the file servers before anything opens a model.** This
     # is the whole of R2.6's first measurement: an agent running as a
