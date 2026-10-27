@@ -519,11 +519,13 @@ class TrayPipe:
         try:
             self._w = _win32()
         except ImportError:
+            # `sys.prefix`, not the executable: under the service that is
+            # pythonservice.exe, which names no environment.
             log.warning(
                 "The tray's channel %s is not served: pywin32 is not installed in %s, so "
                 "the tray cannot pause models.",
                 self.name,
-                sys.executable,
+                sys.prefix,
             )
             return
         self._stop = self._w.event.CreateEvent(None, True, False, None)
