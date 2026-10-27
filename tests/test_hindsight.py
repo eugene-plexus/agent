@@ -624,7 +624,9 @@ async def test_own_account_start_failure_redacts_log_and_error(
 
     monkeypatch.setattr(runner, "state", state)
     with caplog.at_level(logging.ERROR):
-        await supervisor._start(planner)
+        supervisor.start(planner)
+        await supervisor._starting[record.id]
+    await supervisor.stop_all()
     assert "must-hide" not in caplog.text
     assert "must-hide" not in supervisor._errors[record.id]
 
