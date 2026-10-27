@@ -88,6 +88,13 @@ class FakeControl:
         self.refuse_revoke: int | None = None
         self.logins: list[dict[str, Any]] = []
         self.sign_outs: list[str] = []
+        # Its own config document, and every PATCH of it with the caller.
+        self.config: dict[str, Any] = {"securityMode": "prompt_on_startup"}
+        self.config_patches: list[tuple[dict[str, Any], str]] = []
+        # A root that answers its config with a refusal, or takes a PATCH
+        # and rejects the field, as a real one does per field.
+        self.config_status = 200
+        self.reject_patch: str | None = None
         self.list_version = 0
         self._listener = socket.socket()
         self._listener.bind(("127.0.0.1", 0))
@@ -137,6 +144,24 @@ class FakeControl:
             if path == "/v1/auth/sessions/current":
                 self.sign_outs.append(request.headers.get("authorization", ""))
                 return httpx.Response(204)
+            if path == "/v1/config" and request.method == "GET":
+                if self.config_status != 200:
+                    return httpx.Response(self.config_status, json={"detail": "not for you"})
+                return httpx.Response(200, json=self.config)
+            if path == "/v1/config" and request.method == "PATCH":
+                patch = json.loads(request.content)
+                self.config_patches.append((patch, request.headers.get("authorization", "")))
+                if self.reject_patch is not None:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "applied": [],
+                            "rejected": [{"key": k, "message": self.reject_patch} for k in patch],
+                            "requiresRestart": False,
+                        },
+                    )
+                self.config.update(patch)
+                return httpx.Response(200, json={"applied": list(patch), "rejected": []})
             if path == "/v1/trust/bundle":
                 return httpx.Response(200, json={"jws": self.root.bundle().jws})
             if path == "/v1/trust/machines":
@@ -1986,3 +2011,180 @@ def test_an_explicit_bind_host_wins_even_when_it_will_not_work(tmp_path: Any) ->
     NodeIdentityStore(tmp_path / "node.yaml").record_advertise_url("http://192.168.16.75:8079")
     assert _bind_host_of(tmp_path, bind_host="127.0.0.1") == "127.0.0.1"
     assert _bind_host_of(tmp_path, bind_host="192.168.16.75") == "192.168.16.75"
+
+
+# --------------------------------------------------------------------------- #
+# Row 8: the root this machine runs unlocks from the agent's file too
+# --------------------------------------------------------------------------- #
+
+
+def _local_root(app: Any, control: FakeControl, tmp_path: Any) -> None:
+    """This machine runs the root: the active control entry in its topology."""
+    app.state.agent_state.add_topology_entry(
+        ComponentEntry(
+            name="control",
+            kind=ComponentKind.control,
+            url=control.url,  # type: ignore[arg-type]
+            spawn=SpawnConfig(configFile=str(tmp_path / "control.yaml")),
+            safeMode=False,
+        )
+    )
+
+
+def _on_the_file(app: Any, client: TestClient, tmp_path: Any) -> None:
+    app.state.settings.passphrase_file = tmp_path / "passphrase"
+    response = client.patch("/v1/config", json={"securityMode": "passphrase_file"})
+    assert response.status_code == 200, response.text
+
+
+def _sign_in(client: TestClient) -> str:
+    response = client.post(
+        "/v1/auth/login", json={"passphrase": TEST_PASSPHRASE}, headers={"Authorization": ""}
+    )
+    assert response.status_code == 200, response.text
+    return str(response.json()["sessionToken"])
+
+
+def test_a_sign_in_moves_its_own_keyring_root_onto_the_agents_file(
+    app: Any, authed_client: TestClient, control: FakeControl, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """A Mac install that moved from its LaunchAgent to the daemon.
+
+    Its root kept `securityMode: os_keyring` in its own applied state, which
+    no file the installer can rewrite holds, and the daemon's account has no
+    Keychain: every boot would leave the root sealed. The move tells the
+    person to sign in once; that sign-in writes the agent's passphrase file,
+    and now also sets the root this machine runs to the same file -- what
+    the wizard does on a fresh install -- with the session it just got.
+    """
+    from eugene_plexus_agent import keyring_store
+
+    monkeypatch.setattr(keyring_store, "probe_sync", lambda: False)
+    assert _enroll(authed_client, control).status_code == 200
+    _on_the_file(app, authed_client, tmp_path)
+    _local_root(app, control, tmp_path)
+    control.config = {"securityMode": "os_keyring"}
+
+    session = _sign_in(authed_client)
+
+    assert (tmp_path / "passphrase").read_text(encoding="utf-8") == TEST_PASSPHRASE
+    assert control.config_patches == [({"securityMode": "passphrase_file"}, f"Bearer {session}")]
+
+
+def test_a_sign_in_leaves_every_other_root_mode_alone(
+    app: Any, authed_client: TestClient, control: FakeControl, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Only a keyring the account cannot reach moves, and only on this machine.
+
+    A root on `prompt_on_startup` was chosen so; a keyring this account can
+    reach still works; an agent not on the file has nothing to share; and a
+    worker's root is another machine's, which this agent never changes.
+    """
+    from eugene_plexus_agent import keyring_store
+
+    monkeypatch.setattr(keyring_store, "probe_sync", lambda: False)
+    assert _enroll(authed_client, control).status_code == 200
+
+    # A worker: no root of its own here.
+    _on_the_file(app, authed_client, tmp_path)
+    control.config = {"securityMode": "os_keyring"}
+    _sign_in(authed_client)
+    assert control.config_patches == []
+
+    _local_root(app, control, tmp_path)
+    control.config = {"securityMode": "prompt_on_startup"}
+    _sign_in(authed_client)
+    assert control.config_patches == []
+
+    control.config = {"securityMode": "os_keyring"}
+    monkeypatch.setattr(keyring_store, "probe_sync", lambda: True)
+    _sign_in(authed_client)
+    assert control.config_patches == []
+
+    monkeypatch.setattr(keyring_store, "probe_sync", lambda: False)
+    assert (
+        authed_client.patch("/v1/config", json={"securityMode": "prompt_on_startup"}).status_code
+        == 200
+    )
+    _sign_in(authed_client)
+    assert control.config_patches == []
+
+
+def test_a_slow_keyring_or_a_remote_root_never_moves_the_root(
+    app: Any, authed_client: TestClient, control: FakeControl, tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Row 8 review: only a root this machine runs, and only a keyring known absent.
+
+    A Keychain probe that did not answer in time is a Keychain that might
+    work: it must never authorize a permanent change of the root's unlock
+    mode. And a spawned control entry that names another machine's address
+    is not this machine's process.
+    """
+    from eugene_plexus_agent import keyring_store
+    from eugene_plexus_agent.routes import auth as auth_routes
+
+    assert _enroll(authed_client, control).status_code == 200
+    _on_the_file(app, authed_client, tmp_path)
+    control.config = {"securityMode": "os_keyring"}
+
+    # The probe ran out of time: unknown, not absent.
+    monkeypatch.setattr(auth_routes, "KEYRING_PROBE_BUDGET_SECONDS", 0.01)
+
+    def slow() -> bool:
+        time.sleep(0.5)
+        return False
+
+    monkeypatch.setattr(keyring_store, "probe_sync", slow)
+    _local_root(app, control, tmp_path)
+    _sign_in(authed_client)
+    assert control.config_patches == []
+
+    # A spawned control entry whose address is another machine's, with a
+    # probe that answers "absent" in good time.
+    monkeypatch.setattr(auth_routes, "KEYRING_PROBE_BUDGET_SECONDS", 3.0)
+    monkeypatch.setattr(keyring_store, "probe_sync", lambda: False)
+    state = app.state.agent_state
+    entry = state.get_topology_entry("control")
+    state.update_topology_entry(
+        "control", entry.model_copy(update={"url": "http://192.0.2.44:8083"})
+    )
+    _sign_in(authed_client)
+    assert control.config_patches == []
+
+
+def test_a_root_that_refuses_the_move_says_why(
+    app: Any,
+    authed_client: TestClient,
+    control: FakeControl,
+    tmp_path: Any,
+    monkeypatch: Any,
+    caplog: Any,
+) -> None:
+    """Row 8 review: a refusal is named, never logged as a success.
+
+    The root answers a PATCH with 200 and its per-field result; a rejected
+    `securityMode` is a refusal. A config it would not show is one too.
+    """
+    from eugene_plexus_agent import keyring_store
+
+    monkeypatch.setattr(keyring_store, "probe_sync", lambda: False)
+    assert _enroll(authed_client, control).status_code == 200
+    _on_the_file(app, authed_client, tmp_path)
+    _local_root(app, control, tmp_path)
+    control.config = {"securityMode": "os_keyring"}
+
+    control.reject_patch = "this root has no passphrase file configured"
+    with caplog.at_level(logging.INFO, logger="eugene_plexus_agent.routes.auth"):
+        _sign_in(authed_client)
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "this root has no passphrase file configured" in said
+    assert "now unlocks from" not in said
+
+    caplog.clear()
+    control.reject_patch = None
+    control.config_patches.clear()
+    control.config_status = 403
+    with caplog.at_level(logging.INFO, logger="eugene_plexus_agent.routes.auth"):
+        _sign_in(authed_client)
+    assert control.config_patches == []
+    assert "403" in " ".join(r.getMessage() for r in caplog.records)

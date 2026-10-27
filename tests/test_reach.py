@@ -305,6 +305,114 @@ def test_the_task_detector_actually_consults_the_query(monkeypatch) -> None:
     assert reach_module._windows_task_runs_this_install() is False
 
 
+def _launchd_plist(path, program: str) -> object:
+    """A launchd job file as `install.sh` writes one, naming `program`."""
+    import plistlib
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        plistlib.dump(
+            {
+                "Label": reach.LAUNCHD_LABEL,
+                "UserName": "_eugeneplexus",
+                "ProgramArguments": [program, "--unattended"],
+                "KeepAlive": True,
+            },
+            handle,
+        )
+    return path
+
+
+def _this_installs_program() -> str:
+    return os.path.join(sys.prefix, "bin", "eugene-plexus-agent")
+
+
+@pytest.fixture
+def mac_home(tmp_path, monkeypatch):
+    """A home with no LaunchAgent, a daemon plist path under the test's
+    folder, and launchd (pid 1) as this process's parent."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(reach.Path, "home", lambda: home)
+    # raising=False: before row 8 there was no daemon to look for, and the
+    # test must then fail on what it asserts, not on the setup.
+    monkeypatch.setattr(
+        reach, "LAUNCH_DAEMON_PLIST", tmp_path / "LaunchDaemons" / "x.plist", raising=False
+    )
+    monkeypatch.setattr(reach.os, "getppid", lambda: 1)
+    return home
+
+
+def test_a_launch_daemon_of_this_install_starts_at_boot(mac_home, monkeypatch) -> None:
+    """Row 8: a Mac install runs as a LaunchDaemon in its own account.
+
+    It starts at boot, before anyone signs in, and Reach says so. Its
+    account cannot kickstart a job in the system domain, so the restart is
+    this process ending itself, which `KeepAlive` brings back.
+    """
+    _launchd_plist(reach.LAUNCH_DAEMON_PLIST, _this_installs_program())
+    restart = reach._launchd_restart()
+    assert restart.mechanism is Mechanism.launchd
+    assert restart.canSelfRestart is True
+    assert restart.detail == "This agent starts at boot, before anyone signs in."
+    assert restart.command == "sudo launchctl kickstart -k system/com.eugeneplexus.agent"
+
+
+def test_a_launch_daemon_of_another_install_is_not_ours(mac_home, monkeypatch) -> None:
+    """The daemon plist existing is not proof this process is its job.
+
+    The same mistake the Windows task test made: a throwaway agent beside
+    a real install must never stop itself believing launchd will bring it
+    back. A sibling prefix, a prefix spelled as the start of a longer
+    name, a file that is not a plist, and our own plist when launchd is
+    not our parent are all somebody else's.
+    """
+    others = (
+        os.path.join(os.path.dirname(sys.prefix), "other", "bin", "eugene-plexus-agent"),
+        sys.prefix + "2" + os.sep + "bin" + os.sep + "eugene-plexus-agent",
+        "/usr/local/eugene-plexus/venv/bin/eugene-plexus-agent",
+    )
+    for program in others:
+        _launchd_plist(reach.LAUNCH_DAEMON_PLIST, program)
+        restart = reach._launchd_restart()
+        assert restart.mechanism is Mechanism.none, program
+        assert restart.canSelfRestart is False, program
+
+    reach.LAUNCH_DAEMON_PLIST.write_bytes(b"not a plist")
+    assert reach._launchd_restart().mechanism is Mechanism.none
+
+    _launchd_plist(reach.LAUNCH_DAEMON_PLIST, _this_installs_program())
+    monkeypatch.setattr(reach.os, "getppid", lambda: 4242)
+    assert reach._launchd_restart().mechanism is Mechanism.none
+
+
+def test_daemon_restart_signals_only_itself(mac_home) -> None:
+    """The daemon's restart ends this process and no other.
+
+    One pid, this one, and never a process group (`kill -TERM -<pgid>`)
+    or every process the account owns (`kill -1`): the account also runs
+    the gateway, the library and the engines, which this agent stops
+    itself on the way down. `KeepAlive` starts it again.
+    """
+    _launchd_plist(reach.LAUNCH_DAEMON_PLIST, _this_installs_program())
+    argv = reach.restart_argv(reach._launchd_restart())
+    assert argv == ["/bin/sh", "-c", f"sleep 1; kill -TERM {os.getpid()}"]
+
+
+def test_a_launch_agent_says_it_starts_at_sign_in(mac_home) -> None:
+    """`--user` keeps the LaunchAgent, which starts only when someone signs in."""
+    _launchd_plist(
+        mac_home / "Library" / "LaunchAgents" / f"{reach.LAUNCHD_LABEL}.plist",
+        _this_installs_program(),
+    )
+    restart = reach._launchd_restart()
+    assert restart.mechanism is Mechanism.launchd
+    assert restart.detail == "This agent starts when you sign in to this Mac."
+    assert restart.command is not None and restart.command.startswith("launchctl kickstart -k gui/")
+    argv = reach.restart_argv(restart.model_copy(update={"canSelfRestart": True}))
+    assert argv is not None and argv[:3] == ["launchctl", "kickstart", "-k"]
+
+
 def test_describe_restart_answers_something_on_this_platform() -> None:
     described = reach.describe_restart()
     assert described.mechanism in set(Mechanism)

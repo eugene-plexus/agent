@@ -520,6 +520,9 @@ class _ComponentPlanner:
         # — exactly when you want the opposite (debugging a hang where
         # ANY line emitted before the stall is the clue).
         env["PYTHONUNBUFFERED"] = "1"
+        # `-m` would put the folder a component starts in at the head of its
+        # import path: nothing there is imported (row 8; Python 3.11+).
+        env["PYTHONSAFEPATH"] = "1"
 
         return SpawnPlan(
             argv=[_component_python(), "-m", spec.module],

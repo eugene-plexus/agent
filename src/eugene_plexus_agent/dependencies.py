@@ -21,10 +21,20 @@ this machine, the key's grants and the class's lifetime
 **No `service:*` wildcard anywhere** (2026-09-25). Until then a driver's
 token or the library's opened every read on every agent in the install,
 because a service token named a kind and every machine shared one key.
+
+**A limit on frozen trust** (row 46). Every bearer passes `verify_bearer`,
+and there, past `maxTrustBundleAgeHours` without word from the root, a
+token another machine's key signed is refused with 403 on every route that
+changes something (`refuse_when_frozen`). Which routes change something is
+said once, below: GET, HEAD and OPTIONS read, and every other route is
+named in `FROZEN_TRUST_QUESTIONS` or `FROZEN_TRUST_CHANGES`. A route in
+neither is refused as a change, and `tests/test_trust.py` fails until it
+is named.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request, status
@@ -34,11 +44,257 @@ from . import tokens
 from ._generated.common_models import Problem
 from .auth_state import AuthState
 from .state import AgentState
+from .trust import MAX_AGE_HOURS_KEY, frozen_refusal, max_age_hours
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 _SESSION = (tokens.TYP_SESSION,)
 _SESSION_OR_SERVICE = (tokens.TYP_SESSION, tokens.TYP_SERVICE)
+
+#: Methods that read. Every route on them answers past the limit (row 46).
+READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: Row 46: routes on other methods that change nothing, so another machine's
+#: token still reaches them past the limit. Each is a question or part of an
+#: answer: refusing one would stop answers, not changes.
+FROZEN_TRUST_QUESTIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        # The dry run a gateway asks before it wakes a runtime.
+        ("POST", "/v1/runtimes/admission"),
+        # One request's admission for a client key: part of every answer.
+        ("POST", "/v1/auth/client-keys/admission"),
+        ("POST", "/v1/config/test"),
+        ("POST", "/v1/benchmarks/preflight"),
+        ("POST", "/v1/profile-builds/preflight"),
+        ("POST", "/v1/serving-measurements/preflight"),
+        ("POST", "/v1/entrypoint/preview"),
+        ("POST", "/v1/engines/{engine}/prepared/inspect"),
+        ("POST", "/v1/library/folders/check"),
+        ("POST", "/v1/node/update/check"),
+        ("POST", "/v1/people/known"),
+    }
+)
+
+#: Row 46: routes that change something here. Past the limit another
+#: machine's token is refused on each. Many take no token from another
+#: machine today (an operator session is the root's); they are named so
+#: that a route that starts to take one is covered from its first day.
+FROZEN_TRUST_CHANGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        *(
+            (method, "/api/proxy/{target}/{path:path}")
+            for method in ("DELETE", "PATCH", "POST", "PUT")
+        ),
+        ("POST", "/link/approve/items/{ident}"),
+        ("POST", "/link/approve/items/{ident}/reject"),
+        ("POST", "/link/confirm"),
+        ("POST", "/link/key"),
+        ("POST", "/link/key/remove"),
+        ("POST", "/link/passkey/code"),
+        ("POST", "/link/passkey/remove"),
+        ("POST", "/link/remove"),
+        ("POST", "/oidc/{path:path}"),
+        ("POST", "/v1/app-catalogue/custom"),
+        ("DELETE", "/v1/app-catalogue/custom/{app_id}"),
+        ("DELETE", "/v1/apps/{app_id}"),
+        ("PATCH", "/v1/apps/{app_id}/config"),
+        ("DELETE", "/v1/apps/{app_id}/install"),
+        ("POST", "/v1/apps/{app_id}/install"),
+        ("POST", "/v1/apps/{app_id}/restart"),
+        ("POST", "/v1/apps/{app_id}/rollback"),
+        ("PATCH", "/v1/apps/{app_id}/settings"),
+        ("POST", "/v1/apps/{app_id}/start"),
+        ("POST", "/v1/apps/{app_id}/stop"),
+        ("POST", "/v1/apps/{app}/folder-access"),
+        ("POST", "/v1/apps/{app}/folder-access/release"),
+        ("DELETE", "/v1/apps/{app}/folder-access/{ident}"),
+        ("POST", "/v1/apps/{app}/folder-access/{ident}/unknown/{entry}"),
+        ("POST", "/v1/auth/client-keys"),
+        ("DELETE", "/v1/auth/client-keys/{key_id}"),
+        ("PUT", "/v1/auth/client-keys/{key_id}/limits"),
+        ("POST", "/v1/auth/client-keys/{key_id}/rotate"),
+        ("POST", "/v1/auth/initialize"),
+        ("POST", "/v1/auth/login"),
+        ("POST", "/v1/auth/passphrase"),
+        ("POST", "/v1/auth/service-token"),
+        ("DELETE", "/v1/auth/sessions/current"),
+        ("POST", "/v1/benchmarks"),
+        ("POST", "/v1/benchmarks/{job_id}/cancel"),
+        ("POST", "/v1/components"),
+        ("DELETE", "/v1/components/{name}"),
+        ("PATCH", "/v1/components/{name}"),
+        ("POST", "/v1/components/{name}/restart"),
+        ("PATCH", "/v1/config"),
+        ("DELETE", "/v1/engines/{engine}/install"),
+        ("POST", "/v1/engines/{engine}/install"),
+        ("POST", "/v1/engines/{engine}/uninstall"),
+        # Row 8c: what Eugene's own account may run.
+        ("POST", "/v1/exec-approvals"),
+        ("DELETE", "/v1/exec-approvals/{id}"),
+        ("DELETE", "/v1/entrypoint"),
+        ("POST", "/v1/entrypoint/apply"),
+        ("POST", "/v1/logs"),
+        ("POST", "/v1/model-copies/clear"),
+        ("POST", "/v1/node/enroll"),
+        ("DELETE", "/v1/node/history"),
+        ("DELETE", "/v1/node/machine-key"),
+        ("POST", "/v1/node/machine-key"),
+        ("POST", "/v1/node/machine-list"),
+        ("POST", "/v1/node/passphrase"),
+        ("POST", "/v1/node/reach"),
+        ("POST", "/v1/node/trust-bundle"),
+        ("POST", "/v1/node/unenroll"),
+        ("POST", "/v1/node/update"),
+        ("POST", "/v1/ollama/send"),
+        ("POST", "/v1/profile-builds"),
+        ("POST", "/v1/profile-builds/{job_id}/cancel"),
+        ("POST", "/v1/runtimes"),
+        ("DELETE", "/v1/runtimes/{name}"),
+        ("PATCH", "/v1/runtimes/{name}"),
+        ("PUT", "/v1/runtimes/{name}/auto-start"),
+        ("POST", "/v1/runtimes/{name}/restart"),
+        ("POST", "/v1/runtimes/{name}/start"),
+        ("POST", "/v1/runtimes/{name}/stop"),
+        ("POST", "/v1/serving-measurements"),
+        ("POST", "/v1/serving-measurements/{job_id}/cancel"),
+        ("DELETE", "/v1/site/links/{subject}"),
+        ("POST", "/v1/updates/all"),
+    }
+)
+
+#: Row 46: through `/api/proxy` to a component on this machine (another
+#: machine's components reach the browser proxy through this agent's
+#: machine port), the requests on methods other than GET, HEAD and OPTIONS
+#: that are answers or questions, by the kind of component the target
+#: names. Another machine's token still reaches these past the limit;
+#: anything else through the proxy -- a write to the Library or the store,
+#: a component's config -- is refused as a change here is, and so is
+#: anything sent to a kind not named. The agent's own API (`agent`,
+#: `node:<this machine>`) is guarded by its own routes.
+FROZEN_TRUST_PROXY_QUESTIONS: dict[str, frozenset[tuple[str, str]]] = {
+    "inference-driver": frozenset(
+        {
+            *(
+                ("POST", path)
+                for path in (
+                    "/v1/generate",
+                    "/v1/generate/stream",
+                    "/v1/generate/count",
+                    "/v1/moderate",
+                    "/v1/speak",
+                    "/v1/transcribe",
+                    "/v1/image",
+                    "/v1/image/stream",
+                    "/v1/video",
+                    "/v1/embed",
+                    "/v1/rerank",
+                    "/v1/decide",
+                )
+            ),
+            ("POST", "/v1/config/test"),
+        }
+    ),
+    "tool-driver": frozenset({("POST", "/v1/tools/web_search"), ("POST", "/v1/config/test")}),
+    # The doors. Another machine's service token is refused there anyway;
+    # named so the rule is the same for every kind.
+    "gateway": frozenset(
+        {
+            *(
+                ("POST", path)
+                for path in (
+                    "/v1/chat/completions",
+                    "/v1/completions",
+                    "/v1/messages",
+                    "/v1/messages/count_tokens",
+                    "/v1/responses",
+                    "/v1/responses/compact",
+                    "/v1/responses/input_tokens",
+                    "/v1/moderations",
+                    "/v1/audio/speech",
+                    "/v1/audio/transcriptions",
+                    "/v1/audio/translations",
+                    "/v1/web_search",
+                    "/v1/images/generations",
+                    "/v1/images/edits",
+                    "/v1/images/variations",
+                    "/v1/videos",
+                    "/v1/embeddings",
+                    "/v1/rerank",
+                    "/v1/systemone",
+                    "/v1beta/models/{model}:generateContent",
+                    "/v1beta/models/{model}:streamGenerateContent",
+                    "/v1beta/models/{model}:countTokens",
+                    "/v1/models/{model}:generateContent",
+                    "/v1/models/{model}:streamGenerateContent",
+                    "/v1/models/{model}:countTokens",
+                    "/v1/config/test",
+                )
+            ),
+        }
+    ),
+    "library": frozenset(
+        {
+            ("POST", "/v1/eligibility"),
+            ("POST", "/v1/catalogue/search"),
+            ("POST", "/v1/keep-jobs/{id}/files/state"),
+            ("POST", "/v1/config/test"),
+        }
+    ),
+    "store": frozenset(),
+    "control": frozenset(),
+}
+
+
+def _template(path: str) -> re.Pattern[str]:
+    """`/v1/models/{model}:countTokens` as a pattern: one segment per name."""
+    parts = re.split(r"\{[^/{}]+\}", path)
+    return re.compile("^" + "[^/]+".join(re.escape(part) for part in parts) + "$")
+
+
+_PROXY_QUESTIONS = {
+    kind: tuple((method, _template(path)) for method, path in named)
+    for kind, named in FROZEN_TRUST_PROXY_QUESTIONS.items()
+}
+
+
+def proxied_change(kind: str | None, method: str, path: str) -> bool:
+    """Whether a request through the proxy to a component of `kind` on this
+    machine changes something (row 46). A kind not named, and a request
+    in no list, count as changes."""
+    method = method.upper()
+    if method in READ_METHODS:
+        return False
+    return not any(
+        method == named and pattern.match(path)
+        for named, pattern in _PROXY_QUESTIONS.get(kind or "", ())
+    )
+
+
+_ANY_TOKEN = (tokens.TYP_SESSION, tokens.TYP_SERVICE, tokens.TYP_CLIENT, tokens.TYP_ADMINISTRATION)
+
+
+def refuse_proxied_when_frozen(
+    request: Request, kind: str | None, path: str, credentials: list[str]
+) -> None:
+    """The freeze for a request the proxy carries to a component on this
+    machine, which checks its token itself and knows nothing of the root's
+    silence (row 46). Refused when the limit is passed, a credential is
+    another machine's token addressed here, and the request is a change.
+    A credential that does not verify here is the component's to refuse."""
+    auth: AuthState | None = getattr(request.app.state, "auth_state", None)
+    if auth is None or request.method.upper() in READ_METHODS:
+        return
+    trust = auth.trust
+    age = trust.frozen_age(trust_limit_hours(request))
+    if age is None or not proxied_change(kind, request.method, path):
+        return
+    for token in credentials:
+        try:
+            claims = trust.verify(token, classes=_ANY_TOKEN)
+        except tokens.TokenError:
+            continue
+        if trust.minted_elsewhere(claims):
+            raise _problem(status.HTTP_403_FORBIDDEN, "Root not heard", frozen_refusal(age))
 
 
 def _problem(status_code: int, title: str, detail: str) -> HTTPException:
@@ -114,6 +370,7 @@ def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> 
             "Superseded root",
             tokens.no_longer_followed("unknown", int(held or 0)),
         )
+    refuse_when_frozen(request, claims)
     # An operator session that arrived through the HTTPS entry point keeps a
     # configuration applied from Settings; without one it goes back
     # (`entrypoint_setup`). A console kept on its own port has not moved, so
@@ -131,6 +388,44 @@ def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> 
 
         confirm(request.app)
     return claims
+
+
+def trust_limit_hours(request: Request) -> int:
+    """`maxTrustBundleAgeHours` in effect on this agent (row 46)."""
+    state = getattr(request.app.state, "agent_state", None)
+    return max_age_hours(state.get_config(MAX_AGE_HOURS_KEY) if state is not None else None)
+
+
+def changes_something(request: Request) -> bool:
+    """Whether the route this request matched changes something (row 46).
+
+    Read off the matched route's template, so `/v1/runtimes/a/stop` and
+    `/v1/runtimes/b/stop` are one entry. A request with no matched route
+    (a background job re-checking its session) and a route in neither
+    list both count as changes."""
+    method = str(request.scope.get("method") or "").upper()
+    if method in READ_METHODS:
+        return False
+    return (method, getattr(request.scope.get("route"), "path", None)) not in (
+        FROZEN_TRUST_QUESTIONS
+    )
+
+
+def refuse_when_frozen(request: Request, claims: tokens.Claims) -> None:
+    """Past the limit without word from the root, refuse another machine's
+    token on a route that changes something (row 46).
+
+    The root's tokens are checked against the same old bundle and the
+    root is the authority, so they pass; so do this machine's own tokens
+    for its children, and every read, so a dead root never stops answers.
+    """
+    trust = request.app.state.auth_state.trust
+    if not trust.minted_elsewhere(claims):
+        return
+    age = trust.frozen_age(trust_limit_hours(request))
+    if age is None or not changes_something(request):
+        return
+    raise _problem(status.HTTP_403_FORBIDDEN, "Root not heard", frozen_refusal(age))
 
 
 def _legacy_root_token_after_a_promotion(auth: Any, claims: tokens.Claims, record: Any) -> bool:

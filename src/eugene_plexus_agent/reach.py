@@ -49,6 +49,7 @@ import contextlib
 import logging
 import os
 import platform
+import plistlib
 import shutil
 import socket
 import subprocess
@@ -596,7 +597,60 @@ def _systemd_restart() -> AgentRestart:
     )
 
 
+#: Where `install.sh` puts the Mac's system job (row 8): Eugene in its own
+#: account, `_eugeneplexus`, started at boot before anyone signs in.
+LAUNCH_DAEMON_PLIST = Path("/Library/LaunchDaemons") / f"{LAUNCHD_LABEL}.plist"
+#: What a person types to restart the daemon. Also how `restart_argv` tells
+#: the daemon's restart from the LaunchAgent's: the two share a mechanism.
+DAEMON_RESTART_COMMAND = f"sudo launchctl kickstart -k system/{LAUNCHD_LABEL}"
+
+
+def _inside(path: str, prefix: str) -> bool:
+    """Is `path` strictly under `prefix`, as spelled or once links are resolved?"""
+    for norm in (os.path.normpath, os.path.realpath):
+        try:
+            if norm(path).startswith(norm(prefix) + os.sep):
+                return True
+        except (OSError, ValueError):  # pragma: no cover - defensive
+            continue
+    return False
+
+
+def _launch_daemon_runs_this_install() -> bool:
+    """Is the system job the thing that started *this* process?
+
+    The plist is world-readable (root:wheel 0644). It is this install's
+    when the program it starts lives inside the virtualenv this
+    interpreter runs from -- the discriminator the Windows task check
+    uses, for the reason given there -- and launchd is this process's
+    parent. Anything that cannot be read as a plist is nobody's.
+    """
+    if os.getppid() != 1:
+        return False
+    try:
+        with LAUNCH_DAEMON_PLIST.open("rb") as handle:
+            job = plistlib.load(handle)
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+    arguments = job.get("ProgramArguments") if isinstance(job, dict) else None
+    if not isinstance(arguments, list) or not arguments or not isinstance(arguments[0], str):
+        return False
+    return _inside(arguments[0], sys.prefix)
+
+
 def _launchd_restart() -> AgentRestart:
+    # The system job first: since row 8 a Mac install is a LaunchDaemon in
+    # its own account, and `--user` keeps the LaunchAgent below.
+    if _launch_daemon_runs_this_install():
+        return AgentRestart(
+            mechanism=Mechanism.launchd,
+            # This account cannot kickstart a system job, so the restart is
+            # this process ending itself and `KeepAlive` starting it again
+            # (`restart_argv`). /bin/sh is part of macOS.
+            canSelfRestart=True,
+            command=DAEMON_RESTART_COMMAND,
+            detail="This agent starts at boot, before anyone signs in.",
+        )
     # The plist existing is not proof this process is the thing it
     # starts -- the same mistake the Windows task test made, and the
     # acceptance run caught. A launchd-started process is reparented to
@@ -617,6 +671,7 @@ def _launchd_restart() -> AgentRestart:
         mechanism=Mechanism.launchd,
         canSelfRestart=shutil.which("launchctl") is not None,
         command=f"launchctl kickstart -k gui/{uid}/{LAUNCHD_LABEL}",
+        detail="This agent starts when you sign in to this Mac.",
     )
 
 
@@ -713,6 +768,12 @@ def restart_argv(restart: AgentRestart) -> list[str] | None:
         user = ["--user"] if _euid() != 0 else []
         return ["systemctl", *user, "restart", SYSTEMD_UNIT]
     if restart.mechanism is Mechanism.launchd:
+        if restart.command == DAEMON_RESTART_COMMAND:
+            # Eugene's own account cannot ask launchd to restart a system
+            # job. It ends this one process -- never its group, never the
+            # account's others -- and `KeepAlive` starts it again. The
+            # second's wait lets the response go out first.
+            return ["/bin/sh", "-c", f"sleep 1; kill -TERM {os.getpid()}"]
         return ["launchctl", "kickstart", "-k", f"gui/{_uid()}/{LAUNCHD_LABEL}"]
     return None
 

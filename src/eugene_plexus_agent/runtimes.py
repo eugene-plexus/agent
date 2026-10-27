@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import shutil
 import time
@@ -23,13 +24,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import model_copies, ports
+from . import exec_approvals, exec_trust, model_copies, ports
 from ._generated.models import (
     CopyProgress,
     EngineAcquisition,
     EngineDescriptor,
     EngineInstall,
     EngineKind,
+    ExecTrust,
     HostAccelerator,
     LastDevice,
     LoadProgress,
@@ -44,6 +46,7 @@ from ._generated.models import (
     RuntimeSpec,
     RuntimeSpeculation,
     RuntimeStatus,
+    State,
     StopReason,
     StrataEffectiveLaunch,
 )
@@ -70,7 +73,7 @@ from .engines.acquisition import (
     Release,
     Unavailable,
 )
-from .engines.base import DiscoveredBinary, with_engine_version
+from .engines.base import DiscoveredBinary, UntrustedBinaryError, with_engine_version
 from .engines.devices import DeviceSnapshot, DevicesReader, detect_devices
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
@@ -187,6 +190,12 @@ class _RuntimePlanner:
         # config (2026-09-14). This node's `pathMappings` are the
         # overrides and come first.
         self._inherited_rules = inherited_rules
+        self.refused_binary: str | None = None
+        """This runtime's own `binary`, when the last plan refused it because
+        Eugene's own account will not run it (row 8): `Runtime.refusedBinary`."""
+        self.exec_trust: ExecTrust | None = None
+        """Why the last plan did not run the engine's program, and what an
+        owner may approve (part 8c): `Runtime.execTrust`."""
         self._library_roots = library_roots
         self.binary: DiscoveredBinary | None = None
         """Whatever the last plan resolved. Read for `Runtime.engineVersion`
@@ -225,8 +234,18 @@ class _RuntimePlanner:
             # A declared runtime whose engine is missing is a crash, not a
             # skipped entry: the operator asked for something that cannot
             # be delivered and needs to hear about it.
+            self.refused_binary = (
+                self.spec.binary
+                if isinstance(e, UntrustedBinaryError) and self.spec.binary
+                else None
+            )
+            self.exec_trust = (
+                exec_approvals.view(e.verdict) if isinstance(e, UntrustedBinaryError) else None
+            )
             raise SpawnPlanError(str(e)) from e
 
+        self.refused_binary = None
+        self.exec_trust = None
         self.binary = binary
         port = self.spec.port
         if port is None:
@@ -298,6 +317,17 @@ class _RuntimePlanner:
             )
         if launch_spec.env:
             env.update({k: str(v) for k, v in launch_spec.env.items()})
+        # Run as Eugene's own account, the engine finds programs only in
+        # folders nobody else can change (row 8c): the runtime's own PATH
+        # and the system's, each checked; never the one the agent inherited.
+        # No folder passes: the engine is not started (an empty PATH would
+        # search the folder it starts in).
+        try:
+            search = exec_trust.search_path(str((launch_spec.env or {}).get("PATH") or "") or None)
+        except exec_trust.Untrusted as e:
+            raise SpawnPlanError(str(e)) from e
+        if search is not None:
+            env["PATH"] = search
 
         cwd = self._adapter.working_directory(launch_spec, binary)
         try:
@@ -1174,6 +1204,8 @@ class RuntimeSupervisor:
             ),
             lastRestart=last_restart,
             lastError=last_error,
+            refusedBinary=planner.refused_binary if planner is not None else None,
+            execTrust=planner.exec_trust if planner is not None else None,
             loadProgress=load_progress,
             speculation=self._speculation_for(spec, adapter, argv, status),
             promptCache=self._prompt_cache_for(spec, adapter, argv, status),
@@ -1410,6 +1442,79 @@ async def close_installers() -> None:
     _INSTALLERS.clear()
 
 
+#: Builds to fetch again, beside the managed builds (row 8, R8-ENGINES-COPY).
+#: The move of a Mac's per-user install to its daemon copies the person's
+#: engine builds, keeps one only when every file matches the record made
+#: when it was downloaded, and removes and lists the rest here.
+REFETCH_NAME = "refetch.json"
+
+
+async def refetch_listed_builds() -> list[str]:
+    """Fetch again each build listed in `<engine root>/refetch.json`.
+
+    The same install as the console's: the release's own archives,
+    verified against upstream's digests. A version upstream no longer has
+    for this host is replaced by the newest that it does. An entry whose
+    fetch fails stays listed, and the next start tries again; the list goes
+    once nothing is left in it. Returns what was installed."""
+    from .engines.acquisition import engine_root
+
+    marker = engine_root() / REFETCH_NAME
+    if marker.is_symlink() or not marker.is_file():
+        return []
+    try:
+        listed = json.loads(marker.read_text(encoding="utf-8")).get("builds") or []
+    except (OSError, ValueError, AttributeError) as e:
+        log.warning("could not read %s, so no engine build was fetched again: %s", marker, e)
+        return []
+    installed: list[str] = []
+    remaining: list[dict[str, Any]] = []
+    for entry in listed:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            kind = EngineKind(str(entry.get("engine")))
+        except ValueError:
+            continue
+        installer = installer_for(kind)
+        if installer is None:
+            continue
+        version = str(entry["version"]) if entry.get("version") else None
+        variant = str(entry["variant"]) if entry.get("variant") else None
+        plan = await asyncio.to_thread(plan_for, kind, version=version, variant=variant)
+        if isinstance(plan, Unavailable) and version is not None:
+            plan = await asyncio.to_thread(plan_for, kind)
+        if isinstance(plan, Unavailable):
+            log.warning("%s %s was not fetched again: %s", kind.value, version or "", plan.reason)
+            remaining.append(entry)
+            continue
+        try:
+            installer.start(plan)
+        except AcquisitionError as e:
+            log.warning("%s %s was not fetched again: %s", kind.value, plan.version, e)
+            remaining.append(entry)
+            continue
+        done = await installer.wait()
+        if done is not None and done.state is State.done:
+            log.info(
+                "fetched %s %s again (a move could not check its copy)", kind.value, plan.version
+            )
+            installed.append(f"{kind.value} {plan.version}")
+        else:
+            log.warning(
+                "%s %s was not fetched again: %s",
+                kind.value,
+                plan.version,
+                (done.error if done is not None else None) or "the install did not finish",
+            )
+            remaining.append(entry)
+    if remaining:
+        marker.write_text(json.dumps({"builds": remaining}, indent=2), encoding="utf-8")
+    else:
+        marker.unlink(missing_ok=True)
+    return installed
+
+
 def _manual_reason(adapter: EngineAdapter, manual: ManualInstall | None) -> str:
     """Why we will not install a `manual` engine, written so the 422 from
     the install endpoint still tells the operator what to do."""
@@ -1610,15 +1715,19 @@ def describe_engines(
         managed = _managed_for(adapter)
 
         error: str | None = None
+        exec_trust: ExecTrust | None = None
         found: DiscoveredBinary | None
         try:
             found = adapter.discover(configured=_configured_binary(adapter, get_config))
         except EngineUnavailableError as e:
             # A configured path that does not exist. Reported as
             # unavailable with the path named, never quietly replaced by
-            # whatever is on PATH.
+            # whatever is on PATH. Or one Eugene's own account did not
+            # run, and what an owner may approve (row 8, part 8c).
             found = None
             error = str(e)
+            if isinstance(e, UntrustedBinaryError):
+                exec_trust = exec_approvals.view(e.verdict)
 
         if found is None:
             if error is None:
@@ -1644,6 +1753,7 @@ def describe_engines(
                     fit=fit,
                     experimental=adapter.experimental,
                     error=error,
+                    execTrust=exec_trust,
                     flagSchema=adapter.flag_schema(),
                     managed=managed,
                     acquisition=acquisition,

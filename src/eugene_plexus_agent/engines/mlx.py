@@ -232,6 +232,7 @@ class MlxAdapter(EngineAdapter):
         `mlx` rather than about vLLM and torch. Nothing of either engine
         is imported here: the probe runs the *other* interpreter.
         """
+        path = self.trusted(path)
         python = inspect_python_environment(path)
         version: str | None = None
         if python is not None:
@@ -272,9 +273,15 @@ class MlxAdapter(EngineAdapter):
         if not apple:
             return ManualInstall(docsUrl=INSTALL_DOCS_URL, notes=_NOT_APPLE_NOTES)
         uv = _uv_for_recipe()
+        # uv's own Python, never one installed on the Mac (row 8c): the
+        # daemon's account runs an environment only when the Python it was
+        # made from is root's or its own, and a python.org framework is
+        # writable by its group, a Homebrew one the person's. uv keeps its
+        # own under the account's home, which is the install's folder.
         return ManualInstall(
             command=(
-                f"{uv} venv --python {_NATIVE_PYTHON} ~/eugene-mlx && {uv} pip install "
+                f"{uv} venv --python {_NATIVE_PYTHON} --python-preference only-managed "
+                f"~/eugene-mlx && {uv} pip install "
                 f'--python ~/eugene-mlx/bin/python "mlx-lm=={UPSTREAM_VERSION_PINNED}"'
             ),
             docsUrl=INSTALL_DOCS_URL,

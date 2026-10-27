@@ -74,7 +74,11 @@ from .._generated.models import (
 )
 from .._http import internal_client
 from ..auth_state import AuthState
-from ..dependencies import require_operator_or_service, require_operator_session
+from ..dependencies import (
+    require_operator_or_service,
+    require_operator_session,
+    trust_limit_hours,
+)
 from ..engines.devices import DeviceSnapshot, detect_devices
 from ..enrollment import (
     EnrollmentError,
@@ -210,6 +214,7 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
     bundle = trust.bundle if record.enrolled else None
     token_public = tokens.public_b64(trust.signer().key) if record.token_private_key else None
     entry = getattr(request.app.state, "entrypoint_config", None)
+    limit = trust_limit_hours(request)
     return NodeIdentity(
         entrypoint=entry.public_urls() if entry else None,
         enrolled=record.enrolled,
@@ -230,6 +235,9 @@ def _identity(request: Request, snapshot: DeviceSnapshot) -> NodeIdentity:
         clientTls=_client_tls(request),
         trustBundleVersion=bundle.version if bundle is not None else None,
         trustBundleAgeSeconds=trust.heard_age_seconds() if record.enrolled else None,
+        # Row 46: the limit in effect, and whether it refuses changes now.
+        trustBundleMaxAgeSeconds=trust.limit_in_effect(limit) * 3600 if record.enrolled else None,
+        trustBundleFrozen=trust.frozen_age(limit) is not None if record.enrolled else None,
         tokenPublicKey=token_public,
         controlPublicKey=record.control_public_key if record.enrolled else None,
         signingPublicKey=record.signing_public_key,
