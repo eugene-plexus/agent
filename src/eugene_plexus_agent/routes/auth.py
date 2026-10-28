@@ -1262,7 +1262,10 @@ async def mint_client_key(
                 "POST",
                 "/v1/auth/client-keys",
                 authorization=authorization,
-                body=body.model_dump(mode="json"),
+                # What the caller set, and the root fills the rest: every default
+                # filled in here is a field a root a release behind refuses
+                # (`extra='forbid'`; row 11's band and queue bound).
+                body=body.model_dump(mode="json", exclude_unset=True),
             )
         )
     name = body.name.strip()
@@ -1532,7 +1535,7 @@ async def set_client_key_limits(
                 "PUT",
                 f"/v1/auth/client-keys/{quote(key_id, safe='')}/limits",
                 authorization=request.headers.get("authorization"),
-                body=body.model_dump(mode="json"),
+                body=body.model_dump(mode="json", exclude_unset=True),
             )
         )
     try:
@@ -1575,10 +1578,6 @@ async def client_admission(request: Request, body: ClientAdmissionRequest) -> Cl
             )
         )
     except AdmissionRefusal as exc:
-        raise HTTPException(
-            exc.status,
-            detail=exc.detail,
-            headers={"Retry-After": str(exc.retry)} if exc.retry else None,
-        ) from exc
+        raise HTTPException(exc.status, detail=exc.detail, headers=exc.headers) from exc
     except (OSError, ValueError) as exc:
         raise owner.local_unavailable() from exc

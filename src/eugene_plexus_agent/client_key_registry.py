@@ -119,9 +119,7 @@ class ClientKeyRegistry:
                 raise HTTPException(
                     exc.response.status_code,
                     detail=detail,
-                    headers={"Retry-After": exc.response.headers["Retry-After"]}
-                    if "Retry-After" in exc.response.headers
-                    else None,
+                    headers=_passed_on(exc.response),
                 ) from exc
             raise self.unavailable() from exc
         except (httpx.HTTPError, ValueError, TimeoutError) as exc:
@@ -152,6 +150,17 @@ class ClientKeyRegistry:
 
     async def close(self) -> None:
         await self.client.aclose()
+
+
+#: The root's headers a refusal keeps on its way to the gateway: when to ask
+#: again, and which limit a 429 is (row 11), which decides whether the
+#: gateway's queue keeps the request or refuses it.
+PASSED_ON = ("Retry-After", "X-Eugene-Refusal-Reason")
+
+
+def _passed_on(response: httpx.Response) -> dict[str, str] | None:
+    headers = {name: response.headers[name] for name in PASSED_ON if name in response.headers}
+    return headers or None
 
 
 def _said(response: httpx.Response) -> str:

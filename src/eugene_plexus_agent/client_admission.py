@@ -14,6 +14,16 @@ LEASE_SECONDS = 30.0
 WINDOW_SECONDS = 60.0
 MAX_ENTRIES = 50_000
 
+#: A key's queue band (row 11), highest first, and the default for a key that
+#: names none. The gateway's queue reads it; nothing here waits.
+BANDS = ("interactive", "background", "sheddable")
+DEFAULT_BAND = "interactive"
+#: How many of a key's requests may wait in one gateway's line for each person.
+DEFAULT_MAX_QUEUED = 8
+#: The limits the gateway's queue reads and a running request is not bound
+#: to: changing them never cuts a request in flight (`decide`'s digest).
+QUEUE_LIMITS = ("band", "maxQueuedRequests")
+
 
 def model_permitted(allowed: list[str], model: str) -> bool:
     """`allowedModels` entries are exact ids or `*` patterns (P1, 2026-09-27).
@@ -36,9 +46,23 @@ def model_permitted(allowed: list[str], model: str) -> bool:
 
 
 class AdmissionRefusal(Exception):
-    def __init__(self, status: int, detail: str, retry: int | None = None):
-        self.status, self.detail, self.retry = status, detail, retry
+    """A refused admission. `reason` says which limit a 429 is (row 11):
+    `concurrency` or `rate`, sent as `X-Eugene-Refusal-Reason`."""
+
+    def __init__(
+        self, status: int, detail: str, retry: int | None = None, reason: str | None = None
+    ):
+        self.status, self.detail, self.retry, self.reason = status, detail, retry, reason
         super().__init__(detail)
+
+    @property
+    def headers(self) -> dict[str, str] | None:
+        """The headers the refusal is answered with: `Retry-After`, and the
+        reason of a 429 the gateway's queue acts on."""
+        headers = {"Retry-After": str(self.retry)} if self.retry else {}
+        if self.reason:
+            headers["X-Eugene-Refusal-Reason"] = self.reason
+        return headers or None
 
 
 def validate_limits(value: Any) -> dict[str, Any] | None:
@@ -51,6 +75,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         "requestsPerMinute",
         "localOnly",
         "writeLogs",
+        *QUEUE_LIMITS,
     }:
         raise ValueError("invalid client limits")
     allowed = value.get("allowedModels")
@@ -81,6 +106,12 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         raise ValueError("invalid concurrent request limit")
     if type(rate) is not int or not 1 <= rate <= 10_000:
         raise ValueError("invalid request rate limit")
+    band = value.get("band", DEFAULT_BAND)
+    if band not in BANDS:
+        raise ValueError("invalid queue band")
+    queued = value.get("maxQueuedRequests", DEFAULT_MAX_QUEUED)
+    if type(queued) is not int or not 0 <= queued <= 64:
+        raise ValueError("invalid queued request limit")
     return {
         **({"localOnly": True} if value.get("localOnly") else {}),
         "allowedModels": allowed,
@@ -88,7 +119,19 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         "maxConcurrentRequests": concurrency,
         "requestsPerMinute": rate,
         **({"writeLogs": True} if value.get("writeLogs") else {}),
+        # Written down only when it is not the default, so a key nobody gave a
+        # band keeps the shape an older root or standby reads.
+        **({"band": band} if band != DEFAULT_BAND else {}),
+        **({"maxQueuedRequests": queued} if queued != DEFAULT_MAX_QUEUED else {}),
     }
+
+
+def bound_policy(limits: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The limits a running request is bound to: all but the queue's own
+    (`QUEUE_LIMITS`), so a new band or queue bound never cuts a request."""
+    if limits is None:
+        return None
+    return {k: v for k, v in limits.items() if k not in QUEUE_LIMITS}
 
 
 def clean_buckets(buckets: dict[str, Any], now: float) -> dict[str, Any]:
@@ -216,8 +259,20 @@ def decide(
                 "or make a new key under Home -> Use it from your apps.",
             )
     if action == "check":
+        # Row 11: the gateway checks when a request arrives and acquires when it
+        # leaves its queue, so a model outside the key's scope is refused here,
+        # before it waits for anything. A check takes nothing.
+        allowed = limits.get("allowedModels") if limits else None
+        if (
+            model
+            and purpose == "inference"
+            and allowed is not None
+            and not model_permitted(allowed, model)
+        ):
+            raise AdmissionRefusal(403, "This client key does not permit the requested model.")
         return result, None
-    policy = {"limits": limits, "principal": principal} if principal else limits
+    bound = bound_policy(limits)
+    policy = {"limits": bound, "principal": principal} if principal else bound
     digest = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
     if action == "release":
         if existing is not None:
@@ -276,11 +331,15 @@ def decide(
                     "This key's shared concurrent request limit is reached. "
                     "Wait for an active request to finish or cancel it.",
                     retry,
+                    reason="concurrency",
                 )
             if len(recent) >= limits["requestsPerMinute"]:
                 retry = max(1, math.ceil(min(e["started"] for e in recent) + WINDOW_SECONDS - now))
                 raise AdmissionRefusal(
-                    429, "This key's shared rolling-minute request limit is reached.", retry
+                    429,
+                    "This key's shared rolling-minute request limit is reached.",
+                    retry,
+                    reason="rate",
                 )
         if sum(len(b) for b in buckets.values()) >= MAX_ENTRIES:
             raise AdmissionRefusal(503, "Admission is at its bounded capacity; retry shortly.", 30)
