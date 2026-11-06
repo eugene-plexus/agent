@@ -28,6 +28,18 @@ the file can unlock the install. It is 0400 and owned by the service
 account, so that is the account itself and root -- neither of which any
 file permission could keep out anyway.
 
+**In the container the operator's file is the only one** (agent#43,
+2026-11-06). The image and the Unraid template set the control root's
+variable alone (`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`), so an agent on
+this mode had nowhere to read at boot: every update left the root
+unlocked from the file and the agent locked, the console working and
+every driver started without the key its saved secrets need (an
+OpenRouter account's API key read as unset). An agent with no file of its
+own now reads that one (`unlock_path`): the same file, as the system
+installs give both, and the same account reads it either way. **Read,
+never written**: it is the operator's, so a sign-in does not write it,
+and a passphrase change says the operator must.
+
 Every call degrades rather than raises: a missing, unreadable or wrong
 file leaves the agent locked and asking, the behaviour with the mode
 unset.
@@ -45,13 +57,28 @@ from . import _private_files, security
 
 log = logging.getLogger(__name__)
 
-__all__ = ["FILE_MODE", "MAX_BYTES", "read_passphrase", "store_passphrase", "unlock_key"]
+__all__ = [
+    "FILE_MODE",
+    "MAX_BYTES",
+    "read_passphrase",
+    "store_passphrase",
+    "unlock_key",
+    "unlock_path",
+]
 
 FILE_MODE = 0o400
 """Owner read, nothing else. Every write is a new file renamed over it."""
 
 MAX_BYTES = 4096
 """A passphrase, not a file full of them."""
+
+
+def unlock_path(own: Path | None, root: Path | None) -> Path | None:
+    """The file this agent reads its passphrase from at boot: its own
+    (`EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE`), or else the one the control root on
+    this host was given (`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`, the container's
+    only one). Its own wins: it is the one a sign-in keeps current."""
+    return own if own is not None else root
 
 
 def read_passphrase(path: Path | None) -> str | None:
@@ -62,8 +89,9 @@ def read_passphrase(path: Path | None) -> str | None:
     """
     if path is None:
         log.warning(
-            "securityMode is passphrase_file but EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE is "
-            "not set; this agent is locked until someone signs in"
+            "securityMode is passphrase_file but neither EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE "
+            "nor EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE is set; this agent is locked until "
+            "someone signs in"
         )
         return None
     try:

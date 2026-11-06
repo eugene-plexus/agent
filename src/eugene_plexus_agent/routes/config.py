@@ -117,6 +117,7 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         "mlx": shutil.which("mlx_lm.server"),
         "uv": str(uv) if uv is not None else None,
         "passphrase_path": getattr(settings, "passphrase_file", None),
+        "root_passphrase_path": getattr(settings, "root_passphrase_file", None),
         "mode": state.get_config("securityMode"),
         "copy_enabled": state.get_config("modelCopyEnabled") is True,
         "copy_dir": state.get_config("modelCopyDir"),
@@ -246,6 +247,22 @@ def _security_mode_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
         )
     if mode == "passphrase_file":
         path = live["passphrase_path"]
+        root = live.get("root_passphrase_path")
+        if path is None and root is not None:
+            # agent#43: the container's only file, the control root's.
+            if not root.is_file():
+                return ConfigFieldStatus(
+                    level=ConfigFieldStatusLevel.warning,
+                    text=f"{root} does not exist, so a restart leaves this machine locked.",
+                )
+            return ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.info,
+                text=(
+                    f"Unlocks at every start from {root}, the passphrase file this machine "
+                    "was given (EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE). Eugene reads it and "
+                    "never writes it."
+                ),
+            )
         if path is None:
             return ConfigFieldStatus(
                 level=ConfigFieldStatusLevel.warning,
@@ -325,8 +342,23 @@ async def test_config(
                 "Secret Service on Linux, Keychain on macOS)."
             )
     elif effective_mode == "passphrase_file":
-        path = getattr(getattr(request.app.state, "settings", None), "passphrase_file", None)
-        if path is None:
+        settings = getattr(request.app.state, "settings", None)
+        path = getattr(settings, "passphrase_file", None)
+        root = getattr(settings, "root_passphrase_file", None)
+        if path is None and root is not None:
+            # agent#43: the operator's file, read and never written.
+            if await asyncio.to_thread(root.is_file):
+                notes.append(
+                    f"This agent unlocks itself on restart from {root}, the passphrase file "
+                    "this machine was given. Eugene never writes it: after a passphrase "
+                    "change, put the new passphrase in it."
+                )
+            else:
+                problems.append(
+                    f"{root} (EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE) does not exist, so every "
+                    "restart leaves this agent locked."
+                )
+        elif path is None:
             problems.append(
                 "securityMode=passphrase_file needs EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE in "
                 "this agent's environment, which the Linux system install sets. Without it "

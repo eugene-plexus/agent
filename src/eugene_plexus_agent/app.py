@@ -261,11 +261,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         and not app.state.auth_state.has_master_key()
         and state.get_master_salt_b64()
     ):
-        # Row 5: `master_key_for` unwraps a key wrapped after a change.
-        key = await asyncio.to_thread(passphrase_file.unlock_key, settings.passphrase_file, state)
+        # Row 5: `master_key_for` unwraps a key wrapped after a change. Its own
+        # file, or else the root's (agent#43: the container's only one).
+        path = passphrase_file.unlock_path(settings.passphrase_file, settings.root_passphrase_file)
+        key = await asyncio.to_thread(passphrase_file.unlock_key, path, state)
         if key is not None:
             app.state.auth_state.set_master_key(key)
-            log.info("master key recovered from the passphrase file; children will auto-unlock")
+            log.info(
+                "master key recovered from the passphrase file %s; children will auto-unlock",
+                path,
+            )
 
     # **Log in to the file servers before anything opens a model.** This
     # is the whole of R2.6's first measurement: an agent running as a

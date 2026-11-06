@@ -177,8 +177,29 @@ async def auth_status(request: Request) -> AuthStatus:
 
 
 def _passphrase_path(request: Request) -> Path | None:
+    """This agent's own passphrase file, the one it writes."""
     settings = getattr(request.app.state, "settings", None)
     return getattr(settings, "passphrase_file", None)
+
+
+def _root_passphrase_path(request: Request) -> Path | None:
+    """The operator's file the control root on this host was given, which this agent
+    reads at boot when it has none of its own (agent#43) and never writes."""
+    if _passphrase_path(request) is not None:
+        return None
+    settings = getattr(request.app.state, "settings", None)
+    return getattr(settings, "root_passphrase_file", None)
+
+
+def _operators_file_state(path: Path, passphrase: str) -> tuple[str, str | None]:
+    """Row 5's answer for the operator's file, which Eugene never writes: `matches`
+    when it already holds `passphrase`, else `old` and what the operator must do."""
+    if passphrase_file.read_passphrase(path) == passphrase:
+        return "matches", None
+    return "old", (
+        f"{path} is the passphrase file this machine was given, which Eugene reads and never "
+        "writes; put the new passphrase in it, or the next restart stays locked"
+    )
 
 
 def _unlocks_from_file(request: Request, state: AgentState) -> bool:
@@ -199,8 +220,14 @@ def _persist_passphrase_if_file_mode(request: Request, state: AgentState, passph
     one creates it, and any later one repairs a file that was deleted or
     replaced. A changed mode (`PATCH securityMode`) takes effect at the
     next sign-in for the same reason.
+
+    **Never the operator's file** (agent#43): an agent with no file of its own
+    reads the one the control root on this host was given, and that one is
+    the operator's to write.
     """
     if state.get_config("securityMode") != "passphrase_file":
+        return
+    if _root_passphrase_path(request) is not None:
         return
     passphrase_file.store_passphrase(_passphrase_path(request), passphrase)
 
@@ -731,6 +758,9 @@ def _take_new_passphrase(
         _persist_master_key_if_keyring_mode(state, master_key)
     if state.get_config("securityMode") != "passphrase_file":
         return "none", None
+    operators = _root_passphrase_path(request)
+    if operators is not None:
+        return _operators_file_state(operators, new)
     why = passphrase_file.why_not_stored(_passphrase_path(request), new)
     return ("matches", None) if why is None else ("old", why)
 

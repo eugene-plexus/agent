@@ -11,7 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from pydantic import PrivateAttr, field_validator
+from pydantic import Field, PrivateAttr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,6 +72,20 @@ class Settings(BaseSettings):
     bootstrap: the agent must know where to look before it is unlocked,
     which is before any config it could read is open."""
 
+    root_passphrase_file: Path | None = Field(
+        default=None, validation_alias="EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE"
+    )
+    """The passphrase file the control root on this host was given
+    (`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`, the root's own variable, read
+    here as it is). **Read, never written**: it is the operator's file.
+
+    In the container it is the only one there is: the image and the Unraid
+    template set the root's variable alone, so an agent on `passphrase_file`
+    with no file of its own unlocks from this one at boot
+    (`passphrase_file.unlock_path`). Without that, a restart left the root
+    unlocked and the agent locked: the console worked, and every driver
+    started without the key its saved secrets need (agent#43, 2026-11-06)."""
+
     entrypoint_config: Path | None = None
     """Opt-in container HTTPS entry point. Unset, `entrypoint.json` beside
     `agent.yaml` is read where the bundled proxy exists (Settings, Container
@@ -101,7 +115,7 @@ class Settings(BaseSettings):
     _entrypoint_ready: Any = PrivateAttr(default=None)
     """`entrypoint.prepare`'s answer, once per process."""
 
-    @field_validator("passphrase_file", "entrypoint_config", mode="before")
+    @field_validator("passphrase_file", "root_passphrase_file", "entrypoint_config", mode="before")
     @classmethod
     def _blank_is_unset(cls, value: object) -> object:
         """A blank variable is an unset one, and says so.
