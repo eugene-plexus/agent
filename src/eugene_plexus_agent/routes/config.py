@@ -11,6 +11,7 @@ import asyncio
 import logging
 import shutil
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -235,8 +236,41 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
     return field.model_copy(update=update) if update else field
 
 
+def _operators_file_problem(path: Path, state: AgentState) -> str | None:
+    """Why the operator's passphrase file would not unlock this agent at its next
+    start, or None when it would: read and verified by the rule a restart uses."""
+    from .. import passphrase_file, security
+
+    if not path.is_file():
+        return "does not exist"
+    passphrase = passphrase_file.read_passphrase(path, operators=True)
+    if passphrase is None:
+        return "cannot be read as a passphrase (the log says why)"
+    stored = state.get_passphrase_hash()
+    if stored is None or not security.verify_passphrase(passphrase, stored):
+        return "does not hold this install's passphrase"
+    return None
+
+
 def _security_mode_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
     mode = live["mode"]
+    root = live.get("root_passphrase_path")
+    if (
+        mode != "passphrase_file"
+        and live["passphrase_path"] is None
+        and root is not None
+        and (mode != "os_keyring" or live["keyring"] is False)
+    ):
+        # agent#43: the root beside it unlocks from the operator's file, and this agent
+        # would ask, so its drivers' saved keys would wait for a sign-in after a restart.
+        return ConfigFieldStatus(
+            level=ConfigFieldStatusLevel.warning,
+            text=(
+                f"The control root on this machine unlocks itself from {root}, and this "
+                "agent does not: after a restart, its providers' saved keys wait for a "
+                "sign-in. Choose Passphrase file auto-unlock to unlock from the same file."
+            ),
+        )
     if mode == "os_keyring" and live["keyring"] is False:
         return ConfigFieldStatus(
             level=ConfigFieldStatusLevel.warning,
@@ -258,9 +292,10 @@ def _security_mode_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
             return ConfigFieldStatus(
                 level=ConfigFieldStatusLevel.info,
                 text=(
-                    f"Unlocks at every start from {root}, the passphrase file this machine "
-                    "was given (EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE). Eugene reads it and "
-                    "never writes it."
+                    f"This agent reads {root} at every start to unlock itself: the passphrase "
+                    "file this machine was given (EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE). "
+                    "Eugene never writes it. Test checks that it holds this install's "
+                    "passphrase."
                 ),
             )
         if path is None:
@@ -346,8 +381,10 @@ async def test_config(
         path = getattr(settings, "passphrase_file", None)
         root = getattr(settings, "root_passphrase_file", None)
         if path is None and root is not None:
-            # agent#43: the operator's file, read and never written.
-            if await asyncio.to_thread(root.is_file):
+            # agent#43: the operator's file, read and never written. Checked as a
+            # restart reads it, not by its existence: the operator wrote it, not us.
+            why = await asyncio.to_thread(_operators_file_problem, root, state)
+            if why is None:
                 notes.append(
                     f"This agent unlocks itself on restart from {root}, the passphrase file "
                     "this machine was given. Eugene never writes it: after a passphrase "
@@ -355,8 +392,8 @@ async def test_config(
                 )
             else:
                 problems.append(
-                    f"{root} (EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE) does not exist, so every "
-                    "restart leaves this agent locked."
+                    f"{root} (EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE) {why}, so every restart "
+                    "leaves this agent locked."
                 )
         elif path is None:
             problems.append(

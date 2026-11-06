@@ -81,11 +81,18 @@ def unlock_path(own: Path | None, root: Path | None) -> Path | None:
     return own if own is not None else root
 
 
-def read_passphrase(path: Path | None) -> str | None:
+#: What fixes a missing or wrong file, by whose file it is (agent#43): a sign-in
+#: writes this agent's own, and never the operator's.
+_OWN_FIX = "until someone signs in, which writes it"
+_OPERATORS_FIX = "until this install's passphrase is put in it (Eugene never writes this file)"
+
+
+def read_passphrase(path: Path | None, *, operators: bool = False) -> str | None:
     """The passphrase held in `path`, or None if it cannot be had.
 
     Never raises, and every None is logged with its reason: the visible
-    symptom of each is the same locked agent.
+    symptom of each is the same locked agent. `operators` is for the file the
+    control root on this host was given, which only its operator writes.
     """
     if path is None:
         log.warning(
@@ -98,9 +105,9 @@ def read_passphrase(path: Path | None) -> str | None:
         raw = path.read_bytes()
     except FileNotFoundError:
         log.warning(
-            "passphrase file %s does not exist yet; this agent is locked until someone "
-            "signs in, which writes it",
+            "passphrase file %s does not exist; this agent stays locked %s",
             path,
+            _OPERATORS_FIX if operators else _OWN_FIX,
         )
         return None
     except OSError as exc:
@@ -176,7 +183,7 @@ def why_not_stored(path: Path | None, passphrase: str) -> str | None:
     return None
 
 
-def unlock_key(path: Path | None, state: Any) -> bytes | None:
+def unlock_key(path: Path | None, state: Any, *, operators: bool = False) -> bytes | None:
     """The master key, from the passphrase in `path`, or None.
 
     Verified against the install's own hash before anything is derived:
@@ -184,17 +191,18 @@ def unlock_key(path: Path | None, state: Any) -> bytes | None:
     that opens nothing, and every sealed value would read as corrupt
     rather than locked. The key comes from `state.master_key_for`, so a
     key wrapped after a passphrase change (row 5) opens the same way. Two
-    Argon2id runs; call it off the event loop.
+    Argon2id runs; call it off the event loop. `operators`: as for
+    `read_passphrase`.
     """
-    passphrase = read_passphrase(path)
+    passphrase = read_passphrase(path, operators=operators)
     if passphrase is None:
         return None
     passphrase_hash = state.get_passphrase_hash()
     if passphrase_hash is None or not security.verify_passphrase(passphrase, passphrase_hash):
         log.warning(
-            "the passphrase in %s is not this install's; this agent stays locked until "
-            "someone signs in, which replaces it",
+            "the passphrase in %s is not this install's; this agent stays locked %s",
             path,
+            _OPERATORS_FIX if operators else "until someone signs in, which replaces it",
         )
         return None
     try:

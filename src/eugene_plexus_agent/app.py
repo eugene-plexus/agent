@@ -264,7 +264,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Row 5: `master_key_for` unwraps a key wrapped after a change. Its own
         # file, or else the root's (agent#43: the container's only one).
         path = passphrase_file.unlock_path(settings.passphrase_file, settings.root_passphrase_file)
-        key = await asyncio.to_thread(passphrase_file.unlock_key, path, state)
+        operators = settings.passphrase_file is None and path is not None
+        key = await asyncio.to_thread(passphrase_file.unlock_key, path, state, operators=operators)
         if key is not None:
             app.state.auth_state.set_master_key(key)
             log.info(
