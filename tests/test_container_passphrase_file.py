@@ -122,8 +122,10 @@ def test_a_roots_file_that_cannot_unlock_says_the_operator_must_fix_it(
         (tmp_path / "passphrase").write_text(content, encoding="utf-8")
     caplog.set_level(logging.WARNING, logger="eugene_plexus_agent.passphrase_file")
     assert not _unlocked_after_restart(settings)
-    said = [
-        r.getMessage() for r in caplog.records if str(tmp_path / "passphrase") in r.getMessage()
+    said = [  # what says it stays locked (POSIX also warns of a widely readable file)
+        r.getMessage()
+        for r in caplog.records
+        if str(tmp_path / "passphrase") in r.getMessage() and "locked" in r.getMessage()
     ]
     assert said and all("Eugene never writes this file" in s for s in said), said
     assert not any("signs in" in s for s in said), said
