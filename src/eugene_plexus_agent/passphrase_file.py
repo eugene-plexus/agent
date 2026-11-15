@@ -28,6 +28,18 @@ the file can unlock the install. It is 0400 and owned by the service
 account, so that is the account itself and root -- neither of which any
 file permission could keep out anyway.
 
+**In the container the operator's file is the only one** (agent#43,
+2026-11-06). The image and the Unraid template set the control root's
+variable alone (`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`), so an agent on
+this mode had nowhere to read at boot: every update left the root
+unlocked from the file and the agent locked, the console working and
+every driver started without the key its saved secrets need (an
+OpenRouter account's API key read as unset). An agent with no file of its
+own now reads that one (`unlock_path`): the same file, as the system
+installs give both, and the same account reads it either way. **Read,
+never written**: it is the operator's, so a sign-in does not write it,
+and a passphrase change says the operator must.
+
 Every call degrades rather than raises: a missing, unreadable or wrong
 file leaves the agent locked and asking, the behaviour with the mode
 unset.
@@ -45,7 +57,14 @@ from . import _private_files, security
 
 log = logging.getLogger(__name__)
 
-__all__ = ["FILE_MODE", "MAX_BYTES", "read_passphrase", "store_passphrase", "unlock_key"]
+__all__ = [
+    "FILE_MODE",
+    "MAX_BYTES",
+    "read_passphrase",
+    "store_passphrase",
+    "unlock_key",
+    "unlock_path",
+]
 
 FILE_MODE = 0o400
 """Owner read, nothing else. Every write is a new file renamed over it."""
@@ -54,25 +73,41 @@ MAX_BYTES = 4096
 """A passphrase, not a file full of them."""
 
 
-def read_passphrase(path: Path | None) -> str | None:
+def unlock_path(own: Path | None, root: Path | None) -> Path | None:
+    """The file this agent reads its passphrase from at boot: its own
+    (`EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE`), or else the one the control root on
+    this host was given (`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`, the container's
+    only one). Its own wins: it is the one a sign-in keeps current."""
+    return own if own is not None else root
+
+
+#: What fixes a missing or wrong file, by whose file it is (agent#43): a sign-in
+#: writes this agent's own, and never the operator's.
+_OWN_FIX = "until someone signs in, which writes it"
+_OPERATORS_FIX = "until this install's passphrase is put in it (Eugene never writes this file)"
+
+
+def read_passphrase(path: Path | None, *, operators: bool = False) -> str | None:
     """The passphrase held in `path`, or None if it cannot be had.
 
     Never raises, and every None is logged with its reason: the visible
-    symptom of each is the same locked agent.
+    symptom of each is the same locked agent. `operators` is for the file the
+    control root on this host was given, which only its operator writes.
     """
     if path is None:
         log.warning(
-            "securityMode is passphrase_file but EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE is "
-            "not set; this agent is locked until someone signs in"
+            "securityMode is passphrase_file but neither EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE "
+            "nor EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE is set; this agent is locked until "
+            "someone signs in"
         )
         return None
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
         log.warning(
-            "passphrase file %s does not exist yet; this agent is locked until someone "
-            "signs in, which writes it",
+            "passphrase file %s does not exist; this agent stays locked %s",
             path,
+            _OPERATORS_FIX if operators else _OWN_FIX,
         )
         return None
     except OSError as exc:
@@ -148,7 +183,7 @@ def why_not_stored(path: Path | None, passphrase: str) -> str | None:
     return None
 
 
-def unlock_key(path: Path | None, state: Any) -> bytes | None:
+def unlock_key(path: Path | None, state: Any, *, operators: bool = False) -> bytes | None:
     """The master key, from the passphrase in `path`, or None.
 
     Verified against the install's own hash before anything is derived:
@@ -156,17 +191,18 @@ def unlock_key(path: Path | None, state: Any) -> bytes | None:
     that opens nothing, and every sealed value would read as corrupt
     rather than locked. The key comes from `state.master_key_for`, so a
     key wrapped after a passphrase change (row 5) opens the same way. Two
-    Argon2id runs; call it off the event loop.
+    Argon2id runs; call it off the event loop. `operators`: as for
+    `read_passphrase`.
     """
-    passphrase = read_passphrase(path)
+    passphrase = read_passphrase(path, operators=operators)
     if passphrase is None:
         return None
     passphrase_hash = state.get_passphrase_hash()
     if passphrase_hash is None or not security.verify_passphrase(passphrase, passphrase_hash):
         log.warning(
-            "the passphrase in %s is not this install's; this agent stays locked until "
-            "someone signs in, which replaces it",
+            "the passphrase in %s is not this install's; this agent stays locked %s",
             path,
+            _OPERATORS_FIX if operators else "until someone signs in, which replaces it",
         )
         return None
     try:
