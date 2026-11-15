@@ -26,13 +26,16 @@ from .._generated.models import (
     UpdateRun,
 )
 from ..dependencies import require_operator_session
+from ..operations import MACHINES, operation
 from ..state import default_update_channel
 from ..updates import VERSION_FILE, UpdateChecker, valid_ref
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["node"])
-_write_auth = [Depends(require_operator_session)]
+# Row 39: Updates and restarts (`operate-machines`) opens these.
+_read_auth = [Depends(operation(None, require_operator_session))]
+_write_auth = [Depends(operation(MACHINES, require_operator_session))]
 
 
 def checker_for(app: FastAPI) -> UpdateChecker:
@@ -225,7 +228,7 @@ async def _update_now(request: Request, body: UpdateRequest) -> UpdateRun:
     "/v1/updates/all",
     response_model=UpdateAllStatus,
     response_model_exclude_none=True,
-    dependencies=_write_auth,
+    dependencies=_read_auth,
 )
 async def get_update_all(request: Request) -> UpdateAllStatus:
     manager = update_all.manager(request.app)

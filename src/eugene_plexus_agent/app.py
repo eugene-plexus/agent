@@ -1258,6 +1258,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from . import entrypoint
 
     entrypoint.install(app)
+    # Row 39: who changed what on this machine, one row per gated change.
+    from . import operations
+
+    operations.install(app)
 
     # Public routes (no auth required).
     app.include_router(health_routes.router)

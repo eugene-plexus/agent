@@ -25,9 +25,11 @@ from fastapi.responses import StreamingResponse
 from .. import install_info, logs, update_apply
 from .._generated.models import LogLine, LogPage
 from ..dependencies import require_operator_session
+from ..operations import MACHINES, operation
 
 router = APIRouter(tags=["logs"])
-_auth = [Depends(require_operator_session)]
+# R39-LOGS: reading logs comes with Updates and restarts (`operate-machines`).
+_auth = [Depends(operation(MACHINES, require_operator_session))]
 
 KEEPALIVE_SECONDS = 15.0
 

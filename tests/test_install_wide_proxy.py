@@ -402,6 +402,45 @@ def test_a_token_already_addressed_to_the_far_node_passes_unchanged(
     assert [r for r in exchanges.requests if r.url.path == "/v1/auth/token"] == []
 
 
+def _operations(root: FakeRoot, machine: str) -> str:
+    token, _ = root.token.mint(
+        typ=tokens.TYP_OPERATIONS,
+        sub="p-dana",
+        aud=[f"node:{machine}"],
+        ttl_seconds=600,
+        extra={
+            "ops": [tokens.POWER_OPERATE_MODELS],
+            "name": "Dana",
+            "sid": "admin-1",
+            "administration_version": 1,
+        },
+    )
+    return token
+
+
+def test_an_operations_token_for_the_far_machine_passes_and_is_never_exchanged(
+    client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    """Row 39: the console asks the root for a token per machine; the proxy
+    carries the one addressed to the destination unchanged."""
+    token = _operations(exchanges.root, "root")
+    client.get("/api/proxy/gateway/v1/models", headers={"Authorization": f"Bearer {token}"})
+    assert upstream.last.headers["authorization"] == f"Bearer {token}"
+    assert [r for r in exchanges.requests if r.url.path == "/v1/auth/token"] == []
+
+
+def test_an_operations_token_for_another_machine_is_stripped(
+    client: TestClient, upstream: Upstream, exchanges: Exchanges
+) -> None:
+    """Row 39: Dana's token for this machine, or for `other`, sent toward
+    `root`: it is neither exchanged nor re-minted, and does not leave."""
+    for machine in ("worker-1", "other"):
+        token = _operations(exchanges.root, machine)
+        client.get("/api/proxy/gateway/v1/models", headers={"Authorization": f"Bearer {token}"})
+        assert "authorization" not in upstream.last.headers, machine
+    assert [r for r in exchanges.requests if r.url.path == "/v1/auth/token"] == []
+
+
 def test_a_local_service_token_is_reminted_only_within_this_nodes_grants(
     app: FastAPI, client: TestClient, upstream: Upstream, exchanges: Exchanges
 ) -> None:

@@ -91,6 +91,7 @@ from ..engines.strata import StrataAdapter
 from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, resolve_model_path, rules_from_config
 from ..node_work import runtime_launch
+from ..operations import MACHINES, MODELS, operation
 from ..preparation import PreparationJobs
 from ..reservations import ReservationLedger
 from ..runtime_context import RuntimeContext
@@ -119,13 +120,17 @@ router = APIRouter()
 # gateway's own audience, checked exactly. The gateway is the component
 # that sees demand, so it is the one that unloads an idle runtime and
 # wakes one on request. A leaked driver or library token still cannot.
-_read_auth = [Depends(require_operator_or_service)]
+# Row 39: a person with an operations power passes the routes the table in
+# `operations.py` names; every other bearer meets the gate each had before.
+_read_auth = [Depends(operation(None, require_operator_or_service))]
 _write_auth = [Depends(require_operator_session)]
-_lifecycle_auth = [Depends(require_operator_or_gateway)]
+_lifecycle_auth = [Depends(operation(MODELS, require_operator_or_gateway))]
+_models_auth = [Depends(operation(MODELS, require_operator_session))]
+_machines_auth = [Depends(operation(MACHINES, require_operator_session))]
 # And declaring one, from M7: the operator OR the control root, because
 # the control root forwards declarations to the node that will run them
 # and the trust root's token is what every other credential reduces to.
-_declare_auth = [Depends(require_operator_or_control)]
+_declare_auth = [Depends(operation(MODELS, require_operator_or_control))]
 
 
 def _problem(*, code: int, slug: str, title: str, detail: str) -> HTTPException:
@@ -645,7 +650,7 @@ def _engine_kind(engine: str) -> EngineKind:
     response_model=EngineInstall,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["engines"],
-    dependencies=_write_auth,
+    dependencies=_machines_auth,
 )
 async def install_engine(
     request: Request, engine: str, body: EngineInstallRequest | None = None
@@ -735,7 +740,7 @@ async def get_engine_install(engine: str) -> EngineInstall:
     "/v1/engines/{engine}/install",
     response_model=EngineInstall,
     tags=["engines"],
-    dependencies=_write_auth,
+    dependencies=_machines_auth,
 )
 async def cancel_engine_install(engine: str) -> EngineInstall:
     """Cancel an install in flight.
@@ -882,7 +887,7 @@ async def inspect_prepared_model(
 
 
 @router.post(
-    "/v1/engines/{engine}/uninstall", status_code=204, tags=["engines"], dependencies=_write_auth
+    "/v1/engines/{engine}/uninstall", status_code=204, tags=["engines"], dependencies=_machines_auth
 )
 async def uninstall_engine(request: Request, engine: str) -> Response:
     from ..engines import adapter_for
@@ -1104,7 +1109,7 @@ async def get_runtime(
     "/v1/runtimes/{name}",
     response_model=Runtime,
     tags=["runtimes"],
-    dependencies=[*_write_auth, Depends(runtime_launch)],
+    dependencies=[*_models_auth, Depends(runtime_launch)],
 )
 async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runtime:
     state: AgentState = request.app.state.agent_state
@@ -1191,7 +1196,7 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     return _compose(updated, supervisor)
 
 
-@router.delete("/v1/runtimes/{name}", status_code=204, tags=["runtimes"], dependencies=_write_auth)
+@router.delete("/v1/runtimes/{name}", status_code=204, tags=["runtimes"], dependencies=_models_auth)
 async def delete_runtime(request: Request, name: str) -> Response:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
@@ -1212,7 +1217,7 @@ async def delete_runtime(request: Request, name: str) -> Response:
     response_model=RestartResult,
     status_code=202,
     tags=["runtimes"],
-    dependencies=[*_write_auth, Depends(runtime_launch)],
+    dependencies=[*_models_auth, Depends(runtime_launch)],
 )
 async def restart_runtime(request: Request, name: str) -> RestartResult:
     state: AgentState = request.app.state.agent_state
@@ -1401,7 +1406,7 @@ async def start_declared_runtime(
     "/v1/runtimes/{name}/auto-start",
     response_model=Runtime,
     tags=["runtimes"],
-    dependencies=_write_auth,
+    dependencies=_models_auth,
 )
 async def set_runtime_auto_start(request: Request, name: str, body: RuntimeAutoStart) -> Runtime:
     """`autoStart` alone, and no restart (agent#11).

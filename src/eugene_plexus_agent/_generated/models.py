@@ -2586,6 +2586,63 @@ class HostSeries(BaseModel):
     max: list[float | None]
 
 
+class OperationsPower(StrEnum):
+    """
+    Row 39, as `control.yaml` names it.
+    """
+
+    operate_models = 'operate-models'
+    operate_machines = 'operate-machines'
+
+
+class OperationReport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    personId: str = Field(
+        ..., description="The person's id, or `operator` for the owner.", max_length=64
+    )
+    name: str = Field(..., description='The name to show for them.', max_length=64)
+    owner: bool
+    power: OperationsPower | None = Field(
+        None,
+        description='The power the route needs (`control.yaml` `OperationsPower`).',
+    )
+    action: str = Field(
+        ...,
+        description='What was done, a short verb phrase such as `stop runtime`.',
+        max_length=64,
+    )
+    target: str = Field(
+        ...,
+        description='What it was done to (a runtime, an engine, a model), or empty.',
+        max_length=256,
+    )
+    status: int = Field(
+        ..., description='The HTTP status the change answered with.', ge=100, le=599
+    )
+
+
+class OperationRecord(BaseModel):
+    """
+    One row of `OperationsLog`, an `OperationReport` with when and where.
+    """
+
+    at: AwareDatetime
+    component: str
+    personId: str
+    name: str
+    owner: bool
+    power: OperationsPower | None = None
+    action: str
+    target: str
+    status: int
+
+
+class OperationsLog(BaseModel):
+    entries: list[OperationRecord]
+
+
 class HostHistory(BaseModel):
     """
     What this host's hardware did over a window (`GET /v1/node/history`).

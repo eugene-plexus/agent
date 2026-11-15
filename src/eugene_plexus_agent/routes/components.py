@@ -18,6 +18,7 @@ from .._generated.common_models import Problem, RestartResult
 from .._generated.models import Component, ComponentEntry, ComponentList, ComponentStatus
 from ..dependencies import require_operator_or_service, require_operator_session
 from ..node_identity import advertise_host, effective_advertise_url, format_url
+from ..operations import MACHINES, operation
 from ..state import AgentState
 from ..supervisor import Supervisor
 
@@ -192,7 +193,7 @@ async def delete_component(request: Request, name: str) -> Response:
     "/v1/components/{name}/restart",
     response_model=RestartResult,
     status_code=202,
-    dependencies=_write_auth,
+    dependencies=[Depends(operation(MACHINES, require_operator_session))],
 )
 async def restart_component(request: Request, name: str) -> RestartResult:
     state: AgentState = request.app.state.agent_state

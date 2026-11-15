@@ -68,6 +68,9 @@ from .._generated.models import (
     NodeReach,
     NodeReachRequest,
     NodeReachResult,
+    OperationRecord,
+    OperationReport,
+    OperationsLog,
     Os,
     ReachStep,
     SignedMachineList,
@@ -78,6 +81,8 @@ from .._generated.models import (
 from .._http import internal_client
 from ..auth_state import AuthState
 from ..dependencies import (
+    _refuse,
+    require_local_service,
     require_operator_or_service,
     require_operator_session,
     trust_limit_hours,
@@ -100,6 +105,8 @@ from ..node_identity import (
     effective_advertise_url,
     is_loopback_host,
 )
+from ..operations import log_of as operations_log_of
+from ..operations import operation
 from ..state import AgentState
 from ..trust import BundleRollback
 from .updates import checker_for, node_update_view
@@ -108,7 +115,9 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["node"])
 
-_read_auth = [Depends(require_operator_or_service)]
+# Row 39: the reads a person with an operations power may make pass; the
+# table in `operations.py` says which.
+_read_auth = [Depends(operation(None, require_operator_or_service))]
 _write_auth = [Depends(require_operator_session)]
 
 # Revoking at the root is one log entry and a bundle push, but it is a
@@ -1241,6 +1250,45 @@ async def delete_node_history(request: Request) -> Response:
         )
     await asyncio.to_thread(store.clear)
     log.info("host history deleted at an operator's request")
+    return Response(status_code=204)
+
+
+@router.get(
+    "/v1/node/operations-log",
+    response_model=OperationsLog,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def get_operations_log(
+    request: Request, limit: int = Query(default=200, ge=1, le=1000)
+) -> OperationsLog:
+    """Who changed what on this machine (row 39). Owner only."""
+    store = operations_log_of(request.app)
+    try:
+        rows = await asyncio.to_thread(store.recent, limit)
+    except Exception as exc:
+        raise _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "operations-log-unavailable",
+            "The operations log could not be read",
+            store.error or str(exc),
+        ) from exc
+    return OperationsLog(entries=[OperationRecord.model_validate(r) for r in rows])
+
+
+@router.post("/v1/node/operations-log", status_code=204)
+async def report_operation(
+    request: Request,
+    body: OperationReport,
+    claims: Annotated[tokens.Claims, Depends(require_local_service)],
+) -> Response:
+    """This machine's library records a change it made (row 39). The
+    person is what the library read from the token it verified."""
+    if claims.sub != "library":
+        raise _refuse(claims, "write this machine's operations log; only its library may")
+    entry = body.model_dump(mode="json")
+    entry["component"] = "library"
+    await asyncio.to_thread(operations_log_of(request.app).record, entry)
     return Response(status_code=204)
 
 

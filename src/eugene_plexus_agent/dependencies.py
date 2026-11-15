@@ -140,6 +140,8 @@ FROZEN_TRUST_CHANGES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/v1/node/machine-key"),
         ("POST", "/v1/node/machine-key"),
         ("POST", "/v1/node/machine-list"),
+        # Row 39: this machine's library records a change it made.
+        ("POST", "/v1/node/operations-log"),
         ("POST", "/v1/node/passphrase"),
         # Row 35: Pause stops every model here, and Resume starts them.
         ("POST", "/v1/node/pause"),
@@ -281,7 +283,13 @@ def proxied_change(kind: str | None, method: str, path: str) -> bool:
     )
 
 
-_ANY_TOKEN = (tokens.TYP_SESSION, tokens.TYP_SERVICE, tokens.TYP_CLIENT, tokens.TYP_ADMINISTRATION)
+_ANY_TOKEN = (
+    tokens.TYP_SESSION,
+    tokens.TYP_SERVICE,
+    tokens.TYP_CLIENT,
+    tokens.TYP_ADMINISTRATION,
+    tokens.TYP_OPERATIONS,
+)
 
 
 def refuse_proxied_when_frozen(
