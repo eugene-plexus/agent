@@ -380,7 +380,8 @@ def test_a_default_key_is_answered_without_the_queue_fields(authed_client):
     payload = {"action": "acquire", "keyId": plain, "requestId": "one", "model": "m"}
     answered = c.post("/v1/auth/client-keys/admission", json=payload)
     assert answered.status_code == 200, answered.text
-    assert not {"band", "maxQueuedRequests"} & answered.json()["limits"].keys()
+    # Nor `readMetrics` (row 12): a reader a release behind refuses a field it does not know.
+    assert not {"band", "maxQueuedRequests", "readMetrics"} & answered.json()["limits"].keys()
     shaped = c.post(
         "/v1/auth/client-keys",
         json={"name": "shaped", "limits": {"band": "background", "maxQueuedRequests": 3}},
