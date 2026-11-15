@@ -3290,7 +3290,11 @@ class AuthStatus(BaseModel):
     )
     passphraseFile: bool | None = Field(
         None,
-        description='True when this agent unlocks itself from a passphrase file:\n`securityMode` is `passphrase_file` and\n`EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE` names where the file\ngoes. The Linux system install, where the agent runs under\nits own account and has no keyring (2026-09-24). The wizard\nthen says the install unlocks itself after a restart, offers\nno keyring choice, and sets the control root to the same\nmode. Absent from an agent that predates the field, and false\neverywhere else.\n',
+        description="True when this agent can unlock itself from a passphrase\nfile. Two cases:\n\n* Its own file: `securityMode` is `passphrase_file` and\n  `EUGENE_PLEXUS_AGENT_PASSPHRASE_FILE` names where the file\n  goes. The Linux system install, where the agent runs under\n  its own account and has no keyring (2026-09-24).\n* The operator's file (agent#44): no file of its own, and\n  `EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`, the control root's\n  variable, is set on this host. The container. True whatever\n  `securityMode` is now, because the wizard reads it before\n  anything is set; `passphraseFileFromOperator` is then true.\n\nThe wizard then says the install unlocks itself after a\nrestart, offers no keyring choice, and sets this agent and\nthe control root to `passphrase_file`. Absent from an agent\nthat predates the field, and false everywhere else.\n",
+    )
+    passphraseFileFromOperator: bool | None = Field(
+        None,
+        description="True when the file `passphraseFile` means is the one the\noperator gave this host (`EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`),\nwhich this agent reads at every start and never writes. The\nwizard then asks for the passphrase that file holds: a\ndifferent one leaves a restart locked. Not the file's path,\nwhich this unauthenticated answer does not give. Present only\nwhen `passphraseFile` is true; absent from an agent that\npredates the field.\n",
     )
     firstRunComplete: bool | None = Field(
         None,

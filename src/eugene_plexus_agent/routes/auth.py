@@ -168,6 +168,11 @@ async def auth_status(request: Request) -> AuthStatus:
         unlocked=auth.has_master_key(),
         keyringAvailable=available,
         passphraseFile=_unlocks_from_file(request, state),
+        # agent#44: the file is the operator's, so the wizard asks for the passphrase
+        # in it. Only beside a true passphraseFile.
+        passphraseFileFromOperator=(
+            True if _unlocks_from_file(request, state) and _root_passphrase_path(request) else None
+        ),
         # CX2-C1: the console's gate reads it before it has a session, so
         # a half-set-up install goes to setup (one passphrase prompt) and
         # a finished one to sign-in. Only once there is an install to ask
@@ -203,9 +208,19 @@ def _operators_file_state(path: Path, passphrase: str) -> tuple[str, str | None]
 
 
 def _unlocks_from_file(request: Request, state: AgentState) -> bool:
-    """Whether this agent keeps its passphrase in a file (the Linux
-    system install): the mode says so and there is somewhere to put it.
-    The wizard reads it to stop offering a keyring this account lacks."""
+    """Whether this agent can unlock itself from a passphrase file. The wizard reads
+    it to stop offering a keyring this account lacks, and puts this agent and the
+    control root on `passphrase_file`.
+
+    Its own file (the Linux system install): the mode says so and there is somewhere
+    to put it. The operator's file (agent#44, the container): no file of its own and
+    the control root's variable set on this host, whatever the mode is now, because
+    the wizard reads this before any mode is set. Without that, a fresh container's
+    wizard wrote `prompt_on_startup` for this agent, and after every restart its
+    providers' saved keys waited for a sign-in.
+    """
+    if _root_passphrase_path(request) is not None:
+        return True
     return (
         state.get_config("securityMode") == "passphrase_file"
         and _passphrase_path(request) is not None
