@@ -20,6 +20,11 @@ thing to fix by editing the pin.
 settings always, so the profile's numbers are the ones in effect and an upstream change of
 default cannot make them wrong. The values are llama.cpp's own defaults in the build Eugene
 installs (b10948), so no chat model behaves differently until its profile sets one.
+
+**A second deliberate change, row 12:** every llama.cpp line now carries `--metrics`, after what
+Eugene passes and before the operator's own arguments. The agent's `/metrics` reads each engine's
+queue and cache from it; it opens `/metrics` on the engine's own port, which shows counts and no
+text, and changes nothing a model does.
 """
 
 from __future__ import annotations
@@ -369,6 +374,10 @@ def test_a_chat_model_starts_with_exactly_the_command_line_it_always_had(
     argv = LlamaCppAdapter().build_argv(RuntimeSpec.model_validate(body), binary, port=8090)
 
     expected = [token.replace("{model}", model) for token in TODAYS_ARGV[label]]
+    # Row 12: `--metrics` always, after what Eugene passes and before the operator's own
+    # arguments, which stay last.
+    extra = list(PROFILES[label].get("extraArgs", []))
+    expected = [*expected[: len(expected) - len(extra)], "--metrics", *extra]
     assert argv == [str(binary.path), *expected]
 
 

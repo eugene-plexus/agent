@@ -296,6 +296,8 @@ def test_chat_on_an_embedding_file_is_the_command_line_of_a_chat_model(
         "0",
         "--ctx-checkpoints",
         "32",
+        # Row 12: always, for the agent's /metrics.
+        "--metrics",
     ]
     assert "--cache-ram" not in auto
 
