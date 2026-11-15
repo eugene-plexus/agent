@@ -150,9 +150,14 @@ def test_every_mutating_route_is_in_the_table(
             opened.append((method, path, answer.status_code))
     assert len(tried) > 60, tried
     assert opened == []
-    # Each one that names a cause names the owner.
+    # A route that is the owner's says so, rather than that the token is the
+    # wrong kind.
     refused = client.patch("/v1/config", json={}, headers=everything)
-    assert refused.status_code in (401, 403)
+    assert refused.status_code == 403
+    assert "Only the owner" in refused.json()["detail"]["detail"]
+    # A token for another machine is still refused for what it is.
+    elsewhere = _bearer(_operations_token(root, MODELS, machine="gpu-b"))
+    assert client.patch("/v1/config", json={}, headers=elsewhere).status_code == 401
 
 
 def test_a_route_outside_the_table_refuses_the_token_even_behind_the_gate(
@@ -280,7 +285,7 @@ def test_the_operations_log_is_the_owners_and_the_librarys_to_write(
 ) -> None:
     owner = _owner(client, root)
     dana = _bearer(_operations_token(root, MODELS, MACHINES))
-    assert client.get("/v1/node/operations-log", headers=dana).status_code == 401
+    assert client.get("/v1/node/operations-log", headers=dana).status_code == 403
     report = {
         "personId": "p-dana",
         "name": "Dana",
@@ -293,7 +298,7 @@ def test_the_operations_log_is_the_owners_and_the_librarys_to_write(
     library = _bearer(local_service_token(app, "library"))
     gateway = _bearer(local_service_token(app, "gateway"))
     assert client.post("/v1/node/operations-log", json=report, headers=gateway).status_code == 401
-    assert client.post("/v1/node/operations-log", json=report, headers=dana).status_code == 401
+    assert client.post("/v1/node/operations-log", json=report, headers=dana).status_code == 403
     assert client.post("/v1/node/operations-log", json=report, headers=library).status_code == 204
     entries = client.get("/v1/node/operations-log", headers=_bearer(owner)).json()["entries"]
     assert entries[0]["component"] == "library"

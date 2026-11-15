@@ -361,11 +361,35 @@ def require_initialized(request: Request) -> AgentState:
     return state
 
 
+def token_class(token: str) -> object:
+    """The `typ` a token says it is, unverified: only to choose a refusal."""
+    import jwt
+
+    try:
+        return jwt.get_unverified_header(token).get("typ")
+    except jwt.InvalidTokenError:
+        return None
+
+
+def owner_only_problem() -> HTTPException:
+    """Row 39: a person's operations token on a route their powers do not open."""
+    return _problem(
+        status.HTTP_403_FORBIDDEN,
+        "Owner only",
+        "Only the owner can do this. Your operations powers do not include it.",
+    )
+
+
 def verify_bearer(request: Request, token: str, *, classes: tuple[str, ...]) -> tokens.Claims:
     """Verify one bearer addressed to this machine, or raise the 401 that says why."""
     auth: AuthState = request.app.state.auth_state
     if auth.is_revoked(token):
         raise revoked_session_problem()
+    if tokens.TYP_OPERATIONS not in classes and token_class(token) == tokens.TYP_OPERATIONS:
+        # A valid one is a person whose powers do not reach this route: say
+        # so, rather than that the token is of the wrong kind (row 39).
+        verify_bearer(request, token, classes=(tokens.TYP_OPERATIONS,))
+        raise owner_only_problem()
     try:
         claims = auth.trust.verify(token, classes=classes)
     except tokens.TokenError as exc:

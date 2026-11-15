@@ -36,13 +36,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
-import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import tokens
-from .dependencies import _bearer, _bearer_scheme, _problem, verify_bearer
+from .dependencies import (
+    _bearer,
+    _bearer_scheme,
+    _problem,
+    owner_only_problem,
+    token_class,
+    verify_bearer,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,19 +104,8 @@ def _route_of(request: Request) -> tuple[str, str | None]:
     return method, getattr(request.scope.get("route"), "path", None)
 
 
-def _typ(token: str) -> object:
-    try:
-        return jwt.get_unverified_header(token).get("typ")
-    except jwt.InvalidTokenError:
-        return None
-
-
 def only_the_owner() -> HTTPException:
-    return _problem(
-        status.HTTP_403_FORBIDDEN,
-        "Owner only",
-        "Only the owner can do this. Your operations powers do not include it.",
-    )
+    return owner_only_problem()
 
 
 def missing_power(power: str) -> HTTPException:
@@ -158,7 +153,7 @@ def operation(
         token = _bearer(creds)
         route = _route_of(request)
         listed = OPERATIONS_ROUTES.get(route)  # type: ignore[arg-type]
-        if _typ(token) != tokens.TYP_OPERATIONS:
+        if token_class(token) != tokens.TYP_OPERATIONS:
             claims = fallback(request, creds)
             if listed is not None and claims.is_session:
                 _mark(request, claims, listed[0], listed[1])
