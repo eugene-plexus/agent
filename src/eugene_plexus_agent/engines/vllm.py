@@ -324,6 +324,23 @@ class VllmAdapter(EngineAdapter):
             return None
         return speculation.vllm_parse_metrics(response.text)
 
+    async def read_load(self, base_url: str) -> int | None:
+        """vLLM's `GET /load`: `{"server_load": n}`, the requests occupying the
+        engine now from every client. Open without `--api-key`, as `/health` is.
+        Anything that is not a count of at least 0 is unknown."""
+        try:
+            response = await _probe_client().get(
+                f"{base_url.rstrip('/')}/load", timeout=_PROBE_TIMEOUT_SECONDS
+            )
+            body = response.json() if response.is_success else None
+        except (httpx.HTTPError, ValueError) as exc:
+            log.debug("engine load from %s: %s", base_url, exc)
+            return None
+        load = body.get("server_load") if isinstance(body, dict) else None
+        if isinstance(load, int) and not isinstance(load, bool) and load >= 0:
+            return load
+        return None
+
     def manual_install(self, host: HostAccelerator) -> ManualInstall:
         """The install command for this host, copied from upstream's
         v0.29.0 install pages — never composed. A command that does not

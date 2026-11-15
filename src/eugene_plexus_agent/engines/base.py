@@ -746,6 +746,12 @@ class EngineAdapter(abc.ABC):
         """`(drafted, accepted)` token counters from the running engine."""
         return None
 
+    async def read_load(self, base_url: str) -> int | None:
+        """Requests occupying the running engine now, from every client of it
+        (row 14, M4-LOAD). None when the engine has no such number or did not
+        answer: an engine that says nothing is never reported as idle."""
+        return None
+
     def validate_flags(self, flags: dict[str, object]) -> list[str]:
         """Return the flag keys this adapter does not recognise.
 

@@ -7929,6 +7929,11 @@ class Runtime(BaseModel):
     loadProgress: LoadProgress | None = None
     speculation: RuntimeSpeculation | None = None
     promptCache: RuntimePromptCache | None = None
+    engineLoad: int | None = Field(
+        None,
+        description='Requests occupying the engine now, from every client of it, as the\nengine counts them (row 14, M4-LOAD). Only vLLM says: its `GET /load`\nanswers `{"server_load": n}`, read every 2 s while the runtime is\n`ready`. llama.cpp has no such number, so the field is null there, and\nnull when the engine did not answer the last read or is not `ready`.\nIt is never a 0 for an engine that said nothing. A gateway counts only\nits own requests, so this is where another door\'s use shows. Observed,\nnever declared.\n',
+        ge=0,
+    )
 
 
 class LibraryFolderReach(BaseModel):

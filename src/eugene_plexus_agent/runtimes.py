@@ -583,6 +583,10 @@ class RuntimeSupervisor:
         # Keyed on the process too (`_run_of`): counters count from the
         # engine's start, so a restart's are new ones.
         self._speculation: dict[str, tuple[_Run, float, int | None, int | None]] = {}
+        #: Row 14: the engine's own count of requests occupying it, by runtime, with
+        #: the run it was read from (a new run drops it) and None when the engine
+        #: did not say. Read on every readiness poll of a ready engine.
+        self._engine_load: dict[str, tuple[_Run, int | None]] = {}
         # The declared model paths this loop last reconciled against.
         # None until the first pass, so a fresh agent reconciles once.
         self._last_declared: set[str] | None = None
@@ -880,6 +884,7 @@ class RuntimeSupervisor:
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
         self._proved_ready.pop(name, None)
+        self._engine_load.pop(name, None)
         self._load_progress.forget(name)
 
     async def remove_and_stop(self, name: str) -> None:
@@ -890,6 +895,7 @@ class RuntimeSupervisor:
         self._proved_ready.pop(name, None)
         self._stop_reasons.pop(name, None)
         self._speculation.pop(name, None)
+        self._engine_load.pop(name, None)
         self._forget_stop(name)
         self._copy_notes.pop(name, None)
         self._load_progress.forget(name)
@@ -1219,10 +1225,20 @@ class RuntimeSupervisor:
             execTrust=planner.exec_trust if planner is not None else None,
             loadProgress=load_progress,
             speculation=self._speculation_for(spec, adapter, argv, status),
+            engineLoad=self._engine_load_for(name, sp, status),
             promptCache=self._prompt_cache_for(spec, adapter, argv, status),
             lastDevices=[LastDevice(d) for d in self.device_memory.observed(spec)[0]] or None,
             startedOnFewerCards=self.device_memory.observed(spec)[1],
         )
+
+    def _engine_load_for(
+        self, name: str, sp: SupervisedProcess | None, status: RuntimeStatus
+    ) -> int | None:
+        """The engine's own load of this run, while the runtime is ready."""
+        seen = self._engine_load.get(name)
+        if seen is None or sp is None or status is not RuntimeStatus.ready:
+            return None
+        return seen[1] if seen[0] == _run_of(sp) else None
 
     def _prompt_cache_for(
         self,
@@ -1378,6 +1394,12 @@ class RuntimeSupervisor:
             self._readiness[spec.name] = None
         if isinstance(outcome, Ready) and speculation.in_argv(sp.last_argv or []):
             await self._read_speculation(spec, adapter, base, started_at)
+        if isinstance(outcome, Ready):
+            load = await adapter.read_load(base)
+            if self._processes.get(spec.name) is sp and _run_of(sp) == started_at:
+                self._engine_load[spec.name] = (started_at, load)
+        else:
+            self._engine_load.pop(spec.name, None)
 
     async def _read_speculation(
         self, spec: RuntimeSpec, adapter: EngineAdapter, base: str, started_at: _Run
