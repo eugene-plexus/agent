@@ -653,8 +653,10 @@ class SupervisedProcess:
 
         #: Row 13: this run's gateway has been drained (once per run).
         self._drained = False
-        #: Row 13 review #4: a gateway's restart, draining in the background.
+        #: Row 13 review #4: a gateway's restart, draining in the background,
+        #: and how many restarts were asked for it.
         self._restart_task: asyncio.Task[None] | None = None
+        self._restarts_wanted = 0
         self.state: ProcessState = ProcessState.starting
         self.degraded = False
         """Whether the plan currently running is a reduced-mode one. Set
@@ -753,9 +755,13 @@ class SupervisedProcess:
             # itself. In the background (review #4): sign-in, enrollment and
             # the Restart button await this, and a drain may take minutes.
             self._expected_exit = True
+            # A restart asked while one drains is not dropped: sign-in and
+            # enrollment a second later each restart the gateway, and the
+            # second must reach a process spawned after it (C4 on Windows).
+            self._restarts_wanted += 1
             if self._restart_task is None or self._restart_task.done():
                 self._restart_task = asyncio.create_task(
-                    self._drain_then_signal(proc), name=f"restart:{self.name}"
+                    self._restart_in_background(), name=f"restart:{self.name}"
                 )
             return
         if proc is not None and proc.returncode is None:
@@ -770,15 +776,41 @@ class SupervisedProcess:
             isinstance(planner, _ComponentPlanner) and planner.entry.kind is ComponentKind.gateway
         )
 
-    async def _drain_then_signal(self, proc: asyncio.subprocess.Process) -> None:
+    async def _restart_in_background(self) -> None:
+        """Drain and restart the gateway, then once more for every restart
+        asked meanwhile, each time on the process running then."""
         try:
-            await self.drain_first()
-            # Only the process drained: its successor is never signalled
-            # (review #3).
-            if proc.returncode is None and self._proc is proc:
-                await self._signal_restart(proc)
+            done = 0
+            previous: asyncio.subprocess.Process | None = None
+            while done < self._restarts_wanted and not self._stop_requested:
+                done = self._restarts_wanted
+                proc = await self._next_process(previous)
+                if proc is None:
+                    return
+                await self._drain_then_signal(proc)
+                previous = proc
         except Exception:
             self._log.exception("restart of %s failed", self.name)
+
+    async def _next_process(
+        self, previous: asyncio.subprocess.Process | None
+    ) -> asyncio.subprocess.Process | None:
+        """The running process that is not `previous`: the one the loop spawns
+        after a restart. None if none comes within 30 s or the child stops."""
+        deadline = time.perf_counter() + 30.0
+        while time.perf_counter() < deadline and not self._stop_requested:
+            proc = self._proc
+            if proc is not None and proc is not previous and proc.returncode is None:
+                return proc
+            await asyncio.sleep(0.05)
+        return None
+
+    async def _drain_then_signal(self, proc: asyncio.subprocess.Process) -> None:
+        await self.drain_first()
+        # Only the process drained: its successor is never signalled
+        # (review #3).
+        if proc.returncode is None and self._proc is proc:
+            await self._signal_restart(proc)
 
     async def _signal_restart(self, proc: asyncio.subprocess.Process) -> None:
         self._expected_exit = True

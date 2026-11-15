@@ -237,3 +237,57 @@ async def test_a_restart_does_not_wait_for_the_drain(monkeypatch: pytest.MonkeyP
     assert proc.returncode is None
     await sp.stop(drain_cap=0.3)
     assert proc.returncode is not None
+
+
+async def test_a_restart_asked_during_a_restart_restarts_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sign-in restarts every child, and enrollment a second later does it
+    again so the gateway picks up the machine's new keys. With the restart in
+    the background, the second request found the first still draining and
+    did nothing, so the gateway could keep the keys from before enrollment
+    (C4 on Windows). A restart asked meanwhile now restarts the process the
+    first one left, once more."""
+    made: list[_FakeProcess] = []
+    drained: list[int] = []
+
+    async def fake_create(*args: Any, **kwargs: Any) -> _FakeProcess:
+        proc = _FakeProcess()
+        proc.pid = 5000 + len(made)
+        made.append(proc)
+        return proc
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        current = made[-1]
+        if request.method == "POST":
+            drained.append(current.pid)
+            asyncio.get_running_loop().call_later(0.2, current._finish, 0)
+        state = "exiting" if current.returncode is not None else "draining"
+        return httpx.Response(
+            202 if request.method == "POST" else 200, json={"state": state, "running": 0}
+        )
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    _http.set_shared_client(
+        "gateway-drain", httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    owner = Supervisor(logging.getLogger("test"), auth_state=_auth())
+    owner.add_and_start(_entry())
+    sp = owner._processes["gateway"]
+    for _ in range(100):
+        if sp.pid is not None:
+            break
+        await asyncio.sleep(0.01)
+    try:
+        await owner.restart("gateway")  # sign-in
+        await asyncio.sleep(0.05)
+        await owner.restart("gateway")  # enrollment, while the first drains
+        for _ in range(300):
+            if len(made) >= 3 and made[-1].returncode is None and len(drained) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.5)
+        assert drained == [5000, 5001], drained
+        assert len(made) == 3, f"{len(made)} processes"
+    finally:
+        await owner.stop_all()
