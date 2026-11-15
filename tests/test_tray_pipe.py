@@ -371,3 +371,166 @@ def test_may_stop_reads_the_dacl_as_windows_does() -> None:
     finally:
         win32api.CloseHandle(token)
         win32api.CloseHandle(process)
+
+
+# --- review findings (2026-11-15) ---------------------------------------------------------
+
+
+class _Gated(tray_pipe.TrayPipe):
+    """A channel whose thread waits for the test before its first connect."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.gate = threading.Event()
+
+    def _run(self) -> None:
+        self.gate.wait(10)
+        super()._run()
+
+
+@windows
+def test_a_client_gone_before_the_first_connect_does_not_stop_the_channel(
+    loop: asyncio.AbstractEventLoop, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A client that opens and closes the pipe before the agent listens
+    leaves the instance closing: ConnectNamedPipe fails (232) until it is
+    disconnected. The channel disconnects it and answers the next caller,
+    without a log record per spin."""
+    pytest.importorskip("win32pipe")
+    import win32api
+
+    async def answer(verb: str) -> dict[str, Any]:
+        return {"ok": True, "pause": {"paused": False}}
+
+    port = _port()
+    server = _Gated(port=port, answer=answer, loop=loop, read_timeout=1.0)
+    server.start()
+    try:
+        win32api.CloseHandle(_raw(tray_pipe.pipe_name(port)))
+        server.gate.set()
+        deadline = time.perf_counter() + 8
+        reply = tray_pipe.call("state", port=port, service_name="none", expected_pid=os.getpid())
+        while reply.status != "ok" and time.perf_counter() < deadline:
+            reply = tray_pipe.call(
+                "state", port=port, service_name="none", expected_pid=os.getpid()
+            )
+        assert reply.status == "ok", reply
+        assert server.status == tray_pipe.SERVING
+        records = [r for r in caplog.records if r.name == tray_pipe.log.name]
+        assert len(records) < 20, len(records)
+    finally:
+        server.stop()
+
+
+@windows
+def test_a_grant_is_applied_while_the_channel_waits_for_a_client(
+    loop: asyncio.AbstractEventLoop, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sc sdset` adding an account must not wait for some other client to
+    connect first: the waiting channel reads the grants again by itself."""
+    pytest.importorskip("win32pipe")
+    monkeypatch.setattr(tray_pipe, "REFRESH_SECONDS", 0.2)
+
+    async def answer(verb: str) -> dict[str, Any]:
+        return {"ok": True}
+
+    port = _port()
+    server = tray_pipe.TrayPipe(port=port, answer=answer, loop=loop)
+    server.start()
+    try:
+        assert server.status == tray_pipe.SERVING
+        newcomer = "S-1-5-21-1111-2222-3333-1042"
+        before = server._grants()[0]
+        monkeypatch.setattr(
+            server,
+            "_grants",
+            lambda: (tray_pipe.PipeGrants(allowed=(*before.allowed, newcomer)), None),
+        )
+        deadline = time.perf_counter() + 5
+        while newcomer not in (server._sddl or "") and time.perf_counter() < deadline:
+            time.sleep(0.05)
+        assert newcomer in (server._sddl or "")
+        # And the channel still answers.
+        reply = tray_pipe.call("state", port=port, service_name="none", expected_pid=os.getpid())
+        assert reply.status == "ok", reply
+    finally:
+        server.stop()
+
+
+@windows
+def test_the_served_name_takes_no_second_instance(loop: asyncio.AbstractEventLoop) -> None:
+    """One instance, the first: nobody admitted may add an instance beside it."""
+    pytest.importorskip("win32pipe")
+    import pywintypes
+    import win32pipe
+
+    async def answer(verb: str) -> dict[str, Any]:
+        return {"ok": True}
+
+    port = _port()
+    server = tray_pipe.TrayPipe(port=port, answer=answer, loop=loop)
+    server.start()
+    try:
+        assert server.status == tray_pipe.SERVING
+        with pytest.raises(pywintypes.error) as refused:
+            win32pipe.CreateNamedPipe(tray_pipe.pipe_name(port), 3, 0, 255, 4096, 4096, 0, None)
+        assert refused.value.winerror in (5, 231)
+    finally:
+        server.stop()
+
+
+def _level(flags: int) -> int:
+    """The impersonation level a CreateFile's flags ask for (SECURITY_* >> 16)."""
+    return (flags >> 16) & 0x3
+
+
+def test_the_tray_lets_the_agent_identify_it_and_never_act_as_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeWin(server_pid=4321)
+    opened: list[tuple[Any, ...]] = []
+    fake.file.CreateFile = staticmethod(lambda *args: opened.append(args) or "handle")
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(tray_pipe, "_win32", lambda: fake)
+    tray_pipe.call("pause", port=18379, service_name="EP", expected_pid=1234)
+    flags = opened[0][5]
+    # Without SECURITY_SQOS_PRESENT Windows ignores the level: impersonation.
+    assert flags & tray_pipe.SECURITY_SQOS_PRESENT
+    assert _level(flags) == 1  # SecurityIdentification
+    assert not flags & 0x000C0000  # no context tracking, no effective-only games
+
+
+def test_the_agent_asks_who_holds_its_name_anonymously() -> None:
+    fake = _FakeWin(server_pid=4321)
+    opened: list[tuple[Any, ...]] = []
+    fake.file.CreateFile = staticmethod(lambda *args: opened.append(args) or "handle")
+    fake.file.SECURITY_ANONYMOUS = 0
+    server = tray_pipe.TrayPipe(port=18379, answer=None, loop=None)  # type: ignore[arg-type]
+    server._w = fake
+    assert server._holder() == 4321
+    flags = opened[0][5]
+    assert flags & tray_pipe.SECURITY_SQOS_PRESENT
+    assert _level(flags) == 0  # SecurityAnonymous
+
+
+def test_an_answer_that_takes_too_long_is_cancelled_and_named(
+    monkeypatch: pytest.MonkeyPatch, loop: asyncio.AbstractEventLoop
+) -> None:
+    monkeypatch.setattr(tray_pipe, "ANSWER_TIMEOUT_SECONDS", 0.3)
+    cancelled = threading.Event()
+
+    async def answer(verb: str) -> dict[str, Any]:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return {"ok": True}
+
+    server = tray_pipe.TrayPipe(port=18379, answer=answer, loop=loop)
+    reply = server._ask("resume")
+    assert reply["ok"] is False
+    assert reply["error"].startswith(
+        "Eugene took longer than 0.3 seconds to resume the models, and the tray stopped waiting."
+    ), reply
+    assert cancelled.wait(5)

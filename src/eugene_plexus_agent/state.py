@@ -1368,7 +1368,10 @@ def _pause_from_file(raw: Any, runtimes: dict[str, RuntimeSpec]) -> dict[str, An
         since = since.isoformat()
     problem: str | None = None
     try:
-        datetime.fromisoformat(str(since))
+        # A time with no zone is damaged too: `NodePause.since` must be
+        # aware, and a naive one would fail GET /v1/node and the tray.
+        if datetime.fromisoformat(str(since)).tzinfo is None:
+            problem = "since"
     except ValueError:
         problem = "since"
     if not isinstance(since, str):

@@ -22,7 +22,8 @@ grants nothing new; those accounts can already stop the whole service.
   right is copied as a deny. Clients get read and `FILE_WRITE_DATA` only --
   never `FILE_APPEND_DATA`, which on a pipe is `FILE_CREATE_PIPE_INSTANCE`.
   Without the service the agent's own account takes the third place.
-  The DACL is read again before each connection and applied in place.
+  The DACL is read again before each connection, and every
+  `REFRESH_SECONDS` while the channel waits for one, and applied in place.
 * **Each connection is checked again, and that check decides.** After
   the request is read, the agent impersonates the caller, opens the
   thread's token, reverts at once (a failed revert ends the channel), and
@@ -68,6 +69,18 @@ READ_TIMEOUT_SECONDS = 5.0
 #: Pause and Resume stop and start engines; a state read is quick.
 ANSWER_TIMEOUT_SECONDS = 180.0
 RETRY_SECONDS = 30.0
+#: While it waits for a client, the channel reads the service's grants again
+#: this often, so a grant added with `sc sdset` needs no other client first.
+REFRESH_SECONDS = 3.0
+#: After a connection that failed before it began: disconnect, wait this
+#: long, and try again; after CONNECT_FAILURES in a row the channel closes
+#: and opens again after RETRY_SECONDS, reading `unavailable` meanwhile.
+CONNECT_PAUSE_SECONDS = 1.0
+CONNECT_FAILURES = 5
+
+#: CreateFile: the client states the level the server may act at. Without
+#: it Windows ignores the level bits and the server may impersonate.
+SECURITY_SQOS_PRESENT = 0x00100000
 
 SERVING = "serving"
 TAKEN = "taken"
@@ -238,6 +251,12 @@ def pipe_sddl(grants: PipeGrants) -> str:
 
 
 VERBS = ("state", "pause", "resume")
+#: Each verb as the log and an error say it.
+_DOING = {
+    "state": "read whether the models are paused",
+    "pause": "pause the models",
+    "resume": "resume the models",
+}
 DENIED = "This account may not pause models on this machine."
 
 
@@ -311,7 +330,13 @@ def own_service() -> str | None:
         finally:
             w.service.CloseServiceHandle(scm)
     except Exception:
-        log.debug("could not ask which service this process is", exc_info=True)
+        # Read as an install without the service: the pipe then admits the
+        # agent's own account, SYSTEM and Administrators only.
+        log.warning(
+            "could not ask Windows which service this process is; the tray's channel "
+            "admits this agent's own account only",
+            exc_info=True,
+        )
     return None
 
 
@@ -645,7 +670,7 @@ class TrayPipe:
                 0,
                 None,
                 w.file.OPEN_EXISTING,
-                0x00100000 | w.file.SECURITY_ANONYMOUS,  # SECURITY_SQOS_PRESENT
+                SECURITY_SQOS_PRESENT | w.file.SECURITY_ANONYMOUS,
                 None,
             )
         except w.pywintypes.error:
@@ -685,18 +710,31 @@ class TrayPipe:
 
     def _run(self) -> None:
         w = self._w
+        failures = 0
         while not self._stopping():
             if self._handle is None:
                 if w.event.WaitForSingleObject(self._stop, int(RETRY_SECONDS * 1000)) == 0:
                     break
+                failures = 0
                 self._create()
                 continue
             connected = False
             try:
                 self._refresh()
                 connected = self._connect()
-                if not connected:
+            except _Fatal as exc:
+                log.error("The tray's channel %s stopped: %s", self.name, exc)
+                self.status = UNAVAILABLE
+                break
+            except Exception as exc:
+                failures += 1
+                if not self._connect_failed(exc, failures):
                     break
+                continue
+            if not connected:
+                break
+            failures = 0
+            try:
                 self._serve_one()
             except _Fatal as exc:
                 log.error("The tray's channel %s stopped: %s", self.name, exc)
@@ -705,22 +743,70 @@ class TrayPipe:
             except Exception:
                 log.exception("The tray's channel %s: a connection failed", self.name)
             finally:
-                if connected and self._handle is not None:
+                if self._handle is not None:
                     with contextlib.suppress(w.pywintypes.error):
                         w.pipe.DisconnectNamedPipe(self._handle)
         self._close()
 
+    def _connect_failed(self, exc: Exception, failures: int) -> bool:
+        """After a connection failed before it began. False: the channel is stopping.
+
+        A client that opened and closed the pipe before the agent listened
+        leaves the instance closing, and ConnectNamedPipe fails (232) until
+        it is disconnected. So disconnect, and wait a moment: never spin.
+        Failures in a row close the instance, read `unavailable`, and the
+        channel opens again after RETRY_SECONDS.
+        """
+        w = self._w
+        with contextlib.suppress(w.pywintypes.error):
+            w.pipe.DisconnectNamedPipe(self._handle)
+        if failures == 1:
+            log.warning("The tray's channel %s could not take a connection: %s", self.name, exc)
+        if failures >= CONNECT_FAILURES:
+            log.error(
+                "The tray's channel %s failed %d times in a row (%s); it opens again in "
+                "%.0f seconds",
+                self.name,
+                failures,
+                exc,
+                RETRY_SECONDS,
+            )
+            self.status = UNAVAILABLE
+            self._close()
+            return True
+        return bool(
+            w.event.WaitForSingleObject(self._stop, int(CONNECT_PAUSE_SECONDS * 1000))
+            != w.event.WAIT_OBJECT_0
+        )
+
     def _connect(self) -> bool:
+        """Wait for a client. False: the channel is stopping.
+
+        While it waits, it reads the service's grants again every
+        REFRESH_SECONDS, so a grant added with `sc sdset` is honoured at once.
+        """
         w = self._w
         overlapped = _overlapped(w)
         result = w.pipe.ConnectNamedPipe(self._handle, overlapped)
         if result == w.error.ERROR_PIPE_CONNECTED:
             return True
-        which = w.event.WaitForMultipleObjects(
-            [overlapped.hEvent, self._stop], False, w.event.INFINITE
-        )
+        while True:
+            which = w.event.WaitForMultipleObjects(
+                [overlapped.hEvent, self._stop], False, int(REFRESH_SECONDS * 1000)
+            )
+            if which != w.event.WAIT_TIMEOUT:
+                break
+            try:
+                self._refresh()
+            except Exception as exc:
+                # The pipe keeps the DACL it has; the next refresh tries again.
+                if self._reported != str(exc):
+                    log.warning("The tray's channel could not follow the service's grants: %s", exc)
+                self._reported = str(exc)
         if which != w.event.WAIT_OBJECT_0:
             w.file.CancelIo(self._handle)
+            with contextlib.suppress(w.pywintypes.error):
+                w.file.GetOverlappedResult(self._handle, overlapped, True)
             return False
         w.file.GetOverlappedResult(self._handle, overlapped, False)
         return True
@@ -739,17 +825,21 @@ class TrayPipe:
             log.warning("The tray's channel could not tell who is asking: %s", exc)
             return False, "a caller it could not identify"
         token = None
+        unread: Exception | None = None
         try:
             token = w.security.OpenThreadToken(
                 w.api.GetCurrentThread(), w.security.TOKEN_QUERY, True
             )
         except w.pywintypes.error as exc:
-            log.warning("The tray's channel could not read the caller's account: %s", exc)
+            unread = exc
         finally:
             try:
                 w.security.RevertToSelf()
             except Exception as exc:
                 raise _Fatal(f"could not stop acting as the caller ({exc})") from exc
+        # Logged only once the thread is the agent again.
+        if unread is not None:
+            log.warning("The tray's channel could not read the caller's account: %s", unread)
         if token is None:
             return False, "a caller it could not identify"
         try:
@@ -793,13 +883,28 @@ class TrayPipe:
             _read_line(w, self._handle, self._read_timeout, self._stop)
 
     def _ask(self, verb: str) -> dict[str, Any]:
+        what = _DOING.get(verb, verb)
+        future = asyncio.run_coroutine_threadsafe(self._answer(verb), self._loop)
         try:
-            future = asyncio.run_coroutine_threadsafe(self._answer(verb), self._loop)
             answer: dict[str, Any] = future.result(timeout=ANSWER_TIMEOUT_SECONDS)
             return answer
+        except TimeoutError:
+            # Cancelled, so it does not run on unseen. A pause still finishes
+            # stopping what it began: `pause.pause` shields that part.
+            future.cancel()
+            log.error(
+                "The tray's channel stopped waiting to %s after %.0f seconds",
+                what,
+                ANSWER_TIMEOUT_SECONDS,
+            )
+            return {
+                "ok": False,
+                "error": f"Eugene took longer than {ANSWER_TIMEOUT_SECONDS:g} seconds to "
+                f"{what}, and the tray stopped waiting. Look at Machines in the console.",
+            }
         except Exception as exc:
-            log.exception("The tray's channel could not %s models", verb)
-            return {"ok": False, "error": f"Eugene could not {verb} the models: {exc}"}
+            log.exception("The tray's channel could not %s", what)
+            return {"ok": False, "error": f"Eugene could not {what}: {exc}"}
 
 
 # --- the tray's end ---------------------------------------------------------------------
@@ -846,7 +951,9 @@ def call(
                 0,
                 None,
                 w.file.OPEN_EXISTING,
-                w.file.FILE_FLAG_OVERLAPPED | 0x00100000 | w.file.SECURITY_IDENTIFICATION,
+                w.file.FILE_FLAG_OVERLAPPED
+                | SECURITY_SQOS_PRESENT
+                | w.file.SECURITY_IDENTIFICATION,
                 None,
             )
             break

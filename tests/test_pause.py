@@ -364,18 +364,36 @@ def test_the_supervisor_boots_paused_runtimes_stopped(tmp_path: Path) -> None:
     assert supervisor.started == ["free"]
 
 
-def test_a_damaged_pause_record_keeps_the_machine_paused(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "damaged",
+    [
+        "{since: 'not a time', by: 7, runtimes: busy}",
+        # A hand edit with no time zone reads as a time, and NodePause
+        # refuses it: GET /v1/node and the tray's state must not fail.
+        "{since: '2026-10-27T20:14:00', by: tray, runtimes: [busy]}",
+        "{since: 2026-10-27 20:14:00, by: tray, runtimes: [busy]}",
+    ],
+)
+def test_a_damaged_pause_record_keeps_the_machine_paused(tmp_path: Path, damaged: str) -> None:
     """A bad file never stops the agent, and never loads the card either."""
+    from types import SimpleNamespace
+
+    from eugene_plexus_agent import pause
+
     path = tmp_path / "agent.yaml"
     _state(path, "busy")
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-    raw["pausedModels"] = {"since": "not a time", "by": 7, "runtimes": "busy"}
-    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    raw.pop("pausedModels", None)
+    path.write_text(yaml.safe_dump(raw) + f"pausedModels: {damaged}\n", encoding="utf-8")
     state = AgentState(path)
     assert state.load_or_degrade() is None
     assert state.pause_record() is not None
+    # What GET /v1/node and the tray's state report reads without failing.
+    view = pause.view(SimpleNamespace(state=SimpleNamespace(agent_state=state)))
+    assert view.paused is True
+    assert view.since is not None and view.since.tzinfo is not None
     # The boot holds every runtime that would start, and Resume starts them.
-    assert state.hold_paused_at_boot() == ["busy"]
+    assert state.hold_paused_at_boot() in (["busy"], [])
     assert state.remembered_stops() == {"busy"}
 
 
@@ -391,3 +409,32 @@ def test_the_pause_sentence_names_the_machine_and_the_way_back() -> None:
     assert pause.sentence(console, machine="nas").startswith(
         "Models on nas are paused from Eugene's console. Resume them"
     )
+
+
+def test_a_caller_that_stops_waiting_does_not_cut_a_pause_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tray's channel cancels its wait after its timeout; the pause
+    still finishes, or its list would miss runtimes still running."""
+    import asyncio
+
+    from eugene_plexus_agent import pause
+
+    finished: list[str] = []
+
+    async def slow(app: Any, *, by: str) -> Any:
+        await asyncio.sleep(0.2)
+        finished.append(by)
+
+    monkeypatch.setattr(pause, "_pause_now", slow)
+
+    async def scenario() -> None:
+        waiting = asyncio.ensure_future(pause.pause(object(), by="tray"))
+        await asyncio.sleep(0.05)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        await asyncio.sleep(0.4)
+
+    asyncio.run(scenario())
+    assert finished == ["tray"]

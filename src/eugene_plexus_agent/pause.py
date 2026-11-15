@@ -174,7 +174,17 @@ async def _cancel_measurements(app: Any) -> list[str]:
 
 
 async def pause(app: Any, *, by: str) -> NodePauseResult:
-    """Stop every model on this machine, and keep it stopped (row 35)."""
+    """Stop every model on this machine, and keep it stopped (row 35).
+
+    Shielded: a caller that stops waiting (the tray's channel after its
+    timeout) cancels its wait, not the pause. A pause cut part-way would
+    hold a record whose list misses runtimes still running, and a second
+    Pause would then stop nothing.
+    """
+    return await asyncio.shield(_pause_now(app, by=by))
+
+
+async def _pause_now(app: Any, *, by: str) -> NodePauseResult:
     from .measurement_node import running_runtimes
     from .node_work import launch_lock
     from .routes.runtimes import _supervisor
