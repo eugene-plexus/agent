@@ -14,7 +14,7 @@ control root on the same host reads the same file through its own
 
 **The difference from the control root's mode is who writes the file.**
 Control's is the operator's -- a container secret, mounted -- and it
-never writes it. On a system install nobody supplies one: the
+writes it only after a passphrase change, when it can. On a system install nobody supplies one: the
 passphrase is typed into the browser wizard. So this agent writes it,
 at `initialize` and at every sign-in, which are the only moments it
 holds the passphrase itself. We made it, so we manage it.
@@ -84,7 +84,10 @@ def unlock_path(own: Path | None, root: Path | None) -> Path | None:
 #: What fixes a missing or wrong file, by whose file it is (agent#43): a sign-in
 #: writes this agent's own, and never the operator's.
 _OWN_FIX = "until someone signs in, which writes it"
-_OPERATORS_FIX = "until this install's passphrase is put in it (Eugene never writes this file)"
+_OPERATORS_FIX = (
+    "until this install's passphrase is put in it (the agent never writes this file; the "
+    "control root writes a new passphrase here after a change when it can)"
+)
 
 
 def read_passphrase(path: Path | None, *, operators: bool = False) -> str | None:
