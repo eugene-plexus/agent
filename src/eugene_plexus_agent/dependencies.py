@@ -158,6 +158,14 @@ FROZEN_TRUST_CHANGES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/runtimes/{name}/restart"),
         ("POST", "/v1/runtimes/{name}/start"),
         ("POST", "/v1/runtimes/{name}/stop"),
+        # Row 13: a drain changes routing, a report can end one, and a
+        # rollout moves engines.
+        ("POST", "/v1/runtimes/{name}/drain"),
+        ("DELETE", "/v1/runtimes/{name}/drain"),
+        ("POST", "/v1/runtimes/{name}/drain/report"),
+        ("POST", "/v1/engines/{engine}/rollout"),
+        ("DELETE", "/v1/engines/{engine}/rollout"),
+        ("POST", "/v1/engines/{engine}/rollout/answer"),
         ("POST", "/v1/serving-measurements"),
         ("POST", "/v1/serving-measurements/{job_id}/cancel"),
         ("DELETE", "/v1/site/links/{subject}"),
@@ -529,6 +537,20 @@ def require_operator_or_gateway(
     if claims.is_session or claims.sub == tokens.SUB_GATEWAY:
         return claims
     raise _refuse(claims, "start or stop a runtime; only the operator or the gateway may")
+
+
+def require_gateway(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims:
+    """A gateway's own service token, and nothing else (row 13's drain
+    reports): from this machine's gateway, or from a machine the trust bundle
+    grants `gateway` (a `gateway` token from any other machine does not verify).
+    Not an operator session: a report is a gateway's count, which no person has."""
+    claims = verify_bearer(request, _bearer(creds), classes=(tokens.TYP_SERVICE,))
+    if claims.sub == tokens.SUB_GATEWAY:
+        return claims
+    raise _refuse(claims, "report on a drain; only a gateway may")
 
 
 def require_operator_or_control(

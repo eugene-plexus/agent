@@ -20,10 +20,18 @@ import asyncio
 import logging
 import shutil
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
-from .. import install_proxy, library_folders, model_copies
+from .. import (
+    engine_rollout,
+    install_proxy,
+    library_folders,
+    model_copies,
+    runtime_drain,
+    tokens,
+)
 from .._generated.common_models import Problem, RestartResult
 from .._generated.models import (
     Admission,
@@ -33,12 +41,18 @@ from .._generated.models import (
     EngineInstallRequest,
     EngineKind,
     EngineList,
+    EngineRollout,
+    EngineRolloutAnswer,
+    EngineRolloutRequest,
     ModelCopyClearResult,
     ModelCopySkipped,
     PreparedInspectRequest,
     PreparedProvenance,
     Runtime,
     RuntimeAutoStart,
+    RuntimeDrain,
+    RuntimeDrainReport,
+    RuntimeDrainRequest,
     RuntimeList,
     RuntimeSpec,
     RuntimeStatus,
@@ -62,6 +76,7 @@ from ..companions import (
     remove_companion,
 )
 from ..dependencies import (
+    require_gateway,
     require_operator_or_control,
     require_operator_or_gateway,
     require_operator_or_service,
@@ -580,6 +595,11 @@ async def list_engines(request: Request) -> EngineList:
     # takes a `threading.Lock`, so it is safe to call from the worker.
     state: AgentState = request.app.state.agent_state
     engines = await asyncio.to_thread(describe_engines, get_config=state.get_config)
+    # Row 13: each engine's current or last rollout, so the Engines panel and
+    # the Issues list read it with the poll they already make.
+    rollouts = engine_rollout.manager(request.app)
+    for descriptor in engines:
+        descriptor.rollout = rollouts.get(descriptor.engine)
     return EngineList(engines=engines)
 
 
@@ -712,6 +732,87 @@ async def cancel_engine_install(engine: str) -> EngineInstall:
     return snapshot
 
 
+# --------------------------------------------------------------------------- #
+# Engine rollouts (row 13)
+# --------------------------------------------------------------------------- #
+
+
+def _rollout_problem(exc: engine_rollout.RolloutError) -> HTTPException:
+    return _problem(code=exc.status, slug="engine-rollout", title="Engine update", detail=str(exc))
+
+
+@router.post(
+    "/v1/engines/{engine}/rollout",
+    response_model=EngineRollout,
+    response_model_exclude_none=True,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["engines"],
+    dependencies=_write_auth,
+)
+async def start_engine_rollout(
+    request: Request, engine: str, body: EngineRolloutRequest | None = None
+) -> EngineRollout:
+    """Move this node's runtimes to another build, checked, one at a time
+    (`engine_rollout`). Operator only."""
+    kind = _engine_kind(engine)
+    try:
+        return await engine_rollout.manager(request.app).start(kind, body)
+    except engine_rollout.RolloutError as exc:
+        raise _rollout_problem(exc) from exc
+
+
+@router.get(
+    "/v1/engines/{engine}/rollout",
+    response_model=EngineRollout,
+    response_model_exclude_none=True,
+    tags=["engines"],
+    dependencies=_read_auth,
+)
+async def get_engine_rollout(request: Request, engine: str) -> EngineRollout:
+    kind = _engine_kind(engine)
+    rollout = engine_rollout.manager(request.app).get(kind)
+    if rollout is None:
+        raise _problem(
+            code=status.HTTP_404_NOT_FOUND,
+            slug="no-rollout",
+            title="No update",
+            detail=f"No update of {engine} has run on this node.",
+        )
+    return rollout
+
+
+@router.delete(
+    "/v1/engines/{engine}/rollout",
+    response_model=EngineRollout,
+    response_model_exclude_none=True,
+    tags=["engines"],
+    dependencies=_write_auth,
+)
+async def cancel_engine_rollout(request: Request, engine: str) -> EngineRollout:
+    kind = _engine_kind(engine)
+    try:
+        return await engine_rollout.manager(request.app).cancel(kind)
+    except engine_rollout.RolloutError as exc:
+        raise _rollout_problem(exc) from exc
+
+
+@router.post(
+    "/v1/engines/{engine}/rollout/answer",
+    response_model=EngineRollout,
+    response_model_exclude_none=True,
+    tags=["engines"],
+    dependencies=_write_auth,
+)
+async def answer_engine_rollout(
+    request: Request, engine: str, body: EngineRolloutAnswer
+) -> EngineRollout:
+    kind = _engine_kind(engine)
+    try:
+        return engine_rollout.manager(request.app).answer(kind, body.choice)
+    except engine_rollout.RolloutError as exc:
+        raise _rollout_problem(exc) from exc
+
+
 @router.post(
     "/v1/engines/{engine}/prepared/inspect",
     response_model=PreparedProvenance,
@@ -804,10 +905,21 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
     return Response(status_code=204)
 
 
+def _saw_gateway(request: Request, claims: tokens.Claims) -> None:
+    """Row 13: a gateway read this agent's runtimes, so an open drain waits on
+    its report. Keyed by the token's issuer: one gateway per machine."""
+    if claims.is_service and claims.sub == tokens.SUB_GATEWAY:
+        runtime_drain.of(request.app).saw_reader(claims.iss)
+
+
 @router.get("/v1/runtimes", response_model=RuntimeList, tags=["runtimes"], dependencies=_read_auth)
-async def list_runtimes(request: Request) -> RuntimeList:
+async def list_runtimes(
+    request: Request,
+    claims: Annotated[tokens.Claims, Depends(require_operator_or_service)],
+) -> RuntimeList:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
+    _saw_gateway(request, claims)
     return RuntimeList(
         runtimes=[_compose(s, supervisor) for s in state.list_runtime_specs()],
     )
@@ -949,11 +1061,16 @@ async def declare_runtime(
 @router.get(
     "/v1/runtimes/{name}", response_model=Runtime, tags=["runtimes"], dependencies=_read_auth
 )
-async def get_runtime(request: Request, name: str) -> Runtime:
+async def get_runtime(
+    request: Request,
+    name: str,
+    claims: Annotated[tokens.Claims, Depends(require_operator_or_service)],
+) -> Runtime:
     state: AgentState = request.app.state.agent_state
     spec = state.get_runtime_spec(name)
     if spec is None:
         raise _not_found(name)
+    _saw_gateway(request, claims)
     return _compose(spec, _supervisor(request))
 
 
@@ -1123,6 +1240,78 @@ async def stop_runtime(
             f"memory is released. POST .../start to bring it back."
         ),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Drains (row 13)
+# --------------------------------------------------------------------------- #
+
+
+def _drain_problem(exc: runtime_drain.DrainError) -> HTTPException:
+    return _problem(code=exc.status, slug="runtime-drain", title="Runtime drain", detail=str(exc))
+
+
+@router.post(
+    "/v1/runtimes/{name}/drain",
+    response_model=RuntimeDrain,
+    response_model_exclude_none=True,
+    status_code=202,
+    tags=["runtimes"],
+    dependencies=_lifecycle_auth,
+)
+async def drain_runtime(
+    request: Request, name: str, body: RuntimeDrainRequest | None = None
+) -> RuntimeDrain:
+    """Take a running engine out of routing and let its answers finish. The
+    agent holds the drain; every gateway obeys it (`runtime_drain`)."""
+    state: AgentState = request.app.state.agent_state
+    if state.get_runtime_spec(name) is None:
+        raise _not_found(name)
+    try:
+        return runtime_drain.of(request.app).start(name, body)
+    except runtime_drain.DrainError as exc:
+        raise _drain_problem(exc) from exc
+
+
+@router.delete(
+    "/v1/runtimes/{name}/drain",
+    response_model=RuntimeDrain,
+    response_model_exclude_none=True,
+    tags=["runtimes"],
+    dependencies=_lifecycle_auth,
+)
+async def cancel_runtime_drain(request: Request, name: str) -> RuntimeDrain:
+    state: AgentState = request.app.state.agent_state
+    if state.get_runtime_spec(name) is None:
+        raise _not_found(name)
+    try:
+        return await runtime_drain.of(request.app).cancel(name)
+    except runtime_drain.DrainError as exc:
+        raise _drain_problem(exc) from exc
+
+
+@router.post(
+    "/v1/runtimes/{name}/drain/report",
+    response_model=RuntimeDrain,
+    response_model_exclude_none=True,
+    tags=["runtimes"],
+)
+async def report_runtime_drain(
+    request: Request,
+    name: str,
+    body: RuntimeDrainReport,
+    claims: Annotated[tokens.Claims, Depends(require_gateway)],
+) -> RuntimeDrain:
+    """A gateway's own count for a runtime with an open drain. The reporter is
+    the token's issuer: a `gateway` token this machine minted, or one from a
+    machine the trust bundle grants `gateway` (`require_gateway`)."""
+    state: AgentState = request.app.state.agent_state
+    if state.get_runtime_spec(name) is None:
+        raise _not_found(name)
+    try:
+        return runtime_drain.of(request.app).report(name, claims.iss, body)
+    except runtime_drain.DrainError as exc:
+        raise _drain_problem(exc) from exc
 
 
 @router.post(

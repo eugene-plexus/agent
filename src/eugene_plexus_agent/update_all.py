@@ -3,6 +3,11 @@
 The console's own agent holds the job, so the initiating session remains
 exchangeable through the normal proxy. No new service-token write authority.
 Persist before each write; on recovery observe its result, never replay it.
+
+Row 13: after each machine and its apps, its managed llama.cpp moves to the
+newest build for it (`POST /v1/engines/llama_cpp/rollout`), and the job waits
+for that rollout to end before the next machine starts, so a model's copies
+on other machines keep serving.
 """
 
 from __future__ import annotations
@@ -34,6 +39,10 @@ ACTIVE = {"pending", "checking", "updating"}
 GOOD = {"updated", "current"}
 POLL_SECONDS = 3.0
 ITEM_TIMEOUT = timedelta(minutes=45)
+#: The engine Update all moves (row 13): the one Eugene installs and checks.
+ENGINE = "llama_cpp"
+#: A rollout's states that are over.
+ROLLOUT_ENDED = {"done", "kept", "failed", "cancelled"}
 log = logging.getLogger(__name__)
 
 
@@ -227,6 +236,7 @@ class UpdateAll:
                     break
                 if node.state.value in GOOD:
                     await self._apps(node)
+                    await self._engine(node)
         except asyncio.CancelledError:
             # A normal shutdown preserves the job and its short-lived session.
             raise
@@ -465,6 +475,94 @@ class UpdateAll:
             await asyncio.sleep(POLL_SECONDS)
         raise UpdateAllError(
             "The app did not confirm its update within 45 minutes. Check it in Apps."
+        )
+
+    async def _engine(self, node: UpdateAllItem) -> None:
+        """Row 13: move this machine's managed llama.cpp to the newest build
+        for it, and wait until that rollout ends, before the next machine."""
+        assert self.run is not None
+        target = f"node:{node.node}"
+        item = next(
+            (
+                i
+                for i in self.run.items
+                if i.node == node.node and i.kind is UpdateAllItemKind.engine
+            ),
+            None,
+        )
+        if item is not None and item.state.value not in ACTIVE:
+            return
+        if item is None or item.state.value != "updating":
+            # Observe first: a pending item from before a restart is decided
+            # again, from what the machine says now.
+            try:
+                engines = (await self._call(target, "/v1/engines"))["engines"]
+            except UpdateAllError as exc:
+                if exc.status == 401:
+                    raise
+                return
+            engine = next((e for e in engines if e.get("engine") == ENGINE), None) or {}
+            managed = engine.get("managed")
+            if not managed:
+                return  # Eugene does not install llama.cpp here: nothing to move.
+            latest = (engine.get("acquisition") or {}).get("latestVersion")
+            if item is None:
+                item = UpdateAllItem(
+                    node=node.node,
+                    kind=UpdateAllItemKind.engine,
+                    engine=ENGINE,
+                    state=UpdateAllItemState.pending,
+                    detail="Waiting",
+                )
+                self.run.items.append(item)
+                self._save()
+            running = (engine.get("rollout") or {}).get("state") not in (None, *ROLLOUT_ENDED)
+            if not running and (not latest or latest == managed.get("version")):
+                self._set(item, "current", f"llama.cpp {managed.get('version')} is the newest")
+                return
+            self._begin(item, str(latest), f"Moving the models to llama.cpp {latest}")
+            if not running:
+                try:
+                    await self._call(
+                        target,
+                        f"/v1/engines/{ENGINE}/rollout",
+                        "POST",
+                        {"version": latest, "switch": "auto"},
+                    )
+                except UpdateAllError as exc:
+                    if exc.status == 401:
+                        raise
+                    if exc.status != 409:  # 409: one is running already; wait for it
+                        self._set(item, "failed", str(exc))
+                        return
+        try:
+            await self._wait_engine(item, target)
+        except UpdateAllError as exc:
+            if exc.status == 401:
+                raise
+            self._set(item, "failed", str(exc))
+
+    async def _wait_engine(self, item: UpdateAllItem, target: str) -> None:
+        while not self._timed_out(item):
+            try:
+                rollout = await self._call(target, f"/v1/engines/{ENGINE}/rollout")
+            except UpdateAllError as exc:
+                if exc.status < 500:
+                    raise
+                rollout = {}
+            state = rollout.get("state")
+            if state in ROLLOUT_ENDED:
+                message = str(rollout.get("message") or "")
+                if state == "done":
+                    self._set(item, "updated", message or f"On llama.cpp {rollout.get('version')}")
+                else:
+                    raise UpdateAllError(message or f"The engine update ended {state}.")
+                return
+            if rollout.get("message") and rollout.get("message") != item.detail:
+                self._set(item, "updating", str(rollout["message"]))
+            await asyncio.sleep(POLL_SECONDS)
+        raise UpdateAllError(
+            "The engine update did not end within 45 minutes. Check Engines on this machine."
         )
 
 

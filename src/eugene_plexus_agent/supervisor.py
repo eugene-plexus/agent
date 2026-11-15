@@ -48,7 +48,7 @@ import httpx
 
 from . import orphan_kill, ports, process_signals, process_tree, standby, tokens
 from ._generated.models import ComponentEntry, ComponentKind, ComponentStatus
-from ._http import internal_client
+from ._http import internal_client, shared_internal_client
 from .auth_state import AuthState
 from .child_env import child_environment, reserved_override
 from .exit_codes import explain_windows_exit
@@ -59,6 +59,16 @@ from .interpreter import command_python
 # response body to flush over loopback, short enough that a hung child
 # doesn't drag shutdown out for the operator.
 _TERM_TIMEOUT_SECONDS = 5.0
+
+# Row 13: a gateway is drained before it is stopped, so its answers finish.
+# It is ended only this long after the drain's own deadline (the gateway's
+# `shutdownDrainSeconds`), and when the agent itself stops, at most
+# `AGENT_STOP_DRAIN_SECONDS` in all, because a service manager waits no longer.
+DRAIN_KILL_GRACE_SECONDS = 5.0
+AGENT_STOP_DRAIN_SECONDS = 20.0
+#: When a gateway does not say its deadline: its default drain plus the grace.
+_DRAIN_DEFAULT_SECONDS = 120.0
+_DRAIN_POLL_SECONDS = 0.5
 
 # Polling interval for the health-watcher loop. Each spawned component's
 # /healthz is hit on this cadence to refresh its status; pick a value
@@ -197,6 +207,19 @@ _COMPONENT_SPECS: dict[ComponentKind, _ComponentSpec] = {
 # it answers — "does this child get the auth trio?" — is about the kind,
 # not about this particular kind.
 _TRUST_ROOT_KINDS: frozenset[ComponentKind] = frozenset({ComponentKind.control})
+
+
+def _seconds_until(value: object) -> float | None:
+    """Seconds from now until an ISO time a component reported, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    return max(0.0, (at - datetime.now(UTC)).total_seconds())
 
 
 def _format_log_prefix(kind: ComponentKind, name: str) -> str:
@@ -401,6 +424,18 @@ class _ComponentPlanner:
     @property
     def log_prefix(self) -> str:
         return _format_log_prefix(self.entry.kind, self.entry.name)
+
+    def agent_headers(self) -> dict[str, str]:
+        """This agent speaking for itself to its own child (`sub: agent`,
+        addressed to this machine): what the gateway's drain accepts (row 13)."""
+        if self._auth_state is None:
+            return {}
+        try:
+            trust = self._auth_state.trust
+            return {"Authorization": f"Bearer {trust.agent_token(trust.recipient)}"}
+        except Exception as exc:  # no key yet: the gateway refuses, and is stopped as before
+            self._log.info("no token to drain %s with: %s", self.entry.name, exc)
+            return {}
 
     def reset(self) -> None:
         """Manual restart returns the component to normal-mode operation.
@@ -608,6 +643,8 @@ class SupervisedProcess:
         event to the loop, which on Windows they always were — a console
         event produces a non-zero exit code."""
 
+        #: Row 13: this run's gateway has been drained (once per run).
+        self._drained = False
         self.state: ProcessState = ProcessState.starting
         self.degraded = False
         """Whether the plan currently running is a reduced-mode one. Set
@@ -697,6 +734,10 @@ class SupervisedProcess:
             raise RuntimeError(self.last_error or f"{self.name} is still stopping its engine tree")
         self._consecutive_crashes = 0
         self._planner.reset()
+        if self._proc is not None and self._proc.returncode is None:
+            # Row 13: a gateway finishes its answers first, then exits by itself.
+            self._expected_exit = True
+            await self.drain_first()
         proc = self._proc
         if proc is not None and proc.returncode is None:
             self._expected_exit = True
@@ -709,11 +750,75 @@ class SupervisedProcess:
         elif self._task is None or self._task.done():
             self.start()
 
-    async def stop(self) -> None:
+    async def drain_first(self, cap: float | None = None) -> None:
+        """Row 13: let a gateway finish its answers before it is stopped.
+
+        Over HTTP, so it works where a console signal cannot be sent (the
+        Windows service): `POST /v1/admin/drain` with this agent's own token,
+        then `GET` until the gateway exits or says it is exiting. A gateway is
+        ended only `DRAIN_KILL_GRACE_SECONDS` past the deadline it reports,
+        and never later than `cap` seconds from now. Anything that is not a
+        gateway, a gateway too old to drain (404) or one that cannot be asked
+        is stopped as before."""
+        planner = self._planner
+        proc = self._proc
+        if (
+            self._drained
+            or not isinstance(planner, _ComponentPlanner)
+            or planner.entry.kind is not ComponentKind.gateway
+            or proc is None
+            or proc.returncode is not None
+        ):
+            return
+        self._drained = True
+        url = str(planner.entry.url).rstrip("/")
+        began = time.perf_counter()
+        limit = cap if cap is not None else _DRAIN_DEFAULT_SECONDS + DRAIN_KILL_GRACE_SECONDS
+        try:
+            client = shared_internal_client("gateway-drain", timeout=5.0)
+            headers = planner.agent_headers()
+            answer = await client.post(f"{url}/v1/admin/drain", headers=headers)
+            if answer.status_code in (404, 405):
+                return
+            if answer.status_code >= 400:
+                self._log.warning(
+                    "%s refused the drain before its stop (%d): %s",
+                    self.name,
+                    answer.status_code,
+                    answer.text[:200],
+                )
+                return
+            left = _seconds_until(answer.json().get("deadline"))
+            if left is not None:
+                own = time.perf_counter() - began + left + DRAIN_KILL_GRACE_SECONDS
+                limit = own if cap is None else min(cap, own)
+            self._log.info(
+                "draining %s before its stop: %s answer(s) in flight, at most %.0f s",
+                self.name,
+                answer.json().get("running"),
+                limit,
+            )
+            while proc.returncode is None and time.perf_counter() - began < limit:
+                await asyncio.sleep(_DRAIN_POLL_SECONDS)
+                with contextlib.suppress(httpx.HTTPError, ValueError):
+                    view = await client.get(f"{url}/v1/admin/drain", headers=headers)
+                    if view.status_code == 200 and view.json().get("state") == "exiting":
+                        # It is closing on its own: let it, briefly.
+                        with contextlib.suppress(TimeoutError):
+                            await asyncio.wait_for(
+                                self._parent_exit(proc), timeout=_TERM_TIMEOUT_SECONDS
+                            )
+                        return
+        except (httpx.HTTPError, ValueError) as exc:
+            self._log.info("could not drain %s before its stop: %s", self.name, exc)
+
+    async def stop(self, *, drain_cap: float | None = None) -> None:
         """Stop the supervision loop and ensure the child is dead.
-        Asks gracefully first, escalates to a hard kill if it hangs."""
+        Asks gracefully first, escalates to a hard kill if it hangs. A gateway
+        is drained first (row 13)."""
         self._stop_requested = True
         self._expected_exit = True
+        await self.drain_first(drain_cap)
         proc = self._proc
         if proc is not None:
             self._begin_tree_stop(proc)
@@ -1037,6 +1142,7 @@ class SupervisedProcess:
         )
         self.last_restart = datetime.now(UTC)
         self.spawns += 1
+        self._drained = False
         self.last_error = None
         if plan.on_spawn is not None:
             plan.on_spawn()
@@ -1265,9 +1371,19 @@ class Supervisor:
             self._health_loop(get_components), name="supervisor-health"
         )
 
+    async def drain_gateways(self, cap: float = AGENT_STOP_DRAIN_SECONDS) -> None:
+        """Row 13: let every gateway this agent runs finish its answers, at
+        most `cap` seconds, before anything they route to is stopped. The
+        agent's own stop calls this before it stops the engines."""
+        await asyncio.gather(
+            *(sp.drain_first(cap) for sp in self._processes.values()),
+            return_exceptions=True,
+        )
+
     async def stop_all(self) -> None:
         """Shut everything down. Cancels the health loop, terminates and
-        waits for every supervised process. Best-effort — never raises."""
+        waits for every supervised process. Best-effort — never raises. A
+        gateway is drained first, at most `AGENT_STOP_DRAIN_SECONDS`."""
         if self._health_task is not None:
             self._health_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, BaseException):
@@ -1279,7 +1395,7 @@ class Supervisor:
             self._health_client = None
 
         await asyncio.gather(
-            *(sp.stop() for sp in self._processes.values()),
+            *(sp.stop(drain_cap=AGENT_STOP_DRAIN_SECONDS) for sp in self._processes.values()),
             return_exceptions=True,
         )
         self._processes.clear()

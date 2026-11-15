@@ -33,6 +33,7 @@ from . import (
     apps,
     companions,
     default_topology,
+    engine_rollout,
     enrollment,
     exec_approvals,
     firewall_follow,
@@ -764,6 +765,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         if not settings.safe_mode:
             update_all.manager(app).resume()
+            # Row 13: an engine update the agent's stop interrupted goes on.
+            engine_rollout.manager(app).resume()
         yield
     finally:
         exec_approvals.configure(None)
@@ -772,6 +775,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         all_updates = getattr(app.state, "update_all", None)
         if all_updates is not None:
             await all_updates.close()
+        # Row 13: an engine update keeps its saved state for the resume; the
+        # drains it and others held end with the engines.
+        rollouts = getattr(app.state, "engine_rollouts", None)
+        if rollouts is not None:
+            await rollouts.close()
+        drains = getattr(app.state, "runtime_drains", None)
+        if drains is not None:
+            await drains.aclose()
         for task in (
             approval_task,
             sign_in_task,
@@ -838,6 +849,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # abandon and the only one holding a half-written directory, so
         # it goes first.
         await close_installers()
+        # Row 13: a gateway finishes the answers in flight first (at most
+        # 20 s, as long as a service manager waits), while the engines it
+        # routes to still run.
+        if owns_supervisor:
+            await supervisor.drain_gateways()
         # Engines next: they are the ones holding GPU memory, and a
         # driver briefly outliving its engine is harmless while the
         # reverse leaves requests hitting a dead port.

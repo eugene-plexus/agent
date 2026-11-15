@@ -32,6 +32,7 @@ from ._generated.models import (
     EngineInstall,
     EngineKind,
     ExecTrust,
+    HeldRuntime,
     HostAccelerator,
     LastDevice,
     LoadProgress,
@@ -107,7 +108,9 @@ def _companions(spec: RuntimeSpec) -> tuple[str, ...]:
 
 
 # The statuses in which a process holds the file its plan opened.
-_PROCESS_RUNNING = frozenset({RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.ready})
+_PROCESS_RUNNING = frozenset(
+    {RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.ready, RuntimeStatus.draining}
+)
 #: Every status in which a runtime holds memory, or is on its way to it: `copying` too, where
 #: no process exists yet (the same set admission counts).
 _MEMORY_HOLDING = _PROCESS_RUNNING | {RuntimeStatus.copying}
@@ -590,6 +593,9 @@ class RuntimeSupervisor:
         # rather than declared. None until enrollment, which is the only
         # state in which "which node" has no answer.
         self.node_name_provider: Callable[[], str | None] | None = None
+        #: Row 13: the drains this agent holds (`runtime_drain.RuntimeDrains`),
+        #: read at compose time so `status` and `drain` say what is in effect.
+        self.drains: Any = None
 
     # --- collection management --------------------------------------------
 
@@ -1032,6 +1038,10 @@ class RuntimeSupervisor:
 
         job = self._copy_jobs.get(name)
         status = self._status_for(sp, readiness, copying=job is not None)
+        # Row 13: a ready engine with a drain under way is out of routing.
+        drain = self.drains.view(name) if self.drains is not None else None
+        if drain is not None and status is RuntimeStatus.ready and self.drains.leaving(name):
+            status = RuntimeStatus.draining
         effective = (
             planner.card_launch.spec
             if planner is not None
@@ -1177,6 +1187,7 @@ class RuntimeSupervisor:
             driver=companion_name(spec.name) if spec.autoDriver is not False else None,
             node=self.node_name_provider() if self.node_name_provider is not None else None,
             status=status,
+            drain=drain,
             stopReason=stop_reason,
             url=url,  # type: ignore[arg-type]
             argv=sp.last_argv if sp is not None else None,
@@ -1196,7 +1207,7 @@ class RuntimeSupervisor:
                 )
                 if isinstance(readiness, Ready)
                 and readiness.chat_template
-                and status is RuntimeStatus.ready
+                and status in (RuntimeStatus.ready, RuntimeStatus.draining)
                 and sp is not None
                 and sp.pid is not None
                 and self._proved_ready.get(name) == _run_of(sp)
@@ -1660,17 +1671,35 @@ def _acquisition_for(kind: EngineKind, host: HostAccelerator) -> EngineAcquisiti
 
 
 def _managed_for(adapter: EngineAdapter) -> ManagedEngine | None:
-    builds = adapter.managed_store().list_builds()
+    """The managed build **in use** (row 13), what is staged beside it, and
+    the runtimes held on another build: what is in effect, never the newest
+    on disk by accident."""
+    store = adapter.managed_store()
+    builds = store.list_builds()
     if not builds:
         return None
-    current = builds[0]
+    current = store.current()
+    assert current is not None
+    record = store.in_use()
+    on_disk = {b.version for b in builds}
+    staged = store.staged()
+    previous = record.previous if record.previous in on_disk else None
+    if record.version is None and len(builds) > 1:
+        previous = builds[1].version
     return ManagedEngine(
         version=current.version,
         binaryPath=str(current.binary),
         variant=current.variant,
         installedAt=current.installed_at,
         sizeBytes=current.size_bytes,
-        previousVersion=builds[1].version if len(builds) > 1 else None,
+        previousVersion=previous,
+        stagedVersion=staged.version if staged is not None and record.version is not None else None,
+        heldRuntimes=[
+            HeldRuntime(runtime=name, version=entry.version, reason=entry.reason or "")
+            for name, entry in sorted(record.held.items())
+            if entry.version in on_disk
+        ]
+        or None,
     )
 
 

@@ -25,6 +25,10 @@ class Fleet:
         self.lost_reply = False
         self.hold = False
         self.app_progress = {}
+        #: Row 13: machine -> (managed llama.cpp build, newest upstream).
+        self.engines = {}
+        self.rollouts = {}
+        self.kept = set()
 
     async def call(self, target, path, method="GET", body=None):
         self.calls.append((target, path, method))
@@ -88,6 +92,31 @@ class Fleet:
             return self.app_progress[name]
         if path == "/v1/apps/workbench":
             return {"version": self.apps[name], "status": "running"}
+        if path == "/v1/engines":
+            if name not in self.engines:
+                return {"engines": [{"engine": "llama_cpp"}]}
+            version, latest = self.engines[name]
+            return {
+                "engines": [
+                    {
+                        "engine": "llama_cpp",
+                        "managed": {"version": version},
+                        "acquisition": {"latestVersion": latest},
+                    }
+                ]
+            }
+        if path == "/v1/engines/llama_cpp/rollout":
+            if method == "POST":
+                # Every other machine is back to serving while this one moves.
+                assert all(state == "done" for state in self.rollouts.values()), self.rollouts
+                self.rollouts[name] = "running"
+                return {"state": "installing", "version": body["version"]}
+            ended = "kept" if name in self.kept else "done"
+            self.rollouts[name] = ended
+            message = (
+                "b2 could not run any model here; kept b1." if ended == "kept" else "b2 is in use."
+            )
+            return {"state": ended, "version": "b2", "message": message}
         raise AssertionError((target, path, method))
 
 
@@ -127,6 +156,50 @@ async def test_root_first_then_apps_and_workers(tmp_path, monkeypatch, fleet):
         assert len(result.items) == 4  # No absent or custom app installed.
         assert json.loads(m.path.read_text())["token"] == ""
         assert "test-session" not in result.model_dump_json()
+    finally:
+        await m.close()
+
+
+async def test_engines_move_one_machine_at_a_time(tmp_path, monkeypatch, fleet):
+    """Row 13: after each machine and its apps, its managed llama.cpp moves to
+    the newest build, and the next machine waits until that rollout ends, so
+    a model's copies on other machines keep serving."""
+    fleet.engines = {"root": ("b1", "b2"), "worker": ("b1", "b2")}
+    m = manager(tmp_path, monkeypatch, fleet)
+    try:
+        await m.start("test-session")
+        result = await done(m)
+        assert result.state.value == "complete", [i.detail for i in result.items]
+        writes = [c for c in fleet.calls if c[2] == "POST" and not c[1].endswith("check")]
+        assert writes == [
+            ("node:root", "/v1/node/update", "POST"),
+            ("node:root", "/v1/apps/workbench/install", "POST"),
+            ("node:root", "/v1/engines/llama_cpp/rollout", "POST"),
+            ("node:worker", "/v1/node/update", "POST"),
+            ("node:worker", "/v1/apps/workbench/install", "POST"),
+            ("node:worker", "/v1/engines/llama_cpp/rollout", "POST"),
+        ]
+        engines = [i for i in result.items if i.kind.value == "engine"]
+        assert [(i.node, i.state.value, i.target) for i in engines] == [
+            ("root", "updated", "b2"),
+            ("worker", "updated", "b2"),
+        ]
+    finally:
+        await m.close()
+
+
+async def test_an_engine_already_newest_or_kept_says_so(tmp_path, monkeypatch, fleet):
+    fleet.engines = {"root": ("b2", "b2"), "worker": ("b1", "b2")}
+    fleet.kept = {"worker"}
+    m = manager(tmp_path, monkeypatch, fleet)
+    try:
+        await m.start("test-session")
+        result = await done(m)
+        engines = {i.node: i for i in result.items if i.kind.value == "engine"}
+        assert engines["root"].state.value == "current"
+        assert engines["worker"].state.value == "failed"
+        assert "kept b1" in engines["worker"].detail
+        assert result.state.value == "attention"
     finally:
         await m.close()
 

@@ -41,7 +41,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -603,6 +603,72 @@ class InstalledBuild:
     size_bytes: int
 
 
+#: Row 13: which build the runtimes start from, beside the builds.
+IN_USE_NAME = "in-use.json"
+
+
+@dataclass(frozen=True)
+class RuntimeBuild:
+    """One runtime's own build: moved ahead by a rollout (no reason), or held
+    on an older build because the build in use could not run it (R13-CHECK-2,
+    with the reason)."""
+
+    version: str
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class InUse:
+    """`<engine>/in-use.json` (row 13)."""
+
+    #: The build in use. None: none recorded, so the newest is used.
+    version: str | None = None
+    #: The build in use before it, kept for the way back.
+    previous: str | None = None
+    runtimes: dict[str, RuntimeBuild] = field(default_factory=dict)
+
+    @property
+    def held(self) -> dict[str, RuntimeBuild]:
+        """The runtimes held on another build, with why."""
+        return {name: entry for name, entry in self.runtimes.items() if entry.reason}
+
+    def kept_versions(self) -> set[str]:
+        """Every build this record needs on disk."""
+        versions = {v for v in (self.version, self.previous) if v}
+        versions.update(entry.version for entry in self.runtimes.values())
+        return versions
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "version": self.version,
+            "previous": self.previous,
+            "runtimes": {
+                name: {
+                    "version": entry.version,
+                    **({"reason": entry.reason} if entry.reason else {}),
+                }
+                for name, entry in sorted(self.runtimes.items())
+            },
+        }
+
+    @classmethod
+    def from_json(cls, raw: dict[str, object]) -> InUse:
+        def text(value: object) -> str | None:
+            return value if isinstance(value, str) and value else None
+
+        runtimes: dict[str, RuntimeBuild] = {}
+        listed = raw.get("runtimes")
+        if isinstance(listed, dict):
+            for name, entry in listed.items():
+                if isinstance(name, str) and isinstance(entry, dict) and text(entry.get("version")):
+                    runtimes[name] = RuntimeBuild(
+                        version=str(entry["version"]), reason=text(entry.get("reason"))
+                    )
+        return cls(
+            version=text(raw.get("version")), previous=text(raw.get("previous")), runtimes=runtimes
+        )
+
+
 class ManagedStore:
     """The managed builds for one engine, on disk.
 
@@ -666,6 +732,8 @@ class ManagedStore:
                 if directory.is_dir():
                     receipt.write_bytes(saved)
                 raise
+        # Row 13: with no build left, nothing is in use; the next install is.
+        (self._dir / IN_USE_NAME).unlink(missing_ok=True)
 
     def list_builds(self) -> list[InstalledBuild]:
         """Complete builds, newest install first."""
@@ -681,9 +749,96 @@ class ManagedStore:
         out.sort(key=lambda b: b.installed_at or datetime.min.replace(tzinfo=UTC), reverse=True)
         return out
 
-    def current(self) -> InstalledBuild | None:
+    # --- the build in use (row 13) -------------------------------------------
+
+    def in_use(self) -> InUse:
+        """What `in-use.json` says; an empty record when it is missing or
+        unreadable, which means the newest build is used, as before row 13."""
+        path = self._dir / IN_USE_NAME
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return InUse()
+        return InUse.from_json(raw) if isinstance(raw, dict) else InUse()
+
+    def write_in_use(self, record: InUse) -> None:
+        """Replace `in-use.json` in one step, so a crash leaves the old or the
+        new record and never half of one."""
+        self._dir.mkdir(parents=True, exist_ok=True)
+        path = self._dir / IN_USE_NAME
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record.to_json(), indent=2), encoding="utf-8")
+        temporary.replace(path)
+
+    def current(self, runtime: str | None = None) -> InstalledBuild | None:
+        """The build a runtime starts from: its own entry when it has one (a
+        runtime held on an older build, or moved ahead in a rollout), else the
+        build in use, else the newest on disk.
+
+        **Never the newest by accident** (row 13): an install only stages its
+        build, so a runtime that restarts while a new build sits on disk keeps
+        the build the others run. A pointer naming a build that is no longer
+        on disk falls back to the newest, so a removed folder never stops an
+        engine from starting."""
         builds = self.list_builds()
-        return builds[0] if builds else None
+        if not builds:
+            return None
+        record = self.in_use()
+        by_version = {b.version: b for b in builds}
+        if runtime is not None and runtime in record.runtimes:
+            own = by_version.get(record.runtimes[runtime].version)
+            if own is not None:
+                return own
+        if record.version is not None and record.version in by_version:
+            return by_version[record.version]
+        return builds[0]
+
+    def staged(self) -> InstalledBuild | None:
+        """The newest build on disk that nothing uses yet: installed and
+        waiting for a rollout, or one a rollout kept."""
+        record = self.in_use()
+        used = record.kept_versions()
+        for build in self.list_builds():
+            if build.version not in used:
+                return build
+        return None
+
+    def pin_current(self) -> None:
+        """Record the build in use before an install adds a newer one, on an
+        install that has never recorded one (one from before row 13), or whose
+        record names a build no longer on disk. Without this the newest build
+        would become the one in use by being newest."""
+        record = self.in_use()
+        builds = self.list_builds()
+        if record.version is not None and any(b.version == record.version for b in builds):
+            return
+        if builds:
+            self.write_in_use(replace(record, version=builds[0].version))
+
+    def set_in_use(self, version: str) -> InUse:
+        """Make `version` the build in use; the one before it becomes the
+        previous build. Runtime entries for `version` go: they follow it now."""
+        record = self.in_use()
+        previous = record.previous
+        if record.version is not None and record.version != version:
+            previous = record.version
+        runtimes = {
+            name: entry for name, entry in record.runtimes.items() if entry.version != version
+        }
+        updated = InUse(version=version, previous=previous, runtimes=runtimes)
+        self.write_in_use(updated)
+        return updated
+
+    def set_runtime(self, runtime: str, version: str | None, reason: str | None = None) -> None:
+        """Give one runtime its own build (a rollout's move, or a hold with
+        its reason), or with `version` None let it follow the build in use."""
+        record = self.in_use()
+        runtimes = dict(record.runtimes)
+        if version is None:
+            runtimes.pop(runtime, None)
+        else:
+            runtimes[runtime] = RuntimeBuild(version=version, reason=reason)
+        self.write_in_use(replace(record, runtimes=runtimes))
 
     def _read(self, directory: Path) -> InstalledBuild | None:
         meta_path = directory / self.METADATA_NAME
@@ -730,9 +885,23 @@ class ManagedStore:
         (directory / self.METADATA_NAME).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def prune(self, keep: int = RETAINED_BUILDS) -> list[str]:
-        """Drop all but the newest `keep` builds. Returns what went."""
+        """Drop the builds nothing needs. Returns what went.
+
+        Kept (row 13): the build in use, the previous build in use (the way
+        back, "Use b11719 again"), every build a runtime has its own entry
+        for, and the newest of the rest (one staged build: a new install, or
+        one a rollout kept, which stays until the next install). With no
+        build in use recorded, the newest `keep`, as before."""
+        record = self.in_use()
+        builds = self.list_builds()
+        if record.version is None:
+            doomed = builds[keep:]
+        else:
+            needed = record.kept_versions()
+            spare = [b for b in builds if b.version not in needed]
+            doomed = spare[1:]
         removed: list[str] = []
-        for build in self.list_builds()[keep:]:
+        for build in doomed:
             try:
                 shutil.rmtree(build.directory)
                 removed.append(build.version)
@@ -910,6 +1079,11 @@ class EngineInstaller:
             else:
                 progress.state = State.done
                 note = self.finish_note() if self.finish_note is not None else None
+                if self._store.in_use().version not in (None, plan.version):
+                    # Row 13: staged. A rollout moves the runtimes to it.
+                    note = "; ".join(
+                        n for n in (note, "not in use yet: an update moves the models to it") if n
+                    )
                 progress.message = f"installed {plan.version}" + (f"; {note}" if note else "")
         except asyncio.CancelledError:
             progress.cancelled.set()
@@ -988,6 +1162,9 @@ class EngineInstaller:
 
         final = self._store.build_dir(plan.version)
         progress.check_cancelled()
+        # Row 13: an install stages its build. The build in use is recorded
+        # first, so the new one does not become it by being newest.
+        self._store.pin_current()
         _remove_quietly(final)
         # The rename is the commit point: until it lands, nothing outside
         # this function can see a half-installed build.
@@ -995,6 +1172,11 @@ class EngineInstaller:
         binary = final / binary.relative_to(staging)
         self._store.write_metadata(final, version=plan.version, variant=plan.variant, binary=binary)
         progress.committed = True
+        in_use = self._store.in_use().version
+        if in_use is None or all(b.version != in_use for b in self._store.list_builds()):
+            # The first build here, or the one recorded is gone from disk:
+            # nothing runs on another one, so it is in use.
+            self._store.set_in_use(plan.version)
         self._store.prune()
 
 

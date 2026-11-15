@@ -397,6 +397,15 @@ class EngineAdapter(abc.ABC):
         found = self.discover(configured=configured)
         if found is None:
             raise EngineUnavailableError(self._nothing_found_message())
+        if found.origin is Origin.managed:
+            # Row 13: the build this runtime starts from, which is the build in
+            # use unless it is held on another (R13-CHECK-2) or a rollout moved
+            # it ahead.
+            own = self.managed_store().current(runtime=spec.name)
+            if own is not None and own.version != found.version:
+                return DiscoveredBinary(
+                    path=self.trusted(own.binary), origin=Origin.managed, version=own.version
+                )
         return found
 
     def _nothing_found_message(self) -> str:
@@ -437,6 +446,9 @@ class EngineAdapter(abc.ABC):
         installed — must not quietly win over the build we fetched and
         verified. An explicit `binary` on a runtime still beats all of
         these; see `resolve_binary`.
+
+        The managed build is the one **in use** (row 13), not the newest
+        on disk: an install stages its build until a rollout moves to it.
         """
         if configured:
             path = Path(configured).expanduser()

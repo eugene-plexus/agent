@@ -3032,16 +3032,20 @@ class UpdateAllItemState(StrEnum):
 
 class UpdateAllItemKind(StrEnum):
     """
-    A machine's Eugene installation or an installed catalogue app.
+    A machine's Eugene installation, an installed catalogue app, or a
+    managed engine build (row 13: one machine at a time, so a model's
+    copies on other machines keep serving).
+
     """
 
     node = 'node'
     app = 'app'
+    engine = 'engine'
 
 
 class UpdateAllItem(BaseModel):
     """
-    One machine or installed app in the update job.
+    One machine, installed app or engine in the update job.
     """
 
     model_config = ConfigDict(
@@ -3050,6 +3054,9 @@ class UpdateAllItem(BaseModel):
     node: str = Field(..., description='Enrolled machine name.')
     kind: UpdateAllItemKind
     app: str | None = Field(None, description='Catalogue app id for an app item.')
+    engine: str | None = Field(
+        None, description='The engine of an engine item: llama_cpp.'
+    )
     state: UpdateAllItemState
     detail: str = Field(..., description='What happened or what to do next.')
     target: str | None = Field(
@@ -3512,32 +3519,177 @@ class AuthInitializeRequest(BaseModel):
     )
 
 
-class ManagedEngine(BaseModel):
+class HeldRuntime(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    runtime: str = Field(..., description="The runtime's name on this node.")
+    version: str = Field(..., description='The build it starts from.')
+    reason: str = Field(
+        ...,
+        description='What failed on the build in use: "b11800 cannot load\nqwen3-8b: unknown tensor type". The next rollout tries it\nagain.\n',
+    )
+
+
+class EngineRolloutSwitch(StrEnum):
     """
-    A build this install fetched and owns, as opposed to one found on
-    PATH or pointed at by hand. Present only when we installed it.
+    `auto` (default; DI-C3b): move each runtime when its other copies
+    carry the load, a model with one copy at once. `ask`: wait for
+    an answer before the first runtime moves.
 
     """
 
-    version: str = Field(
-        ...,
-        description='Upstream build identifier - for llama.cpp a `bNNNN` tag, not\na semver. Copied verbatim from the release, because the only\nuseful thing to do with it is compare it to what upstream\nhas.\n',
+    auto = 'auto'
+    ask = 'ask'
+
+
+class EngineRolloutRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    binaryPath: str = Field(
-        ..., description='Absolute path to the executable inside the managed directory.'
-    )
-    variant: str = Field(
-        ...,
-        description='Which asset was chosen, e.g. `win-cuda-13.3-x64`. Recorded\nbecause it is the answer to "why is this slow" often enough\nto be worth surfacing: a host that fell back to a CPU build\nlooks identical from the outside otherwise.\n\nA `+vulkan` suffix (`win-cuda-13.4-x64+vulkan`, since\n2026-09-27) is that build with the Vulkan backend from the\nsame release added, so a second vendor\'s card can be used\nbeside an NVIDIA one in one process.\n',
-    )
-    installedAt: AwareDatetime | None = None
-    sizeBytes: int | None = Field(
+    version: str | None = Field(
         None,
-        description='On-disk size of this build. A Windows CUDA install is roughly\nhalf a gigabyte unpacked and we retain two, so this is worth\nshowing before someone asks where their disk went.\n',
+        description='The build to move to. Absent: the staged build, else the\nnewest upstream build for this host (installed first). A\nbuild still on disk is used without a download.\n',
     )
-    previousVersion: str | None = Field(
+    switch: EngineRolloutSwitch | None = None
+
+
+class EngineRolloutState(StrEnum):
+    """
+    `checking` and `switching` alternate, one runtime at a time.
+    `done`: the build is in use (runtimes it could not run are held
+    on the old one). `kept`: it could run none of the checked models,
+    so the old build stays in use. `failed`: the install failed.
+
+    """
+
+    installing = 'installing'
+    checking = 'checking'
+    asking = 'asking'
+    switching = 'switching'
+    done = 'done'
+    kept = 'kept'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class EngineRolloutChoice(StrEnum):
+    switch_now = 'switch_now'
+    switch_idle = 'switch_idle'
+    keep = 'keep'
+
+
+class EngineRolloutAnswer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    choice: EngineRolloutChoice
+
+
+class EngineSpeed(BaseModel):
+    """
+    Tokens a second, llama-bench's average over its repetitions.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    old: float | None = None
+    new: float | None = None
+
+
+class EngineCheckModel(BaseModel):
+    """
+    What the check measured on one model (R13-CHECK: shown, never a
+    gate). `passes` is whether the build ran it at all (R13-CHECK-2).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    runtime: str
+    model: str = Field(..., description='The model as the runtime serves it.')
+    promptTps: EngineSpeed | None = None
+    generationTps: EngineSpeed | None = None
+    sameTopTokenPercent: float | None = None
+    standardError: float | None = None
+    meanKld: float | None = None
+    passes: bool = Field(
+        ..., description='The new build loaded the model and answered.'
+    )
+    measured: bool | None = Field(
+        None, description='Whether speed and answers were measured.'
+    )
+    reason: str | None = Field(
         None,
-        description='The build retained alongside this one, if any. Retention is\ncurrent plus previous: keeping every build is not viable at\nthis size, and keeping only the newest leaves a bad upgrade\nwith no way back.\n',
+        description='In a person\'s words: what the numbers say, what failed, or why\nit was not measured ("b11800 is 12% slower at generating on\nqwen3-8b here"; "Not measured: the only copy, and in use").\n',
+    )
+
+
+class EngineRolloutRuntimeState(StrEnum):
+    """
+    Where one runtime stands in a rollout: `moved` to the new build,
+    `held` on the old one (it could not run there), or `skipped`
+    (removed, stopped, or the rollout ended first).
+
+    """
+
+    waiting = 'waiting'
+    draining = 'draining'
+    measuring = 'measuring'
+    starting = 'starting'
+    moved = 'moved'
+    held = 'held'
+    skipped = 'skipped'
+
+
+class EngineRolloutRuntime(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str
+    state: EngineRolloutRuntimeState
+    message: str | None = None
+
+
+class EngineRolloutCheck(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    models: list[EngineCheckModel]
+    passes: bool | None = Field(
+        None, description='Whether the new build ran at least one checked model.'
+    )
+
+
+class EngineRollout(BaseModel):
+    """
+    One rollout of one engine on this node (row 13), saved across restarts.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    engine: EngineKind
+    version: str = Field(..., description='The build it moves to.')
+    from_: str | None = Field(
+        None, alias='from', description='The build in use when it started.'
+    )
+    state: EngineRolloutState
+    switch: EngineRolloutSwitch
+    startedAt: AwareDatetime
+    finishedAt: AwareDatetime | None = None
+    runtimes: list[EngineRolloutRuntime]
+    check: EngineRolloutCheck
+    question: str | None = Field(
+        None,
+        description='While `asking`: "b11800 is ready. Switch now, or when idle?"\n',
+    )
+    message: str | None = Field(
+        None,
+        description='Where it stands or how it ended, in a person\'s words: "1 of 3\nruntimes on b11800", "b11800 did not start qwen3-8b: exit\n3221225477. Kept b11719."\n',
     )
 
 
@@ -4403,6 +4555,11 @@ class RuntimeStatus(StrEnum):
       and compilation dominate it.
     * `ready` — model loaded and serving. The only state in which
       the gateway will route to it.
+    * `draining` — loaded, and out of routing while the answers it
+      is running finish (row 13): an engine update, a check, or an
+      operator's drain. `drain` says why, how many answers run and
+      how long is left. A gateway routes nothing new to it; one
+      whose `then` is `restart` is counted as coming up.
     * `stopped` — deliberately stopped, or declared with
       `autoStart: false`. Not an error; the respawn loop is
       suppressed.
@@ -4422,6 +4579,7 @@ class RuntimeStatus(StrEnum):
     starting = 'starting'
     loading = 'loading'
     ready = 'ready'
+    draining = 'draining'
     stopped = 'stopped'
     exited = 'exited'
     crashed = 'crashed'
@@ -4463,6 +4621,171 @@ class RuntimeCapabilities(BaseModel):
     )
     multimodal: bool | None = Field(
         None, description='Whether a projector was loaded alongside the model.'
+    )
+
+
+class RuntimeDrainReason(StrEnum):
+    """
+    Why a runtime drains: an engine `update`, a `check` that measures
+    builds (it stops the runtime, `stopReason: measurement`), the
+    `maintenance` of its machine, or an `operator`'s request.
+
+    """
+
+    update = 'update'
+    check = 'check'
+    maintenance = 'maintenance'
+    operator = 'operator'
+
+
+class RuntimeDrainWhen(StrEnum):
+    """
+    * `now` — leave routing at once.
+    * `idle` — once every gateway reports the runtime idle for
+      `idleSeconds` with nothing running.
+    * `covered` — once every gateway reports that the model's other
+      ready copies can carry its current demand (the requests running
+      on every copy and waiting in line, against the other copies'
+      slots). A model with no other running copy drains at once, and
+      its requests wait in line (DI-C3 and DI-C3b, Troy 2026-10-21).
+
+    """
+
+    now = 'now'
+    idle = 'idle'
+    covered = 'covered'
+
+
+class RuntimeDrainThen(StrEnum):
+    """
+    What happens once the drain ends (`drained` or `cut`): `restart`
+    on the build in use for the runtime, `stop` it, or `hold` it
+    running and out of routing until the drain is cancelled.
+
+    """
+
+    restart = 'restart'
+    stop = 'stop'
+    hold = 'hold'
+
+
+class RuntimeDrainState(StrEnum):
+    """
+    `waiting_idle` and `waiting_covered`: still routed (`status:
+    ready`). `draining`: out of routing, answers finishing.
+    `drained`: every gateway reported none running. `cut`: the grace
+    ran out with answers still running. `cancelled`: `DELETE`.
+
+    """
+
+    waiting_idle = 'waiting_idle'
+    waiting_covered = 'waiting_covered'
+    draining = 'draining'
+    drained = 'drained'
+    cut = 'cut'
+    cancelled = 'cancelled'
+
+
+class RuntimeDrainRequest(BaseModel):
+    """
+    Body for `POST /v1/runtimes/{name}/drain`. Every field has a default.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    reason: RuntimeDrainReason | None = None
+    when: RuntimeDrainWhen | None = None
+    idleSeconds: int | None = Field(
+        600,
+        description='For `when: idle`, how long every gateway must report it idle.',
+        ge=60,
+        le=86400,
+    )
+    graceSeconds: int | None = Field(
+        120,
+        description='How long answers may run once it leaves routing. Then the\ndrain is `cut` and `then` runs anyway (R13-DRAIN, Troy\n2026-10-21: an update must end).\n',
+        ge=0,
+        le=900,
+    )
+    then: RuntimeDrainThen | None = None
+
+
+class RuntimeDrain(BaseModel):
+    """
+    One drain of one runtime, as the agent holds it.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    reason: RuntimeDrainReason
+    when: RuntimeDrainWhen
+    idleSeconds: int | None = None
+    graceSeconds: int
+    then: RuntimeDrainThen
+    state: RuntimeDrainState
+    requestedAt: AwareDatetime
+    startedAt: AwareDatetime | None = Field(
+        None, description='When it left routing. Absent while it waits.'
+    )
+    deadline: AwareDatetime | None = Field(
+        None, description='When it is cut. Absent while it waits.'
+    )
+    running: int = Field(
+        ...,
+        description='Answers still running on it, by the last report of each\ngateway that reads this agent (0 when none reads it).\n',
+        ge=0,
+    )
+    gateways: int | None = Field(
+        None, description='How many gateways it waits on.', ge=0
+    )
+    idleFor: float | None = Field(
+        None,
+        description='When it left routing, the fewest seconds any gateway reported\nsince its last request there. Absent when no gateway reported.\n',
+        ge=0.0,
+    )
+    otherCopies: int | None = Field(
+        None,
+        description='The other running copies of its model the gateways reported\nwhen it left routing (the fewest any gateway saw).\n',
+        ge=0,
+    )
+    message: str | None = Field(
+        None,
+        description='What it waits for, or how it ended, in a person\'s words:\n"2 answers were cut at the 120 s limit."\n',
+    )
+
+
+class RuntimeDrainReport(BaseModel):
+    """
+    A gateway's report for one runtime with an open drain: what it
+    routes there and what it sees of the model's other copies.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    running: int = Field(
+        ..., description='Answers this gateway has running on the runtime now.', ge=0
+    )
+    state: RuntimeDrainState | None = Field(
+        None,
+        description="The drain state this gateway's routing table holds for the\nruntime. The agent counts `running: 0` toward the drain only\nfrom a gateway whose table already shows it `draining` (or\nlater), so a table a moment stale, which could still route a\nrequest there, cannot end the drain.\n",
+    )
+    idleSeconds: float | None = Field(
+        None,
+        description='Seconds since this gateway last sent the runtime a request.',
+        ge=0.0,
+    )
+    otherCopies: int | None = Field(
+        None,
+        description="The model's other copies this gateway routes to that are\nrunning or on their way (not stopped, not crashed).\n",
+        ge=0,
+    )
+    covered: bool | None = Field(
+        None,
+        description="Whether the model's other ready copies have free slots for\neverything running on any copy and waiting in line for the\nmodel, on this gateway, now.\n",
     )
 
 
@@ -6242,6 +6565,43 @@ class ClientKeyCreated(BaseModel):
     )
 
 
+class ManagedEngine(BaseModel):
+    """
+    A build this install fetched and owns, as opposed to one found on
+    PATH or pointed at by hand. Present only when we installed it.
+
+    """
+
+    version: str = Field(
+        ...,
+        description='The build **in use** (row 13): the one every runtime without a\n`heldRuntimes` entry starts from. Not the newest on disk: an\ninstall stages its build, and a rollout moves the runtimes.\nUpstream build identifier - for llama.cpp a `bNNNN` tag, not\na semver. Copied verbatim from the release, because the only\nuseful thing to do with it is compare it to what upstream\nhas.\n',
+    )
+    stagedVersion: str | None = Field(
+        None,
+        description='A build on disk that is not in use yet: installed, and waiting\nfor a rollout, or one a rollout kept (it could run none of the\nmodels here). Absent when there is none.\n',
+    )
+    heldRuntimes: list[HeldRuntime] | None = Field(
+        None,
+        description='Runtimes that start from another build than `version`, and\nwhy (R13-CHECK-2): a build that could not load a model,\ncrashed, or answered with an error is not used for it.\n',
+    )
+    binaryPath: str = Field(
+        ..., description='Absolute path to the executable inside the managed directory.'
+    )
+    variant: str = Field(
+        ...,
+        description='Which asset was chosen, e.g. `win-cuda-13.3-x64`. Recorded\nbecause it is the answer to "why is this slow" often enough\nto be worth surfacing: a host that fell back to a CPU build\nlooks identical from the outside otherwise.\n\nA `+vulkan` suffix (`win-cuda-13.4-x64+vulkan`, since\n2026-09-27) is that build with the Vulkan backend from the\nsame release added, so a second vendor\'s card can be used\nbeside an NVIDIA one in one process.\n',
+    )
+    installedAt: AwareDatetime | None = None
+    sizeBytes: int | None = Field(
+        None,
+        description='On-disk size of this build. A Windows CUDA install is roughly\nhalf a gigabyte unpacked and we retain two, so this is worth\nshowing before someone asks where their disk went.\n',
+    )
+    previousVersion: str | None = Field(
+        None,
+        description='The build that was in use before this one, kept so a rollout\ncan go back to it with no download ("Use b11719 again").\nRetention is the build in use, the previous one, one staged\nbuild and any build a runtime is held on: keeping every build\nis not viable at this size, and keeping only the newest leaves\na bad upgrade with no way back.\n',
+    )
+
+
 class EngineAcquisition(BaseModel):
     """
     Whether this host can be given a build of this engine, and which
@@ -7513,6 +7873,10 @@ class Runtime(BaseModel):
         description="Name of the companion `inference-driver` component the agent\ndeclared for this runtime, when `autoDriver` is true. What\nthe gateway's routing table calls this backend, and the\nentry to read in `GET /v1/components` for its health. Absent\nwhen the operator fronts the runtime by hand.\n",
     )
     status: RuntimeStatus
+    drain: RuntimeDrain | None = Field(
+        None,
+        description='The drain open on this runtime (row 13): waiting for idleness\nor for its other copies to carry the load (status still\n`ready`), or draining (status `draining`). Absent when none\nis open.\n',
+    )
     stopReason: StopReason | None = Field(
         None,
         description='Why a `stopped` runtime is stopped. Present only in that\nstate; cleared on start. An observation, not a declaration\n— it is never replicated, and after a control-root\npromotion the answer is re-read from this agent.\n',
@@ -7870,6 +8234,10 @@ class EngineDescriptor(BaseModel):
         description="Present when `error` is Eugene's own account not running the\nbinary it found (row 8, part 8c).\n",
     )
     managed: ManagedEngine | None = None
+    rollout: EngineRollout | None = Field(
+        None,
+        description='The current or most recent rollout of this engine on this node\n(row 13), so the Engines panel and the Issues list read it with\nthe poll they already make.\n',
+    )
     acquisition: EngineAcquisition | None = None
     python: PythonEngine | None = Field(
         None,

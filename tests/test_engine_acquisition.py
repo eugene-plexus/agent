@@ -857,11 +857,13 @@ async def test_a_failed_install_leaves_the_previous_build_alone(
     assert current.binary.read_bytes() == b"good"
 
 
-async def test_retention_keeps_current_and_previous(
+async def test_retention_keeps_the_build_in_use_and_one_staged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Every build is not viable at half a gigabyte each; only the newest
-    leaves a bad upgrade with no way back."""
+    leaves a bad upgrade with no way back. Row 13: an install stages its
+    build, so what stays is the build in use (and the one before it) and the
+    newest staged build."""
     store = ManagedStore(tmp_path, EngineKind.llama_cpp)
     for version in ("b1", "b2", "b3"):
         await _run_install(
@@ -870,9 +872,17 @@ async def test_retention_keeps_current_and_previous(
             {"a.zip": _zip_bytes({"llama-server": version.encode()})},
             version=version,
         )
-    versions = [b.version for b in store.list_builds()]
-    assert len(versions) == 2
-    assert set(versions) == {"b2", "b3"}
+    assert {b.version for b in store.list_builds()} == {"b1", "b3"}
+    assert store.current().version == "b1"  # type: ignore[union-attr]
+
+    store.set_in_use("b3")
+    await _run_install(
+        tmp_path,
+        monkeypatch,
+        {"a.zip": _zip_bytes({"llama-server": b"b4"})},
+        version="b4",
+    )
+    assert {b.version for b in store.list_builds()} == {"b1", "b3", "b4"}
 
 
 async def test_a_second_install_is_refused_while_one_runs(

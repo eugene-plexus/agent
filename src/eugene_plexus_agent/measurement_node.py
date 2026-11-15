@@ -40,6 +40,8 @@ _MANAGERS = (
     ("benchmarks", "A benchmark"),
     ("profile_builds", "A settings build"),
     ("serving_measurements", "A serving measurement"),
+    # Row 13: an engine update measures old and new builds on a stopped model.
+    ("engine_rollouts", "An engine check"),
 )
 
 
