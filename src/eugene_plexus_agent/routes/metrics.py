@@ -3,9 +3,11 @@
 Admits an operator session, or a client key that has `readMetrics`. Whether a
 key may is the key authority's answer, asked with a `check` admission of
 purpose `metrics` (no model, no lease), as the log ingress asks for
-`writeLogs`: a revoked key stops at once on a standalone agent and within
-`_CHECK_TTL_SECONDS` on an enrolled one. The grant opens nothing else, and a
-key that runs inference does not read metrics by that alone.
+`writeLogs`. A standalone agent asks its own registry every time, so a revoked
+key or a withdrawn grant stops at once; an enrolled one asks the root and keeps
+the answer for `_CHECK_TTL_SECONDS`, so a scraper every fifteen seconds is not a
+question to the root each time. The grant opens nothing else, and a key that runs
+inference does not read metrics by that alone.
 
 The engines are read when the scrape arrives (`engine_metrics`), so the series
 are what the engines say now, and a machine with no running engine answers an
@@ -20,6 +22,7 @@ import time
 from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 
 from .. import engine_metrics, tokens
 from .._generated.models import RuntimeStatus
@@ -75,13 +78,13 @@ async def _standing(request: Request, key_id: str) -> _Standing:
     cached = cache.get(key_id)
     if cached is not None and cached.until > now:
         return cached
+    owner = registry(request)
     body = {
         "action": "check",
         "keyId": key_id,
         "requestId": secrets.token_hex(8),
         "purpose": "metrics",
     }
-    owner = registry(request)
     refused: AdmissionRefusal | HTTPException | None = None
     result = None
     try:
@@ -116,7 +119,9 @@ async def _standing(request: Request, key_id: str) -> _Standing:
     standing = _Standing(
         name=str((result or {}).get("keyName") or ""),
         may_read=limits.get("readMetrics") is True,
-        until=now + _CHECK_TTL_SECONDS,
+        # Only a root's answer is kept: a standalone agent's own registry is read
+        # at every request.
+        until=now + (_CHECK_TTL_SECONDS if owner.enrolled else 0.0),
     )
     cache[key_id] = standing
     return standing
@@ -168,6 +173,13 @@ def engine_client():  # type: ignore[no-untyped-def]
 
 @router.get("/metrics", operation_id="getPrometheusMetrics")
 async def get_prometheus_metrics(request: Request) -> Response:
+    # A browser that opens `/metrics` is looking for the console's Metrics page, which
+    # this path hides without its slash: send it there. A scraper sends a credential,
+    # or asks for text.
+    if not request.headers.get("authorization") and "text/html" in request.headers.get(
+        "accept", ""
+    ):
+        return RedirectResponse("/metrics/", status_code=307)
     await require_metrics_reader(request)
     reads = await engine_metrics.gather(engine_client(), _targets(request))
     return Response(engine_metrics.render(reads), media_type=_TEXT)

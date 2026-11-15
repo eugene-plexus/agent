@@ -22,6 +22,7 @@ No prompt or answer is in an engine's counters, and none is read.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 from collections.abc import Callable, Iterable, Sequence
@@ -34,6 +35,12 @@ from .engines import speculation
 #: How long one engine is given to answer a scrape. A slow engine costs its own
 #: series, never the scrape.
 SCRAPE_TIMEOUT_SECONDS = 2.0
+
+log = logging.getLogger(__name__)
+
+#: The last cause each runtime's read failed with, so a cause is logged when it
+#: changes and not at every scrape.
+_LAST_CAUSE: dict[tuple[str, str], str] = {}
 
 #: The most bytes read from one engine. An engine's counters are a few tens of
 #: KiB; a body past this is not read further.
@@ -212,7 +219,28 @@ async def gather(
     client: httpx.AsyncClient, targets: Sequence[Target], *, seconds: float = SCRAPE_TIMEOUT_SECONDS
 ) -> list[_Read]:
     """Every target's `/metrics`, in parallel, `seconds` seconds each."""
-    return list(await asyncio.gather(*(_read(client, t, seconds) for t in targets)))
+    reads = list(await asyncio.gather(*(_read(client, t, seconds) for t in targets)))
+    note_causes(reads)
+    return reads
+
+
+def note_causes(reads: Sequence[_Read]) -> None:
+    """Say why an engine's `/metrics` could not be read, once for each change:
+    `eugene_engine_scrape_ok 0` is the symptom, and this is the observed cause."""
+    for read in reads:
+        who = (read.target.node, read.target.runtime)
+        if read.error is None:
+            if _LAST_CAUSE.pop(who, None) is not None:
+                log.info("engine %r: /metrics answers again", read.target.runtime)
+        elif _LAST_CAUSE.get(who) != read.error:
+            _LAST_CAUSE[who] = read.error
+            log.warning(
+                "engine %r on %s: /metrics could not be read (%s) at %s",
+                read.target.runtime,
+                read.target.node,
+                read.error,
+                read.target.url,
+            )
 
 
 def render(reads: Sequence[_Read]) -> str:

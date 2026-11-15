@@ -197,8 +197,8 @@ def test_a_revoked_scrape_key_is_refused(authed_client: TestClient, anonymous: T
     token, key_id = _mint(authed_client, "prometheus", readMetrics=True)
     assert _get(anonymous, token).status_code == 200
     assert authed_client.delete(f"/v1/auth/client-keys/{key_id}").status_code == 204
-    # The standing is kept for a few seconds, as the log ingress keeps it.
-    anonymous.app.state.metrics_keys.clear()
+    # A standalone agent reads its own registry every time, so there is nothing kept
+    # to clear: the next read is refused at once.
     assert _get(anonymous, token).status_code in (401, 403)
 
 
@@ -211,5 +211,89 @@ def test_a_scrape_key_that_loses_the_grant_is_refused(
         f"/v1/auth/client-keys/{key_id}/limits", json={"limits": {"readMetrics": False}}
     )
     assert edited.status_code == 200, edited.text
-    anonymous.app.state.metrics_keys.clear()
     assert _get(anonymous, token).status_code == 403
+
+
+def test_a_lenient_authority_does_not_widen_the_grant(
+    authed_client: TestClient, anonymous: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent reads `limits.readMetrics` itself: an authority that answers a metrics
+    check with no refusal and no grant does not open the page."""
+    from eugene_plexus_agent.client_keys import ClientKeyStore
+
+    token, _ = _mint(authed_client, "Continue")
+
+    def lenient(self: object, *, key_id: str, **kwargs: object) -> dict[str, object]:
+        return {"keyId": key_id, "keyName": "Continue", "limits": {"allowedModels": None}}
+
+    monkeypatch.setattr(ClientKeyStore, "admit", lenient)
+    refused = _get(anonymous, token)
+    assert refused.status_code == 403
+    assert "May read metrics" in refused.text
+
+
+def test_an_enrolled_agent_keeps_the_roots_answer_for_a_few_seconds_and_then_asks_again(
+    authed_client: TestClient, anonymous: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token, _ = _mint(authed_client, "prometheus", readMetrics=True)
+
+    class Root:
+        enrolled = True
+        asked = 0
+
+        async def forward(self, method: str, path: str, body: dict | None = None) -> dict:
+            Root.asked += 1
+            assert body and body["purpose"] == "metrics"
+            return {"keyName": "prometheus", "limits": {"readMetrics": True}}
+
+    monkeypatch.setattr(metrics_route, "registry", lambda request: Root())
+    assert _get(anonymous, token).status_code == 200
+    assert _get(anonymous, token).status_code == 200
+    assert Root.asked == 1, (
+        "a scraper every fifteen seconds is not a question to the root each time"
+    )
+    monkeypatch.setattr(metrics_route, "_CHECK_TTL_SECONDS", 0.0)
+    anonymous.app.state.metrics_keys.clear()
+    assert _get(anonymous, token).status_code == 200
+    assert _get(anonymous, token).status_code == 200
+    assert Root.asked == 3, "an answer that has expired is asked for again"
+
+
+def test_a_browser_that_opens_metrics_is_sent_to_the_console_page(
+    authed_client: TestClient, anonymous: TestClient
+) -> None:
+    """`GET /metrics` hides the console's Metrics page, which has no slash to tell the
+    two apart: a browser (no credential, asks for html) goes to `/metrics/`."""
+    sent = anonymous.get(
+        "/metrics", headers={"accept": "text/html,application/xhtml+xml"}, follow_redirects=False
+    )
+    assert sent.status_code == 307
+    assert sent.headers["location"] == "/metrics/"
+    # A scraper with no credential still hears it is refused, and one with a key reads.
+    assert anonymous.get("/metrics", headers={"accept": "text/plain"}).status_code == 401
+    token, _ = _mint(authed_client, "prometheus", readMetrics=True)
+    page = anonymous.get(
+        "/metrics",
+        headers={"accept": "text/html", "authorization": f"Bearer {token}"},
+        follow_redirects=False,
+    )
+    assert page.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_why_an_engine_could_not_be_read_is_logged_once_for_each_change(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine_metrics._LAST_CAUSE.clear()
+    target = _targets()[2]  # "down": its connection is refused
+    with caplog.at_level("INFO", logger="eugene_plexus_agent.engine_metrics"):
+        for _ in range(3):
+            await engine_metrics.gather(_client(), [target])
+        said = [r.getMessage() for r in caplog.records]
+        assert len(said) == 1, said
+        assert "down" in said[0] and "ConnectError" in said[0] and "http://down.test" in said[0]
+        # A different cause is said again; an engine that answers again says so.
+        engine_metrics.note_causes([engine_metrics._Read(target, None, "HTTP 501")])
+        engine_metrics.note_causes([engine_metrics._Read(target, engine_metrics.parse(LLAMA))])
+    said = [r.getMessage() for r in caplog.records]
+    assert len(said) == 3 and "HTTP 501" in said[1] and "answers again" in said[2], said
