@@ -69,6 +69,10 @@ AGENT_STOP_DRAIN_SECONDS = 20.0
 #: When a gateway does not say its deadline: its default drain plus the grace.
 _DRAIN_DEFAULT_SECONDS = 120.0
 _DRAIN_POLL_SECONDS = 0.5
+#: The token this agent mints to drain its own gateway (row 13 review): its own
+#: `sub`, which nothing else accepts, living only as long as one drain's calls.
+DRAIN_SUB = "gateway-drain"
+DRAIN_TOKEN_SECONDS = 60
 
 # Polling interval for the health-watcher loop. Each spawned component's
 # /healthz is hit on this cadence to refresh its status; pick a value
@@ -426,13 +430,17 @@ class _ComponentPlanner:
         return _format_log_prefix(self.entry.kind, self.entry.name)
 
     def agent_headers(self) -> dict[str, str]:
-        """This agent speaking for itself to its own child (`sub: agent`,
-        addressed to this machine): what the gateway's drain accepts (row 13)."""
+        """This agent asking its own gateway to drain (row 13): a token with
+        `sub: gateway-drain`, addressed to this machine, for 60 s. Not the
+        agent's year-long `sub: agent` token, which other components accept."""
         if self._auth_state is None:
             return {}
         try:
             trust = self._auth_state.trust
-            return {"Authorization": f"Bearer {trust.agent_token(trust.recipient)}"}
+            token, _ = trust.mint_service(
+                sub=DRAIN_SUB, audience=trust.recipient, ttl_seconds=DRAIN_TOKEN_SECONDS
+            )
+            return {"Authorization": f"Bearer {token}"}
         except Exception as exc:  # no key yet: the gateway refuses, and is stopped as before
             self._log.info("no token to drain %s with: %s", self.entry.name, exc)
             return {}
@@ -645,6 +653,8 @@ class SupervisedProcess:
 
         #: Row 13: this run's gateway has been drained (once per run).
         self._drained = False
+        #: Row 13 review #4: a gateway's restart, draining in the background.
+        self._restart_task: asyncio.Task[None] | None = None
         self.state: ProcessState = ProcessState.starting
         self.degraded = False
         """Whether the plan currently running is a reduced-mode one. Set
@@ -734,21 +744,50 @@ class SupervisedProcess:
             raise RuntimeError(self.last_error or f"{self.name} is still stopping its engine tree")
         self._consecutive_crashes = 0
         self._planner.reset()
-        if self._proc is not None and self._proc.returncode is None:
-            # Row 13: a gateway finishes its answers first, then exits by itself.
-            self._expected_exit = True
-            await self.drain_first()
+        # The process this restart is for. A gateway that drains exits by
+        # itself and the loop spawns its successor, which this restart must
+        # never signal (row 13 review #3: one restart spawned three times).
         proc = self._proc
-        if proc is not None and proc.returncode is None:
+        if proc is not None and proc.returncode is None and self._drains():
+            # Row 13: a gateway finishes its answers first, then exits by
+            # itself. In the background (review #4): sign-in, enrollment and
+            # the Restart button await this, and a drain may take minutes.
             self._expected_exit = True
-            self._begin_tree_stop(proc)
-            sent = process_signals.request_stop(proc, name=self.name, logger=self._log)
-            self._log.info("restart requested for %s; sent %s to pid %d", self.name, sent, proc.pid)
-            await self._escalate_if_still_alive(proc)
-            if self._tree_stop is not None:
-                await asyncio.shield(self._tree_stop)
+            if self._restart_task is None or self._restart_task.done():
+                self._restart_task = asyncio.create_task(
+                    self._drain_then_signal(proc), name=f"restart:{self.name}"
+                )
+            return
+        if proc is not None and proc.returncode is None:
+            await self._signal_restart(proc)
         elif self._task is None or self._task.done():
             self.start()
+
+    def _drains(self) -> bool:
+        """Whether this child is a gateway, which drains before a stop."""
+        planner = self._planner
+        return (
+            isinstance(planner, _ComponentPlanner) and planner.entry.kind is ComponentKind.gateway
+        )
+
+    async def _drain_then_signal(self, proc: asyncio.subprocess.Process) -> None:
+        try:
+            await self.drain_first()
+            # Only the process drained: its successor is never signalled
+            # (review #3).
+            if proc.returncode is None and self._proc is proc:
+                await self._signal_restart(proc)
+        except Exception:
+            self._log.exception("restart of %s failed", self.name)
+
+    async def _signal_restart(self, proc: asyncio.subprocess.Process) -> None:
+        self._expected_exit = True
+        self._begin_tree_stop(proc)
+        sent = process_signals.request_stop(proc, name=self.name, logger=self._log)
+        self._log.info("restart requested for %s; sent %s to pid %d", self.name, sent, proc.pid)
+        await self._escalate_if_still_alive(proc)
+        if self._tree_stop is not None:
+            await asyncio.shield(self._tree_stop)
 
     async def drain_first(self, cap: float | None = None) -> None:
         """Row 13: let a gateway finish its answers before it is stopped.
@@ -818,6 +857,19 @@ class SupervisedProcess:
         is drained first (row 13)."""
         self._stop_requested = True
         self._expected_exit = True
+        restarting = self._restart_task
+        if restarting is not None and not restarting.done():
+            # A restart's drain is under way: let it finish, within this
+            # stop's own limit, and never signal past it.
+            limit = (
+                drain_cap
+                if drain_cap is not None
+                else _DRAIN_DEFAULT_SECONDS + DRAIN_KILL_GRACE_SECONDS
+            )
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(restarting), limit)
+            restarting.cancel()
+            await asyncio.gather(restarting, return_exceptions=True)
         await self.drain_first(drain_cap)
         proc = self._proc
         if proc is not None:
@@ -1375,6 +1427,11 @@ class Supervisor:
         """Row 13: let every gateway this agent runs finish its answers, at
         most `cap` seconds, before anything they route to is stopped. The
         agent's own stop calls this before it stops the engines."""
+        for sp in self._processes.values():
+            # The agent is stopping: a gateway that drains and exits 0 is not
+            # spawned again (row 13 review #2). `stop_all` ends the rest.
+            sp._stop_requested = True
+            sp._expected_exit = True
         await asyncio.gather(
             *(sp.drain_first(cap) for sp in self._processes.values()),
             return_exceptions=True,

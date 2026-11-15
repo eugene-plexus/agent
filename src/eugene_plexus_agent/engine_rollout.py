@@ -102,6 +102,10 @@ TERMINAL = frozenset(
         EngineRolloutState.cancelled,
     }
 )
+#: A runtime on its way up, which a rollout waits for before it chooses.
+_COMING_UP = frozenset(
+    {RuntimeStatus.copying, RuntimeStatus.starting, RuntimeStatus.loading, RuntimeStatus.exited}
+)
 FINISHED_RUNTIME = frozenset(
     {
         EngineRolloutRuntimeState.moved,
@@ -159,12 +163,29 @@ async def run_tool(
     try:
         out, err = await asyncio.wait_for(process.communicate(), seconds)
     except TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        await process.wait()
+        await _end_tool(process)
         return -1, f"{Path(argv[0]).name} did not finish within {seconds:.0f} s"
+    except BaseException:
+        # Stop the update, or the agent's own stop, during a measurement: the
+        # tool and what it started end too, rather than keep the GPU (review #11).
+        await asyncio.shield(_end_tool(process))
+        raise
     text = (out[-MAX_OUTPUT:] + b"\n" + err[-MAX_OUTPUT:]).decode("utf-8", errors="replace")
     return int(process.returncode or 0), text
+
+
+async def _end_tool(process: asyncio.subprocess.Process) -> None:
+    """End a tool and every process under it, then reap it."""
+    import psutil
+
+    with contextlib.suppress(psutil.Error):
+        for child in psutil.Process(process.pid).children(recursive=True):
+            with contextlib.suppress(psutil.Error):
+                child.kill()
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(process.wait(), 10)
 
 
 def _tool(build: InstalledBuild, name: str) -> Path | None:
@@ -582,6 +603,7 @@ class EngineRollouts:
                 self._end(rollout, EngineRolloutState.done, f"{rollout.version} is in use.")
                 return
             if not rollout.runtimes:
+                await self._settle(engine)
                 rollout.runtimes = [
                     EngineRolloutRuntime(name=name, state=EngineRolloutRuntimeState.waiting)
                     for name in self._targets(engine, rollout.version)
@@ -620,7 +642,19 @@ class EngineRollouts:
             raise
         except Exception as exc:
             log.exception("the %s rollout to %s failed", engine.value, rollout.version)
+            with contextlib.suppress(Exception):
+                self._forget_moves(self.store_for(engine), rollout)
             self._end(rollout, EngineRolloutState.failed, f"The update stopped: {exc}")
+
+    @staticmethod
+    def _forget_moves(store: ManagedStore, rollout: EngineRollout) -> None:
+        """A rollout that ends without moving the build in use (stopped, or
+        failed) leaves no runtime pinned to its build (review #10): each one
+        moved runs on until it restarts, then starts on the build in use, so
+        the fleet comes back together. Holds (with a reason) stay."""
+        for name, entry in store.in_use().runtimes.items():
+            if entry.version == rollout.version and not entry.reason:
+                store.set_runtime(name, None)
 
     def _end(self, rollout: EngineRollout, state: EngineRolloutState, message: str) -> None:
         self._set(rollout, state=state, message=message, finishedAt=_now(), question=None)
@@ -654,6 +688,30 @@ class EngineRollouts:
             )
             return False
         return True
+
+    async def _settle(self, engine: EngineKind) -> None:
+        """Wait, at most `ready_seconds`, while a runtime of `engine` is on
+        its way up (copying, starting, loading, or restarting after an exit):
+        right after a machine's own update its models are still loading, and
+        a rollout that went on would move the build in use under them with no
+        drain or check (review #9)."""
+        deadline = time.perf_counter() + self.ready_seconds
+        while time.perf_counter() < deadline:
+            coming = [
+                spec.name
+                for spec in self._state().list_runtime_specs()
+                if spec.engine is engine
+                and not spec.binary
+                and (view := self._view(spec)) is not None
+                and view.status in _COMING_UP
+            ]
+            if not coming:
+                return
+            self._set(
+                self._rollouts[engine.value],
+                message=f"Waiting for {', '.join(coming)} to finish loading.",
+            )
+            await asyncio.sleep(self.poll_seconds)
 
     def _targets(self, engine: EngineKind, version: str) -> list[str]:
         """This node's runtimes of `engine` on a managed build (not those with
@@ -784,12 +842,22 @@ class EngineRollouts:
         except BaseException:
             self.measuring = None
             raise
-        if drained.state is RuntimeDrainState.cancelled:
+        stopped = drained.message == runtime_drain.STOPPED_MEANWHILE
+        if drained.state is RuntimeDrainState.cancelled or stopped:
+            # Cancelled, or stopped by someone else while it drained (an
+            # operator's Stop, an idle unload): it is not measured or started
+            # here (review #8). It starts on the build in use next time.
             self.measuring = None
             if store.in_use().runtimes.get(name) == RuntimeBuild(version=new.version):
                 store.set_runtime(name, None)
             self._runtime(
-                rollout, runtime, EngineRolloutRuntimeState.skipped, "Its drain was cancelled."
+                rollout,
+                runtime,
+                EngineRolloutRuntimeState.skipped,
+                "It was stopped during its update, so it was not moved. It starts on the "
+                "build in use."
+                if stopped
+                else "Its drain was cancelled.",
             )
             return
         if skip:
@@ -1052,8 +1120,13 @@ class EngineRollouts:
                 runtime.state = EngineRolloutRuntimeState.skipped
                 runtime.message = "Cancelled; it stays on the build in use."
         finally:
+            with contextlib.suppress(Exception):
+                self._forget_moves(self.store_for(engine), rollout)
             self._end(
-                rollout, EngineRolloutState.cancelled, f"Cancelled. {self._progress(rollout)}."
+                rollout,
+                EngineRolloutState.cancelled,
+                f"Cancelled. {self._progress(rollout)}; they start on "
+                f"{rollout.from_ or 'the build in use'} when they next restart.",
             )
 
 

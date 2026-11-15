@@ -148,7 +148,7 @@ async def test_a_new_approved_run_can_retry_an_old_failed_install(app, monkeypat
     )
     attempts = []
 
-    async def install(engine):
+    async def install(context, engine):  # the route takes its request first (row 13)
         attempts.append(engine)
         return started
 

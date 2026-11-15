@@ -12,9 +12,9 @@ answers finish first. The design is `specs/docs/design/rows/row-13.md` §2.1:
    drain is open (every 2 s then): its own count of answers running on the
    runtime, and the drain state its routing table holds.
 4. **Drained.** The real subject: every gateway that read `GET /v1/runtimes`
-   in the last 60 s reported `running: 0`, after the drain began, from a table
+   in the last 330 s reported `running: 0`, after the drain began, from a table
    that already shows the runtime draining. No reader: drained at once. A
-   reader silent for 60 s is no longer waited for, and the message names it.
+   reader silent for 330 s is no longer waited for, and the message names it.
 5. **Grace.** After `graceSeconds` the drain is `cut` and `then` runs anyway:
    "2 answers were cut at the 120 s limit."
 6. **Then.** `restart` (on the build in use for it), `stop`, or `hold` until
@@ -58,11 +58,17 @@ from ._generated.models import (
 log = logging.getLogger(__name__)
 
 #: A gateway that read this agent's runtimes this recently is waited on.
-READER_SECONDS = 60.0
+READER_SECONDS = 330.0
+# Longer than the longest `routingRefreshSeconds` a gateway takes (300 s), so a
+# gateway that reads at its slowest is still waited on (row 13 review #6). The
+# same span bounds a gateway that reads but never reports.
 #: How often an open drain looks at its reports.
 TICK_SECONDS = 0.25
 #: A report older than this does not answer whether a runtime may leave now.
 FRESH_SECONDS = 10.0
+#: How a drain ends when its runtime was stopped by someone else meanwhile; its
+#: `then` does not run.
+STOPPED_MEANWHILE = "It was stopped while it drained, so nothing more was done."
 #: The states in which the runtime is out of routing.
 LEAVING = frozenset({RuntimeDrainState.draining, RuntimeDrainState.drained, RuntimeDrainState.cut})
 #: The table states a gateway reports from which its `running: 0` counts.
@@ -268,8 +274,14 @@ class RuntimeDrains:
         drain = self._drains.get(name)
         if drain is None:
             raise DrainError(f"No drain is open on {name}.")
-        if drain.task is not None and drain.task.done() and drain.then is not RuntimeDrainThen.hold:
-            raise DrainError(f"The drain on {name} has ended.")
+        if drain.then is not RuntimeDrainThen.hold and drain.state in (
+            RuntimeDrainState.drained,
+            RuntimeDrainState.cut,
+        ):
+            # Its `then` runs (or ran): stopping it halfway would leave the
+            # model stopped while saying it is back in routing (review #7).
+            doing = "restarting" if drain.then is RuntimeDrainThen.restart else "stopping"
+            raise DrainError(f"The drain on {name} has ended, and it is {doing} now.")
         drain.state = RuntimeDrainState.cancelled
         drain.message = "Cancelled. It is back in routing."
         if drain.task is not None and not drain.task.done():
@@ -345,7 +357,7 @@ class RuntimeDrains:
             drain.waiting_on &= live
         if drain.state in (RuntimeDrainState.waiting_idle, RuntimeDrainState.waiting_covered):
             # A gateway that reads the runtimes but has not reported once in
-            # 60 s (one from before row 13) cannot say idle or covered: it is
+            # 330 s (one from before row 13) cannot say idle or covered: it is
             # not waited for, and the message names it, so a wait never
             # outlives the gateways that can end it.
             mute = {
@@ -418,10 +430,14 @@ class RuntimeDrains:
             while not self._evaluate(drain):
                 if not self._is_running(drain.name):
                     # Stopped meanwhile (an idle unload, an operator's stop):
-                    # nothing runs on it, so there is nothing left to wait for.
+                    # nothing runs on it, so there is nothing left to wait for,
+                    # and its `then` does not run: whoever stopped it decided
+                    # (row 13 review #8).
                     drain.state = RuntimeDrainState.drained
-                    drain.message = "It stopped while it drained."
-                    break
+                    drain.message = STOPPED_MEANWHILE
+                    log.info("runtime %s: %s", drain.name, drain.message)
+                    self._finish(drain)
+                    return
                 await asyncio.sleep(TICK_SECONDS)
             if drain.state is RuntimeDrainState.cancelled:
                 return

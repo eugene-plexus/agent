@@ -113,7 +113,9 @@ async def test_gateway_stop_drains_first(monkeypatch: pytest.MonkeyPatch) -> Non
     trust = _auth().trust  # a different node: only its own may drain it
     assert token and trust.recipient
     claims = sp._planner._auth_state.trust.verify(token, classes=(tokens.TYP_SERVICE,))  # type: ignore[attr-defined]
-    assert claims.sub == "agent" and claims.is_local_service(claims.iss)
+    # Review note: its own `sub`, short-lived, not the year-long `sub: agent`.
+    assert claims.sub == supervisor.DRAIN_SUB and claims.is_local_service(claims.iss)
+    assert claims.exp - claims.iat <= 300
 
 
 async def test_a_gateway_that_never_exits_is_ended_at_the_cap(
@@ -171,6 +173,67 @@ async def test_agent_stop_drains_gateways_before_anything_else(
         if owner._processes["gateway"].pid is not None:
             break
         await asyncio.sleep(0.01)
+    sp = owner._processes["gateway"]
     await owner.drain_gateways(cap=5)
     assert gateway.events == ["drain"] and proc.returncode == 0
+    # Review #2: the agent is stopping, so a gateway that drained and exited 0
+    # is not spawned again.
+    await asyncio.sleep(1.0)
+    assert sp.spawns == 1, f"spawned {sp.spawns} times during the agent's stop"
     await owner.stop_all()
+
+
+@pytest.mark.parametrize("finish_after", [0.05, 0.2, 0.7])
+async def test_one_restart_spawns_once(
+    monkeypatch: pytest.MonkeyPatch, finish_after: float
+) -> None:
+    """Review #3: a gateway that finishes its drain exits by itself and the
+    loop spawns it again; the restart then signalled that new process too, so
+    one restart spawned up to three times. Only the process drained is ever
+    signalled."""
+    first = _FakeProcess()
+    made: list[_FakeProcess] = []
+
+    async def fake_create(*args: Any, **kwargs: Any) -> _FakeProcess:
+        proc = first if not made else _FakeProcess()
+        made.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    gateway = Gateway(first, finish_after, 60)
+    _http.set_shared_client(
+        "gateway-drain", httpx.AsyncClient(transport=httpx.MockTransport(gateway.handler))
+    )
+    owner = Supervisor(logging.getLogger("test"), auth_state=_auth())
+    owner.add_and_start(_entry())
+    sp = owner._processes["gateway"]
+    for _ in range(100):
+        if sp.pid is not None:
+            break
+        await asyncio.sleep(0.01)
+    try:
+        await owner.restart("gateway")
+        await asyncio.sleep(1.5)
+        assert len(made) == 2, f"{len(made)} processes for one restart"
+        assert not made[1].terminated and not made[1].killed, "the new gateway was signalled"
+    finally:
+        await owner.stop_all()
+
+
+async def test_a_restart_does_not_wait_for_the_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review #4: sign-in, enrollment and `POST /v1/components/{name}/restart`
+    await a restart, which waited for the whole drain (up to 125 s, 905 s at
+    the most). The restart now returns at once; the drain and the stop run in
+    the background."""
+    sp, proc, gateway, _signals = await _spawned(monkeypatch, _entry(), None, 60)
+    began = time.perf_counter()
+    await asyncio.wait_for(sp.restart(), 2)
+    assert time.perf_counter() - began < 1.0
+    for _ in range(100):
+        if gateway.events:
+            break
+        await asyncio.sleep(0.01)
+    assert gateway.events == ["drain"], "the drain still runs, in the background"
+    assert proc.returncode is None
+    await sp.stop(drain_cap=0.3)
+    assert proc.returncode is not None

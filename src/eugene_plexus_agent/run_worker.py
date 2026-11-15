@@ -17,7 +17,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 import httpx
@@ -327,7 +327,8 @@ class NodeActions:
             else:
                 return record
         try:
-            result = await actions.install_engine(engine)
+            # The route reads the app off its request (row 13: an update running refuses).
+            result = await actions.install_engine(cast(Any, NodeContext(self.app)), engine)
             return result.model_dump(mode="json")
         except HTTPException as exc:
             if exc.status_code != 409:

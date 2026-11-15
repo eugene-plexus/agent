@@ -603,6 +603,28 @@ async def list_engines(request: Request) -> EngineList:
     return EngineList(engines=engines)
 
 
+def _refuse_during_rollout(request: Request, kind: EngineKind) -> None:
+    """Row 13 review: an install while an update runs could prune the build it
+    moves to, and an uninstall would remove it. 409, naming the update."""
+    rollouts = engine_rollout.manager(request.app)
+    if not rollouts.running(kind):
+        return
+    rollout = rollouts.get(kind)
+    words = f" to {rollout.version}" if rollout is not None else ""
+    raise _problem(
+        code=status.HTTP_409_CONFLICT,
+        slug="engine-update-running",
+        title="An engine update is running",
+        detail=(
+            f"An update of {ENGINE_WORDS.get(kind.value, kind.value)}{words} is running on "
+            "this node. Wait for it to end, or stop it, first."
+        ),
+    )
+
+
+ENGINE_WORDS = {"llama_cpp": "llama.cpp", "vllm": "vLLM", "mlx": "MLX"}
+
+
 def _engine_kind(engine: str) -> EngineKind:
     try:
         return EngineKind(engine)
@@ -625,7 +647,9 @@ def _engine_kind(engine: str) -> EngineKind:
     tags=["engines"],
     dependencies=_write_auth,
 )
-async def install_engine(engine: str, body: EngineInstallRequest | None = None) -> EngineInstall:
+async def install_engine(
+    request: Request, engine: str, body: EngineInstallRequest | None = None
+) -> EngineInstall:
     """Fetch, verify and unpack an engine build.
 
     Returns immediately. The download is hundreds of megabytes — on
@@ -642,6 +666,7 @@ async def install_engine(engine: str, body: EngineInstallRequest | None = None) 
             title="Unknown engine",
             detail=f"No adapter for engine {engine!r} in this build.",
         )
+    _refuse_during_rollout(request, kind)
     if installer.running:
         raise _problem(
             code=status.HTTP_409_CONFLICT,
@@ -864,6 +889,7 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
 
     kind = _engine_kind(engine)
     installer = installer_for(kind)
+    _refuse_during_rollout(request, kind)
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     active = [

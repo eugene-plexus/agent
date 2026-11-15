@@ -63,6 +63,8 @@ class Fleet:
         self.crashed: dict[str, str] = {}
         self.drains: Any = None
         self.starts: list[tuple[str, str]] = []
+        #: Runtimes still loading their model (just after a machine update).
+        self.loading: set[str] = set()
         for name in names:
             self.start(name)
 
@@ -97,6 +99,8 @@ class Fleet:
         name = spec.name
         if name in self.crashed:
             status = RuntimeStatus.crashed
+        elif name in self.loading:
+            status = RuntimeStatus.loading
         elif name in self.running:
             status = RuntimeStatus.ready
             if self.drains is not None and self.drains.leaving(name):
@@ -362,6 +366,61 @@ async def test_rollout_resumes_after_restart(tmp_path: Path) -> None:
     assert store.in_use().version == "b2" and fleet.running == {"qwen": "b2"}
 
 
+async def test_a_rollout_resumed_mid_start_checks_the_runtime_on_the_new_build(
+    tmp_path: Path,
+) -> None:
+    """Review #12: the agent stops while a runtime is starting on the new
+    build (its entry already names it). The next agent does not drain or
+    measure it again: it starts it there and checks that it answers."""
+    rollouts, store, fleet, app = _setup(tmp_path, ["qwen"])
+    hang = asyncio.Event()
+    plain = rollouts.launch
+
+    async def launch(name: str) -> str | None:
+        await hang.wait()  # the agent stops during this start
+        return await plain(name)
+
+    rollouts.launch = launch
+    await rollouts.start(ENGINE, EngineRolloutRequest(version="b2"))
+    for _ in range(300):
+        rollout = rollouts.get(ENGINE)
+        if (
+            rollout
+            and rollout.runtimes
+            and rollout.runtimes[0].state is (EngineRolloutRuntimeState.starting)
+        ):
+            break
+        await asyncio.sleep(0.01)
+    assert store.in_use().runtimes["qwen"].version == "b2"
+    await rollouts.close()
+    measured_before = [m.measured for m in rollouts.get(ENGINE).check.models]  # type: ignore[union-attr]
+
+    again = engine_rollout.EngineRollouts(app, tmp_path / "engine-rollouts.json")
+    again.store_for = rollouts.store_for
+    again.launch = plain
+    again.probe = rollouts.probe
+    measures: list[str] = []
+
+    async def measure(*args: Any) -> Any:
+        measures.append("measured")
+        return await _measured()(*args)
+
+    again.measure_model = measure
+    again.poll_seconds = 0.01
+    app.state.engine_rollouts = again
+    again.resume()
+    rollout = await _ended(again)
+    assert rollout.state is EngineRolloutState.done, rollout.message
+    assert measures == [], "not measured again"
+    [check] = rollout.check.models
+    assert check.passes
+    assert "the agent restarted during its check" in (check.reason or ""), (
+        check.reason,
+        measured_before,
+    )
+    assert fleet.running == {"qwen": "b2"} and store.in_use().version == "b2"
+
+
 async def test_a_second_rollout_is_refused_while_one_runs(tmp_path: Path) -> None:
     rollouts, _store, _fleet, _app = _setup(tmp_path, ["qwen"])
     await rollouts.start(ENGINE, EngineRolloutRequest(version="b2", switch=EngineRolloutSwitch.ask))
@@ -408,3 +467,149 @@ def test_check_words_say_what_the_numbers_say() -> None:
         words
         == "b11800 on qwen3-8b: 12% slower at generating, 97.1% same next token, 99% expected."
     )
+
+
+async def test_a_runtime_stopped_while_its_drain_waits_is_left_stopped(tmp_path: Path) -> None:
+    """Review #8: an operator stops a runtime while its drain waits for cover.
+    It was then measured and started again. Now the rollout leaves it stopped,
+    and says so."""
+    rollouts, _store, fleet, app = _setup(tmp_path, ["qwen"])
+    drains = app.state.runtime_drains
+    drains.saw_reader(GW)
+
+    async def gateway() -> None:
+        while True:
+            view = drains.view("qwen")
+            if view is not None:
+                drains.report(
+                    "qwen",
+                    GW,
+                    RuntimeDrainReport(
+                        running=1, state=view.state, otherCopies=1, covered=False, idleSeconds=1
+                    ),
+                )
+            drains.saw_reader(GW)
+            await asyncio.sleep(0.01)
+
+    reporting = asyncio.create_task(gateway())
+    try:
+        await rollouts.start(ENGINE, EngineRolloutRequest(version="b2"))
+        for _ in range(100):
+            if drains.view("qwen") is not None:
+                break
+            await asyncio.sleep(0.01)
+        await fleet.stop_one("qwen")  # the operator's Stop
+        rollout = await _ended(rollouts)
+    finally:
+        reporting.cancel()
+    assert fleet.starts == [("qwen", "b1")], "it was not started again"
+    assert fleet.running == {}
+    [runtime] = rollout.runtimes
+    assert runtime.state is EngineRolloutRuntimeState.skipped
+    assert "stopped during its update" in (runtime.message or "")
+    assert rollout.check.models == [], "nothing was measured"
+    assert rollouts.measuring is None
+
+
+async def test_a_model_still_loading_is_waited_for_and_moved(tmp_path: Path) -> None:
+    """Review #9: right after a machine's own update its models are still
+    loading; a rollout then saw none `ready`, moved the build in use with no
+    drain or check, and said "No model was running here". It now waits for
+    them (at most its ready limit) and moves them."""
+    rollouts, _store, fleet, _app = _setup(tmp_path, ["qwen"])
+    fleet.loading.add("qwen")
+
+    async def loaded() -> None:
+        await asyncio.sleep(0.3)
+        fleet.loading.discard("qwen")
+
+    finishing = asyncio.create_task(loaded())
+    await rollouts.start(ENGINE, EngineRolloutRequest(version="b2"))
+    rollout = await _ended(rollouts)
+    await finishing
+    assert rollout.state is EngineRolloutState.done, rollout.message
+    assert [r.name for r in rollout.runtimes] == ["qwen"], rollout.message
+    assert rollout.runtimes[0].state is EngineRolloutRuntimeState.moved
+    assert fleet.running == {"qwen": "b2"}
+
+
+async def test_a_stopped_update_leaves_no_runtime_pinned_to_its_build(tmp_path: Path) -> None:
+    """Review #10: after Stop the update, a runtime already moved kept its own
+    entry at the new build while the build in use stayed the old one, so it
+    stayed on the new build through every restart and the stale-build advice
+    ("Restarting them picks up...") was false forever. Its entry goes: it runs
+    on until it restarts, then starts on the build in use."""
+    rollouts, store, _fleet, _app = _setup(tmp_path, ["a", "b"])
+    gate = asyncio.Event()
+    plain = rollouts.launch
+
+    held: list[str] = []
+
+    async def launch(name: str) -> str | None:
+        if name == "b" and not held:  # its first start, on b2, hangs
+            held.append(name)
+            await gate.wait()
+        return await plain(name)
+
+    rollouts.launch = launch
+    await rollouts.start(ENGINE, EngineRolloutRequest(version="b2"))
+    for _ in range(300):
+        rollout = rollouts.get(ENGINE)
+        if (
+            rollout is not None
+            and [r.state for r in rollout.runtimes][:1] == [EngineRolloutRuntimeState.moved]
+            and rollout.runtimes[1].state is EngineRolloutRuntimeState.starting
+        ):
+            break
+        await asyncio.sleep(0.01)
+    assert store.in_use().runtimes.get("a") is not None, "a was moved to b2"
+    cancelled = await rollouts.cancel(ENGINE)
+    gate.set()
+    assert cancelled.state is EngineRolloutState.cancelled
+    record = store.in_use()
+    assert record.version == "b1" and record.runtimes == {}, record
+
+
+async def test_a_failed_update_leaves_no_runtime_pinned_to_its_build(tmp_path: Path) -> None:
+    rollouts, store, fleet, _app = _setup(tmp_path, ["a", "b"])
+    plain = rollouts.probe
+
+    async def probe(view: Any) -> str | None:
+        if fleet.running.get("b") == "b2":
+            raise RuntimeError("the agent lost its supervisor")
+        return await plain(view)
+
+    rollouts.probe = probe
+    await rollouts.start(ENGINE, EngineRolloutRequest(version="b2"))
+    rollout = await _ended(rollouts)
+    assert rollout.state is EngineRolloutState.failed, rollout.message
+    record = store.in_use()
+    assert record.version == "b1" and record.runtimes == {}, record
+
+
+def test_install_and_uninstall_wait_for_a_running_update(
+    authed_client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review note: a second install while an update runs could prune the
+    build the update moves to, and an uninstall would take it away. Both are
+    refused while one runs, and the refusal names the update."""
+    app = authed_client.app
+    rollouts = engine_rollout.manager(app)
+    monkeypatch.setattr(rollouts, "running", lambda engine: engine is ENGINE)
+    rollouts._rollouts[ENGINE.value] = engine_rollout.EngineRollout.model_validate(
+        {
+            "id": "x",
+            "engine": "llama_cpp",
+            "version": "b2",
+            "from": "b1",
+            "state": "switching",
+            "switch": "auto",
+            "startedAt": "2026-11-15T00:00:00Z",
+            "runtimes": [],
+            "check": {"models": []},
+        }
+    )
+    for path in ("/v1/engines/llama_cpp/install", "/v1/engines/llama_cpp/uninstall"):
+        refused = authed_client.post(path, json={})
+        assert refused.status_code == 409, (path, refused.text)
+        assert "update of llama.cpp to b2" in refused.text, refused.text

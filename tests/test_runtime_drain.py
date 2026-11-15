@@ -137,6 +137,23 @@ async def test_cut_at_grace_names_count() -> None:
     assert ran == [("r", "restart")], "then runs anyway: an update must end"
 
 
+async def test_a_gateway_with_the_longest_refresh_is_still_waited_for() -> None:
+    """Review #6: a gateway reads the runtimes every `routingRefreshSeconds`,
+    up to 300 s. One that read 200 s before the drain began is still a reader,
+    so the drain waits for its report rather than ending at once."""
+    clock = Clock()
+    drains, ran = _drains(clock)
+    drains.saw_reader(GW)
+    clock.now += 200
+    view = drains.start("r", RuntimeDrainRequest(then=RuntimeDrainThen.stop))
+    assert view.gateways == 1, "the gateway is waited on"
+    await _settle()
+    assert ran == [], "not drained until it reports"
+    drains.report("r", GW, _report(0))
+    await asyncio.wait_for(drains.wait("r"), 2)
+    assert ran == [("r", "stop")]
+
+
 async def test_a_silent_gateway_is_not_waited_for_and_is_named() -> None:
     clock = Clock()
     drains, ran = _drains(clock)
@@ -146,7 +163,7 @@ async def test_a_silent_gateway_is_not_waited_for_and_is_named() -> None:
     drains.report("r", GW, _report(0))
     await _settle()
     assert ran == [], "attic has not reported"
-    clock.now += 61
+    clock.now += runtime_drain.READER_SECONDS + 1
     drains.saw_reader(GW)
     drains.report("r", GW, _report(0))
     final = await asyncio.wait_for(drains.wait("r"), 2)
@@ -189,7 +206,7 @@ async def test_a_gateway_that_never_reports_does_not_hold_a_wait_forever() -> No
     )
     await _settle()
     assert drains.view("r").state is RuntimeDrainState.waiting_covered
-    clock.now += 61
+    clock.now += runtime_drain.READER_SECONDS + 1
     drains.saw_reader("node:attic")  # still reading, never reporting
     final = await asyncio.wait_for(drains.wait("r"), 2)
     assert ran == [("r", "stop")]
@@ -357,3 +374,47 @@ def test_drain_routes_report_and_status(ready_app: Any) -> None:
         assert back.status_code == 200 and back.json()["state"] == "cancelled"
         assert c.get("/v1/runtimes/r", headers=_bearer(operator)).json()["status"] == "ready"
         assert c.delete("/v1/runtimes/r/drain", headers=_bearer(operator)).status_code == 409
+
+
+async def test_a_drain_cannot_be_cancelled_once_its_then_runs() -> None:
+    """Review #7: a cancel between the stop and the start of `then: restart`
+    said "back in routing" and left the model stopped. Once the drain has
+    ended and its `then` runs, a cancel is refused, and the restart finishes."""
+    stopped = asyncio.Event()
+    release = asyncio.Event()
+    running = {"r"}
+    log: list[str] = []
+
+    async def run_then(name: str, then: RuntimeDrainThen, reason: RuntimeDrainReason) -> None:
+        running.discard(name)
+        log.append("stopped")
+        stopped.set()
+        await release.wait()  # the launch: admission, the lock, the model load
+        running.add(name)
+        log.append("started")
+
+    drains = runtime_drain.RuntimeDrains(run_then=run_then, is_running=lambda n: n in running)
+    drains.start("r", RuntimeDrainRequest(then=RuntimeDrainThen.restart, graceSeconds=0))
+    await asyncio.wait_for(stopped.wait(), 2)
+    with pytest.raises(runtime_drain.DrainError, match="restarting"):
+        await drains.cancel("r")
+    release.set()
+    final = await asyncio.wait_for(drains.wait("r"), 2)
+    assert log == ["stopped", "started"] and running == {"r"}
+    assert final.state is RuntimeDrainState.drained
+
+
+async def test_a_runtime_stopped_by_someone_else_is_not_restarted_by_its_drain() -> None:
+    """Review #8: an operator's Stop (or an idle unload) while a drain waits
+    ends the drain, and its `then: restart` does not start the model again."""
+    alive = {"r"}
+    drains, ran = _drains(Clock(), alive)
+    drains.saw_reader(GW)
+    drains.start(
+        "r", RuntimeDrainRequest(when=RuntimeDrainWhen.covered, then=RuntimeDrainThen.restart)
+    )
+    await _settle()
+    alive.discard("r")  # the operator's Stop
+    final = await asyncio.wait_for(drains.wait("r"), 2)
+    assert ran == [], "the drain did not start it again"
+    assert final.message == runtime_drain.STOPPED_MEANWHILE
