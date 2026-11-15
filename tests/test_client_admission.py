@@ -167,6 +167,35 @@ def test_write_logs_must_be_a_boolean():
     assert validate_limits({"writeLogs": False}) == validate_limits({})
 
 
+def test_the_standalone_mirror_admits_a_metrics_check_only_with_read_metrics(tmp_path):
+    """Row 12: the standalone mirror answers `purpose: metrics` as the root does."""
+    path = tmp_path / "keys.json"
+    store = ClientKeyStore(path)
+    store.add(replace(_record(), limits={"readMetrics": True, "allowedModels": []}))
+    store = ClientKeyStore(path)
+    store.load()
+    checked = store.admit(
+        key_id="abc", action="check", request_id="m", model=None, purpose="metrics"
+    )
+    assert checked["limits"]["readMetrics"] is True and "leaseSeconds" not in checked
+    # No lease, no model.
+    for action, model in (("acquire", None), ("renew", None), ("release", None), ("check", "m")):
+        with pytest.raises(AdmissionRefusal) as caught:
+            store.admit(key_id="abc", action=action, request_id="m", model=model, purpose="metrics")
+        assert caught.value.status == 403
+    # The grant opens no inference: the model list is empty.
+    with pytest.raises(AdmissionRefusal) as caught:
+        store.admit(key_id="abc", action="acquire", request_id="i", model="m")
+    assert caught.value.status == 403
+    # Without the grant the same check is refused, saying what to turn on.
+    store.set_limits("abc", {"allowedModels": None})
+    with pytest.raises(AdmissionRefusal) as caught:
+        store.admit(key_id="abc", action="check", request_id="m2", model=None, purpose="metrics")
+    assert caught.value.status == 403 and "May read metrics" in caught.value.detail
+    with pytest.raises(ValueError):
+        validate_limits({"readMetrics": 1})
+
+
 def test_a_search_is_admitted_with_no_model_under_the_keys_limits(tmp_path):
     """Row 34: a web search has no model, and still counts against the key."""
     store = ClientKeyStore(tmp_path / "keys.json")

@@ -443,7 +443,9 @@ def test_a_build_without_it_says_so_on_the_run(
     spec = _spec(plain_model(tmp_path / "m.gguf"))
     adapter = LlamaCppAdapter()
     argv = adapter.build_argv(spec, binary, 8100)
-    assert "--spec-type" not in argv and "--metrics" not in argv
+    assert "--spec-type" not in argv
+    # `--metrics` is always on (row 12): the agent reads the queue and cache from it.
+    assert "--metrics" in argv
     view = adapter.speculation_view(spec, argv)
     assert view is not None and view.types == []
     assert view.note is not None and "does not offer" in view.note

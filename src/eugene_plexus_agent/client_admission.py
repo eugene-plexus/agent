@@ -75,6 +75,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         "requestsPerMinute",
         "localOnly",
         "writeLogs",
+        "readMetrics",
         *QUEUE_LIMITS,
     }:
         raise ValueError("invalid client limits")
@@ -94,6 +95,9 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
     # C1: may send log records to an agent's ingress (POST /v1/logs).
     if "writeLogs" in value and not isinstance(value["writeLogs"], bool):
         raise ValueError("writeLogs must be a boolean")
+    # Row 12: may read `GET /metrics` (purpose `metrics`). Grants nothing else.
+    if "readMetrics" in value and not isinstance(value["readMetrics"], bool):
+        raise ValueError("readMetrics must be a boolean")
     if allowed is not None and (
         not isinstance(allowed, list)
         or len(allowed) > 100
@@ -119,6 +123,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         "maxConcurrentRequests": concurrency,
         "requestsPerMinute": rate,
         **({"writeLogs": True} if value.get("writeLogs") else {}),
+        **({"readMetrics": True} if value.get("readMetrics") else {}),
         # Written down only when it is not the default, so a key nobody gave a
         # band keeps the shape an older root or standby reads.
         **({"band": band} if band != DEFAULT_BAND else {}),
@@ -237,6 +242,9 @@ def decide(
     """No mutation until the caller persists the returned candidate atomically."""
     limits = validate_limits(key.get("limits")) if key else None
     result: dict[str, Any] = {"keyId": key_id, "keyName": key["name"] if key else ""}
+    if purpose == "metrics" and (action != "check" or model):
+        # A scraper reads numbers: it takes no lease and names no model.
+        raise AdmissionRefusal(403, "Metrics access only permits checking the key's grants.")
     if limits is not None:
         result["limits"] = limits
     buckets = clean_buckets(ledger["buckets"], now)
@@ -259,6 +267,11 @@ def decide(
                 "or make a new key under Home -> Use it from your apps.",
             )
     if action == "check":
+        if purpose == "metrics" and not (limits and limits.get("readMetrics")):
+            raise AdmissionRefusal(
+                403,
+                "This key may not read metrics. Turn on May read metrics for it under Keys.",
+            )
         # Row 11: the gateway checks when a request arrives and acquires when it
         # leaves its queue, so a model outside the key's scope is refused here,
         # before it waits for anything. A check takes nothing.

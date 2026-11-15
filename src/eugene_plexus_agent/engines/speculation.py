@@ -248,9 +248,13 @@ def _check_target(draft: DraftingFacts, draft_path: str, model_path: str) -> Non
 
 
 def metrics_argv(argv: Sequence[str]) -> list[str]:
-    """`--metrics` when the command line speculates and does not already
-    expose the counters the runtime's acceptance rate is read from."""
-    if METRICS_FLAG in argv or not in_argv(argv):
+    """`--metrics` unless the command line already has it.
+
+    Always, not only when the run speculates (row 12): the agent's `/metrics`
+    reads the engine's queue and cache from it, and the acceptance rate of a
+    speculating run is read from it too. It opens `/metrics` on the engine's
+    own port, which shows counts and no text."""
+    if METRICS_FLAG in argv:
         return []
     return [METRICS_FLAG]
 

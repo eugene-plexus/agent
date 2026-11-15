@@ -69,6 +69,7 @@ from .routes import exec_approvals as exec_approval_routes
 from .routes import health as health_routes
 from .routes import log_ingress as log_ingress_routes
 from .routes import logs as logs_routes
+from .routes import metrics as metrics_routes
 from .routes import node as node_routes
 from .routes import oidc_forward as oidc_forward_routes
 from .routes import people as people_routes
@@ -1256,6 +1257,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # The log ingress (C1): POST /v1/logs, the one route that takes a client
     # key, write-only and only from a key with writeLogs.
     app.include_router(log_ingress_routes.router)
+    # Row 12: GET /metrics, this machine's engines for a scraper; an operator
+    # session or a key with readMetrics.
+    app.include_router(metrics_routes.router)
     # Signing in with Eugene (C2): /oidc/* forwards to the control root.
     app.include_router(oidc_forward_routes.router)
     # Row 53: this machine's store asks which people the root still has.

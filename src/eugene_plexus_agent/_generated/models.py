@@ -3338,6 +3338,8 @@ class Action(StrEnum):
 
 class Purpose(StrEnum):
     """
+    Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key's `readMetrics` is on. It never acquires, renews or releases.
+
     Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
 
     Search is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.
@@ -3348,6 +3350,7 @@ class Purpose(StrEnum):
     logs = 'logs'
     catalog = 'catalog'
     search = 'search'
+    metrics = 'metrics'
 
 
 class ClientAdmissionRequest(BaseModel):
@@ -3373,7 +3376,7 @@ class ClientAdmissionRequest(BaseModel):
     requestId: str = Field(..., max_length=128, min_length=1)
     purpose: Purpose | None = Field(
         'inference',
-        description="Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.\n",
+        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
     )
     model: str | None = Field(None, max_length=256, min_length=1)
     personToken: str | None = Field(
@@ -6006,12 +6009,16 @@ class ClientKeyLimits(BaseModel):
     )
     allowedTools: list[AllowedTool] | None = Field(
         None,
-        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
+        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search`, `image_generation`, and `mcp`\n(remote MCP servers the key\'s caller names, row 59b). **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
         max_length=100,
     )
     writeLogs: bool | None = Field(
         False,
         description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
+    )
+    readMetrics: bool | None = Field(
+        False,
+        description='Whether this key may read `GET /metrics` on a gateway or an agent,\nand `GET /v1/metrics/export` on a gateway (row 12): the numbers a\nPrometheus scraper reads. **It grants nothing else.** A key with it\nruns no inference unless `allowedModels` also names a model, and a\nkey without it is refused at every metrics path with 403.\n\nThe console\'s "Make a scrape key" sets it together with\n`allowedModels: []`, so the key can read numbers and run nothing.\nThe metrics paths ask the authority with admission purpose\n`metrics`: a check that names no model and takes no lease.\n',
     )
     maxConcurrentRequests: int | None = Field(
         2,
