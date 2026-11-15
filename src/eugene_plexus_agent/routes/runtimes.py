@@ -91,7 +91,7 @@ from ..engines.strata import StrataAdapter
 from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, resolve_model_path, rules_from_config
 from ..node_work import runtime_launch
-from ..operations import MACHINES, MODELS, operation
+from ..operations import MACHINES, MODELS, note_target, operation
 from ..preparation import PreparationJobs
 from ..reservations import ReservationLedger
 from ..runtime_context import RuntimeContext
@@ -991,6 +991,7 @@ async def create_runtime(
     body: RuntimeSpec,
     force: bool = Query(default=False),
 ) -> Runtime:
+    note_target(request, body.name)
     return await declare_runtime(request, body, force=force)
 
 

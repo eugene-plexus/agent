@@ -135,6 +135,14 @@ def _mark(request: Request, claims: tokens.Claims, power: str | None, action: st
     )
 
 
+def note_target(request: Request, target: str) -> None:
+    """Name what a change on a route with no target in its path is about (a
+    new runtime's name), for its row in the operations log."""
+    holder = getattr(request.state, STATE_KEY, None)
+    if isinstance(holder, dict) and holder.get("action"):
+        holder["target"] = target[:256]
+
+
 def operation(
     power: str | None, fallback: Callable[..., tokens.Claims]
 ) -> Callable[..., tokens.Claims]:

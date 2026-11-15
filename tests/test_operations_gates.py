@@ -212,6 +212,8 @@ def test_stop_with_operate_models(
     assert ("Dana", "p-dana", "stop runtime", 202) in names
     assert ("Owner", "operator", "stop runtime", 202) in names
     assert ("Owner", "operator", "create runtime", 201) in names
+    created = next(e for e in entries if e["action"] == "create runtime")
+    assert created["target"] == "qwen"
     # A refused attempt is not a change, and is not recorded.
     assert all(e["status"] != 403 for e in entries)
 
