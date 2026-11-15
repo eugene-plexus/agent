@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     does the machine port; a test app does not front a gateway unless it
     asks."""
 
+    tray_channel_enabled: bool = False
+    """Whether this process serves the tray icon's local channel on Windows,
+    the named pipe `\\\\.\\pipe\\eugene-plexus-agent-<port>` (row 35,
+    `tray_pipe`). `build_server` turns it on, as it does the machine port; an
+    app built in a test or a harness holds no pipe unless it asks."""
+
     safe_mode: bool = False
     """If true, skip loading the persistent state file at startup and run on
     built-in defaults — empty topology, default UI prefs. Provides a recovery

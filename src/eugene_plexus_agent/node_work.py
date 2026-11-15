@@ -25,8 +25,13 @@ async def runtime_launch(request: Request) -> AsyncIterator[None]:
 @asynccontextmanager
 async def launch_guard(request: RuntimeContext) -> AsyncIterator[None]:
     from .measurement_node import active_measurement
+    from .pause import refusal
 
     async with launch_lock(request):
+        # Row 35: while the models here are paused nothing starts one --
+        # Start, Restart, a declaration, an edit, a gateway wake, a Run.
+        if (paused := refusal(request.app)) is not None:
+            raise paused
         if kind := active_measurement(request.app):
             raise HTTPException(
                 409,

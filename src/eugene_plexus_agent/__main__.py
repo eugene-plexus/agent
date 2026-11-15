@@ -279,6 +279,9 @@ def build_server(settings: Settings, *, unattended: bool = False) -> uvicorn.Ser
     # port and app ports, the same way.
     if "client_doors_enabled" not in settings.model_fields_set:
         settings.client_doors_enabled = True
+    # The tray icon's local channel (row 35), on Windows, the same way.
+    if "tray_channel_enabled" not in settings.model_fields_set:
+        settings.tray_channel_enabled = True
     app = create_app(settings)
     # The interface this process will actually listen on, recorded where
     # `GET /v1/node`'s `reach` can read it. Not the same thing as the

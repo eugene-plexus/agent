@@ -43,6 +43,7 @@ from .. import (
     host_history,
     leaving,
     machine_port,
+    pause,
     peer,
     reach,
     security,
@@ -62,6 +63,8 @@ from .._generated.models import (
     MachineKeyChange,
     MachinePort,
     NodeIdentity,
+    NodePauseBy,
+    NodePauseResult,
     NodeReach,
     NodeReachRequest,
     NodeReachResult,
@@ -317,7 +320,35 @@ async def get_node(request: Request) -> NodeIdentity:
     # The version a person calls it, from what the update check matched:
     # memory only, so no GitHub on this path either (row 75).
     identity.version = checker_for(request.app).version(install)
+    # Row 35: whether this machine's models are paused, as in effect.
+    identity.pause = pause.view(request.app)
     return identity
+
+
+@router.post(
+    "/v1/node/pause",
+    response_model=NodePauseResult,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def pause_models(request: Request) -> NodePauseResult:
+    """Stop every model on this machine, and keep serving (row 35).
+
+    The console's Pause; the tray asks over its own channel (`tray_pipe`).
+    An operator session only: a service token or a client key is refused.
+    """
+    return await pause.pause(request.app, by=NodePauseBy.console.value)
+
+
+@router.post(
+    "/v1/node/resume",
+    response_model=NodePauseResult,
+    response_model_exclude_none=True,
+    dependencies=_write_auth,
+)
+async def resume_models(request: Request) -> NodePauseResult:
+    """Start again what Pause stopped, through admission (row 35)."""
+    return await pause.resume(request.app)
 
 
 @router.post(

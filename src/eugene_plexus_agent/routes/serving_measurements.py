@@ -41,6 +41,7 @@ from .._http import internal_client
 from ..dependencies import require_operator_session
 from ..measurement_node import active_measurement, restart_stopped, stop_agreed
 from ..node_work import launch_lock
+from ..pause import refusal as pause_refusal
 from ..serving_sweep import (
     MEASUREMENT_KEY_CONCURRENCY,
     ServingMeasurements,
@@ -339,6 +340,9 @@ async def preflight(
 @router.post("/v1/serving-measurements", response_model=ServingMeasurement, status_code=202)
 async def start(body: ServingMeasurementRequest, request: Request) -> ServingMeasurement:
     async with launch_lock(request):
+        # Row 35: its model is stopped while paused, and nothing starts it.
+        if (paused := pause_refusal(request.app)) is not None:
+            raise paused
         manager = manager_for(request)
         if manager.load_error:
             raise HTTPException(503, manager.load_error)

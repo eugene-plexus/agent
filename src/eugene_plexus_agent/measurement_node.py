@@ -30,6 +30,7 @@ from ._generated.models import (
     RuntimeStatus,
     StopReason,
 )
+from .runtime_context import RuntimeContext
 
 log = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ def active_measurement(app) -> str | None:  # type: ignore[no-untyped-def]
     return None
 
 
-def running_runtimes(request: Request) -> list[str]:
+def running_runtimes(request: Request | RuntimeContext) -> list[str]:
     """Runtimes on this node that are not stopped: the preflight's question."""
     from .routes.runtimes import _compose, _supervisor
 
@@ -106,8 +107,28 @@ def pending(names: Sequence[str]) -> list[MeasurementRestart]:
     return [MeasurementRestart(name=n, state=MeasurementRestartState.pending) for n in names]
 
 
+def _paused(request: Request | RuntimeContext, names: Sequence[str]) -> list[MeasurementRestart]:
+    """Skipped, each, when the models here are paused (row 35); else []."""
+    from .pause import machine_name, record, sentence
+
+    held = record(request.app)
+    if held is None:
+        return []
+    why = sentence(held, machine=machine_name(request.app))
+    return [
+        MeasurementRestart(
+            name=n, state=MeasurementRestartState.skipped, detail=f"Not started again. {why}"
+        )
+        for n in names
+    ]
+
+
 async def restart_stopped(
-    request: Request, names: Sequence[str], *, enabled: bool, hold_lock: bool = True
+    request: Request | RuntimeContext,
+    names: Sequence[str],
+    *,
+    enabled: bool,
+    hold_lock: bool = True,
 ) -> list[MeasurementRestart]:
     """Start again what a measurement stopped, as the Start button would.
 
@@ -120,6 +141,11 @@ async def restart_stopped(
     `hold_lock=False` is for a caller already holding the launch lock (a
     start route undoing its own stops after a refusal): asyncio's lock is
     not re-entrant, and taking it again there would wait forever.
+
+    **While the models here are paused it starts nothing** (row 35), and
+    says so for each. Asked before the lock, because Pause holds it while
+    it cancels the measurement whose end calls this; and again inside it,
+    for a restart that was already waiting when the pause began.
     """
     import contextlib
 
@@ -129,6 +155,8 @@ async def restart_stopped(
     results: list[MeasurementRestart] = []
     if not names:
         return results
+    if skipped := _paused(request, names):
+        return skipped
     if not enabled:
         return [
             MeasurementRestart(
@@ -141,6 +169,8 @@ async def restart_stopped(
     state = request.app.state.agent_state
     guard = launch_lock(request) if hold_lock else contextlib.nullcontext()
     async with guard:
+        if skipped := _paused(request, names):
+            return skipped
         for name in names:
             try:
                 spec = state.get_runtime_spec(name)

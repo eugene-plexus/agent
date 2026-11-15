@@ -41,6 +41,7 @@ from .._generated.models import (
     RuntimeAutoStart,
     RuntimeList,
     RuntimeSpec,
+    RuntimeStatus,
     StopReason,
     StopRequest,
 )
@@ -156,7 +157,31 @@ def _compose(spec: RuntimeSpec, supervisor: RuntimeSupervisor | None) -> Runtime
         # No supervisor wired (some tests): report the declaration with a
         # spec-valid `stopped`, which is honest — nothing is running it.
         return RuntimeSupervisor().compose(spec)
-    return supervisor.compose(spec)
+    return _with_pause(supervisor.compose(spec), supervisor)
+
+
+def _with_pause(runtime: Runtime, supervisor: RuntimeSupervisor) -> Runtime:
+    """`stopReason` as the pause has it (row 35), so it never says otherwise.
+
+    The supervisor records `paused` when Pause stops a runtime, and at boot
+    calls a runtime the pause holds `operator` (its stop memory is all it
+    reads). A stopped runtime the pause holds reads `paused`; one that reads
+    `paused` with no pause holding it -- Resume could not start it -- is a
+    person's stop, and the pause remembered it so.
+    """
+    if runtime.status is not RuntimeStatus.stopped:
+        return runtime
+    # `RuntimeSupervisor` keeps its stop memory private; the agent wires
+    # `AgentState` there (`app.py`), which holds the pause.
+    memory = getattr(supervisor, "_stop_memory", None)
+    if not isinstance(memory, AgentState):
+        return runtime
+    held = memory.pause_record()
+    if held is not None and runtime.name in held["runtimes"]:
+        return runtime.model_copy(update={"stopReason": StopReason.paused})
+    if runtime.stopReason is StopReason.paused:
+        return runtime.model_copy(update={"stopReason": StopReason.operator})
+    return runtime
 
 
 # --------------------------------------------------------------------------- #
@@ -1084,6 +1109,9 @@ async def stop_runtime(
     if state.get_runtime_spec(name) is None:
         raise _not_found(name)
     reason = body.reason if body is not None and body.reason is not None else StopReason.operator
+    if reason is StopReason.paused:
+        # Pause's alone (row 35): a stop that names it is a person's stop.
+        reason = StopReason.operator
     supervisor = _supervisor(request)
     if supervisor is not None:
         await supervisor.stop_one(name, reason=reason)

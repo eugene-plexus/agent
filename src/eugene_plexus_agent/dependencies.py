@@ -141,6 +141,9 @@ FROZEN_TRUST_CHANGES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/node/machine-key"),
         ("POST", "/v1/node/machine-list"),
         ("POST", "/v1/node/passphrase"),
+        # Row 35: Pause stops every model here, and Resume starts them.
+        ("POST", "/v1/node/pause"),
+        ("POST", "/v1/node/resume"),
         ("POST", "/v1/node/reach"),
         ("POST", "/v1/node/trust-bundle"),
         ("POST", "/v1/node/unenroll"),
