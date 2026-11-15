@@ -197,12 +197,12 @@ def _root_passphrase_path(request: Request) -> Path | None:
 
 
 def _operators_file_state(path: Path, passphrase: str) -> tuple[str, str | None]:
-    """Row 5's answer for the operator's file, which Eugene never writes: `matches`
+    """Row 5's answer for the operator's file, which this agent never writes: `matches`
     when it already holds `passphrase`, else `old` and what the operator must do."""
     if passphrase_file.read_passphrase(path, operators=True) == passphrase:
         return "matches", None
     return "old", (
-        f"{path} is the passphrase file this machine was given, which Eugene reads and never "
+        f"{path} is the passphrase file this machine was given, which the agent never "
         "writes; put the new passphrase in it, or the next restart stays locked"
     )
 

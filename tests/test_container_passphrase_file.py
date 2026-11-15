@@ -127,7 +127,7 @@ def test_a_roots_file_that_cannot_unlock_says_the_operator_must_fix_it(
         for r in caplog.records
         if str(tmp_path / "passphrase") in r.getMessage() and "locked" in r.getMessage()
     ]
-    assert said and all("Eugene never writes this file" in s for s in said), said
+    assert said and all("the agent never writes this file" in s for s in said), said
     assert not any("signs in" in s for s in said), said
 
 
@@ -288,3 +288,56 @@ def test_the_agents_own_file_is_not_the_operators(tmp_path: Path) -> None:
         status = c.get("/v1/auth/status").json()
     assert status["passphraseFile"] is True
     assert "passphraseFileFromOperator" not in status, status
+
+
+def _security_mode_status(settings: Settings, root_content: bytes | None) -> dict[str, str]:
+    """The agent's Security mode field status, set up as the wizard leaves a container."""
+    root = settings.root_passphrase_file
+    assert root is not None
+    with TestClient(_app(settings)) as c:
+        token = c.post("/v1/auth/initialize", json={"passphrase": TEST_PASSPHRASE}).json()
+        c.headers["Authorization"] = f"Bearer {token['sessionToken']}"
+        if root_content is not None:
+            root.write_bytes(root_content)
+        body = c.get("/v1/config/schema").json()
+    field = next(f for f in body["fields"] if f["key"] == "securityMode")
+    return dict(field["status"])
+
+
+@pytest.mark.parametrize(
+    "content, fragment",
+    [
+        (None, "does not exist"),
+        (b"somebody else's phrase", "does not hold this install's passphrase"),
+    ],
+    ids=["missing", "wrong"],
+)
+def test_the_field_never_says_it_unlocks_from_a_file_that_would_not(
+    tmp_path: Path, content: bytes | None, fragment: str
+) -> None:
+    """Settings never lie (review of agent#44): the status read the file's existence
+    only, so a file holding another passphrase showed "reads ... to unlock itself"."""
+    status = _security_mode_status(_container(tmp_path), content)
+    assert status["level"] == "warning", status
+    assert fragment in status["text"] and "to unlock itself" not in status["text"], status
+    assert "locked" in status["text"], status
+
+
+def test_the_field_says_it_unlocks_from_a_file_that_would(tmp_path: Path) -> None:
+    status = _security_mode_status(_container(tmp_path), TEST_PASSPHRASE.encode() + b"\n")
+    assert status["level"] == "info" and "to unlock itself" in status["text"], status
+
+
+def test_no_message_says_eugene_never_writes_the_operators_file(tmp_path: Path) -> None:
+    """After a passphrase change the control root writes the new one there when it can
+    (control's passphrase_change.write_file); only this agent never does."""
+    from eugene_plexus_agent import passphrase_file
+
+    said = [
+        passphrase_file._OPERATORS_FIX,
+        _security_mode_status(_container(tmp_path), TEST_PASSPHRASE.encode())["text"],
+        _operators_file_state(tmp_path / "passphrase", "another phrase")[1] or "",
+    ]
+    for text in said:
+        assert "Eugene never writes" not in text and "Eugene reads and never" not in text, text
+        assert "agent never writes" in text, text

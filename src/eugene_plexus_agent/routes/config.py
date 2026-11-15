@@ -119,6 +119,7 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         "uv": str(uv) if uv is not None else None,
         "passphrase_path": getattr(settings, "passphrase_file", None),
         "root_passphrase_path": getattr(settings, "root_passphrase_file", None),
+        "root_passphrase_problem": _root_file_problem(settings, state),
         "mode": state.get_config("securityMode"),
         "copy_enabled": state.get_config("modelCopyEnabled") is True,
         "copy_dir": state.get_config("modelCopyDir"),
@@ -252,6 +253,35 @@ def _operators_file_problem(path: Path, state: AgentState) -> str | None:
     return None
 
 
+#: The last verdict on the operator's file: one Argon2id run per change of the file
+#: or of this install's passphrase, not one per schema read (review of agent#44).
+_root_file_verdict: dict[str, Any] = {}
+
+
+def _root_file_problem(settings: Any, state: AgentState) -> str | None:
+    """`_operators_file_problem` for the operator's file when this agent unlocks from
+    it (`passphrase_file`, no file of its own); None otherwise. Cached by the file's
+    identity, size and time and the stored passphrase hash, which is all a verdict
+    reads."""
+    root = getattr(settings, "root_passphrase_file", None)
+    if (
+        root is None
+        or getattr(settings, "passphrase_file", None) is not None
+        or state.get_config("securityMode") != "passphrase_file"
+    ):
+        return None
+    try:
+        stat = root.stat()
+        seen: tuple[Any, ...] = (str(root), stat.st_ino, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        seen = (str(root), None, None, None)
+    key = (*seen, state.get_passphrase_hash())
+    if _root_file_verdict.get("key") != key:
+        _root_file_verdict.update(key=key, problem=_operators_file_problem(root, state))
+    problem: str | None = _root_file_verdict["problem"]
+    return problem
+
+
 def _security_mode_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
     mode = live["mode"]
     root = live.get("root_passphrase_path")
@@ -283,19 +313,23 @@ def _security_mode_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
         path = live["passphrase_path"]
         root = live.get("root_passphrase_path")
         if path is None and root is not None:
-            # agent#43: the container's only file, the control root's.
-            if not root.is_file():
+            # agent#43: the container's only file, the control root's. Checked as a
+            # restart reads it, so the field never claims an unlock that would not happen.
+            why = live.get("root_passphrase_problem")
+            if why is not None:
                 return ConfigFieldStatus(
                     level=ConfigFieldStatusLevel.warning,
-                    text=f"{root} does not exist, so a restart leaves this machine locked.",
+                    text=(
+                        f"{root} {why}, so a restart leaves this machine locked. Put this "
+                        "install's passphrase in it."
+                    ),
                 )
             return ConfigFieldStatus(
                 level=ConfigFieldStatusLevel.info,
                 text=(
                     f"This agent reads {root} at every start to unlock itself: the passphrase "
                     "file this machine was given (EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE). "
-                    "Eugene never writes it. Test checks that it holds this install's "
-                    "passphrase."
+                    "The agent never writes it."
                 ),
             )
         if path is None:
@@ -387,7 +421,7 @@ async def test_config(
             if why is None:
                 notes.append(
                     f"This agent unlocks itself on restart from {root}, the passphrase file "
-                    "this machine was given. Eugene never writes it: after a passphrase "
+                    "this machine was given. The agent never writes it: after a passphrase "
                     "change, put the new passphrase in it."
                 )
             else:
