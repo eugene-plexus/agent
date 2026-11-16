@@ -372,3 +372,34 @@ async def test_an_edited_runtime_saves_and_keeps_its_conversations(
     await supervisor.remove_and_stop("qwen", keep_conversations=True)
     assert engine.events == ["save 0", "stop"]
     assert [f.slot for f in dpc.saved(folder)] == [0]
+
+
+@pytest.mark.asyncio
+async def test_a_save_that_fails_never_stops_the_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor, spec, engine, _ = setup(
+        tmp_path, monkeypatch, slots=[{"id": 0, "is_processing": False, "n_prompt_tokens": 9}]
+    )
+    await _ready(supervisor, spec)
+
+    def broken(*args: object, **kwargs: object) -> int:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(dpc, "prune", broken)
+    await supervisor.stop_one("qwen", reason=StopReason.idle)
+    assert engine.events[-1] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_a_process_with_no_command_line_still_stops(tmp_path: Path) -> None:
+    stopped: list[str] = []
+
+    class Bare:
+        async def stop(self) -> None:
+            stopped.append("stop")
+
+    supervisor = RuntimeSupervisor(prompt_cache_root=tmp_path / "prompt-cache")
+    supervisor._processes["bare"] = Bare()  # type: ignore[assignment]
+    await supervisor.stop_one("bare")
+    assert stopped == ["stop"]

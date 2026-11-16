@@ -1328,9 +1328,10 @@ class RuntimeSupervisor:
 
     def _managed_folder(self, sp: SupervisedProcess | None) -> Path | None:
         """The folder this run saves to, when it is one this agent made."""
-        if sp is None or not sp.last_argv:
+        argv = getattr(sp, "last_argv", None) if sp is not None else None
+        if self.prompt_cache_root is None or not argv:
             return None
-        folder = disk_prompt_cache.folder_of(sp.last_argv)
+        folder = disk_prompt_cache.folder_of(argv)
         return folder if disk_prompt_cache.is_managed(self.prompt_cache_root, folder) else None
 
     def active_cache_folders(self) -> list[Path]:
@@ -1396,6 +1397,17 @@ class RuntimeSupervisor:
         return RuntimeDiskPromptCache(saving=True, conversations=count, bytes=size, note=None)
 
     async def save_conversations(self, name: str, *, budget: float = _SAVE_SECONDS) -> int:
+        """Before a planned stop: see `_save_conversations`. Never raises: a stop never
+        fails, or waits, for a save that went wrong."""
+        if self.prompt_cache_root is None:
+            return 0
+        try:
+            return await self._save_conversations(name, budget=budget)
+        except Exception as exc:
+            self._log.warning("runtime %s: saved no conversations to disk: %s", name, exc)
+            return 0
+
+    async def _save_conversations(self, name: str, *, budget: float) -> int:
         """Before a planned stop: the conversations a ready engine holds, to its folder.
 
         Only a ready engine with Eugene's folder, while the setting is on. A slot that is
