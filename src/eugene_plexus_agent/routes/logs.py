@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
@@ -25,7 +26,7 @@ from fastapi.responses import StreamingResponse
 from .. import install_info, logs, update_apply
 from .._generated.models import LogLine, LogPage
 from ..dependencies import require_operator_session
-from ..operations import MACHINES, operation
+from ..operations import MACHINES, operation, operations_claims
 
 router = APIRouter(tags=["logs"])
 # R39-LOGS: reading logs comes with Updates and restarts (`operate-machines`).
@@ -87,6 +88,10 @@ async def follow_logs(
     sources = source or None
     wanted = contains or None
     bus: logs.Bus = getattr(request.app.state, "log_bus", None) or logs.BUS
+    # Review S4: a follow opened with an operations token ends when the
+    # token does, so a removed power is not outlived by an open stream.
+    claims = operations_claims(request)
+    ends = float(claims.exp) if claims is not None else None
 
     async def frames() -> AsyncIterator[bytes]:
         with bus.follow() as follower:
@@ -96,8 +101,15 @@ async def follow_logs(
             yield b": following\n\n"
             reported = 0
             while True:
+                wait = KEEPALIVE_SECONDS
+                if ends is not None:
+                    left = ends - time.time()
+                    if left <= 0:
+                        yield b'event: ended\ndata: {"reason": "the operations token expired"}\n\n'
+                        return
+                    wait = min(wait, left)
                 try:
-                    line = await asyncio.wait_for(follower.queue.get(), KEEPALIVE_SECONDS)
+                    line = await asyncio.wait_for(follower.queue.get(), wait)
                 except TimeoutError:
                     yield b": keepalive\n\n"
                     continue

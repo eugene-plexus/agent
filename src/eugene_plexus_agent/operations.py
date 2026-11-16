@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -38,6 +39,7 @@ from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import tokens
@@ -86,7 +88,6 @@ OPERATIONS_ROUTES: dict[tuple[str, str], tuple[str, str]] = {
     ("POST", "/v1/engines/{engine}/uninstall"): (MACHINES, "remove engine"),
     ("POST", "/v1/node/update/check"): (MACHINES, "check for updates"),
     ("POST", "/v1/node/update"): (MACHINES, "update Eugene"),
-    ("POST", "/v1/updates/all"): (MACHINES, "update all"),
     ("POST", "/v1/components/{name}/restart"): (MACHINES, "restart component"),
     # R39-LOGS: reading logs comes with Updates and restarts.
     ("GET", "/v1/logs"): (MACHINES, "read logs"),
@@ -97,6 +98,7 @@ OPERATIONS_ROUTES: dict[tuple[str, str], tuple[str, str]] = {
 _TARGET_PARAMS = ("name", "engine", "id", "model_id")
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 STATE_KEY = "ep_operation"
+CLAIMS_KEY = "ep_operations_claims"
 
 
 def _route_of(request: Request) -> tuple[str, str | None]:
@@ -170,15 +172,91 @@ def operation(
         if power is None:
             if route not in OPERATIONS_READS or not claims.ops:
                 raise only_the_owner()
+            setattr(request.state, CLAIMS_KEY, claims)
             return claims
         if listed is None or listed[0] != power:
             raise only_the_owner()
         if not claims.holds(power):
             raise missing_power(power)
         _mark(request, claims, power, listed[1])
+        setattr(request.state, CLAIMS_KEY, claims)
         return claims
 
     return require_operation
+
+
+def operations_claims(request: Any) -> tokens.Claims | None:
+    """The operations token this request passed `operation(...)` with, if any."""
+    found = getattr(getattr(request, "state", None), CLAIMS_KEY, None)
+    return found if isinstance(found, tokens.Claims) else None
+
+
+#: Review B1: what a runtime declaration may say that reaches past running a
+#: model, so only the owner sets or changes it. With what each is, for the
+#: refusal.
+OWNER_SPEC_FIELDS: dict[str, str] = {
+    "env": "environment variables",
+    "workingDirectory": "the working directory",
+    "binary": "the engine program",
+    "extraArgs": "extra command-line arguments",
+}
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+#: A flag that names a file or folder on this machine.
+PATH_FLAG = re.compile(r"(Path|File|Dir|Directory)$")
+
+
+def owner_field(field: str, what: str) -> HTTPException:
+    return _problem(
+        status.HTTP_403_FORBIDDEN,
+        "Owner only",
+        f"Only the owner can set {what} ({field}). Leave it as it was, or ask the owner.",
+    )
+
+
+def refuse_owner_fields(
+    request: Any, spec: Any, previous: Any = None, *, folders: Any = None
+) -> None:
+    """Review B1: an operations token may declare or change a runtime, but
+    not what reaches past running a model: environment variables, the
+    working directory, the program, extra arguments, an address other
+    machines can reach, or a file outside the Library's folders. A value
+    the declaration already had is left alone. The owner is never checked
+    here. `folders` is the Library folder cache; None or unread refuses
+    every path, since nothing then says where the Library is."""
+    if operations_claims(request) is None:
+        return
+
+    def kept(field: str) -> bool:
+        return previous is not None and getattr(previous, field, None) == getattr(spec, field)
+
+    for field, what in OWNER_SPEC_FIELDS.items():
+        if getattr(spec, field, None) and not kept(field):
+            raise owner_field(field, what)
+    host = getattr(spec, "host", None)
+    if host and host not in LOOPBACK_HOSTS and not kept("host"):
+        raise owner_field("host", "an address other machines can reach")
+    known = folders is not None and getattr(folders, "known", False)
+
+    def in_library(path: Any) -> bool:
+        return isinstance(path, str) and known and folders.folder_for(path) is not None
+
+    if not in_library(getattr(spec, "modelPath", None)) and not kept("modelPath"):
+        raise owner_field("modelPath", "a model outside the Library's folders")
+    flags = getattr(spec, "flags", None) or {}
+    before = (getattr(previous, "flags", None) or {}) if previous is not None else {}
+    for key, value in flags.items():
+        if not PATH_FLAG.search(key) or value in (None, "") or before.get(key) == value:
+            continue
+        if not in_library(value):
+            raise owner_field(f"flags.{key}", "a file outside the Library's folders")
+
+
+def scrub_for_operations[M: BaseModel](request: Request, runtime: M) -> M:
+    """Review S6: a runtime read with an operations token carries no
+    environment values and no extra arguments; either can hold a key."""
+    if operations_claims(request) is None:
+        return runtime
+    return runtime.model_copy(update={"env": None, "extraArgs": None})
 
 
 # --------------------------------------------------------------------------- #
@@ -188,6 +266,8 @@ def operation(
 FILE_NAME = "operations-log.sqlite3"
 KEEP_SECONDS = 90 * 24 * 3600
 KEEP_ROWS = 10_000
+#: Refused and failed attempts: kept apart from the changes, under their own cap.
+KEEP_REFUSED_ROWS = 1_000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS operations (
@@ -245,11 +325,15 @@ class OperationsLog:
                     ),
                 )
                 db.execute("DELETE FROM operations WHERE at < ?", (at - KEEP_SECONDS,))
-                db.execute(
-                    "DELETE FROM operations WHERE id <= "
-                    "(SELECT id FROM operations ORDER BY id DESC LIMIT 1 OFFSET ?)",
-                    (KEEP_ROWS,),
-                )
+                # Review S3: refused attempts are kept apart, under their own
+                # smaller cap, so a flood of them never evicts a change.
+                for kept, failed in ((KEEP_ROWS, "<"), (KEEP_REFUSED_ROWS, ">=")):
+                    db.execute(
+                        f"DELETE FROM operations WHERE status {failed} 400 AND id <= "
+                        f"(SELECT id FROM operations WHERE status {failed} 400 "
+                        "ORDER BY id DESC LIMIT 1 OFFSET ?)",
+                        (kept,),
+                    )
                 self.error = None
             except (sqlite3.Error, OSError) as exc:
                 self.error = f"the operations log {self.path} could not be written: {exc}"

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
@@ -49,7 +49,6 @@ EXPECTED_ROUTES = {
     ("POST", "/v1/engines/{engine}/uninstall"): MACHINES,
     ("POST", "/v1/node/update/check"): MACHINES,
     ("POST", "/v1/node/update"): MACHINES,
-    ("POST", "/v1/updates/all"): MACHINES,
     ("POST", "/v1/components/{name}/restart"): MACHINES,
     ("GET", "/v1/logs"): MACHINES,
     ("GET", "/v1/logs/stream"): MACHINES,
@@ -320,3 +319,174 @@ def test_the_log_keeps_ninety_days_and_ten_thousand_rows(tmp_path: Path) -> None
     assert kept[0]["target"] == str(operations.KEEP_ROWS + 4)
     count = store._open().execute("SELECT count(*) FROM operations").fetchone()[0]
     assert count == operations.KEEP_ROWS
+
+
+# ------------------------------------------------------------ review findings
+
+
+def _library_at(app: FastAPI, folder: Path) -> None:
+    from eugene_plexus_agent.library_folders import FolderRecord, LibraryFolderCache
+
+    cache = LibraryFolderCache(folder.parent / "library_folders.json")
+    cache.update([FolderRecord(path=str(folder))], library_url="http://library.test")
+    app.state.library_folders = cache
+
+
+def _spec(tmp_path: Path, **extra: Any) -> dict[str, Any]:
+    model = tmp_path / "lib" / "q.gguf"
+    model.parent.mkdir(exist_ok=True)
+    model.write_bytes(b"GGUF" + b"\0" * 64)
+    return {"name": "q", "engine": "llama_cpp", "modelPath": str(model), **extra}
+
+
+@pytest.mark.parametrize(
+    ("extra", "field"),
+    [
+        ({"env": {"LD_PRELOAD": "/tmp/x.so"}}, "env"),
+        ({"workingDirectory": "/etc"}, "workingDirectory"),
+        ({"binary": "/bin/sh"}, "binary"),
+        ({"extraArgs": ["--api-key", "x"]}, "extraArgs"),
+        ({"host": "0.0.0.0", "port": 18123}, "host"),
+        ({"flags": {"chatTemplateFile": "/home/me/.eugene/node.yaml"}}, "flags.chatTemplateFile"),
+        ({"flags": {"projectorPath": "/elsewhere/mmproj.gguf"}}, "flags.projectorPath"),
+        ({"flags": {"draftModelPath": "/elsewhere/draft.gguf"}}, "flags.draftModelPath"),
+        ({"modelPath": "/elsewhere/other.gguf"}, "modelPath"),
+    ],
+)
+def test_models_cannot_declare_what_reaches_past_running_a_model(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path, extra: Any, field: str
+) -> None:
+    """Review B1: a runtime declaration can read files, run programs and
+    open ports; with an operations token those fields are the owner's."""
+    _library_at(app, tmp_path / "lib")
+    dana = _bearer(_operations_token(root, MODELS))
+    refused = client.post("/v1/runtimes", json=_spec(tmp_path, **extra), headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert f"({field})" in refused.json()["detail"]["detail"]
+    assert client.get("/v1/runtimes", headers=dana).json()["runtimes"] == []
+
+
+def test_models_declares_and_changes_a_plain_runtime_and_keeps_the_owners_fields(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    _library_at(app, tmp_path / "lib")
+    dana = _bearer(_operations_token(root, MODELS))
+    owner = _bearer(_owner(client, root))
+    spec = _spec(tmp_path, host="127.0.0.1", flags={"contextSize": 4096})
+    made = client.post("/v1/runtimes", json=spec, headers=dana)
+    assert made.status_code == 201, made.text
+    # The owner sets an environment; Dana's change keeps it as it is.
+    owned = {**spec, "env": {"HF_TOKEN": "hf-secret"}}
+    assert client.patch("/v1/runtimes/q", json=owned, headers=owner).status_code == 200
+    kept = {**owned, "flags": {"contextSize": 8192}}
+    assert client.patch("/v1/runtimes/q", json=kept, headers=dana).status_code == 200
+    changed = {**owned, "env": {"HF_TOKEN": "mine"}}
+    refused = client.patch("/v1/runtimes/q", json=changed, headers=dana)
+    assert refused.status_code == 403
+    assert "(env)" in refused.json()["detail"]["detail"]
+
+
+def test_a_path_is_refused_when_the_library_folders_are_unknown(
+    client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    """Nothing says where the Library is: an operations token declares nothing."""
+    dana = _bearer(_operations_token(root, MODELS))
+    refused = client.post("/v1/runtimes", json=_spec(tmp_path), headers=dana)
+    assert refused.status_code == 403
+    assert "(modelPath)" in refused.json()["detail"]["detail"]
+
+
+def test_runtime_reads_carry_no_environment_values_for_operations(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    """Review S6: an environment can hold a key (HF_TOKEN, a vLLM API key)."""
+    owner = _bearer(_owner(client, root))
+    spec = _spec(tmp_path, env={"HF_TOKEN": "hf-secret"})
+    assert client.post("/v1/runtimes", json=spec, headers=owner).status_code == 201
+    dana = _bearer(_operations_token(root, MODELS))
+    for answer in (
+        client.get("/v1/runtimes", headers=dana).json()["runtimes"][0],
+        client.get("/v1/runtimes/q", headers=dana).json(),
+    ):
+        assert "hf-secret" not in str(answer)
+    assert client.get("/v1/runtimes/q", headers=owner).json()["env"] == {"HF_TOKEN": "hf-secret"}
+
+
+def test_update_all_is_the_owners(client: TestClient, root: FakeRoot) -> None:
+    """Review S1: Update all re-checks the person who started it as a session."""
+    machines = _bearer(_operations_token(root, MACHINES))
+    refused = client.post("/v1/updates/all", headers=machines)
+    assert refused.status_code == 403
+    assert "Only the owner" in refused.json()["detail"]["detail"]
+
+
+def test_a_log_follow_ends_when_the_operations_token_does(
+    app: FastAPI, client: TestClient, root: FakeRoot
+) -> None:
+    """Review S4: the gate is checked once, at open."""
+    token, _ = root.token.mint(
+        typ=tokens.TYP_OPERATIONS,
+        sub="p-dana",
+        aud=["node:gpu-a"],
+        ttl_seconds=2,
+        extra={"ops": [MACHINES], "name": "Dana", "sid": "s", "administration_version": 1},
+    )
+    started = time.perf_counter()
+    with client.stream("GET", "/v1/logs/stream", headers=_bearer(token)) as answer:
+        assert answer.status_code == 200
+        said = "".join(answer.iter_text())
+    assert "event: ended" in said
+    assert time.perf_counter() - started < 10
+
+
+def test_operation_refuses_a_route_the_table_does_not_name() -> None:
+    """Review S8: the write side's table check, alone."""
+    from eugene_plexus_agent.dependencies import require_operator_session
+
+    root = FakeRoot()
+    root.register("gpu-a", tokens.generate_private_key().public_key())
+    small = FastAPI()
+    small.state.auth_state = _StaticAuth(root)
+    small.state.node_identity = None
+    gate = operations.operation(MODELS, require_operator_session)
+
+    @small.post("/v1/not-in-the-table", dependencies=[Depends(gate)])
+    async def unlisted() -> dict[str, str]:
+        return {"ran": "yes"}
+
+    with TestClient(small) as c:
+        answer = c.post("/v1/not-in-the-table", headers=_bearer(_operations_token(root, MODELS)))
+    assert answer.status_code == 403, answer.text
+    assert "Only the owner" in answer.json()["detail"]["detail"]
+
+
+class _StaticAuth:
+    """Just enough AuthState for `verify_bearer` against one root's bundle."""
+
+    def __init__(self, root: FakeRoot) -> None:
+        from types import SimpleNamespace
+
+        bundle = root.bundle()
+        self.trust = SimpleNamespace(
+            verify=lambda token, classes: tokens.verify(
+                token, bundle=bundle, recipient="node:gpu-a", classes=classes
+            ),
+            minted_elsewhere=lambda claims: False,
+        )
+
+    def is_revoked(self, token: str) -> bool:
+        return False
+
+
+def test_refused_attempts_never_evict_changes(tmp_path: Path) -> None:
+    """Review S3: a flood of failed attempts keeps under its own cap."""
+    store = operations.OperationsLog(tmp_path / "ops.sqlite3")
+    now = time.time()
+    row = {"personId": "p", "name": "P", "action": "stop runtime", "target": "q"}
+    store.record({**row, "status": 202, "target": "kept"}, now=now)
+    for _ in range(operations.KEEP_REFUSED_ROWS + 10):
+        store.record({**row, "status": 404}, now=now)
+    rows = store.recent(limit=5000)
+    assert any(r["target"] == "kept" for r in rows)
+    failed = store._open().execute("SELECT count(*) FROM operations WHERE status >= 400")
+    assert failed.fetchone()[0] == operations.KEEP_REFUSED_ROWS

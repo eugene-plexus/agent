@@ -91,7 +91,14 @@ from ..engines.strata import StrataAdapter
 from ..install_proxy import lookup_authorization
 from ..model_paths import PathRule, resolve_model_path, rules_from_config
 from ..node_work import runtime_launch
-from ..operations import MACHINES, MODELS, note_target, operation
+from ..operations import (
+    MACHINES,
+    MODELS,
+    note_target,
+    operation,
+    refuse_owner_fields,
+    scrub_for_operations,
+)
 from ..preparation import PreparationJobs
 from ..reservations import ReservationLedger
 from ..runtime_context import RuntimeContext
@@ -122,7 +129,10 @@ router = APIRouter()
 # wakes one on request. A leaked driver or library token still cannot.
 # Row 39: a person with an operations power passes the routes the table in
 # `operations.py` names; every other bearer meets the gate each had before.
-_read_auth = [Depends(operation(None, require_operator_or_service))]
+# One callable, so a route that also takes the claims (row 13's gateway
+# reader) gets them from this gate, once, and an operations token passes.
+_read_gate = operation(None, require_operator_or_service)
+_read_auth = [Depends(_read_gate)]
 _write_auth = [Depends(require_operator_session)]
 _lifecycle_auth = [Depends(operation(MODELS, require_operator_or_gateway))]
 _models_auth = [Depends(operation(MODELS, require_operator_session))]
@@ -946,13 +956,16 @@ def _saw_gateway(request: Request, claims: tokens.Claims) -> None:
 @router.get("/v1/runtimes", response_model=RuntimeList, tags=["runtimes"], dependencies=_read_auth)
 async def list_runtimes(
     request: Request,
-    claims: Annotated[tokens.Claims, Depends(require_operator_or_service)],
+    claims: Annotated[tokens.Claims, Depends(_read_gate)],
 ) -> RuntimeList:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     _saw_gateway(request, claims)
     return RuntimeList(
-        runtimes=[_compose(s, supervisor) for s in state.list_runtime_specs()],
+        runtimes=[
+            scrub_for_operations(request, _compose(s, supervisor))
+            for s in state.list_runtime_specs()
+        ],
     )
 
 
@@ -1000,6 +1013,10 @@ async def declare_runtime(
 ) -> Runtime:
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
+    # Row 39 review B1: with an operations token, what reaches past running
+    # a model is the owner's -- said first, naming the field.
+    await refresh_library_folders(request)
+    refuse_owner_fields(request, body, folders=folder_cache_for(request))
 
     # Validate before persisting: a declaration that can only fail at
     # spawn is worse than a 400, because the failure surfaces minutes
@@ -1096,14 +1113,14 @@ async def declare_runtime(
 async def get_runtime(
     request: Request,
     name: str,
-    claims: Annotated[tokens.Claims, Depends(require_operator_or_service)],
+    claims: Annotated[tokens.Claims, Depends(_read_gate)],
 ) -> Runtime:
     state: AgentState = request.app.state.agent_state
     spec = state.get_runtime_spec(name)
     if spec is None:
         raise _not_found(name)
     _saw_gateway(request, claims)
-    return _compose(spec, _supervisor(request))
+    return scrub_for_operations(request, _compose(spec, _supervisor(request)))
 
 
 @router.patch(
@@ -1116,6 +1133,11 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
     state: AgentState = request.app.state.agent_state
     supervisor = _supervisor(request)
     components = _component_supervisor(request)
+    # Row 39 review B1, as on create; a value the declaration had is kept.
+    await refresh_library_folders(request)
+    refuse_owner_fields(
+        request, body, state.get_runtime_spec(name), folders=folder_cache_for(request)
+    )
 
     if (reason := validate_spec(body, state.get_config)) is not None:
         raise _problem(
