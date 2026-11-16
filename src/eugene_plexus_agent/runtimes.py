@@ -445,6 +445,10 @@ class _RuntimePlanner:
         if self._data_dir is None:
             raise SpawnPlanError("this agent has no data folder for a container's cache")
         found = container_runtime.current()
+        if not found.usable:
+            # Review S2: what was unusable a moment ago (Docker Desktop still
+            # starting) is asked again at every start.
+            found = container_runtime.current(max_age=0)
         if not found.usable or found.cli is None or found.kind is None:
             raise SpawnPlanError(
                 "This model runs vLLM from its container, and "
@@ -466,17 +470,18 @@ class _RuntimePlanner:
         launch_spec = self._launch_spec()
         self.opened_path = launch_spec.modelPath
         cli, image = found.cli, pulled.image
+        context_agent = container_runtime.agent_id(self._data_dir)
         context = vllm_container.Context(
             cli=cli,
             kind=found.kind,
             image=image,
-            agent=container_runtime.agent_id(self._data_dir),
+            agent=context_agent,
             node=self._node_name() if self._node_name is not None else None,
             cache_root=self._data_dir / "vllm-cache",
             gpu=vllm_container.gpu_for(detect_host(), found.gpus),
             wsl=found.wsl,
             base_env=child_environment(),
-            offered=lambda: container_long_flags(cli, image),
+            offered=lambda: container_long_flags(cli, image, agent=context_agent),
         )
         try:
             launch = self._adapter.build_container_launch(launch_spec, port, context)
@@ -506,7 +511,11 @@ class _RuntimePlanner:
             cwd=None,
             port=port,
             on_spawn=self._record_cards,
-            container=ContainerStop(name=name, stop=lambda: container_runtime.stop(cli, name)),
+            container=ContainerStop(
+                name=name,
+                stop=lambda: container_runtime.stop(cli, name),
+                remove=lambda: container_runtime.remove_after_failed_stop(cli, name),
+            ),
         )
 
     @staticmethod
@@ -1081,6 +1090,27 @@ class RuntimeSupervisor:
             await sp.stop()
         if not keep_conversations:
             await asyncio.to_thread(disk_prompt_cache.remove_runtime, self.prompt_cache_root, name)
+            await asyncio.to_thread(self._remove_compile_cache, name)
+
+    def _remove_compile_cache(self, name: str) -> None:
+        """Row 42: a deleted runtime's vLLM compile cache goes with it. A
+        container that ran as root may have left files this account cannot
+        remove: the log names the folder and why."""
+        if self.data_dir is None:
+            return
+        folder = self.data_dir / "vllm-cache" / container_runtime.safe_name(name)
+        if not folder.exists():
+            return
+        failed: list[str] = []
+        shutil.rmtree(folder, onexc=lambda _f, path, exc: failed.append(f"{path}: {exc}"))
+        if failed:
+            self._log.warning(
+                "%s: could not remove all of its vLLM compile cache in %s (%s); a container "
+                "running as root wrote it. Remove the folder as an administrator.",
+                name,
+                folder,
+                failed[0],
+            )
 
     async def restart(self, name: str) -> bool:
         sp = self._processes.get(name)
@@ -1499,10 +1529,23 @@ class RuntimeSupervisor:
             "their memory is not attributed to Eugene's engines"
         )
 
-    async def sweep_orphan_containers(self) -> list[str]:
+    async def sweep_orphan_containers(
+        self, *, own_port: int | None = None, own_host: str = "127.0.0.1"
+    ) -> list[str]:
         """At agent start, before any runtime starts: stop every container an
-        earlier run of this agent left running (row 42)."""
+        earlier run of this agent left running (row 42).
+
+        Not when this agent's own port is held (review S6): that is a second
+        agent process on the same data folder, and the containers are the
+        first one's, live."""
         if self.data_dir is None:
+            return []
+        if own_port is not None and not ports.is_free(own_port, host=own_host, reuse_address=True):
+            self._log.warning(
+                "port %s is held, so another agent on this data folder may be running: its "
+                "containers are left alone",
+                own_port,
+            )
             return []
         if not any(shutil.which(kind) for kind in ("docker", "podman")):
             return []

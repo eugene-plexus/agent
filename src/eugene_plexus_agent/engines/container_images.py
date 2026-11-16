@@ -60,6 +60,9 @@ class ImageRecord:
     variant: str
     installed_at: str
     size_bytes: int | None = None
+    #: This agent pulled it. False for an image that was on the machine before
+    #: (a local build named by its ID, the person's own copy): never removed.
+    pulled: bool = False
 
 
 class ImageStore:
@@ -109,11 +112,16 @@ class ImageStore:
         version: str,
         variant: str,
         size: int | None = None,
+        pulled: bool = True,
     ) -> list[ImageRecord]:
         """Make this image the one in use. Returns the records that fell off,
-        which nothing kept uses: those images may be removed."""
+        which nothing kept uses and this agent pulled: those images may be
+        removed. One that was here before is never returned."""
         records = self._read()
         current, previous = records.get("current"), records.get("previous")
+        before = next(
+            (r for r in (current, previous) if r is not None and r.digest == digest), None
+        )
         new = ImageRecord(
             image=image,
             digest=digest,
@@ -121,6 +129,8 @@ class ImageStore:
             variant=variant,
             installed_at=datetime.now(UTC).isoformat(),
             size_bytes=size,
+            # Present because this agent pulled it earlier is still its pull.
+            pulled=pulled or (before is not None and before.pulled),
         )
         dropped: list[ImageRecord] = []
         if current is not None and current.digest == digest:
@@ -136,16 +146,18 @@ class ImageStore:
             updated["previous"] = kept
         self._write(updated)
         keep = {r.digest for r in updated.values()}
-        return [r for r in dropped if r.digest not in keep]
+        return [r for r in dropped if r.digest not in keep and r.pulled]
 
-    def remove_all(self, cli: str | None) -> list[ImageRecord]:
-        """Remove every image recorded here, then the record."""
+    def forget_all(self) -> list[ImageRecord]:
+        """Drop the record, so nothing starts from it; returns what it held."""
         records = list(self._read().values())
-        if cli is not None:
-            for record in records:
-                _remove_image(cli, record.digest)
         (self._dir / RECORD_NAME).unlink(missing_ok=True)
         return records
+
+    def keep(self, records: list[ImageRecord]) -> None:
+        """Record these again (images that could not be removed), the first in use."""
+        if records:
+            self._write(dict(zip(("current", "previous"), records, strict=False)))
 
     def view(self) -> ManagedImage | None:
         records = self._read()
@@ -200,20 +212,37 @@ def inspect_image(cli: str, image: str) -> tuple[str, int | None] | None:
     return first["Id"], int(size) if isinstance(size, int) else None
 
 
-def remove_images(cli: str, records: list[ImageRecord]) -> None:
-    """Remove these recorded images (blocking)."""
+def remove_images(cli: str | None, records: list[ImageRecord]) -> list[tuple[ImageRecord, str]]:
+    """Remove the images among these that this agent pulled (blocking). Returns
+    each it could not remove, with why. One that was here before is left."""
+    failed: list[tuple[ImageRecord, str]] = []
     for record in records:
-        _remove_image(cli, record.digest)
+        if not record.pulled:
+            log.info("left image %s: it was on this machine before Eugene", record.image)
+            continue
+        error = (
+            _remove_image(cli, record.digest)
+            if cli is not None
+            else "no container runtime can be used here now"
+        )
+        if error is not None:
+            failed.append((record, error))
+    return failed
 
 
-def _remove_image(cli: str, digest: str) -> None:
+def _remove_image(cli: str, digest: str) -> str | None:
     try:
         answer = _run(cli, "image", "rm", digest)
     except (OSError, subprocess.SubprocessError) as exc:
         log.warning("could not remove image %s: %s", digest, exc)
-        return
+        return str(exc)
     if answer.returncode != 0:
-        log.warning("could not remove image %s: %s", digest, answer.stderr.strip())
+        why = answer.stderr.strip() or f"exit code {answer.returncode}"
+        if "no such image" in why.lower():
+            return None
+        log.warning("could not remove image %s: %s", digest, why)
+        return why
+    return None
 
 
 def _short(digest: str) -> str:
@@ -280,6 +309,7 @@ class ImageInstaller(EngineInstaller):
     async def _pull_run(self, plan: ImagePlan, progress: _Progress) -> None:
         try:
             present = await asyncio.to_thread(inspect_image, plan.cli, plan.image)
+            pulled = present is None
             if present is None:
                 await self._pull(plan, progress)
                 present = await asyncio.to_thread(inspect_image, plan.cli, plan.image)
@@ -291,7 +321,12 @@ class ImageInstaller(EngineInstaller):
             version = plan.version or _short(image_id)
             progress.version = version
             dropped = self._images.record_pull(
-                image=plan.image, digest=image_id, version=version, variant=plan.variant, size=size
+                image=plan.image,
+                digest=image_id,
+                version=version,
+                variant=plan.variant,
+                size=size,
+                pulled=pulled,
             )
             progress.committed = True
             for record in dropped:

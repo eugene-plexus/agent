@@ -62,6 +62,38 @@ CACHE_TARGET = "/root/.cache/vllm"
 _DIGEST = re.compile(r"(?:[a-z0-9][a-z0-9._/:-]*@)?sha256:[0-9a-f]{64}")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+#: Variables the `docker`/`podman` CLI reads for itself: which daemon, which
+#: credentials, which program and libraries. A profile may not set them.
+_CLI_PREFIXES = ("DOCKER_", "PODMAN_", "CONTAINERS_", "CONTAINER_", "BUILDKIT_", "LD_", "DYLD_")
+_CLI_NAMES = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "REGISTRY_AUTH_FILE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
+        "TMPDIR",
+    }
+)
+
+
+def steers_the_cli(name: str) -> bool:
+    return name in _CLI_NAMES or name.upper().startswith(_CLI_PREFIXES)
+
+
 #: The variables that choose cards; they become device options instead.
 _NVIDIA_PINS = "CUDA_VISIBLE_DEVICES"
 
@@ -357,6 +389,13 @@ def plan_launch(
     for name in declared:
         if not _ENV_NAME.fullmatch(name):
             raise ValueError(f"{name!r} is not a variable name a container accepts")
+        if steers_the_cli(name):
+            # Values ride in the CLI's own environment (`-e NAME`), so one of
+            # these would choose the daemon, its credentials or the program.
+            raise ValueError(
+                f"{name} would steer the container program itself, not vLLM inside the "
+                "container; remove it from this runtime's environment"
+            )
     container_env.update(declared)
 
     name = container_runtime.container_name(context.agent, spec.name)

@@ -287,6 +287,9 @@ class ContainerStop:
     name: str
     #: Blocking; returns None when the container stopped, else the runtime's words.
     stop: Callable[[], str | None]
+    #: Blocking; removes the container whatever its state. Run when the stop
+    #: failed or the CLI had to be killed, so a stopped runtime holds no GPU.
+    remove: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -964,9 +967,11 @@ class SupervisedProcess:
             self._log.warning("%s: stopping container %s: %s", self.name, container.name, error)
         else:
             self._log.info("%s: stopped container %s", self.name, container.name)
+        killed = False
         try:
             await asyncio.wait_for(self._parent_exit(proc), timeout=_TERM_TIMEOUT_SECONDS)
         except TimeoutError:
+            killed = True
             self._log.warning(
                 "%s: the container CLI did not end with container %s; killing pid %s",
                 self.name,
@@ -977,6 +982,11 @@ class SupervisedProcess:
                 proc.kill()
             with contextlib.suppress(BaseException):
                 await self._parent_exit(proc)
+        if (error is not None or killed) and container.remove is not None:
+            # Review S1: a stop that failed must not leave a container holding
+            # the GPU while its runtime reads stopped.
+            await asyncio.to_thread(container.remove)
+            self._log.info("%s: removed container %s", self.name, container.name)
 
     def _begin_tree_stop(self, proc: asyncio.subprocess.Process) -> None:
         if self._tree_stop is not None:

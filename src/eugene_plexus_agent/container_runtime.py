@@ -20,6 +20,7 @@ never stop each other's containers.
 from __future__ import annotations
 
 import contextlib
+import getpass
 import hashlib
 import json
 import logging
@@ -33,13 +34,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ._generated.models import ContainerRuntime, ContainerRuntimeKind
+from ._generated.models import Accelerator, ContainerRuntime, ContainerRuntimeKind
 from .child_env import child_environment
 
 log = logging.getLogger(__name__)
 
 #: How long one detection stays current (design: at start and every 10 minutes).
 CHECK_SECONDS = 600.0
+#: How long a detection that found nothing usable is kept: Docker Desktop still
+#: starting at sign-in must not read as "not running" for ten minutes.
+UNUSABLE_SECONDS = 5.0
 #: One CLI call; `docker info` on a cold Docker Desktop can take several seconds.
 _TIMEOUT_SECONDS = 15.0
 
@@ -80,6 +84,8 @@ class Found:
     inside_container: bool = False
     error: str | None = None
     fix: str | None = None
+    #: Why GPUs do not reach containers, when known.
+    gpu_note: str | None = None
     checked_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def view(self) -> ContainerRuntime:
@@ -92,6 +98,7 @@ class Found:
             insideContainer=self.inside_container or None,
             error=self.error,
             fix=self.fix,
+            gpuNote=self.gpu_note,
             checkedAt=self.checked_at,
         )
 
@@ -125,6 +132,27 @@ def _first_line(text: str) -> str:
     return text.strip()
 
 
+def _account() -> str:
+    try:
+        return getpass.getuser()
+    except Exception:  # no name for this account: say so plainly
+        return "this account"
+
+
+def group_note(kind: ContainerRuntimeKind | None = ContainerRuntimeKind.docker) -> str:
+    """The expert's way past "this account may not use Docker", with its cost."""
+    account = _account()
+    if kind is ContainerRuntimeKind.podman:
+        return (
+            f"Expert: give {account} its own rootless Podman, or access to Podman's socket, "
+            "then restart Eugene."
+        )
+    return (
+        f"Expert: an administrator can add {account} to the docker group, then restart "
+        f"Eugene. Membership gives {account} control of this whole machine, as root has."
+    )
+
+
 def _refusal(kind: ContainerRuntimeKind, text: str) -> tuple[str, str | None]:
     """The runtime's own words, and the fix for the cases we know."""
     words = _first_line(text) or f"{kind.value} did not answer"
@@ -132,10 +160,9 @@ def _refusal(kind: ContainerRuntimeKind, text: str) -> tuple[str, str | None]:
     name = "Docker" if kind is ContainerRuntimeKind.docker else "Podman"
     if "permission denied" in lowered:
         return (
-            f"This account may not use {name}: {words}",
-            f"Add this account to the {kind.value} group, then restart Eugene."
-            if kind is ContainerRuntimeKind.docker
-            else "Give this account access to Podman, then restart Eugene.",
+            f"Eugene's account ({_account()}) may not use {name}, so vLLM cannot run from "
+            f"its container on this machine: {words}",
+            group_note(kind),
         )
     if any(
         s in lowered
@@ -163,6 +190,23 @@ def _cdi_nvidia() -> bool:
     return False
 
 
+def _host_accelerator() -> Accelerator | None:
+    """This machine's GPU kind (`engines.host`), read only where it decides
+    something: Docker Desktop, which passes NVIDIA GPUs and no others."""
+    from .engines.host import detect_host
+
+    try:
+        return detect_host().accelerator
+    except Exception:
+        return None
+
+
+_DESKTOP_GPU_NOTE = (
+    "Docker Desktop passes only NVIDIA GPUs to containers, and this machine's GPU is {}: "
+    "vLLM's container runs without it. Run vLLM from your own install for this GPU."
+)
+
+
 def _from_docker_info(cli: str, info: dict[str, Any]) -> Found:
     runtimes = info.get("Runtimes") if isinstance(info.get("Runtimes"), dict) else {}
     devices = (
@@ -172,15 +216,35 @@ def _from_docker_info(cli: str, info: dict[str, Any]) -> Found:
     kernel = str(info.get("KernelVersion") or "")
     desktop = "docker desktop" in system.lower()
     wsl = "microsoft" in kernel.lower() or "wsl" in kernel.lower()
-    gpus = (
-        "nvidia" in (runtimes or {})
-        or any(
-            isinstance(d, dict) and str(d.get("ID", "")).startswith("nvidia.com/gpu")
-            for d in devices or []
-        )
-        # Docker Desktop's WSL 2 backend passes NVIDIA GPUs to containers.
-        or (desktop and wsl)
+    gpus = "nvidia" in (runtimes or {}) or any(
+        isinstance(d, dict) and str(d.get("ID", "")).startswith("nvidia.com/gpu")
+        for d in devices or []
     )
+    note: str | None = None
+    if not gpus and desktop and wsl:
+        # Docker Desktop's WSL 2 backend passes NVIDIA GPUs to containers, and
+        # only those: an AMD or Intel GPU is said, never sent to NVIDIA's toolkit.
+        accelerator = _host_accelerator()
+        if accelerator is Accelerator.cuda:
+            gpus = True
+        else:
+            kind = (
+                {
+                    Accelerator.rocm: "AMD's",
+                    Accelerator.sycl: "Intel's",
+                    Accelerator.vulkan: "not NVIDIA's",
+                }.get(accelerator)
+                if accelerator is not None
+                else None
+            )
+            note = (
+                _DESKTOP_GPU_NOTE.format(kind)
+                if kind
+                else (
+                    "Docker Desktop passes only NVIDIA GPUs to containers, and no NVIDIA GPU "
+                    "was found on this machine: vLLM's container runs without a GPU."
+                )
+            )
     return Found(
         kind=ContainerRuntimeKind.docker,
         cli=cli,
@@ -189,6 +253,7 @@ def _from_docker_info(cli: str, info: dict[str, Any]) -> Found:
         gpus=gpus,
         desktop=desktop,
         wsl=wsl,
+        gpu_note=note,
     )
 
 
@@ -273,8 +338,10 @@ def current(*, max_age: float = CHECK_SECONDS) -> Found:
     with _lock:
         cached = _cached
     now = time.perf_counter()
-    if cached is not None and now - cached[0] < max_age:
-        return cached[1]
+    if cached is not None:
+        keep = max_age if cached[1].usable else min(max_age, UNUSABLE_SECONDS)
+        if now - cached[0] < keep:
+            return cached[1]
     found = detect()
     with _lock:
         _cached = (time.perf_counter(), found)
@@ -376,6 +443,15 @@ def remove(cli: str, name: str) -> None:
         run(cli, "rm", "-f", name, timeout=30.0)
 
 
+def remove_after_failed_stop(cli: str, name: str) -> None:
+    """After a stop that failed or was cut short: remove the container, and
+    once more a moment later, for a `docker run` whose create was already on
+    its way to the daemon when its CLI was killed (a stop during a start)."""
+    remove(cli, name)
+    time.sleep(1.0)
+    remove(cli, name)
+
+
 def stop(cli: str, name: str, *, seconds: int = 30) -> str | None:
     """`docker stop -t <seconds> <name>`: the engine gets `seconds` to end, then
     is killed. None when it stopped; the runtime's own words when not."""
@@ -385,10 +461,9 @@ def stop(cli: str, name: str, *, seconds: int = 30) -> str | None:
         return str(exc)
     if answer.returncode == 0:
         return None
-    text = answer.stderr or answer.stdout
-    if "no such container" in text.lower():
-        return None
-    return _first_line(text)
+    # "No such container" is not a stop: during a start the container may
+    # not exist yet and appear a moment later. The caller removes it then.
+    return _first_line(answer.stderr or answer.stdout) or f"exit code {answer.returncode}"
 
 
 def inspect(cli: str, name: str) -> dict[str, Any] | None:

@@ -204,6 +204,8 @@ OWNER_SPEC_FIELDS: dict[str, str] = {
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 #: A flag that names a file or folder on this machine.
 PATH_FLAG = re.compile(r"(Path|File|Dir|Directory)$")
+#: Flags that name one whose key does not say so (agent#48): vLLM's tokenizer.
+PATH_FLAG_KEYS = frozenset({"tokenizer"})
 
 
 def owner_field(field: str, what: str) -> HTTPException:
@@ -246,7 +248,8 @@ def refuse_owner_fields(
     flags = getattr(spec, "flags", None) or {}
     before = (getattr(previous, "flags", None) or {}) if previous is not None else {}
     for key, value in flags.items():
-        if not PATH_FLAG.search(key) or value in (None, "") or before.get(key) == value:
+        names_a_path = PATH_FLAG.search(key) or key in PATH_FLAG_KEYS
+        if not names_a_path or value in (None, "") or before.get(key) == value:
             continue
         if not in_library(value):
             raise owner_field(f"flags.{key}", "a file outside the Library's folders")

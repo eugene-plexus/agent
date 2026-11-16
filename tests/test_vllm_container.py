@@ -288,3 +288,22 @@ def test_an_unknown_source_is_refused_before_anything_runs(model: Path) -> None:
     assert problem is not None and "container" in problem and "binary" in problem
     problem = adapter.declaration_problem(_spec(model, flags={vc.KEY_SHM: "lots"}))
     assert problem is not None and "Shared memory" in problem
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "CONTAINER_HOST", "PATH", "LD_PRELOAD"],
+)
+def test_a_variable_that_steers_the_container_program_is_refused(
+    model: Path, tmp_path: Path, name: str
+) -> None:
+    """Review note: profile values ride in the CLI's own environment, so one of
+    these would choose the daemon, its credentials or the program."""
+    with pytest.raises(ValueError, match="steer the container program"):
+        _launch(model, tmp_path, _spec(model, env={name: "tcp://elsewhere:2375"}))
+
+
+@pytest.mark.parametrize("name", ["1BAD", "A-B", "A=B"])
+def test_a_name_that_is_not_a_variable_is_refused(model: Path, tmp_path: Path, name: str) -> None:
+    with pytest.raises(ValueError, match="not a variable name"):
+        _launch(model, tmp_path, _spec(model, env={name: "x"}))

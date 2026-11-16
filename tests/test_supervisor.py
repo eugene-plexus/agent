@@ -991,7 +991,12 @@ async def test_a_planner_that_waits_and_cannot_build_is_a_crash_like_any_other()
 
 
 async def _container_run(
-    monkeypatch: pytest.MonkeyPatch, stops: list[str], *, cli_exits: bool = True
+    monkeypatch: pytest.MonkeyPatch,
+    stops: list[str],
+    *,
+    cli_exits: bool = True,
+    stop_error: str | None = None,
+    removes: list[str] | None = None,
 ) -> tuple[SupervisedProcess, _FakeProcess]:
     """A runtime whose plan runs `docker run` in the foreground, as row 42's do."""
     procs: list[_FakeProcess] = []
@@ -1007,14 +1012,18 @@ async def _container_run(
         if cli_exits:
             # The attached CLI ends when its container does.
             procs[-1]._finish(0)
-        return None
+        return stop_error
+
+    def docker_rm() -> None:
+        if removes is not None:
+            removes.append("ep-abc-qwen")
 
     class _ContainerPlanner(_FakeEnginePlanner):
         def plan(self) -> SpawnPlan:
             return SpawnPlan(
                 argv=["/usr/bin/docker", "run", "--rm", "--name", "ep-abc-qwen"],
                 env={},
-                container=ContainerStop(name="ep-abc-qwen", stop=docker_stop),
+                container=ContainerStop(name="ep-abc-qwen", stop=docker_stop, remove=docker_rm),
             )
 
     sp = SupervisedProcess(_ContainerPlanner([]), logging.getLogger("test"))
@@ -1053,3 +1062,36 @@ async def test_a_cli_that_outlives_docker_stop_is_killed(monkeypatch: pytest.Mon
     await sp.stop()
     assert stops == ["ep-abc-qwen"]
     assert proc.killed
+
+
+async def test_a_clean_container_stop_removes_nothing_more(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stops: list[str] = []
+    removes: list[str] = []
+    sp, _ = await _container_run(monkeypatch, stops, removes=removes)
+    await sp.stop()
+    assert stops == ["ep-abc-qwen"] and removes == []
+
+
+async def test_a_stop_that_failed_removes_the_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Review S1: "No such container" during a start, or any stop error, must not
+    leave a container holding the GPU while the runtime reads stopped."""
+    stops: list[str] = []
+    removes: list[str] = []
+    sp, _ = await _container_run(
+        monkeypatch, stops, stop_error="Error: No such container: ep-abc-qwen", removes=removes
+    )
+    await sp.stop()
+    assert removes == ["ep-abc-qwen"]
+
+
+async def test_a_cli_killed_after_its_stop_removes_the_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stops: list[str] = []
+    removes: list[str] = []
+    monkeypatch.setattr("eugene_plexus_agent.supervisor._TERM_TIMEOUT_SECONDS", 0.05)
+    sp, proc = await _container_run(monkeypatch, stops, cli_exits=False, removes=removes)
+    await sp.stop()
+    assert proc.killed and removes == ["ep-abc-qwen"]

@@ -1378,8 +1378,8 @@ def _explain_container(tail: str) -> str | None:
         )
     if "permission denied" in lowered and "docker" in lowered and "sock" in lowered:
         return (
-            "This account may not use Docker. Add this account to the docker group, then "
-            "restart Eugene."
+            "Eugene's account may not use Docker, so vLLM cannot run from its container "
+            "here. " + container_runtime.group_note()
         )
     if "cannot connect to the docker daemon" in lowered or "error during connect" in lowered:
         return "Docker is not running. Start Docker, then start this model again."
@@ -1440,9 +1440,12 @@ _container_help_cache: dict[tuple[str, str], frozenset[str]] = {}
 _CONTAINER_HELP_TIMEOUT_SECONDS = 180.0
 
 
-def container_long_flags(cli: str, image: str) -> frozenset[str] | None:
+def container_long_flags(
+    cli: str, image: str, *, agent: str | None = None
+) -> frozenset[str] | None:
     """Every `--long-flag` the image's `vllm serve --help=all` lists, or None
-    when it could not be asked."""
+    when it could not be asked. Its container carries this agent's label, so
+    one left behind is removed at the next start, and no new privileges."""
     key = (cli, image)
     cached = _container_help_cache.get(key)
     if cached is not None:
@@ -1453,6 +1456,11 @@ def container_long_flags(cli: str, image: str) -> frozenset[str] | None:
                 cli,
                 "run",
                 "--rm",
+                *(["--label", f"eugene-plexus.agent={agent}"] if agent else []),
+                "--label",
+                "eugene-plexus.probe=help",
+                "--security-opt",
+                "no-new-privileges",
                 "--pull",
                 "never",
                 "--network",

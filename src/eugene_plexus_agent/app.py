@@ -608,7 +608,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Row 42: a container an earlier run left running holds a GPU and a
         # port; every one labelled with this agent is an orphan now.
         try:
-            await runtime_supervisor.sweep_orphan_containers()
+            await runtime_supervisor.sweep_orphan_containers(
+                own_port=int(settings.bind_port), own_host=settings.bind_host or "127.0.0.1"
+            )
         except Exception:
             log.exception("could not look for containers an earlier run left running")
         for spec in state.list_runtime_specs():

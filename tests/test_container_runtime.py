@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from eugene_plexus_agent import container_runtime
-from eugene_plexus_agent._generated.models import ContainerRuntimeKind
+from eugene_plexus_agent._generated.models import Accelerator, ContainerRuntimeKind
 
 from .fake_cli import FakeCli, docker_info
 
@@ -66,7 +66,10 @@ def test_docker_without_a_gpu_runtime_is_usable_without_gpus(path_dir: Path) -> 
     assert found.usable and not found.gpus and not found.desktop
 
 
-def test_docker_desktop_on_wsl2_passes_gpus(path_dir: Path) -> None:
+def test_docker_desktop_on_wsl2_passes_gpus(
+    path_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(container_runtime, "_host_accelerator", lambda: Accelerator.cuda)
     FakeCli(path_dir, "docker").rules(
         [
             {
@@ -79,7 +82,34 @@ def test_docker_desktop_on_wsl2_passes_gpus(path_dir: Path) -> None:
         ]
     )
     found = container_runtime.detect()
-    assert found.desktop and found.gpus and found.wsl
+    assert found.desktop and found.gpus and found.wsl and found.gpu_note is None
+
+
+@pytest.mark.parametrize(
+    ("accelerator", "words"),
+    [(Accelerator.vulkan, "not NVIDIA's"), (Accelerator.rocm, "AMD's"), (None, "no NVIDIA GPU")],
+)
+def test_docker_desktop_with_another_gpu_says_so(
+    path_dir: Path, monkeypatch: pytest.MonkeyPatch, accelerator: object, words: str
+) -> None:
+    """Review S5: Docker Desktop passes NVIDIA GPUs only; an AMD or Intel card
+    is said, and nothing points at NVIDIA's toolkit."""
+    monkeypatch.setattr(container_runtime, "_host_accelerator", lambda: accelerator)
+    FakeCli(path_dir, "docker").rules(
+        [
+            {
+                "args": ["info"],
+                "out": docker_info(
+                    OperatingSystem="Docker Desktop",
+                    KernelVersion="6.6.87.2-microsoft-standard-WSL2",
+                ),
+            }
+        ]
+    )
+    found = container_runtime.detect()
+    assert found.usable and not found.gpus
+    assert words in (found.gpu_note or "") and "toolkit" not in (found.gpu_note or "").lower()
+    assert found.view().gpuNote == found.gpu_note
 
 
 def test_a_permission_error_names_the_docker_group(path_dir: Path) -> None:
@@ -100,7 +130,30 @@ def test_a_permission_error_names_the_docker_group(path_dir: Path) -> None:
     assert not found.usable
     assert found.kind is ContainerRuntimeKind.docker
     assert "permission denied" in (found.error or "")
-    assert "docker group" in (found.fix or "")
+    # Review S3: the account by name, an expert's step, and what it costs.
+    account = container_runtime._account()
+    assert account in (found.error or "") and "cannot run" in (found.error or "")
+    assert (found.fix or "").startswith("Expert:") and "docker group" in (found.fix or "")
+    assert account in (found.fix or "") and "control of this whole machine" in (found.fix or "")
+    assert "usermod" not in (found.fix or "") and "sudo" not in (found.fix or "")
+
+
+def test_an_unusable_detection_is_kept_only_seconds(
+    path_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review S2: Docker Desktop still starting at sign-in is seen once it is up,
+    not ten minutes later; a usable answer is kept the full ten."""
+    docker = FakeCli(path_dir, "docker")
+    docker.rules([{"args": ["info"], "rc": 1, "err": "error during connect: not running\n"}])
+    now = [1000.0]
+    monkeypatch.setattr(container_runtime.time, "perf_counter", lambda: now[0])
+    assert not container_runtime.current().usable
+    docker.rules([{"args": ["info"], "out": docker_info()}])
+    now[0] += container_runtime.UNUSABLE_SECONDS + 1
+    assert container_runtime.current().usable
+    docker.rules([{"args": ["info"], "rc": 1, "err": "error during connect\n"}])
+    now[0] += 60
+    assert container_runtime.current().usable
 
 
 def test_a_stopped_daemon_says_to_start_docker(path_dir: Path) -> None:
@@ -214,3 +267,24 @@ def test_eugenes_own_account_runs_only_a_trusted_docker(
     found = container_runtime.detect()
     assert not found.usable and found.cli is None
     assert "can be changed by another account" in (found.error or "")
+
+
+def test_no_such_container_is_not_a_stop(path_dir: Path) -> None:
+    """Review S1: during a start the container may not exist yet."""
+    docker = FakeCli(path_dir, "docker")
+    docker.rules(
+        [{"args": ["stop"], "rc": 1, "err": "Error response from daemon: No such container: x\n"}]
+    )
+    said = container_runtime.stop(str(docker.path), "x")
+    assert said is not None and "No such container" in said
+    docker.rules([{"args": ["stop"], "out": "x\n"}])
+    assert container_runtime.stop(str(docker.path), "x") is None
+
+
+def test_a_failed_stop_removes_the_container_twice(
+    path_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docker = FakeCli(path_dir, "docker")
+    monkeypatch.setattr(container_runtime.time, "sleep", lambda _s: None)
+    container_runtime.remove_after_failed_stop(str(docker.path), "ep-a-b")
+    assert [c for c in docker.calls() if c[:1] == ["rm"]] == [["rm", "-f", "ep-a-b"]] * 2

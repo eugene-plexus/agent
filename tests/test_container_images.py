@@ -15,6 +15,7 @@ from eugene_plexus_agent.engines.container_images import (
     ImageInstaller,
     ImagePlan,
     ImageStore,
+    remove_images,
 )
 
 from .fake_cli import FakeCli
@@ -144,6 +145,29 @@ async def test_an_image_already_here_is_recorded_without_a_pull(
     assert not [c for c in docker.calls() if c[:1] == ["pull"]]
     view = store.view()
     assert view is not None and view.version == "ffffffffffff" and view.digest == local
+    # Review B1: it was here before Eugene, so it is never Eugene's to remove:
+    # not when two pulls push it off the record, not at uninstall.
+    current = store.current()
+    assert current is not None and current.pulled is False
+    for n, image in enumerate((FIRST, SECOND)):
+        dropped = store.record_pull(
+            image=image, digest=f"sha256:{n}" + "0" * 63, version="x", variant="cuda"
+        )
+        assert local not in [r.digest for r in dropped]
+    assert remove_images(str(docker.path), [current]) == []
+    assert not [c for c in docker.calls() if c[:2] == ["image", "rm"]]
+
+
+async def test_an_image_eugene_pulled_stays_its_own_when_pulled_again(
+    docker: FakeCli, tmp_path: Path
+) -> None:
+    docker.rules(_rules_for(FIRST, "sha256:" + "a" * 64, "first"))
+    store = ImageStore(tmp_path / "engines")
+    installer = ImageInstaller(store, EngineKind.vllm)
+    await _install(installer, _plan(docker, FIRST))
+    await _install(installer, _plan(docker, FIRST))  # present now: no pull, still Eugene's
+    current = store.current()
+    assert current is not None and current.pulled is True
 
 
 async def test_a_pull_can_be_cancelled(docker: FakeCli, tmp_path: Path) -> None:
@@ -168,7 +192,29 @@ def test_removing_the_images_removes_only_what_was_recorded(
     store = ImageStore(tmp_path / "engines")
     store.record_pull(image=FIRST, digest="sha256:" + "a" * 64, version="0.31.0", variant="cuda")
     store.record_pull(image=SECOND, digest="sha256:" + "b" * 64, version="0.32.0", variant="cuda")
-    store.remove_all(str(docker.path))
+    assert remove_images(str(docker.path), store.forget_all()) == []
     removed = sorted(c[2] for c in docker.calls() if c[:2] == ["image", "rm"])
     assert removed == ["sha256:" + "a" * 64, "sha256:" + "b" * 64]
     assert store.current() is None and store.view() is None
+
+
+def test_an_image_that_could_not_be_removed_is_named(docker: FakeCli, tmp_path: Path) -> None:
+    """Review S7: the caller keeps its record and says so."""
+    docker.rules(
+        [
+            {
+                "args": ["image", "rm"],
+                "rc": 1,
+                "err": "conflict: image is being used by a container\n",
+            }
+        ]
+    )
+    store = ImageStore(tmp_path / "engines")
+    store.record_pull(image=FIRST, digest="sha256:" + "a" * 64, version="0.31.0", variant="cuda")
+    failed = remove_images(str(docker.path), store.forget_all())
+    assert [(r.image, why) for r, why in failed] == [
+        (FIRST, "conflict: image is being used by a container")
+    ]
+    store.keep([r for r, _ in failed])
+    current = store.current()
+    assert current is not None and current.image == FIRST and current.pulled

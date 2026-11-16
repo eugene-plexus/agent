@@ -223,3 +223,83 @@ def test_uninstall_removes_the_pulled_images_and_only_those(
     assert authed_client.post("/v1/engines/vllm/uninstall").status_code == 204
     assert [c for c in docker.calls() if c[:2] == ["image", "rm"]] == [["image", "rm", IMAGE_ID]]
     assert store.current() is None
+
+
+def test_uninstall_says_which_images_stay_and_keeps_their_record(
+    docker: FakeCli, tmp_path: Path, authed_client
+) -> None:
+    """Review S7: not a silent 204 when an image could not be removed."""
+    docker.rules(
+        [
+            {"args": ["info"], "out": docker_info()},
+            {"args": ["image", "rm"], "rc": 1, "err": "conflict: image is in use"},
+        ]
+    )
+    store = ImageStore(tmp_path / "engines")
+    store.record_pull(image=IMAGE, digest=IMAGE_ID, version="0.33.0", variant="cuda")
+    container_runtime.forget()
+    answer = authed_client.post("/v1/engines/vllm/uninstall")
+    assert answer.status_code == 409, answer.text
+    assert IMAGE in answer.text and "conflict: image is in use" in answer.text
+    current = store.current()
+    assert current is not None and current.digest == IMAGE_ID
+
+
+def test_a_start_asks_docker_again_when_it_was_not_up(
+    docker: FakeCli, model: Path, tmp_path: Path
+) -> None:
+    """Review S2: Docker Desktop still starting a moment ago is not the answer
+    for the start that follows it."""
+    docker.rules([{"args": ["info"], "rc": 1, "err": "error during connect: starting"}])
+    assert not container_runtime.current().usable
+    docker.rules([{"args": ["info"], "out": docker_info()}])
+    _pulled(tmp_path)
+    plan = _planner(model, tmp_path, source="container").plan()
+    assert plan.container is not None
+
+
+def test_the_help_probe_container_is_labelled_and_unprivileged(docker: FakeCli) -> None:
+    from eugene_plexus_agent.engines import vllm as vllm_module
+
+    docker.rules([{"args": ["run"], "out": "--host --port --kv-offloading-size\n"}])
+    flags = vllm_module.container_long_flags(str(docker.path), IMAGE, agent="abc123abc123")
+    assert flags is not None and "--kv-offloading-size" in flags
+    run = next(c for c in docker.calls() if c[:1] == ["run"])
+    assert "eugene-plexus.agent=abc123abc123" in run
+    assert run[run.index("--security-opt") + 1] == "no-new-privileges"
+    assert run[run.index("--network") + 1] == "none"
+    assert "--mount" not in run and "-v" not in run
+
+
+async def test_a_deleted_runtime_takes_its_compile_cache(tmp_path: Path) -> None:
+    supervisor = runtimes.RuntimeSupervisor(data_dir=tmp_path / "data")
+    cache = tmp_path / "data" / "vllm-cache" / "qwen"
+    (cache / "torch_compile_cache").mkdir(parents=True)
+    (cache / "torch_compile_cache" / "graph.bin").write_bytes(b"x")
+    other = tmp_path / "data" / "vllm-cache" / "other"
+    other.mkdir()
+    await supervisor.remove_and_stop("qwen")
+    assert not cache.exists() and other.exists()
+
+
+async def test_no_sweep_while_another_agent_holds_this_ones_port(
+    docker: FakeCli, tmp_path: Path
+) -> None:
+    """Review S6: a second agent process on the same data folder never removes
+    the first one's live containers."""
+    import socket
+
+    docker.rules(
+        [
+            {"args": ["info"], "out": docker_info()},
+            {"args": ["ps"], "out": "ep-x-live\n"},
+        ]
+    )
+    supervisor = runtimes.RuntimeSupervisor(data_dir=tmp_path / "data")
+    with socket.socket() as held:
+        held.bind(("127.0.0.1", 0))
+        held.listen()
+        port = held.getsockname()[1]
+        assert await supervisor.sweep_orphan_containers(own_port=port) == []
+    assert not [c for c in docker.calls() if c[:1] in (["ps"], ["rm"])]
+    assert await supervisor.sweep_orphan_containers(own_port=port) == ["ep-x-live"]

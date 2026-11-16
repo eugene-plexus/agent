@@ -563,3 +563,27 @@ def test_models_may_choose_the_vllm_container_and_its_shared_memory(
     }
     made = client.post("/v1/runtimes", json=spec, headers=dana)
     assert made.status_code == 201, made.text
+
+
+def test_models_cannot_point_vllms_tokenizer_outside_the_library(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    """agent#48: vLLM's `tokenizer` names a folder though its key does not say
+    so; natively vLLM reads it, so it is a path like the others."""
+    _library_at(app, tmp_path / "lib")
+    folder = tmp_path / "lib" / "Qwen3-8B"
+    folder.mkdir(parents=True)
+    (folder / "tok").mkdir()
+    dana = _bearer(_operations_token(root, MODELS))
+    spec = {"name": "q", "engine": "vllm", "modelPath": str(folder), "autoStart": False}
+    refused = client.post(
+        "/v1/runtimes",
+        json={**spec, "flags": {"tokenizer": str(tmp_path / "elsewhere")}},
+        headers=dana,
+    )
+    assert refused.status_code == 403, refused.text
+    assert "(flags.tokenizer)" in refused.json()["detail"]["detail"]
+    inside = client.post(
+        "/v1/runtimes", json={**spec, "flags": {"tokenizer": str(folder / "tok")}}, headers=dana
+    )
+    assert inside.status_code == 201, inside.text

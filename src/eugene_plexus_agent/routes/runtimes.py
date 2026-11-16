@@ -956,7 +956,7 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
         adapter.managed_store().remove_builds()
         # Row 42: the container images this agent pulled, and only those: the
         # record goes now, the images below, off the event loop.
-        dropped = ImageStore(engine_root()).remove_all(None) if kind is EngineKind.vllm else []
+        dropped = ImageStore(engine_root()).forget_all() if kind is EngineKind.vllm else []
         # Its preparations' folders on this node go with it (LS10, B107):
         # what they made is in the Library folders.
         shutil.rmtree(engine_root() / "preparing" / kind.value, ignore_errors=True)
@@ -966,8 +966,20 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
         ) from exc
     if dropped:
         found = await asyncio.to_thread(container_runtime.current)
-        if found.usable and found.cli is not None:
-            await asyncio.to_thread(remove_images, found.cli, dropped)
+        failed = await asyncio.to_thread(
+            remove_images, found.cli if found.usable else None, dropped
+        )
+        if failed:
+            # Kept on the record, so the next uninstall tries them again.
+            ImageStore(engine_root()).keep([record for record, _ in failed])
+            raise _problem(
+                code=409,
+                slug="engine-images-kept",
+                title="Container images not removed",
+                detail="vLLM is removed, but not these container images: "
+                + "; ".join(f"{record.image} ({why})" for record, why in failed)
+                + ". They stay recorded; remove vLLM again to retry.",
+            )
     return Response(status_code=204)
 
 
