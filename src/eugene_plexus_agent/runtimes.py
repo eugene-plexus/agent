@@ -1485,9 +1485,10 @@ class RuntimeSupervisor:
     def unattributed(self) -> str | None:
         """Why this host's GPU memory cannot be attributed to its engines, when
         a running one is a container in Docker Desktop's virtual machine."""
+        # Read from the history sampler's thread: a snapshot of the planners.
         if not any(
             getattr(planner, "container", None) is not None and self.is_running(name)
-            for name, planner in self._planners.items()
+            for name, planner in list(self._planners.items())
         ):
             return None
         found = container_runtime.current()
