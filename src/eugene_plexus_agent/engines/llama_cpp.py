@@ -649,7 +649,12 @@ class LlamaCppAdapter(EngineAdapter):
         )
 
     async def save_slots(
-        self, base_url: str, filename_for: Callable[[int], str], *, budget: float
+        self,
+        base_url: str,
+        filename_for: Callable[[int], str],
+        *,
+        budget: float,
+        skip: Callable[[int, int, float], str | None] | None = None,
     ) -> disk_prompt_cache.SlotSaves:
         """`GET /slots`, then `POST /slots/{id}?action=save` for each slot that ran a
         conversation and is not answering now.
@@ -657,7 +662,10 @@ class LlamaCppAdapter(EngineAdapter):
         A slot read back at this start and not used since reports no task, and a slot the
         engine moved to its RAM cache reports no tokens: neither is saved again. Only the
         id, `is_processing` and `n_prompt_tokens` are read; the slot list also carries the
-        last prompt's text, which is never kept or logged."""
+        last prompt's text, which is never kept or logged.
+
+        `skip(slot, tokens, seconds left)` names a reason not to save a slot (no room, no
+        time), asked just before each save, so a save just written is counted."""
         url = base_url.rstrip("/")
         started = time.perf_counter()
         try:
@@ -686,12 +694,14 @@ class LlamaCppAdapter(EngineAdapter):
             if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0:
                 continue
             left = budget - (time.perf_counter() - started)
-            if left <= 0:
+            reason = "no time was left" if left <= 0 else skip(slot, tokens, left) if skip else None
+            if reason is not None:
                 saves.append(
-                    disk_prompt_cache.SlotSave(slot, None, tokens, None, "no time was left")
+                    disk_prompt_cache.SlotSave(slot, None, tokens, None, reason, skipped=True)
                 )
                 continue
             filename = filename_for(slot)
+            began = time.perf_counter()
             try:
                 answer = await _probe_client().post(
                     f"{url}/slots/{slot}",
@@ -699,9 +709,21 @@ class LlamaCppAdapter(EngineAdapter):
                     json={"filename": filename},
                     timeout=left,
                 )
+            except httpx.TimeoutException:
+                saves.append(
+                    disk_prompt_cache.SlotSave(
+                        slot,
+                        None,
+                        tokens,
+                        None,
+                        f"it did not finish in the {left:.0f} s left",
+                        timed_out=True,
+                    )
+                )
+                continue
             except httpx.HTTPError as e:
                 saves.append(
-                    disk_prompt_cache.SlotSave(slot, None, tokens, None, str(e) or "timed out")
+                    disk_prompt_cache.SlotSave(slot, None, tokens, None, str(e) or "no answer")
                 )
                 continue
             if not answer.is_success:
@@ -721,6 +743,7 @@ class LlamaCppAdapter(EngineAdapter):
                     saved if isinstance(saved, int) else tokens,
                     written if isinstance(written, int) else None,
                     None,
+                    seconds=time.perf_counter() - began,
                 )
             )
         return disk_prompt_cache.SlotSaves(saves, None)

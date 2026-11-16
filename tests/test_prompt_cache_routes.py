@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -97,3 +98,46 @@ def test_the_setting_says_what_is_kept_now(
     fields = {f["key"]: f for f in authed_client.get("/v1/config/schema").json()["fields"]}
     status = fields[dpc.ENABLED_KEY].get("status") or {}
     assert "1 saved conversation" in status.get("text", ""), status
+
+
+def _ops_root(app: FastAPI) -> Any:
+    from .conftest import FakeRoot, enroll_app
+    from .test_operations_gates import _reissue
+
+    found = FakeRoot()
+    enroll_app(app, found, "gpu-a")
+    _reissue(app, found)
+    return found
+
+
+def test_a_service_token_neither_reads_nor_clears(
+    app: FastAPI, client: TestClient, tmp_path: Path
+) -> None:
+    from .conftest import local_service_token
+
+    root = _root(app, tmp_path)
+    kept = _file(root / "qwen" / "k1", "1-aaaaaa-s0.bin", 100)
+    headers = {"Authorization": f"Bearer {local_service_token(app, 'gateway')}"}
+    assert client.get("/v1/prompt-cache", headers=headers).status_code in (401, 403)
+    assert client.delete("/v1/prompt-cache", headers=headers).status_code in (401, 403)
+    assert kept.exists()
+
+
+def test_an_operations_token_neither_reads_nor_clears(
+    app: FastAPI, client: TestClient, tmp_path: Path
+) -> None:
+    from eugene_plexus_agent import tokens
+
+    from .test_operations_gates import _bearer, _operations_token
+
+    ops = _ops_root(app)
+    root = _root(app, tmp_path)
+    kept = _file(root / "qwen" / "k1", "1-aaaaaa-s0.bin", 100)
+    headers = _bearer(
+        _operations_token(ops, tokens.POWER_OPERATE_MODELS, tokens.POWER_OPERATE_MACHINES)
+    )
+    # The token opens what the table gives it, so a refusal here is the route's own gate.
+    assert client.get("/v1/runtimes", headers=headers).status_code == 200
+    assert client.get("/v1/prompt-cache", headers=headers).status_code == 403
+    assert client.delete("/v1/prompt-cache", headers=headers).status_code == 403
+    assert kept.exists()

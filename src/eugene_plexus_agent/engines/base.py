@@ -770,7 +770,12 @@ class EngineAdapter(abc.ABC):
         return argv, None
 
     async def save_slots(
-        self, base_url: str, filename_for: Callable[[int], str], *, budget: float
+        self,
+        base_url: str,
+        filename_for: Callable[[int], str],
+        *,
+        budget: float,
+        skip: Callable[[int, int, float], str | None] | None = None,
     ) -> disk_prompt_cache.SlotSaves:
         """Save each slot that ran a conversation and is not answering now."""
         return disk_prompt_cache.SlotSaves(saves=[], error=None)

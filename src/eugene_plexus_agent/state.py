@@ -473,8 +473,11 @@ CONFIG_FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key=disk_prompt_cache.DAYS_KEY,
-        label="Delete a saved conversation unused for (days)",
-        description="Counted from the last time a model read it back or saved it.",
+        label="Delete a saved conversation after (days)",
+        description=(
+            "Counted from when it was saved. A conversation that goes on is saved again at "
+            "the next stop; one that was only read back is not."
+        ),
         category=disk_prompt_cache.CATEGORY,
         valueType=ConfigValueType.integer,
         default=disk_prompt_cache.DEFAULT_DAYS,
@@ -491,6 +494,21 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.integer,
         default=disk_prompt_cache.DEFAULT_CAP_GIB,
         minimum=1,
+        maximum=100000,
+    ),
+    ConfigField(
+        key=disk_prompt_cache.MIN_FREE_KEY,
+        label="Always leave at least this much free (GB)",
+        description=(
+            "A save that would leave less free space on this disk is skipped, and the model "
+            "says why.\n\n"
+            "The files are kept beside this machine's own settings, so a full disk would stop "
+            "Eugene saving them."
+        ),
+        category=disk_prompt_cache.CATEGORY,
+        valueType=ConfigValueType.integer,
+        default=disk_prompt_cache.DEFAULT_MIN_FREE_GB,
+        minimum=0,
         maximum=100000,
     ),
 ]

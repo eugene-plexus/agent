@@ -45,6 +45,9 @@ class Engine:
         self.restored: list[tuple[int, str]] = []
         self.events: list[str] = []
         self.slot_reads = 0
+        #: How a save answers: "ok", "refused" (the engine's own 500), or "slow" (no answer
+        #: in the time given).
+        self.save_answer = "ok"
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -56,6 +59,15 @@ class Engine:
             action = request.url.params.get("action")
             filename = json.loads(request.content)["filename"]
             target = self.folder / filename
+            if action == "save" and self.save_answer == "slow":
+                target.write_bytes(b"sta")
+                raise httpx.ReadTimeout("timed out", request=request)
+            if action == "save" and self.save_answer == "refused":
+                target.write_bytes(b"sta")
+                return httpx.Response(
+                    500,
+                    json={"error": {"code": 500, "message": "Unable to save slot"}},
+                )
             if action == "save":
                 target.write_bytes(b"state" * 10)
                 self.saved.append((slot, filename))
@@ -268,8 +280,10 @@ async def test_the_next_start_reads_the_newest_back_before_it_is_ready(
     assert reading.status is RuntimeStatus.loading
     await _ready(supervisor, spec)
     assert sorted(engine.restored) == [(0, newer.name), (1, newest.name)]
-    assert time.time() - newest.stat().st_mtime < 60  # used now
-    assert time.time() - old.stat().st_mtime > 250  # not read back, not touched
+    # Review S2: reading back does not mark a file used, so one never continued still
+    # expires its days after it was saved.
+    assert time.time() - newest.stat().st_mtime > 90
+    assert time.time() - old.stat().st_mtime > 250
     view = supervisor.compose(spec).diskPromptCache
     assert view is not None and view.saving is True and view.conversations == 2
 
@@ -403,3 +417,152 @@ async def test_a_process_with_no_command_line_still_stops(tmp_path: Path) -> Non
     supervisor._processes["bare"] = Bare()  # type: ignore[assignment]
     await supervisor.stop_one("bare")
     assert stopped == ["stop"]
+
+
+@pytest.mark.asyncio
+async def test_a_save_the_engine_refuses_leaves_no_file_and_says_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor, spec, engine, folder = setup(
+        tmp_path, monkeypatch, slots=[{"id": 0, "is_processing": False, "n_prompt_tokens": 9}]
+    )
+    engine.save_answer = "refused"
+    await _ready(supervisor, spec)
+    await supervisor.stop_one("qwen", reason=StopReason.idle)
+    assert not list(folder.iterdir()), list(folder.iterdir())
+    assert "Unable to save slot" in supervisor._save_notes["qwen"]
+
+
+@pytest.mark.asyncio
+async def test_a_save_that_ran_out_of_time_is_not_tried_again_blindly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor, spec, engine, folder = setup(
+        tmp_path, monkeypatch, slots=[{"id": 0, "is_processing": False, "n_prompt_tokens": 900}]
+    )
+    engine.save_answer = "slow"
+    await _ready(supervisor, spec)
+    await supervisor.save_conversations("qwen")
+    assert "did not finish" in supervisor._save_notes["qwen"]
+    assert not list(folder.glob("*.bin"))
+    engine.save_answer = "ok"
+    engine.saved.clear()
+    await supervisor.save_conversations("qwen")
+    assert engine.saved == []
+    note = supervisor.compose(spec).diskPromptCache
+    assert note is not None and "900 tokens" in (note.note or "")
+
+
+@pytest.mark.asyncio
+async def test_a_save_never_takes_the_disk_below_its_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor, spec, engine, folder = setup(
+        tmp_path, monkeypatch, slots=[{"id": 0, "is_processing": False, "n_prompt_tokens": 9}]
+    )
+    await _ready(supervisor, spec)
+    gib = dpc.GIB
+    monkeypatch.setattr(dpc, "free_bytes", lambda folder: 5 * gib)
+    await supervisor.stop_one("qwen", reason=StopReason.idle)
+    assert engine.saved == [] and not list(folder.glob("*.bin"))
+    assert "less than 10 GB free" in supervisor._save_notes["qwen"]
+
+
+@pytest.mark.asyncio
+async def test_a_first_save_that_took_the_disk_below_its_floor_is_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor, spec, engine, folder = setup(
+        tmp_path, monkeypatch, slots=[{"id": 0, "is_processing": False, "n_prompt_tokens": 9}]
+    )
+    await _ready(supervisor, spec)
+    gib = dpc.GIB
+    answers = iter([11 * gib, 9 * gib])  # before the save, then after it
+    monkeypatch.setattr(dpc, "free_bytes", lambda folder: next(answers, 9 * gib))
+    await supervisor.stop_one("qwen", reason=StopReason.idle)
+    assert engine.saved and not list(folder.glob("*.bin"))
+    assert "less than 10 GB free" in supervisor._save_notes["qwen"]
+
+
+@pytest.mark.asyncio
+async def test_a_save_larger_than_the_cap_is_not_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor, spec, engine, folder = setup(
+        tmp_path,
+        monkeypatch,
+        config={dpc.CAP_KEY: 1},
+        slots=[{"id": 0, "is_processing": False, "n_prompt_tokens": 2_000_000}],
+    )
+    await _ready(supervisor, spec)
+    # An earlier save of this launch: 1 KiB a token, so 2M tokens would be about 2 GiB.
+    (folder / "1-aaaaaa-s0-t10.bin").write_bytes(b"x" * 10_240)
+    await supervisor.stop_one("qwen", reason=StopReason.idle)
+    assert engine.saved == []
+    assert "1 GiB cap" in supervisor._save_notes["qwen"]
+
+
+@pytest.mark.asyncio
+async def test_a_folder_the_plan_did_not_make_is_never_saved_into(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    supervisor, spec, engine, _ = setup(
+        tmp_path, monkeypatch, slots=[{"id": 0, "is_processing": False, "n_prompt_tokens": 9}]
+    )
+    # The process names a folder under the root, but its plan made none (review note).
+    supervisor._planners["qwen"].disk_launch = dpc.Launch(None, dpc.NOTE_OFF)
+    await _ready(supervisor, spec)
+    await supervisor.stop_one("qwen", reason=StopReason.idle)
+    assert engine.slot_reads == 0 and engine.saved == []
+
+
+@pytest.mark.asyncio
+async def test_turning_it_off_deletes_every_file_from_the_readiness_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review S5: the real trigger, the readiness loop's look at the settings."""
+    values: dict[str, Any] = {dpc.ENABLED_KEY: True}
+    supervisor, spec, _, folder = setup(tmp_path, monkeypatch)
+    supervisor._get_config = values.get
+    kept = _saved_file(folder, "1-aaaaaa-s0.bin", age=10)
+    other = _saved_file(folder.parent, "stray.dat", age=10)
+    monkeypatch.setattr("eugene_plexus_agent.runtimes._READINESS_POLL_SECONDS", 0.01)
+    await supervisor.start_readiness_loop(lambda: [spec])
+    try:
+        await asyncio.sleep(0.1)
+        assert kept.exists()
+        values[dpc.ENABLED_KEY] = False
+        for _ in range(200):
+            if not kept.exists() and not other.exists():
+                break
+            await asyncio.sleep(0.01)
+        assert not kept.exists() and not other.exists()
+    finally:
+        await supervisor.stop_all()
+
+
+@pytest.mark.asyncio
+async def test_a_sweep_that_fails_is_logged_and_the_loop_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    supervisor, spec, _, _ = setup(tmp_path, monkeypatch)
+    calls = 0
+
+    async def broken(specs: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(supervisor, "_sweep_when_due", broken)
+    monkeypatch.setattr("eugene_plexus_agent.runtimes._READINESS_POLL_SECONDS", 0.01)
+    caplog.set_level(logging.ERROR)
+    await supervisor.start_readiness_loop(lambda: [spec])
+    try:
+        for _ in range(200):
+            if calls >= 2:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        await supervisor.stop_all()
+    assert calls >= 2
+    assert "could not apply its limits" in caplog.text and "disk gone" in caplog.text

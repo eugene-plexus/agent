@@ -45,6 +45,7 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "diskPromptCache",
         "diskPromptCacheDays",
         "diskPromptCacheGib",
+        "diskPromptCacheMinFreeGb",
         "uvBinary",
         "allowCustomApps",
         "updateChecks",

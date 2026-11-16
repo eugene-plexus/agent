@@ -562,6 +562,12 @@ class RuntimeSupervisor:
         self._swept_with: disk_prompt_cache.Settings | None = None
         #: Slots per runtime, from the engine's last ready answer.
         self._engine_slots: dict[str, int | None] = {}
+        #: Why the last save of each runtime kept less than it held, for its view (S6, S7).
+        self._save_notes: dict[str, str] = {}
+        #: Bytes a second the last save of each runtime wrote, to tell whether the next fits
+        #: its time, and the smallest slot (in tokens) whose save ran out of time.
+        self._write_rate: dict[str, float] = {}
+        self._too_slow: dict[str, int] = {}
         # A person's Stop outlives the agent: before agent#11 every runtime
         # with `autoStart` came back at the next boot, so a model stopped to
         # free the GPU took it back after every update and reboot.
@@ -1326,20 +1332,25 @@ class RuntimeSupervisor:
             return disk_prompt_cache.Settings(False, disk_prompt_cache.DEFAULT_DAYS, 0)
         return disk_prompt_cache.settings_from_config(self._get_config)
 
-    def _managed_folder(self, sp: SupervisedProcess | None) -> Path | None:
-        """The folder this run saves to, when it is one this agent made."""
+    def _managed_folder(self, name: str) -> Path | None:
+        """The folder this run saves to: the one its plan made (`disk_launch`), and only
+        while the running process was started with it."""
+        planner = self._planners.get(name)
+        launch = planner.disk_launch if planner is not None else None
+        folder = launch.folder if launch is not None else None
+        sp = self._processes.get(name)
         argv = getattr(sp, "last_argv", None) if sp is not None else None
-        if self.prompt_cache_root is None or not argv:
+        if self.prompt_cache_root is None or folder is None or not argv:
             return None
-        folder = disk_prompt_cache.folder_of(argv)
-        return folder if disk_prompt_cache.is_managed(self.prompt_cache_root, folder) else None
+        return folder if disk_prompt_cache.folder_of(argv) == folder else None
 
     def active_cache_folders(self) -> list[Path]:
         """The folders running engines save to: never removed under them."""
         return [
             folder
-            for sp in self._processes.values()
-            if sp.supervising and (folder := self._managed_folder(sp)) is not None
+            for name, sp in list(self._processes.items())
+            if getattr(sp, "supervising", False)
+            and (folder := self._managed_folder(name)) is not None
         ]
 
     def _slot_count(self, name: str) -> int:
@@ -1394,7 +1405,9 @@ class RuntimeSupervisor:
                 bytes=size,
                 note="Turned off: this run saves nothing, and its saved conversations are deleted.",
             )
-        return RuntimeDiskPromptCache(saving=True, conversations=count, bytes=size, note=None)
+        return RuntimeDiskPromptCache(
+            saving=True, conversations=count, bytes=size, note=self._save_notes.get(spec.name)
+        )
 
     async def save_conversations(self, name: str, *, budget: float = _SAVE_SECONDS) -> int:
         """Before a planned stop: see `_save_conversations`. Never raises: a stop never
@@ -1415,7 +1428,7 @@ class RuntimeSupervisor:
         save. The number saved."""
         sp = self._processes.get(name)
         planner = self._planners.get(name)
-        folder = self._managed_folder(sp)
+        folder = self._managed_folder(name)
         if (
             sp is None
             or planner is None
@@ -1439,16 +1452,16 @@ class RuntimeSupervisor:
             return disk_prompt_cache.part_name(names[slot])
 
         started = time.perf_counter()
-        try:
-            await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
-            result = await adapter.save_slots(base, filename_for, budget=budget)
-        except Exception as exc:  # a stop never fails for a save
-            self._log.warning("runtime %s: saved no conversations to disk: %s", name, exc)
-            return 0
+        await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
+        per_token = await asyncio.to_thread(disk_prompt_cache.bytes_per_token, folder)
+        skip = self._room_for(name, folder, settings, per_token, budget)
+        result = await adapter.save_slots(base, filename_for, budget=budget, skip=skip)
         if result.error is not None:
             self._log.warning("runtime %s: saved no conversations to disk: %s", name, result.error)
+            self._save_notes[name] = f"The last stop saved nothing: {result.error}."
             return 0
         kept = size = 0
+        problems: list[str] = []
         for save in result.saves:
             if save.error is not None or save.filename is None:
                 self._log.warning(
@@ -1457,16 +1470,33 @@ class RuntimeSupervisor:
                     save.slot,
                     save.error,
                 )
+                problems.append(str(save.error))
+                if save.timed_out and save.tokens:
+                    self._too_slow[name] = min(self._too_slow.get(name, save.tokens), save.tokens)
                 if save.slot in names:
                     disk_prompt_cache.discard(
                         folder / disk_prompt_cache.part_name(names[save.slot])
                     )
                 continue
-            path = await asyncio.to_thread(disk_prompt_cache.finish, folder, names[save.slot])
-            if path is not None:
-                kept += 1
-                with contextlib.suppress(OSError):
-                    size += path.stat().st_size
+            path = await asyncio.to_thread(
+                disk_prompt_cache.finish, folder, names[save.slot], save.tokens
+            )
+            if path is None:
+                problems.append("it could not be kept")
+                continue
+            written = path.stat().st_size if path.exists() else 0
+            free = await asyncio.to_thread(disk_prompt_cache.free_bytes, folder)
+            if free is not None and free < settings.min_free_bytes:
+                # Written with no size to go by (a first save): it took the disk below the
+                # floor, so it goes again (review S6).
+                disk_prompt_cache.discard(path)
+                floor = settings.min_free_bytes // disk_prompt_cache.GIB
+                problems.append(f"it left less than {floor} GB free on this disk")
+                continue
+            kept += 1
+            size += written
+            if save.seconds and save.seconds > 0.05 and written:
+                self._write_rate[name] = written / save.seconds
         await asyncio.to_thread(disk_prompt_cache.prune, folder, self._slot_count(name))
         await asyncio.to_thread(
             disk_prompt_cache.sweep,
@@ -1474,6 +1504,14 @@ class RuntimeSupervisor:
             settings,
             active=self.active_cache_folders(),
         )
+        if problems:
+            more = f" ({len(problems) - 1} more)" if len(problems) > 1 else ""
+            self._save_notes[name] = (
+                f"The last stop did not save {len(problems)} conversation"
+                f"{'s' if len(problems) != 1 else ''}: {problems[0]}{more}."
+            )
+        else:
+            self._save_notes.pop(name, None)
         if result.saves:
             self._log.info(
                 "runtime %s: saved %d conversation(s) to disk (%.1f MiB) in %.1f s",
@@ -1483,6 +1521,46 @@ class RuntimeSupervisor:
                 time.perf_counter() - started,
             )
         return kept
+
+    def _room_for(
+        self,
+        name: str,
+        folder: Path,
+        settings: disk_prompt_cache.Settings,
+        per_token: float | None,
+        budget: float,
+    ) -> Callable[[int, int, float], str | None]:
+        """Review S6: why the next slot is not saved, asked just before each save. The folder
+        is beside agent.yaml and node.yaml, so a save never takes the disk below the floor,
+        never writes more than the cap, and is not tried when it cannot finish in time."""
+        floor_gb = settings.min_free_bytes // disk_prompt_cache.GIB
+
+        def skip(slot: int, tokens: int, left: float) -> str | None:
+            estimate = tokens * per_token if per_token else None
+            free = disk_prompt_cache.free_bytes(folder)
+            if free is not None and free - (estimate or 0) < settings.min_free_bytes:
+                return f"the disk would have less than {floor_gb} GB free"
+            if estimate is not None and estimate > settings.cap_bytes:
+                gib = disk_prompt_cache.GIB
+                return (
+                    f"it would take about {estimate / gib:.1f} GiB, more than the "
+                    f"{settings.cap_bytes // gib} GiB cap"
+                )
+            slow = self._too_slow.get(name)
+            if slow is not None and tokens >= slow:
+                return (
+                    f"a save of {slow} tokens did not finish in time before, so one of "
+                    f"{tokens} is not tried"
+                )
+            rate = self._write_rate.get(name)
+            if estimate is not None and rate and estimate / rate > left:
+                return (
+                    f"it would take about {estimate / rate:.0f} s, more than the "
+                    f"{left:.0f} s left of {budget:.0f} s"
+                )
+            return None
+
+        return skip
 
     def _forget_read_back(self, name: str) -> None:
         self._read_back.pop(name, None)
@@ -1502,7 +1580,7 @@ class RuntimeSupervisor:
         running = self._reading_back.get(name)
         if running is not None and running[0] == run:
             return Loading(detail="Reading saved conversations back from disk")
-        folder = self._managed_folder(sp)
+        folder = self._managed_folder(name)
         if (
             folder is None
             or not self.disk_settings().enabled
@@ -1544,8 +1622,10 @@ class RuntimeSupervisor:
                 tried += 1
                 result = await adapter.restore_slot(base, slot, item.path.name, budget=left)
                 if result.error is None:
+                    # Not marked used (review S2): a file read back and never continued
+                    # still expires its days after it was saved. A continued conversation
+                    # is saved anew at the next stop.
                     done += 1
-                    await asyncio.to_thread(disk_prompt_cache.touch, item.path)
                 elif result.refused:
                     # The engine said the file is not one it can use: never tried again.
                     await asyncio.to_thread(disk_prompt_cache.discard, item.path)
@@ -1674,8 +1754,10 @@ class RuntimeSupervisor:
             while True:
                 specs: list[RuntimeSpec] = get_specs()  # type: ignore[operator]
                 await self._reconcile_copies_if_changed(specs)
-                with contextlib.suppress(Exception):
+                try:
                     await self._sweep_when_due(specs)
+                except Exception:
+                    self._log.exception("the prompt cache on disk could not apply its limits")
                 await asyncio.gather(
                     *(self._probe_one(s) for s in specs),
                     return_exceptions=True,

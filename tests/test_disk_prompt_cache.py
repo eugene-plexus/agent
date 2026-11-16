@@ -124,6 +124,35 @@ def test_anything_that_shapes_the_state_changes_the_key(tmp_path: Path, change: 
     assert dpc.launch_key(after_argv, env) != before
 
 
+@pytest.mark.parametrize("spelling", ["--model=", "LLAMA_ARG_MODEL"])
+def test_a_model_named_any_way_is_part_of_the_key(tmp_path: Path, spelling: str) -> None:
+    model = _model(tmp_path)
+
+    def key() -> str:
+        if spelling == "--model=":
+            return dpc.launch_key(["/engines/llama-server", f"--model={model}"], {})
+        return dpc.launch_key(["/engines/llama-server"], {"LLAMA_ARG_MODEL": str(model)})
+
+    before = key()
+    model.write_bytes(b"GGUF-two-longer")
+    assert key() != before
+
+
+def test_a_file_replaced_in_place_with_the_same_size_and_time_is_another_file(
+    tmp_path: Path,
+) -> None:
+    model = _model(tmp_path, body=b"GGUF-one")
+    argv = ["/engines/llama-server", "--model", str(model)]
+    stamp = model.stat().st_mtime_ns
+    before = dpc.launch_key(argv, {})
+    other = tmp_path / "other.gguf"
+    other.write_bytes(b"GGUF-two")
+    os.utime(other, ns=(stamp, stamp))
+    os.replace(other, model)
+    assert model.stat().st_size == 8 and model.stat().st_mtime_ns == stamp
+    assert dpc.launch_key(argv, {}) != before
+
+
 def test_a_search_model_keeps_no_cache(tmp_path: Path) -> None:
     argv = _argv(_model(tmp_path), "--embeddings")
     assert _plan(tmp_path, argv, search=True) == (argv, None)
@@ -136,13 +165,76 @@ def test_off_passes_nothing_and_says_so(tmp_path: Path) -> None:
     assert launch == dpc.Launch(None, dpc.NOTE_OFF)
 
 
-def test_an_engine_other_machines_can_reach_saves_nothing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("where", ["spec", "extraArgs", "extraArgs=", "env"])
+def test_an_engine_other_machines_can_reach_saves_nothing(tmp_path: Path, where: str) -> None:
+    """Review B1: llama-server takes the last `--host`, and `extraArgs` come last; with no
+    `--host` at all it reads LLAMA_ARG_HOST."""
     argv = _argv(_model(tmp_path))
-    planned, launch = _plan(tmp_path, argv, host="0.0.0.0")
+    extra: list[str] = []
+    env: dict[str, str] = {}
+    if where == "spec":
+        argv[argv.index("--host") + 1] = "0.0.0.0"
+    elif where == "extraArgs":
+        extra = ["--host", "0.0.0.0"]
+    elif where == "extraArgs=":
+        extra = ["--host=0.0.0.0"]
+    else:
+        index = argv.index("--host")
+        del argv[index : index + 2]
+        env = {"LLAMA_ARG_HOST": "0.0.0.0"}
+    argv += extra
+    planned, launch = _plan(tmp_path, argv, extra_args=extra, env=env)
     assert planned == argv
     assert launch is not None and launch.folder is None
     assert "0.0.0.0" in (launch.note or "")
     assert not (tmp_path / "prompt-cache").exists()
+
+
+def test_a_later_loopback_host_still_saves(tmp_path: Path) -> None:
+    argv = [*_argv(_model(tmp_path)), "--host", "0.0.0.0", "--host=127.0.0.1"]
+    _, launch = _plan(tmp_path, argv, extra_args=argv[-3:])
+    assert launch is not None and launch.folder is not None
+
+
+@pytest.mark.parametrize(
+    ("extra", "env", "cause"),
+    [
+        (["--no-slots"], {}, "--no-slots"),
+        ([], {"LLAMA_ARG_ENDPOINT_SLOTS": "0"}, "--no-slots"),
+        (["--api-key", "secret"], {}, "--api-key"),
+        (["--api-key-file=/k"], {}, "--api-key"),
+        ([], {"LLAMA_ARG_API_KEY": "secret"}, "--api-key"),
+    ],
+)
+def test_a_command_line_on_which_every_save_fails_keeps_none(
+    tmp_path: Path, extra: list[str], env: dict[str, str], cause: str
+) -> None:
+    """Review S7: no slot routes, or slot routes behind a key, and the runtime says why."""
+    argv = [*_argv(_model(tmp_path)), *extra]
+    planned, launch = _plan(tmp_path, argv, extra_args=extra, env=env)
+    assert planned == argv
+    assert launch is not None and launch.folder is None
+    assert cause in (launch.note or "")
+    assert "secret" not in (launch.note or "")
+
+
+def test_slots_turned_back_on_still_save(tmp_path: Path) -> None:
+    extra = ["--no-slots", "--slots"]
+    _, launch = _plan(tmp_path, [*_argv(_model(tmp_path)), *extra], extra_args=extra)
+    assert launch is not None and launch.folder is not None
+
+
+def test_a_folder_that_cannot_be_made_names_the_cause_not_the_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(path: Path, root: Path) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(dpc, "make_private_dir", refuse)
+    _, launch = _plan(tmp_path, _argv(_model(tmp_path)))
+    assert launch is not None and launch.folder is None
+    assert "Permission denied" in (launch.note or "")
+    assert str(tmp_path) not in (launch.note or "") and "prompt-cache" not in (launch.note or "")
 
 
 @pytest.mark.parametrize("where", ["extraArgs", "env"])
@@ -297,3 +389,55 @@ def test_clear_deletes_every_file_and_counts_them(tmp_path: Path) -> None:
     assert (cleared.conversations, cleared.bytes_freed, cleared.not_deleted) == (2, 40, 0)
     assert dpc.usage(root, ["qwen"]).conversations == 0
     assert (root / "qwen" / "k1").is_dir()
+
+
+# --- review S3: every file in the folder is the cache's ---------------------------------
+
+
+def test_a_file_saved_under_another_name_counts_and_goes(tmp_path: Path) -> None:
+    root = tmp_path / "prompt-cache"
+    ours = _file(root / "qwen" / "k1", "1-aaaaaa-s0.bin", 10)
+    stray = _file(root / "qwen" / "k1", "anything.dat", 40)
+    assert dpc.usage(root, ["qwen"]).bytes == 50
+    # Above the cap the oldest goes, whatever its name.
+    os.utime(stray, (time.time() - 300, time.time() - 300))
+    dpc.sweep(root, dpc.Settings(True, 3, 30), declared=["qwen"])
+    assert ours.exists() and not stray.exists()
+    stray = _file(root / "qwen" / "k1", "anything.dat", 40, age_seconds=4 * 86400)
+    dpc.sweep(root, ON, declared=["qwen"])
+    assert not stray.exists()
+    stray = _file(root / "qwen" / "k1", "anything.dat", 40)
+    cleared = dpc.clear(root)
+    assert cleared.conversations == 2 and not stray.exists() and not ours.exists()
+    stray = _file(root / "qwen" / "k1", "anything.dat", 40)
+    dpc.sweep(root, dpc.Settings(False, 3, 20 * GIB), declared=["qwen"])
+    assert not stray.exists()
+
+
+def test_prune_keeps_only_the_newest_saves(tmp_path: Path) -> None:
+    folder = tmp_path / "f"
+    ours = _file(folder, "1-aaaaaa-s0.bin", 10)
+    stray = _file(folder, "x.dat", 10)
+    dpc.prune(folder, keep=4)
+    assert ours.exists() and not stray.exists()
+
+
+def test_a_file_the_system_kept_is_not_counted_as_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "prompt-cache"
+    old = _file(root / "qwen" / "k1", "1-aaaaaa-s0.bin", 10, age_seconds=4 * 86400)
+    monkeypatch.setattr(dpc, "discard", lambda path: False)
+    result = dpc.sweep(root, ON, declared=["qwen"])
+    assert old.exists()
+    assert (result.expired, result.bytes_freed) == (0, 0)
+
+
+def test_the_size_of_a_next_save_is_estimated_from_the_last(tmp_path: Path) -> None:
+    folder = tmp_path / "f"
+    name = dpc.new_name(0)
+    _file(folder, dpc.part_name(name), 1000)
+    kept = dpc.finish(folder, name, tokens=100)
+    assert kept is not None and kept.name.endswith("-s0-t100.bin")
+    assert dpc.saved(folder)[0].tokens == 100
+    assert dpc.bytes_per_token(folder) == 10.0

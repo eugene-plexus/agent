@@ -55,13 +55,17 @@ log = logging.getLogger(__name__)
 ENABLED_KEY = "diskPromptCache"
 DAYS_KEY = "diskPromptCacheDays"
 CAP_KEY = "diskPromptCacheGib"
-KEYS = frozenset({ENABLED_KEY, DAYS_KEY, CAP_KEY})
+MIN_FREE_KEY = "diskPromptCacheMinFreeGb"
+KEYS = frozenset({ENABLED_KEY, DAYS_KEY, CAP_KEY, MIN_FREE_KEY})
 CATEGORY = "promptCache"
 
 #: DI-C4 (Troy, 2026-10-21): on for llama.cpp, kept 3 days, a 20 GiB cap that is a setting.
 DEFAULT_ENABLED = True
 DEFAULT_DAYS = 3
 DEFAULT_CAP_GIB = 20
+#: Review S6: the folder is beside agent.yaml and node.yaml, so a save never takes the
+#: disk below this much free space.
+DEFAULT_MIN_FREE_GB = 10
 GIB = 1024**3
 
 FOLDER_NAME = "prompt-cache"
@@ -79,7 +83,14 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _NOT_STATE = frozenset({"--host", "--port", "--alias", "-a", FLAG})
 _NOT_STATE_VARIABLES = frozenset({"LLAMA_ARG_HOST", "LLAMA_ARG_PORT", "LLAMA_ARG_ALIAS", VARIABLE})
 _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
-_FILE_NAME = re.compile(r"^(\d+)-[0-9a-f]{6}-s(\d+)$")
+_FILE_NAME = re.compile(r"^(\d+)-[0-9a-f]{6}-s(\d+)(?:-t(\d+))?$")
+_HOST_FLAGS = ("--host",)
+#: Flags with which every save fails: no slot routes, or slot routes that want a key.
+_NO_SLOTS = ("--no-slots",)
+_SLOTS = ("--slots",)
+_KEY_FLAGS = ("--api-key", "--api-key-file")
+_KEY_VARIABLES = ("LLAMA_ARG_API_KEY", "LLAMA_ARG_API_KEY_FILE")
+_FALSE = frozenset({"0", "false", "off", "no", "disabled"})
 
 NOTE_OFF = "Off in this machine's settings."
 
@@ -92,6 +103,7 @@ class Settings:
     enabled: bool
     days: int
     cap_bytes: int
+    min_free_bytes: int = DEFAULT_MIN_FREE_GB * GIB
 
     @property
     def max_age_seconds(self) -> float:
@@ -114,6 +126,7 @@ def settings_from_config(get_config: Callable[[str], Any] | None) -> Settings:
         enabled=DEFAULT_ENABLED if enabled is None else enabled is True,
         days=_whole(get_config(DAYS_KEY), DEFAULT_DAYS, 1),
         cap_bytes=_whole(get_config(CAP_KEY), DEFAULT_CAP_GIB, 1) * GIB,
+        min_free_bytes=_whole(get_config(MIN_FREE_KEY), DEFAULT_MIN_FREE_GB, 0) * GIB,
     )
 
 
@@ -128,8 +141,16 @@ def runtime_folder(root: Path, runtime: str) -> Path:
 
 
 def _identity(token: str) -> list[object] | None:
-    """`[size, mtime_ns]` of a file a command-line value names, or None when it names none."""
-    if not token or token.startswith("-") or len(token) > 4096:
+    """`[size, mtime_ns, device, file id]` of a file a command-line value names (`PATH`, or
+    the value of `--flag=PATH`), or None when it names none. The file id is the inode, or
+    the file index on Windows: a file replaced in place under the same size and time is
+    still another file."""
+    if token.startswith("-"):
+        _, equals, value = token.partition("=")
+        if not equals:
+            return None
+        token = value
+    if not token or len(token) > 4096:
         return None
     try:
         found = os.stat(token)
@@ -137,7 +158,7 @@ def _identity(token: str) -> list[object] | None:
         return None
     if not stat.S_ISREG(found.st_mode):
         return None
-    return [found.st_size, found.st_mtime_ns]
+    return [found.st_size, found.st_mtime_ns, found.st_dev, found.st_ino]
 
 
 def launch_key(argv: Sequence[str], env: Mapping[str, str] | None) -> str:
@@ -156,28 +177,73 @@ def launch_key(argv: Sequence[str], env: Mapping[str, str] | None) -> str:
             skip = not equals
             continue
         kept.append([token, _identity(token)])
-    variables = sorted(
-        (key, value)
-        for key, value in (env or {}).items()
+    variables = [
+        [key, value, _identity(value)]
+        for key, value in sorted((env or {}).items())
         if key.startswith("LLAMA_ARG_") and key not in _NOT_STATE_VARIABLES
-    )
+    ]
     payload = json.dumps({"argv": kept, "env": variables}, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
-def folder_of(argv: Sequence[str]) -> Path | None:
-    """The folder a running engine saves to: the last `--slot-save-path` on its command line."""
+def last_value(argv: Sequence[str], names: Sequence[str]) -> str | None:
+    """The value of the last `--flag value` or `--flag=value` among `argv`: the one
+    llama-server's parser ends with."""
     found: str | None = None
     items = [str(token) for token in argv]
     for index, token in enumerate(items):
         name, equals, inline = token.partition("=")
-        if name != FLAG:
+        if name not in names:
             continue
         if equals:
             found = inline
         elif index + 1 < len(items):
             found = items[index + 1]
+    return found
+
+
+def _last_switch(argv: Sequence[str], on: Sequence[str], off: Sequence[str]) -> bool | None:
+    """Whether the last of a pair of switches (`--slots`/`--no-slots`) is on; None if neither."""
+    found: bool | None = None
+    for token in argv:
+        if token in on:
+            found = True
+        elif token in off:
+            found = False
+    return found
+
+
+def folder_of(argv: Sequence[str]) -> Path | None:
+    """The folder a running engine saves to: the last `--slot-save-path` on its command line."""
+    found = last_value(argv, (FLAG,))
     return Path(found) if found else None
+
+
+def listens_on(argv: Sequence[str], env: Mapping[str, str] | None) -> str:
+    """Where the engine listens, as llama-server decides it (review B1): the last `--host`
+    on its command line, `extraArgs` included, else `LLAMA_ARG_HOST`, else loopback."""
+    host = last_value(argv, _HOST_FLAGS)
+    if host is None:
+        host = (env or {}).get("LLAMA_ARG_HOST") or None
+    return host or "127.0.0.1"
+
+
+def _why_saves_fail(argv: Sequence[str], env: Mapping[str, str] | None) -> str | None:
+    """Review S7: a command line on which every save would fail, and why."""
+    env = env or {}
+    slots = _last_switch(argv, _SLOTS, _NO_SLOTS)
+    if slots is None and env.get("LLAMA_ARG_ENDPOINT_SLOTS", "").strip().lower() in _FALSE:
+        slots = False
+    if slots is False:
+        return "Not kept: the slot routes are off (--no-slots), so the engine cannot save them."
+    if any(last_value(argv, (flag,)) for flag in _KEY_FLAGS) or any(
+        env.get(variable) for variable in _KEY_VARIABLES
+    ):
+        return (
+            "Not kept: the engine was given an API key (--api-key), so Eugene cannot ask it "
+            "to save or read them back."
+        )
+    return None
 
 
 def is_managed(root: Path | None, folder: Path | None) -> bool:
@@ -242,21 +308,27 @@ def plan(
         return argv, Launch(None, NOTE_OFF)
     if root is None:
         return argv, Launch(None, "This agent has no folder of its own to keep them in.")
-    if (host or "127.0.0.1") not in LOOPBACK_HOSTS:
+    listening = listens_on(argv, env) if argv else (host or "127.0.0.1")
+    if listening not in LOOPBACK_HOSTS:
         # llama-server's slot routes take no key: an engine other machines can reach would
         # let them write, read back and erase files in this folder.
         return argv, Launch(
             None,
-            f"Not kept: this model listens on {host}, which other machines can reach, and "
-            "saving needs an engine that listens on this machine only.",
+            f"Not kept: this model listens on {listening}, which other machines can reach, "
+            "and saving needs an engine that listens on this machine only.",
         )
+    failing = _why_saves_fail(argv, env)
+    if failing is not None:
+        return argv, Launch(None, failing)
     if offered is not None and FLAG not in offered:
         return argv, Launch(None, f"This llama.cpp build has no {FLAG}, so nothing is saved.")
     folder = runtime_folder(root, runtime) / launch_key(argv, env)
     try:
         make_private_dir(folder, root)
     except OSError as exc:
-        return argv, Launch(None, f"Its folder could not be made: {exc}")
+        # The cause only: the note is read by services and operations tokens, which are
+        # not told where this machine keeps its files.
+        return argv, Launch(None, f"Its folder could not be made: {exc.strerror or 'refused'}.")
     tail = len(extra_args or [])
     head = argv[: len(argv) - tail] if tail else list(argv)
     return [*head, FLAG, str(folder), *argv[len(head) :]], Launch(folder, None)
@@ -274,6 +346,11 @@ class SlotSave:
     tokens: int | None
     bytes: int | None
     error: str | None
+    #: Not attempted: `error` is the agent's reason (no room, no time).
+    skipped: bool = False
+    #: The engine did not answer within the time left.
+    timed_out: bool = False
+    seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -302,13 +379,16 @@ class Saved:
     bytes: int
     used: float
     saved: int
+    tokens: int | None = None
 
 
-def _parse(name: str) -> tuple[int, int | None]:
+def _parse(name: str) -> tuple[int, int | None, int | None]:
+    """`(saved at, slot, tokens)` from a file's name."""
     match = _FILE_NAME.match(name)
     if match is None:
-        return 0, None
-    return int(match.group(1)), int(match.group(2))
+        return 0, None, None
+    tokens = match.group(3)
+    return int(match.group(1)), int(match.group(2)), int(tokens) if tokens else None
 
 
 def new_name(slot: int) -> str:
@@ -340,16 +420,17 @@ def saved(folder: Path) -> list[Saved]:
             continue
         if not stat.S_ISREG(info.st_mode):
             continue
-        at, slot = _parse(entry.name[: -len(SAVED)])
-        out.append(Saved(Path(entry.path), slot, info.st_size, info.st_mtime, at))
+        at, slot, tokens = _parse(entry.name[: -len(SAVED)])
+        out.append(Saved(Path(entry.path), slot, info.st_size, info.st_mtime, at, tokens))
     out.sort(key=lambda s: (s.used, s.saved, s.path.name), reverse=True)
     return out
 
 
-def finish(folder: Path, name: str) -> Path | None:
-    """The engine finished saving `<name>.part`: make it `<name>.bin`, owner-only."""
+def finish(folder: Path, name: str, tokens: int | None = None) -> Path | None:
+    """The engine finished saving `<name>.part`: make it `<name>-t<tokens>.bin`, owner-only.
+    The token count in the name is what the next save's size is estimated from."""
     source = folder / part_name(name)
-    target = folder / (name + SAVED)
+    target = folder / (name + (f"-t{tokens}" if tokens else "") + SAVED)
     try:
         if os.name != "nt":
             os.chmod(source, 0o600)
@@ -362,27 +443,42 @@ def finish(folder: Path, name: str) -> Path | None:
     return target
 
 
-def discard(path: Path) -> None:
-    with contextlib.suppress(OSError):
+def discard(path: Path) -> bool:
+    """Delete `path`; whether it is gone."""
+    try:
         path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
-def touch(path: Path) -> None:
-    """Mark a file used now: it was read back."""
-    with contextlib.suppress(OSError):
-        os.utime(path)
+def bytes_per_token(folder: Path) -> float | None:
+    """The largest size per token of the files this launch saved, or None when no file says
+    its token count: what a next save of N tokens is estimated to take (review S6)."""
+    rates = [f.bytes / f.tokens for f in saved(folder) if f.tokens]
+    return max(rates) if rates else None
+
+
+def free_bytes(folder: Path) -> int | None:
+    try:
+        return shutil.disk_usage(folder).free
+    except OSError:
+        return None
 
 
 def prune(folder: Path, keep: int) -> int:
-    """Keep the `keep` most recently used files of a launch folder (the engine reads back at
-    most one per slot), and no unfinished save. The number deleted."""
+    """Keep the `keep` most recently used finished files of a launch folder (the engine reads
+    back at most one per slot) and nothing else: every other regular file there is the
+    cache's, whatever its name (review S3), and goes. The number deleted."""
+    kept = {item.path.name for item in saved(folder)[: max(keep, 0)]}
     gone = 0
-    for item in saved(folder)[max(keep, 0) :]:
-        discard(item.path)
-        gone += 1
     for entry in _entries(folder):
-        if entry.name.endswith(PART) and not entry.is_symlink():
-            discard(Path(entry.path))
+        if entry.name in kept or entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+            continue
+        if discard(Path(entry.path)) and entry.name.endswith(SAVED):
+            gone += 1
     return gone
 
 
@@ -393,28 +489,41 @@ class _Walk:
     parts: list[tuple[Path, Path, float]] = field(default_factory=list)
 
 
+def _regular(entry: os.DirEntry[str]) -> os.stat_result | None:
+    if entry.is_symlink():
+        return None
+    try:
+        info = entry.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    return info if stat.S_ISREG(info.st_mode) else None
+
+
 def _walk(root: Path) -> _Walk:
+    """Every regular file under the root down to the launch folders, whatever its name
+    (review S3): a file another local process had the engine save is the cache's too, and
+    counts toward the cap and the days. An unfinished save (`.part`) is listed apart."""
     found = _Walk()
-    for runtime in _entries(root):
-        if runtime.is_symlink() or not runtime.is_dir(follow_symlinks=False):
+    for top in _entries(root):
+        if (info := _regular(top)) is not None:
+            found.files.append((root, Path(top.path), info.st_size, info.st_mtime))
             continue
-        for launch in _entries(Path(runtime.path)):
+        if top.is_symlink() or not top.is_dir(follow_symlinks=False):
+            continue
+        for launch in _entries(Path(top.path)):
+            if (info := _regular(launch)) is not None:
+                found.files.append((Path(top.path), Path(launch.path), info.st_size, info.st_mtime))
+                continue
             if launch.is_symlink() or not launch.is_dir(follow_symlinks=False):
                 continue
             for entry in _entries(Path(launch.path)):
-                if entry.is_symlink():
-                    continue
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if not stat.S_ISREG(info.st_mode):
+                if (info := _regular(entry)) is None:
                     continue
                 path = Path(entry.path)
-                if entry.name.endswith(SAVED):
-                    found.files.append((Path(runtime.path), path, info.st_size, info.st_mtime))
-                elif entry.name.endswith(PART):
+                if entry.name.endswith(PART):
                     found.parts.append((Path(launch.path), path, info.st_mtime))
+                else:
+                    found.files.append((Path(top.path), path, info.st_size, info.st_mtime))
     return found
 
 
@@ -453,9 +562,10 @@ def sweep(
             if runtime.name in names or any(p.parent == path for p in in_use):
                 continue
             walked = _walk_one(path)
-            unused += walked[0]
-            freed += walked[1]
             shutil.rmtree(path, ignore_errors=True)
+            if not path.exists():
+                unused += walked[0]
+                freed += walked[1]
     walk = _walk(root)
     for launch, part, mtime in walk.parts:
         if (
@@ -466,20 +576,21 @@ def sweep(
             discard(part)
     keep: list[tuple[Path, int, float]] = []
     for _, path, size, used in walk.files:
-        if not settings.enabled or now - used > settings.max_age_seconds:
-            discard(path)
+        # Counted only when it is really gone (review): a file the system kept is still
+        # there, and still counts toward the cap below.
+        if (not settings.enabled or now - used > settings.max_age_seconds) and discard(path):
             expired += 1
             freed += size
-        else:
-            keep.append((path, size, used))
+            continue
+        keep.append((path, size, used))
     total = sum(size for _, size, _ in keep)
     for path, size, _ in sorted(keep, key=lambda item: item[2]):
         if total <= settings.cap_bytes:
             break
-        discard(path)
-        total -= size
-        over_cap += 1
-        freed += size
+        if discard(path):
+            total -= size
+            over_cap += 1
+            freed += size
     _drop_empty(root, in_use)
     if expired or over_cap or unused:
         log.info(
@@ -500,10 +611,9 @@ def _walk_one(runtime: Path) -> tuple[int, int]:
         if launch.is_symlink() or not launch.is_dir(follow_symlinks=False):
             continue
         for entry in _entries(Path(launch.path)):
-            if entry.name.endswith(SAVED) and not entry.is_symlink():
+            if (info := _regular(entry)) is not None and not entry.name.endswith(PART):
                 count += 1
-                with contextlib.suppress(OSError):
-                    size += entry.stat(follow_symlinks=False).st_size
+                size += info.st_size
     return count, size
 
 
