@@ -43,6 +43,18 @@ def _build(store: ManagedStore, version: str) -> None:
     binary = directory / "llama-server"
     binary.write_bytes(version.encode())
     store.write_metadata(directory, version=version, variant="cpu", binary=binary)
+    # Installed in the order made, a second apart: on Windows the clock under
+    # Python 3.12 ticks every 15.6 ms, so builds made in one test shared a time
+    # and "the newest" was whichever the folder listing gave first (agent CI,
+    # 2026-11-16, test_prune_never_deletes_the_build_in_use_or_a_held_one).
+    _build.made += 1  # type: ignore[attr-defined]
+    record = directory / store.METADATA_NAME
+    meta = json.loads(record.read_text(encoding="utf-8"))
+    meta["installedAt"] = f"2026-01-01T00:{_build.made // 60 % 60:02d}:{_build.made % 60:02d}+00:00"  # type: ignore[attr-defined]
+    record.write_text(json.dumps(meta), encoding="utf-8")
+
+
+_build.made = 0  # type: ignore[attr-defined]
 
 
 def _spec(name: str) -> RuntimeSpec:
