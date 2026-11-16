@@ -285,8 +285,25 @@ def _kept_app_secret(data_dir: str, filename: str = APP_SECRET_FILE) -> str:
 
 
 def database_secret(data_dir: str) -> str:
+    """The database password, made once and kept.
+
+    Never one that starts with `-`: pg0 is started with `--password <it>`
+    and its argument parser refuses a value that looks like a flag
+    ("unexpected argument '-e' found"), so a URL-safe secret that began with
+    `-` -- one time in 64 -- left Hindsight unable ever to start. A kept one
+    that does was never accepted by pg0, so no database holds it, and it is
+    replaced."""
     with _DATA_FILES:
-        return _kept_app_secret(data_dir, DATABASE_SECRET_FILE)
+        path = os.path.join(data_dir, DATABASE_SECRET_FILE)
+        existing = _secret(path)
+        if existing and not existing.startswith("-"):
+            return existing
+        os.makedirs(data_dir, exist_ok=True)
+        value = secrets.token_urlsafe(32)
+        while value.startswith("-"):
+            value = secrets.token_urlsafe(32)
+        _write_own(path, value)
+        return value
 
 
 _DATABASE_URI = re.compile(r"(?i)\b((?:pg0|postgres(?:ql)?)://)[^\s\"'<>]*@")

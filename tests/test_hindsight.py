@@ -891,3 +891,25 @@ async def test_catalogue_install_pins_pg0_in_the_same_resolution(
     )
     install = next(argv for argv in calls if "install" in argv)
     assert "pg0-embedded==0.15.2" in install
+
+
+def test_a_database_password_never_starts_with_a_dash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pg0 takes it as `--password <secret>` and refuses a value that starts
+    with `-` ("unexpected argument '-e' found"): a URL-safe secret does, one
+    time in 64, and Hindsight then never starts (specs CI, 2026-11-16)."""
+    from eugene_plexus_agent import app_launcher
+
+    made = iter(["-eLooksLikeAFlag", "_fine-after"])
+    monkeypatch.setattr(app_launcher.secrets, "token_urlsafe", lambda n=32: next(made))
+    first = app_launcher.database_secret(str(tmp_path / "fresh"))
+    assert not first.startswith("-")
+    # One kept by an earlier build: it never started a database, so a new
+    # one replaces it.
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    (kept / app_launcher.DATABASE_SECRET_FILE).write_text("-eKept", encoding="utf-8")
+    made = iter(["-xAgain", "replaced"])
+    monkeypatch.setattr(app_launcher.secrets, "token_urlsafe", lambda n=32: next(made))
+    assert app_launcher.database_secret(str(kept)) == "replaced"
