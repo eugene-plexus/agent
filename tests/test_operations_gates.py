@@ -8,6 +8,7 @@ machine's operations log, the person read from the token.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from pathlib import Path
@@ -490,3 +491,54 @@ def test_refused_attempts_never_evict_changes(tmp_path: Path) -> None:
     assert any(r["target"] == "kept" for r in rows)
     failed = store._open().execute("SELECT count(*) FROM operations WHERE status >= 400")
     assert failed.fetchone()[0] == operations.KEEP_REFUSED_ROWS
+
+
+@pytest.mark.parametrize("sep", ["/", "\\"], ids=["posix", "windows"])
+@pytest.mark.parametrize("field", ["flags.chatTemplateFile", "modelPath"])
+def test_a_path_that_climbs_out_of_the_library_is_refused(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path, sep: str, field: str
+) -> None:
+    """Review B1, second pass: folder matching compares components and
+    normalizes nothing, so `<folder>/../../x` matched the folder."""
+    lib = tmp_path / "lib"
+    _library_at(app, lib)
+    climbing = sep.join([str(lib), "..", "..", "outside", "secret.txt"])
+    extra = (
+        {"flags": {"chatTemplateFile": climbing}}
+        if field.startswith("flags.")
+        else {"modelPath": climbing}
+    )
+    dana = _bearer(_operations_token(root, MODELS))
+    refused = client.post("/v1/runtimes", json=_spec(tmp_path, **extra), headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert f"({field})" in refused.json()["detail"]["detail"]
+
+
+def test_a_link_inside_the_library_that_points_out_is_refused(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "node.yaml").write_text("secret", encoding="utf-8")
+    try:
+        os.symlink(outside, lib / "out", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        if os.name != "nt":
+            pytest.skip(f"this machine cannot make a symlink here: {exc}")
+        # Windows without the symlink privilege: a junction, which needs none.
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(lib / "out"))
+    _library_at(app, lib)
+    dana = _bearer(_operations_token(root, MODELS))
+    linked = {"flags": {"chatTemplateFile": str(lib / "out" / "node.yaml")}}
+    refused = client.post("/v1/runtimes", json=_spec(tmp_path, **linked), headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert "(flags.chatTemplateFile)" in refused.json()["detail"]["detail"]
+    # A real file inside the folder still passes.
+    (lib / "template.jinja").write_text("{{ x }}", encoding="utf-8")
+    inside = {"flags": {"chatTemplateFile": str(lib / "template.jinja")}}
+    made = client.post("/v1/runtimes", json=_spec(tmp_path, **inside), headers=dana)
+    assert made.status_code == 201, made.text

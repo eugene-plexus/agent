@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -238,7 +239,7 @@ def refuse_owner_fields(
     known = folders is not None and getattr(folders, "known", False)
 
     def in_library(path: Any) -> bool:
-        return isinstance(path, str) and known and folders.folder_for(path) is not None
+        return isinstance(path, str) and known and inside_library_folder(folders, path)
 
     if not in_library(getattr(spec, "modelPath", None)) and not kept("modelPath"):
         raise owner_field("modelPath", "a model outside the Library's folders")
@@ -249,6 +250,46 @@ def refuse_owner_fields(
             continue
         if not in_library(value):
             raise owner_field(f"flags.{key}", "a file outside the Library's folders")
+
+
+_SEPARATORS = re.compile(r"[\\/]")
+
+
+def inside_library_folder(folders: Any, path: str) -> bool:
+    """Whether `path` really lies inside one of the Library's folders, as
+    an operations token's declaration must (review B1, second pass).
+
+    `LibraryFolderCache.folder_for` compares components and normalizes
+    nothing, so `<folder>/../../etc/passwd` and a link inside a folder that
+    points out would pass it. Here, for operations tokens only: no `..`
+    component under either separator; the path has the folder's own shape;
+    and, opened on this machine (through the folder's mount when the
+    folder is the other shape), it resolves to somewhere inside that folder.
+    A folder this machine has no form of is refused."""
+    from .model_paths import is_windows_shaped, join_local, match
+
+    if ".." in _SEPARATORS.split(path):
+        return False
+    folder = folders.folder_for(path)
+    if folder is None or is_windows_shaped(path) != is_windows_shaped(folder.path):
+        return False
+    remainder = match(folder.as_rule(), path)
+    if remainder is None:
+        return False
+    here_windows = os.name == "nt"
+    root = (
+        folder.path
+        if is_windows_shaped(folder.path) == here_windows
+        else folder.mount_for(windows=here_windows)
+    )
+    if not root:
+        return False
+    real_root = os.path.realpath(str(root))
+    real = os.path.realpath(join_local(root, remainder))
+    try:
+        return bool(os.path.commonpath([real_root, real]) == real_root)
+    except ValueError:  # different drives
+        return False
 
 
 def scrub_for_operations[M: BaseModel](request: Request, runtime: M) -> M:
