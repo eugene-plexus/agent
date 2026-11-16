@@ -24,10 +24,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import disk_prompt_cache, exec_approvals, exec_trust, model_copies, ports
+from . import (
+    container_runtime,
+    disk_prompt_cache,
+    exec_approvals,
+    exec_trust,
+    model_copies,
+    ports,
+)
 from ._generated.models import (
     CopyProgress,
     EngineAcquisition,
+    EngineContainer,
     EngineDescriptor,
     EngineInstall,
     EngineKind,
@@ -38,9 +46,11 @@ from ._generated.models import (
     LoadProgress,
     ManagedEngine,
     ManualInstall,
+    Origin,
     Policy,
     Runtime,
     RuntimeCapabilities,
+    RuntimeContainer,
     RuntimeDiskPromptCache,
     RuntimeLocalPathSource,
     RuntimeMode,
@@ -67,6 +77,7 @@ from .engines import (
     interpret_readiness,
     same_answer,
     speculation,
+    vllm_container,
 )
 from .engines.acquisition import (
     AcquisitionError,
@@ -74,17 +85,21 @@ from .engines.acquisition import (
     EngineInstaller,
     Release,
     Unavailable,
+    engine_root,
 )
 from .engines.base import DiscoveredBinary, UntrustedBinaryError, with_engine_version
+from .engines.container_images import ImageInstaller, ImagePlan, ImageStore
 from .engines.devices import DeviceSnapshot, DevicesReader, detect_devices
 from .engines.host import detect_host
 from .engines.llama_cpp import LlamaCppAdapter
 from .engines.llama_cpp import alternatives as llama_alternatives
+from .engines.vllm import VllmAdapter, container_long_flags
 from .library_folders import RulesProvider, effective_rules
 from .model_copies import resolve_local_path
 from .model_paths import PathRule, rules_from_config
 from .process_io import LoadProgressTracker
 from .supervisor import (
+    ContainerStop,
     ProcessState,
     SpawnPlan,
     SpawnPlanError,
@@ -108,6 +123,11 @@ _SHUTDOWN_SAVE_SECONDS = 10.0
 _READ_BACK_SECONDS = 120.0
 #: How often the limits (days, size) are applied while nothing else applies them.
 _SWEEP_SECONDS = 3600.0
+#: Row 42: the other way to run vLLM, named where the owner's own is not found.
+_CONTAINER_HINT = (
+    "Or run vLLM from its official container: pull it on this machine's Engines page "
+    "(vLLM, Install container)"
+)
 
 
 def _companions(spec: RuntimeSpec) -> tuple[str, ...]:
@@ -194,9 +214,16 @@ class _RuntimePlanner:
         inherited_rules: RulesProvider | None = None,
         library_roots: Callable[[], Sequence[str]] | None = None,
         prompt_cache_root: Path | None = None,
+        data_dir: Path | None = None,
+        node_name: Callable[[], str | None] | None = None,
     ) -> None:
         self.spec = spec
         self._prompt_cache_root = prompt_cache_root
+        #: Row 42: this agent's data folder (container labels, compile caches).
+        self._data_dir = data_dir
+        self._node_name = node_name
+        self.container: RuntimeContainer | None = None
+        """The container the last plan runs, when it runs one (row 42)."""
         self.disk_launch: disk_prompt_cache.Launch | None = None
         """Row 15: what the last plan does with the prompt cache on disk."""
         self._adapter = adapter
@@ -241,12 +268,17 @@ class _RuntimePlanner:
         reason = _launch_policy(self.spec, self._adapter, self._get_config)
         if reason is not None:
             raise SpawnPlanError(reason)
+        self.container = None
+        if isinstance(self._adapter, VllmAdapter) and self._runs_in_container():
+            return self._plan_container()
         try:
             binary = self._adapter.resolve_binary(
                 self.spec,
                 configured=_configured_binary(self._adapter, self._get_config),
             )
         except EngineUnavailableError as e:
+            if isinstance(self._adapter, VllmAdapter) and not isinstance(e, UntrustedBinaryError):
+                raise SpawnPlanError(f"{e}. {_CONTAINER_HINT}") from e
             # A declared runtime whose engine is missing is a crash, not a
             # skipped entry: the operator asked for something that cannot
             # be delivered and needs to hear about it.
@@ -386,6 +418,95 @@ class _RuntimePlanner:
                 else None
             ),
             on_spawn=self._record_cards,
+        )
+
+    def _runs_in_container(self) -> bool:
+        """Row 42: whether this vLLM runtime runs from the container image.
+
+        The profile's `source` when it says; unset, the image when it is
+        pulled here, the container runtime can be used and no vLLM program is
+        set (`vllmBinary`, or this runtime's `binary`), else the owner's own
+        vLLM (`VllmAdapter` flag `source`, `unsetMeans`)."""
+        source = (self.spec.flags or {}).get(vllm_container.KEY_SOURCE)
+        if source == vllm_container.SOURCE_CONTAINER:
+            return True
+        if source == vllm_container.SOURCE_BINARY:
+            return False
+        if self.spec.binary or _configured_binary(self._adapter, self._get_config):
+            return False
+        if self._data_dir is None or ImageStore(engine_root()).current() is None:
+            return False
+        return container_runtime.current().usable
+
+    def _plan_container(self) -> SpawnPlan:
+        """`docker run` (or `podman run`) in the foreground, the image's `vllm
+        serve` inside (`engines/vllm_container.py`)."""
+        assert isinstance(self._adapter, VllmAdapter)
+        if self._data_dir is None:
+            raise SpawnPlanError("this agent has no data folder for a container's cache")
+        found = container_runtime.current()
+        if not found.usable or found.cli is None or found.kind is None:
+            raise SpawnPlanError(
+                "This model runs vLLM from its container, and "
+                + (found.error or "no container runtime answered")
+                + (f" {found.fix}" if found.fix else "")
+            )
+        pulled = ImageStore(engine_root()).current()
+        if pulled is None:
+            raise SpawnPlanError(
+                "The vLLM container image is not on this machine. Pull it on this machine's "
+                "Engines page (vLLM, Install container), then start this model again."
+            )
+        port = self.spec.port
+        if port is None:
+            raise SpawnPlanError(
+                f"runtime {self.spec.name!r} has no port assigned; "
+                f"re-save it so the agent can allocate one"
+            )
+        launch_spec = self._launch_spec()
+        self.opened_path = launch_spec.modelPath
+        cli, image = found.cli, pulled.image
+        context = vllm_container.Context(
+            cli=cli,
+            kind=found.kind,
+            image=image,
+            agent=container_runtime.agent_id(self._data_dir),
+            node=self._node_name() if self._node_name is not None else None,
+            cache_root=self._data_dir / "vllm-cache",
+            gpu=vllm_container.gpu_for(detect_host(), found.gpus),
+            wsl=found.wsl,
+            base_env=child_environment(),
+            offered=lambda: container_long_flags(cli, image),
+        )
+        try:
+            launch = self._adapter.build_container_launch(launch_spec, port, context)
+        except ValueError as e:
+            raise SpawnPlanError(str(e)) from e
+        # What a stop that was cut short left under this name.
+        container_runtime.remove(cli, launch.name)
+        self.binary = DiscoveredBinary(
+            path=Path(cli), origin=Origin.managed, version=pulled.version
+        )
+        self.container = RuntimeContainer(name=launch.name, image=image, digest=pulled.digest)
+        self.refused_binary = None
+        self.exec_trust = None
+        self.disk_launch = None
+        self.same_answer = same_answer.effective(EngineKind.vllm, launch.argv, launch.env)
+        log.info(
+            "%s: vLLM %s in container %s (%s)",
+            self.spec.name,
+            pulled.version,
+            launch.name,
+            found.kind.value,
+        )
+        name = launch.name
+        return SpawnPlan(
+            argv=launch.argv,
+            env=launch.env,
+            cwd=None,
+            port=port,
+            on_spawn=self._record_cards,
+            container=ContainerStop(name=name, stop=lambda: container_runtime.stop(cli, name)),
         )
 
     @staticmethod
@@ -551,10 +672,16 @@ class RuntimeSupervisor:
         stop_memory: StopMemory | None = None,
         library_roots: Callable[[], Sequence[str]] | None = None,
         prompt_cache_root: Path | None = None,
+        data_dir: Path | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
         #: Row 15: this agent's private folder for the prompt cache on disk; None keeps none.
         self.prompt_cache_root = prompt_cache_root
+        #: Row 42: this agent's data folder; None runs no runtime in a container.
+        self.data_dir = data_dir
+        #: Row 42: what `docker inspect` said of each runtime's container, by run:
+        #: (run, id, image id, the container's main pid on this host or None).
+        self._container_seen: dict[str, tuple[_Run, str | None, str | None, int | None]] = {}
         #: The run whose saved conversations were read back (or had none), by runtime.
         self._read_back: dict[str, _Run] = {}
         self._reading_back: dict[str, tuple[_Run, asyncio.Task[None]]] = {}
@@ -715,6 +842,8 @@ class RuntimeSupervisor:
             inherited_rules=self._inherited_rules,
             library_roots=self._library_roots,
             prompt_cache_root=self.prompt_cache_root,
+            data_dir=self.data_dir,
+            node_name=self.node_name_provider,
         )
         planner.before_start = self._check_cards
         planner.after_start = lambda launch: self.device_memory.record(spec, launch)
@@ -1082,6 +1211,10 @@ class RuntimeSupervisor:
                 loading += 1
             if sp is not None and sp.pid is not None and sp.supervising:
                 pids.append(sp.pid)
+                seen = self._container_seen.get(name)
+                if seen is not None and seen[0] == _run_of(sp) and seen[3] is not None:
+                    # Row 42: the engine is the container's, not the CLI's child.
+                    pids.append(seen[3])
         return ready, loading, tuple(pids)
 
     async def _cancel_copy(self, name: str) -> None:
@@ -1182,7 +1315,9 @@ class RuntimeSupervisor:
         resolved = resolve_local_path(spec.modelPath, self._rules(), self.copy_settings())
         local_path = resolved.path
         load_progress: LoadProgress | None = None
-        if status in (RuntimeStatus.loading, RuntimeStatus.starting):
+        in_container = getattr(planner, "container", None) is not None
+        if status in (RuntimeStatus.loading, RuntimeStatus.starting) and not in_container:
+            # Not for a container: the process here is the CLI, which reads nothing.
             observed = self._load_progress.sample(
                 spec.name, sp.pid if sp is not None else None, local_path
             )
@@ -1297,6 +1432,82 @@ class RuntimeSupervisor:
             diskPromptCache=self._disk_cache_for(spec, adapter, argv, status, readiness),
             lastDevices=[LastDevice(d) for d in self.device_memory.observed(spec)[0]] or None,
             startedOnFewerCards=self.device_memory.observed(spec)[1],
+            container=self._container_for(name, sp, planner, status),
+        )
+
+    def _container_for(
+        self,
+        name: str,
+        sp: SupervisedProcess | None,
+        planner: _RuntimePlanner | None,
+        status: RuntimeStatus,
+    ) -> RuntimeContainer | None:
+        """Row 42: the container this run runs in, with what `docker inspect` said."""
+        container: RuntimeContainer | None = getattr(planner, "container", None)
+        if container is None or sp is None:
+            return None
+        if status not in _PROCESS_RUNNING:
+            return None
+        seen = self._container_seen.get(name)
+        if seen is None or seen[0] != _run_of(sp):
+            return container
+        return container.model_copy(
+            update={"id": seen[1] or None, "digest": seen[2] or container.digest}
+        )
+
+    async def _inspect_container(self, name: str, sp: SupervisedProcess, run: _Run) -> None:
+        """Once a run: the container's ID, image and main pid (row 42)."""
+        planner = self._planners.get(name)
+        container = getattr(planner, "container", None)
+        if container is None:
+            self._container_seen.pop(name, None)
+            return
+        seen = self._container_seen.get(name)
+        if seen is not None and seen[0] == run:
+            return
+        found = container_runtime.current()
+        if found.cli is None:
+            return
+        info = await asyncio.to_thread(container_runtime.inspect, found.cli, container.name)
+        if info is None or self._processes.get(name) is not sp or _run_of(sp) != run:
+            return
+        state = info.get("State") if isinstance(info.get("State"), dict) else {}
+        pid = state.get("Pid") if isinstance(state, dict) else None
+        self._container_seen[name] = (
+            run,
+            str(info.get("Id") or "") or None,
+            str(info.get("Image") or "") or None,
+            # On Docker Desktop the pid is inside its virtual machine: no
+            # process here is the engine's, so none is attributed.
+            pid if isinstance(pid, int) and pid > 0 and not found.desktop else None,
+        )
+
+    def unattributed(self) -> str | None:
+        """Why this host's GPU memory cannot be attributed to its engines, when
+        a running one is a container in Docker Desktop's virtual machine."""
+        if not any(
+            getattr(planner, "container", None) is not None and self.is_running(name)
+            for name, planner in self._planners.items()
+        ):
+            return None
+        found = container_runtime.current()
+        if not found.desktop:
+            return None
+        return (
+            "Docker Desktop runs this machine's vLLM containers in a virtual machine, so "
+            "their memory is not attributed to Eugene's engines"
+        )
+
+    async def sweep_orphan_containers(self) -> list[str]:
+        """At agent start, before any runtime starts: stop every container an
+        earlier run of this agent left running (row 42)."""
+        if self.data_dir is None:
+            return []
+        if not any(shutil.which(kind) for kind in ("docker", "podman")):
+            return []
+        found = await asyncio.to_thread(container_runtime.current)
+        return await asyncio.to_thread(
+            container_runtime.sweep_orphans, found, container_runtime.agent_id(self.data_dir)
         )
 
     def _engine_load_for(
@@ -1844,6 +2055,7 @@ class RuntimeSupervisor:
                 self._engine_load[spec.name] = (started_at, load)
         else:
             self._engine_load.pop(spec.name, None)
+        await self._inspect_container(spec.name, sp, started_at)
 
     async def _read_speculation(
         self, spec: RuntimeSpec, adapter: EngineAdapter, base: str, started_at: _Run
@@ -1896,6 +2108,9 @@ def installer_for(
             existing = StrataInstaller(adapter.managed_store(), kind)
             if get_config is not None:
                 existing.finish_note = _strata_finish_note(get_config)
+        elif kind is EngineKind.vllm:
+            # Row 42: the one vLLM install Eugene makes is its container image.
+            existing = ImageInstaller(ImageStore(engine_root()), kind)
         else:
             existing = EngineInstaller(adapter.managed_store(), kind)
         _INSTALLERS[kind] = existing
@@ -1961,8 +2176,9 @@ async def refetch_listed_builds() -> list[str]:
         plan = await asyncio.to_thread(plan_for, kind, version=version, variant=variant)
         if isinstance(plan, Unavailable) and version is not None:
             plan = await asyncio.to_thread(plan_for, kind)
-        if isinstance(plan, Unavailable):
-            log.warning("%s %s was not fetched again: %s", kind.value, version or "", plan.reason)
+        if isinstance(plan, Unavailable | ImagePlan):
+            why = plan.reason if isinstance(plan, Unavailable) else "not a build"
+            log.warning("%s %s was not fetched again: %s", kind.value, version or "", why)
             remaining.append(entry)
             continue
         try:
@@ -2015,7 +2231,8 @@ def plan_for(
     version: str | None = None,
     host: HostAccelerator | None = None,
     variant: str | None = None,
-) -> AcquisitionPlan | Unavailable:
+    get_config: ConfigGetter | None = None,
+) -> AcquisitionPlan | ImagePlan | Unavailable:
     """What we would fetch for this host, or why we cannot.
 
     A `manual` engine is always `Unavailable`, on every host, and the
@@ -2036,12 +2253,20 @@ def plan_for(
     """
     detected = host if host is not None else detect_host()
     adapter = adapter_for(kind)
+    if kind is EngineKind.vllm and variant == CONTAINER_VARIANT:
+        return container_plan(detected, get_config)
     if kind is EngineKind.strata:
         from .engines.strata_install import plan
 
         return plan(detected, version, variant)
     if adapter is not None and adapter.install_policy is Policy.manual:
-        return Unavailable(reason=_manual_reason(adapter, adapter.manual_install(detected)))
+        reason = _manual_reason(adapter, adapter.manual_install(detected))
+        if kind is EngineKind.vllm:
+            reason += (
+                " Or pull its official container image with Docker or Podman: "
+                "install with variant container."
+            )
+        return Unavailable(reason=reason)
     if not isinstance(adapter, LlamaCppAdapter):
         return Unavailable(
             reason=f"engine {kind.value!r} has no managed-install support in this build"
@@ -2066,6 +2291,63 @@ def plan_for(
             )
         )
     return adapter.plan_acquisition(detected, release, variant=variant)
+
+
+#: Row 42: the install variant that pulls vLLM's container image.
+CONTAINER_VARIANT = "container"
+
+
+def container_plan(
+    host: HostAccelerator, get_config: ConfigGetter | None = None
+) -> ImagePlan | Unavailable:
+    """The pull an install of vLLM's container makes here, or why it cannot."""
+    found = container_runtime.current()
+    if not found.usable or found.cli is None or found.kind is None:
+        return Unavailable(
+            reason=" ".join(
+                part
+                for part in (found.error or "No container runtime answered.", found.fix)
+                if part
+            )
+        )
+    try:
+        choice = vllm_container.image_choice(get_config, host)
+    except ValueError as exc:
+        return Unavailable(reason=str(exc))
+    return ImagePlan(
+        cli=found.cli,
+        kind=found.kind,
+        image=choice.image,
+        version=choice.version,
+        variant=choice.variant,
+    )
+
+
+def _container_for_engine(
+    host: HostAccelerator, get_config: ConfigGetter | None
+) -> EngineContainer:
+    """`EngineDescriptor.container` for vLLM (row 42)."""
+    found = container_runtime.current()
+    reason: str | None = None
+    try:
+        choice: vllm_container.ImageChoice | None = vllm_container.image_choice(get_config, host)
+    except ValueError as exc:
+        choice, reason = None, str(exc)
+    if not found.usable:
+        reason = (
+            " ".join(p for p in (found.error, found.fix) if p) or "No container runtime answered."
+        )
+    pinned = vllm_container.pinned_for(host)
+    return EngineContainer(
+        image=choice.image if choice is not None else pinned.image,
+        version=choice.version if choice is not None else None,
+        source=choice.source if choice is not None else None,
+        variant=choice.variant if choice is not None else None,
+        untested=(choice.untested or None) if choice is not None else None,
+        installable=found.usable and choice is not None,
+        reason=reason,
+        pulled=ImageStore(engine_root()).view(),
+    )
 
 
 def _acquisition_for(kind: EngineKind, host: HostAccelerator) -> EngineAcquisition:
@@ -2208,6 +2490,7 @@ def describe_engines(
         fit = adapter.fit_model_here(read)
         acquisition = _acquisition_for(kind, host)
         managed = _managed_for(adapter)
+        container = _container_for_engine(host, get_config) if kind is EngineKind.vllm else None
 
         error: str | None = None
         exec_trust: ExecTrust | None = None
@@ -2224,6 +2507,32 @@ def describe_engines(
             if isinstance(e, UntrustedBinaryError):
                 exec_trust = exec_approvals.view(e.verdict)
 
+        if (
+            found is None
+            and error is None
+            and container is not None
+            and container.pulled is not None
+            and container.installable
+        ):
+            # Row 42: vLLM from its container image is vLLM installed.
+            out.append(
+                EngineDescriptor(
+                    engine=kind,
+                    available=True,
+                    modelFormats=list(adapter.model_formats),
+                    accepts=list(adapter.accepts_for(None)),
+                    supportedModels=list(adapter.supported_models_here()),
+                    fit=fit,
+                    experimental=adapter.experimental,
+                    version=container.pulled.version,
+                    origin=Origin.managed,
+                    flagSchema=adapter.flag_schema(),
+                    managed=managed,
+                    acquisition=acquisition,
+                    container=container,
+                )
+            )
+            continue
         if found is None:
             if error is None:
                 if adapter.configured_binary_key is not None:
@@ -2252,6 +2561,7 @@ def describe_engines(
                     flagSchema=adapter.flag_schema(),
                     managed=managed,
                     acquisition=acquisition,
+                    container=container,
                 )
             )
             continue
@@ -2271,6 +2581,7 @@ def describe_engines(
                 managed=managed,
                 acquisition=acquisition,
                 python=found.python,
+                container=container,
             )
         )
     return out

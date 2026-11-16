@@ -276,6 +276,20 @@ class SpawnPlanError(Exception):
 
 
 @dataclass(frozen=True)
+class ContainerStop:
+    """How to stop a child that is `docker run` in the foreground (row 42).
+
+    Signalling the CLI alone would leave the container running and holding
+    the GPU, so a stop runs `stop` (`docker stop -t 30 <name>`, in a thread)
+    and the CLI then ends with its container. A CLI that outlives that is
+    killed."""
+
+    name: str
+    #: Blocking; returns None when the container stopped, else the runtime's words.
+    stop: Callable[[], str | None]
+
+
+@dataclass(frozen=True)
 class SpawnPlan:
     """One resolved launch. Everything `SupervisedProcess` needs and
     nothing it has to interpret."""
@@ -308,6 +322,9 @@ class SpawnPlan:
 
     on_spawn: Callable[[], None] | None = None
     """Record observations only after a process was successfully created."""
+
+    container: ContainerStop | None = None
+    """Set when the child runs a container in the foreground (row 42)."""
 
 
 class SpawnPlanner(Protocol):
@@ -691,6 +708,8 @@ class SupervisedProcess:
         #: 15.6 ms, so a respawn can carry the same time as the run it replaced.
         self.spawns = 0
         self.last_launch_settings: dict[str, object] | None = None
+        #: Row 42: how to stop the container this child runs, if it runs one.
+        self._container: ContainerStop | None = None
 
     @classmethod
     def for_component(
@@ -815,6 +834,11 @@ class SupervisedProcess:
     async def _signal_restart(self, proc: asyncio.subprocess.Process) -> None:
         self._expected_exit = True
         self._begin_tree_stop(proc)
+        if self._container is not None:
+            await self._stop_container(proc)
+            if self._tree_stop is not None:
+                await asyncio.shield(self._tree_stop)
+            return
         sent = process_signals.request_stop(proc, name=self.name, logger=self._log)
         self._log.info("restart requested for %s; sent %s to pid %d", self.name, sent, proc.pid)
         await self._escalate_if_still_alive(proc)
@@ -906,7 +930,9 @@ class SupervisedProcess:
         proc = self._proc
         if proc is not None:
             self._begin_tree_stop(proc)
-        if proc is not None and proc.returncode is None:
+        if proc is not None and proc.returncode is None and self._container is not None:
+            await self._stop_container(proc)
+        elif proc is not None and proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 process_signals.request_stop(proc, name=self.name, logger=self._log)
             try:
@@ -927,6 +953,30 @@ class SupervisedProcess:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, BaseException):
                 await self._task
+
+    async def _stop_container(self, proc: Any) -> None:
+        """Row 42: `docker stop` the container, then let its CLI end; kill the
+        CLI only when it outlives its container."""
+        container = self._container
+        assert container is not None
+        error = await asyncio.to_thread(container.stop)
+        if error is not None:
+            self._log.warning("%s: stopping container %s: %s", self.name, container.name, error)
+        else:
+            self._log.info("%s: stopped container %s", self.name, container.name)
+        try:
+            await asyncio.wait_for(self._parent_exit(proc), timeout=_TERM_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self._log.warning(
+                "%s: the container CLI did not end with container %s; killing pid %s",
+                self.name,
+                container.name,
+                proc.pid,
+            )
+            with contextlib.suppress(ProcessLookupError, BaseException):
+                proc.kill()
+            with contextlib.suppress(BaseException):
+                await self._parent_exit(proc)
 
     def _begin_tree_stop(self, proc: asyncio.subprocess.Process) -> None:
         if self._tree_stop is not None:
@@ -1214,6 +1264,7 @@ class SupervisedProcess:
         self._last_port = plan.port
         self.last_argv = list(plan.argv)
         self.last_launch_settings = plan.launch_settings
+        self._container = plan.container
         # `plan.env` is None for an engine -- adapters build argv and
         # inherit the environment -- and an engine has no bind host to
         # record anyway. Reading it unguarded raised AttributeError

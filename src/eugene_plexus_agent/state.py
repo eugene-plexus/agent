@@ -222,6 +222,21 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.file_path,
     ),
     ConfigField(
+        # Row 42: read at each pull and shown on the Engines page.
+        key="vllmContainerImage",
+        label="vLLM container image",
+        description=(
+            "The container image vLLM runs from on this machine, named by digest.\n\n"
+            "Expert override. Leave it empty for the image this release pins for this "
+            "machine's GPUs. Name another image by digest "
+            "(`name@sha256:<64 hex digits>`), never by a tag that can move; it is pulled "
+            "on the Engines page and runs from the next start."
+        ),
+        category="engines",
+        valueType=ConfigValueType.string,
+        unsetMeans="The image this release pins for this machine's GPUs.",
+    ),
+    ConfigField(
         key="uvBinary",
         label="uv binary",
         description=(

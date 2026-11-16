@@ -376,6 +376,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             stop_memory=state,
             # Row 15: the prompt cache on disk, in this agent's own private folder.
             prompt_cache_root=settings.config_file.resolve().parent / PROMPT_CACHE_FOLDER,
+            # Row 42: container labels and compile caches, from the same folder.
+            data_dir=settings.config_file.resolve().parent,
         )
         owns_runtimes = True
     else:
@@ -603,6 +605,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "The models on this machine are paused; none starts at boot%s",
                 f" (held as well: {', '.join(held)})" if held else "",
             )
+        # Row 42: a container an earlier run left running holds a GPU and a
+        # port; every one labelled with this agent is an orphan now.
+        try:
+            await runtime_supervisor.sweep_orphan_containers()
+        except Exception:
+            log.exception("could not look for containers an earlier run left running")
         for spec in state.list_runtime_specs():
             runtime_supervisor.start_at_boot(spec)
         await runtime_supervisor.start_readiness_loop(state.list_runtime_specs)
@@ -638,7 +646,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     def _history_probe() -> host_probes.HostProbe:
         def counts() -> host_probes.RuntimeCounts:
             ready, loading, pids = runtime_supervisor.host_counts()
-            return host_probes.RuntimeCounts(running=ready, loading=loading, pids=pids)
+            return host_probes.RuntimeCounts(
+                running=ready,
+                loading=loading,
+                pids=pids,
+                unattributed=runtime_supervisor.unattributed(),
+            )
 
         return host_probes.HostProbe(
             devices=getattr(app.state, "device_detector", None) or detect_devices,

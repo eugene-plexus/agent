@@ -1,0 +1,16 @@
+{
+  "comment": "Row 42: the vLLM container images this agent pulls, by digest. Keep equal to specs release/manifest.json vllmImages.",
+  "cuda": {
+    "version": "0.33.0",
+    "image": "vllm/vllm-openai@sha256:d825baf9ce4b1b6bfc5ecc7b79880c7e6748c65a72d697ce3d47607aafa84c6e"
+  },
+  "cuda12": {
+    "version": "0.32.0",
+    "image": "vllm/vllm-openai@sha256:bc0445dac61accbf1c3b17fbb524a71eee0b1b32f55ba45952095e3be8991c3f"
+  },
+  "rocm": {
+    "version": "0.29.0",
+    "image": "rocm/vllm@sha256:e0ea9a10b729573ea8598bdc073bda0ea382fe1037eec7c0761b6fa7f46baaf4",
+    "untested": true
+  }
+}

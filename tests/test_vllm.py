@@ -685,8 +685,11 @@ def test_every_schema_flag_has_a_cli_mapping(adapter: VllmAdapter) -> None:
 
     # These four settings compose one JSON flag rather than individual CLI flags.
     assert {f.key for f in adapter.flag_schema().fields} == (
-        set(_FLAG_CLI_NAMES) | speculation.KEYS | {"sameAnswerEveryTime", "missingCard"}
-    )  # DI7 sets VLLM_BATCH_INVARIANT, not a CLI switch; missingCard is the agent's.
+        set(_FLAG_CLI_NAMES)
+        | speculation.KEYS
+        | {"sameAnswerEveryTime", "missingCard", "source", "shmSizeGiB"}
+    )  # DI7 sets VLLM_BATCH_INVARIANT, not a CLI switch; missingCard is the agent's;
+    # source and shmSizeGiB choose and shape the container (row 42).
 
 
 def test_the_curated_surface_is_the_designed_twelve_and_the_cache(adapter: VllmAdapter) -> None:
@@ -716,6 +719,9 @@ def test_the_curated_surface_is_the_designed_twelve_and_the_cache(adapter: VllmA
         "draftWith",
         "draftModelPath",
         "draftTokens",
+        # Row 42: the container, not vLLM's own flags.
+        "source",
+        "shmSizeGiB",
     }
     assert "servedModelName" not in keys
     assert "model" not in keys

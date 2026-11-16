@@ -36,6 +36,7 @@ from eugene_plexus_agent.supervisor import (
     _COMPONENT_STATUS_BY_STATE,
     _HEALTHZ_2XX_LINE,
     _TRUST_ROOT_KINDS,
+    ContainerStop,
     ProcessState,
     SpawnPlan,
     SpawnPlanError,
@@ -982,3 +983,73 @@ async def test_a_planner_that_waits_and_cannot_build_is_a_crash_like_any_other()
     await sp._spawn_once()
     assert sp.state == ProcessState.crashed
     assert sp.last_error == "could not fill in how the app starts: {nope}"
+
+
+# --------------------------------------------------------------------------- #
+# Row 42: a runtime in a container
+# --------------------------------------------------------------------------- #
+
+
+async def _container_run(
+    monkeypatch: pytest.MonkeyPatch, stops: list[str], *, cli_exits: bool = True
+) -> tuple[SupervisedProcess, _FakeProcess]:
+    """A runtime whose plan runs `docker run` in the foreground, as row 42's do."""
+    procs: list[_FakeProcess] = []
+
+    async def fake_create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        procs.append(_FakeProcess())
+        return procs[-1]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+
+    def docker_stop() -> str | None:
+        stops.append("ep-abc-qwen")
+        if cli_exits:
+            # The attached CLI ends when its container does.
+            procs[-1]._finish(0)
+        return None
+
+    class _ContainerPlanner(_FakeEnginePlanner):
+        def plan(self) -> SpawnPlan:
+            return SpawnPlan(
+                argv=["/usr/bin/docker", "run", "--rm", "--name", "ep-abc-qwen"],
+                env={},
+                container=ContainerStop(name="ep-abc-qwen", stop=docker_stop),
+            )
+
+    sp = SupervisedProcess(_ContainerPlanner([]), logging.getLogger("test"))
+    sp.start()
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if procs:
+            break
+    return sp, procs[-1]
+
+
+async def test_container_stop_uses_docker_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stopping the `docker run` CLI alone leaves the container running and
+    holding the GPU: a stop is `docker stop`, and the CLI then ends by itself."""
+    stops: list[str] = []
+    sp, proc = await _container_run(monkeypatch, stops)
+    await sp.stop()
+    assert stops == ["ep-abc-qwen"]
+    assert not proc.terminated and not proc.killed
+    assert proc.returncode == 0
+
+
+async def test_container_restart_uses_docker_stop(monkeypatch: pytest.MonkeyPatch) -> None:
+    stops: list[str] = []
+    sp, proc = await _container_run(monkeypatch, stops)
+    await sp.restart()
+    assert stops == ["ep-abc-qwen"]
+    assert not proc.terminated and not proc.killed
+    await sp.stop()
+
+
+async def test_a_cli_that_outlives_docker_stop_is_killed(monkeypatch: pytest.MonkeyPatch) -> None:
+    stops: list[str] = []
+    monkeypatch.setattr("eugene_plexus_agent.supervisor._TERM_TIMEOUT_SECONDS", 0.05)
+    sp, proc = await _container_run(monkeypatch, stops, cli_exits=False)
+    await sp.stop()
+    assert stops == ["ep-abc-qwen"]
+    assert proc.killed

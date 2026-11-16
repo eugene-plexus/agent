@@ -542,3 +542,24 @@ def test_a_link_inside_the_library_that_points_out_is_refused(
     inside = {"flags": {"chatTemplateFile": str(lib / "template.jinja")}}
     made = client.post("/v1/runtimes", json=_spec(tmp_path, **inside), headers=dana)
     assert made.status_code == 201, made.text
+
+
+def test_models_may_choose_the_vllm_container_and_its_shared_memory(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    """Row 42: `source` and `shmSizeGiB` name no file, image, volume, device or
+    variable: the image is this release's or the owner's (`vllmContainerImage`,
+    config), and the container gets only the model's folder, read only."""
+    _library_at(app, tmp_path / "lib")
+    folder = tmp_path / "lib" / "Qwen3-8B"
+    folder.mkdir(parents=True)
+    dana = _bearer(_operations_token(root, MODELS))
+    spec = {
+        "name": "q",
+        "engine": "vllm",
+        "modelPath": str(folder),
+        "autoStart": False,
+        "flags": {"source": "container", "shmSizeGiB": 16},
+    }
+    made = client.post("/v1/runtimes", json=spec, headers=dana)
+    assert made.status_code == 201, made.text

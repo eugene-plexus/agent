@@ -122,6 +122,8 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         ),
         "advertise_restart": restart,
         "vllm": shutil.which("vllm"),
+        "vllm_image": _vllm_image_in_use(),
+        "vllm_image_set": state.get_config("vllmContainerImage"),
         "mlx": shutil.which("mlx_lm.server"),
         "uv": str(uv) if uv is not None else None,
         "passphrase_path": getattr(settings, "passphrase_file", None),
@@ -133,6 +135,15 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         "history_bytes": _history_bytes(request),
         "prompt_cache": _prompt_cache_usage(request, state),
     }
+
+
+def _vllm_image_in_use() -> str | None:
+    """Row 42: the vLLM image this machine pulled and runs, if any."""
+    from ..engines.acquisition import engine_root
+    from ..engines.container_images import ImageStore
+
+    current = ImageStore(engine_root()).current()
+    return f"{current.image} (vLLM {current.version})" if current is not None else None
 
 
 def _prompt_cache_usage(request: Request, state: AgentState) -> disk_prompt_cache.Usage | None:
@@ -188,6 +199,27 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
         )
         if found:
             update["unsetResolvesTo"] = found
+    elif key == "vllmContainerImage":
+        from ..engines.vllm_container import by_digest
+
+        in_use = live["vllm_image"]
+        update["unsetMeans"] = "The image this release pins for this machine's GPUs." + (
+            f" In use now: {in_use}." if in_use else " None is pulled yet."
+        )
+        chosen = live["vllm_image_set"]
+        if isinstance(chosen, str) and chosen.strip() and not by_digest(chosen.strip()):
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning,
+                text=(
+                    "Not named by digest (name@sha256:<64 hex digits>), so it is not pulled "
+                    "or run; the image in use stays."
+                ),
+            )
+        elif in_use and isinstance(chosen, str) and chosen.strip() and chosen.strip() not in in_use:
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning,
+                text=f"Not pulled yet: models run {in_use} until it is pulled on the Engines page.",
+            )
     elif key == "uvBinary":
         found = live["uv"]
         update["unsetMeans"] = (

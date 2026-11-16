@@ -92,6 +92,9 @@ class RuntimeCounts:
     loading: int
     #: The engine processes this agent launched; their descendants count too.
     pids: tuple[int, ...] = ()
+    #: Row 42: why an engine's memory cannot be attributed to its processes here
+    #: (a container in Docker Desktop's virtual machine): "unknown", never zero.
+    unattributed: str | None = None
 
 
 @dataclass(frozen=True)
@@ -854,7 +857,7 @@ class HostProbe:
         ram_available = int(memory.available)
         counters = self._pdh.collect() if self._pdh is not None else None
         for gpu in self._gpus:
-            readings += self._gpu(gpu, pids, ram_available, counters)
+            readings += self._gpu(gpu, pids, ram_available, counters, counts.unattributed)
         readings += self._host(memory)
         readings += self._disks()
         readings += [
@@ -871,6 +874,7 @@ class HostProbe:
         pids: set[int],
         ram_available: int,
         counters: WindowsGpuCounters | None,
+        unattributed: str | None = None,
     ) -> list[Reading]:
         device = gpu.device
         name = device.name or f"GPU {device.index}"
@@ -965,7 +969,11 @@ class HostProbe:
         put(HostMetric.gpuMemoryUsed, used, used_reason)
         put(HostMetric.gpuMemoryTotal, float(total) if total is not None else None,
             "this card does not report its memory size")  # fmt: skip
-        eugene, eugene_reason = self._eugene_share(gpu, pids, counters, luid, shared)
+        eugene, eugene_reason = (
+            (None, unattributed)
+            if unattributed is not None
+            else self._eugene_share(gpu, pids, counters, luid, shared)
+        )
         put(HostMetric.gpuMemoryEugene, eugene, eugene_reason)
 
         labels = {

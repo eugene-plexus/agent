@@ -29,6 +29,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 import httpx
@@ -59,7 +60,7 @@ from .._generated.models import (
     RuntimeSpeculation,
 )
 from ..child_env import child_environment
-from . import prompt_cache, same_answer, speculation
+from . import prompt_cache, same_answer, speculation, vllm_container
 from .base import (
     DiscoveredBinary,
     EngineAdapter,
@@ -268,9 +269,12 @@ class VllmAdapter(EngineAdapter):
             return (
                 f"vLLM could not keep {needed / 1024:g} GiB of prompt cache in system memory: "
                 f"it holds that buffer in /dev/shm, which has {free} MiB free. Lower Prompt "
-                "cache in system memory on this profile, or give /dev/shm more room "
-                "(--shm-size or --ipc=host for a container)."
+                "cache in system memory on this profile, or give /dev/shm more room: in the "
+                "container, raise Shared memory (GiB) on this profile (--shm-size)."
             )
+        container = _explain_container(output_tail)
+        if container is not None:
+            return container
         for signature, explanation in _EXIT_EXPLANATIONS:
             if signature in output_tail:
                 return explanation
@@ -281,6 +285,18 @@ class VllmAdapter(EngineAdapter):
         return prompt_cache.vllm_view(spec, argv)
 
     def declaration_problem(self, spec: RuntimeSpec) -> str | None:
+        flags = spec.flags or {}
+        source = flags.get(vllm_container.KEY_SOURCE)
+        if source not in (None, vllm_container.SOURCE_CONTAINER, vllm_container.SOURCE_BINARY):
+            return (
+                f"Run vLLM from (source) is {vllm_container.SOURCE_CONTAINER!r} or "
+                f"{vllm_container.SOURCE_BINARY!r}, not {source!r}"
+            )
+        shm = flags.get(vllm_container.KEY_SHM)
+        if shm is not None and (
+            isinstance(shm, bool) or not isinstance(shm, int | float) or not 1 <= shm <= 1024
+        ):
+            return f"Shared memory (shmSizeGiB) is a number of GiB from 1 to 1024, not {shm!r}"
         return speculation.declaration_problem(spec.modelPath, spec.flags)
 
     def companion_files(self, spec: RuntimeSpec) -> tuple[str, ...]:
@@ -352,11 +368,39 @@ class VllmAdapter(EngineAdapter):
     # --- launching --------------------------------------------------------
 
     def build_argv(self, spec: RuntimeSpec, binary: DiscoveredBinary, port: int) -> list[str]:
+        """`<vllm> serve <model> ...` for the owner's own vLLM."""
+        return [
+            str(binary.path),
+            *self._serve_args(spec, port, offered=lambda: _supported_long_flags(binary.path)),
+        ]
+
+    def build_container_launch(
+        self, spec: RuntimeSpec, port: int, context: vllm_container.Context
+    ) -> vllm_container.ContainerLaunch:
+        """The same `serve` arguments inside `docker run` (row 42): the image's
+        `vllm` entrypoint, the model's folder read only, the port on loopback
+        unless the profile names a host. `spec` carries this machine's paths."""
+        return vllm_container.plan_launch(
+            spec,
+            port,
+            context,
+            lambda inside: self._serve_args(inside, inside.port or port, offered=context.offered),
+        )
+
+    def _serve_args(
+        self,
+        spec: RuntimeSpec,
+        port: int,
+        *,
+        offered: Callable[[], frozenset[str] | None],
+    ) -> list[str]:
+        """Everything after the program: what the native path and the container
+        share. `offered` lists the flags this build's help names, asked only
+        when a setting needs it (it imports PyTorch)."""
         # The model is positional: `vllm serve [model_tag] [options]`
         # (`entrypoints/cli/serve.py`, which copies `model_tag` onto
         # `args.model` and hides `--model` from `vllm serve --help`).
         argv = [
-            str(binary.path),
             "serve",
             spec.modelPath,
             "--host",
@@ -390,6 +434,7 @@ class VllmAdapter(EngineAdapter):
             if (
                 field.key in (prompt_cache.KV_OFFLOAD_KEY, same_answer.KEY)
                 or field.key in speculation.KEYS
+                or field.key in (vllm_container.KEY_SOURCE, vllm_container.KEY_SHM)
             ):
                 continue
             if field.key not in flags:
@@ -414,8 +459,8 @@ class VllmAdapter(EngineAdapter):
         # error, and a build whose help could not be read is not guessed at.
         offload = prompt_cache.kv_offload_gib(flags)
         if offload is not None:
-            offered = _supported_long_flags(binary.path)
-            if offered is not None and prompt_cache.KV_OFFLOAD_FLAG in offered:
+            listed = offered()
+            if listed is not None and prompt_cache.KV_OFFLOAD_FLAG in listed:
                 argv += [
                     prompt_cache.KV_OFFLOAD_BACKEND_FLAG,
                     "native",
@@ -436,9 +481,7 @@ class VllmAdapter(EngineAdapter):
             flags.get(speculation.DRAFT_WITH_KEY) not in (None, "off")
             or flags.get(speculation.REUSE_TEXT_KEY) is not False
         ):
-            planned = speculation.vllm_plan(
-                flags, extra_args=spec.extraArgs, offered=_supported_long_flags(binary.path)
-            )
+            planned = speculation.vllm_plan(flags, extra_args=spec.extraArgs, offered=offered())
             argv += list(planned.argv)
             if planned.note and not planned.argv:
                 log.warning("%s: %s The profile's setting is not passed", spec.name, planned.note)
@@ -904,6 +947,7 @@ _CATEGORIES = {
     "parallelism": "Parallelism",
     "performance": "Performance",
     "model": "Model loading",
+    "container": "Container",
 }
 
 # Curated flags -> `vllm serve` CLI names. Every name checked against
@@ -971,6 +1015,41 @@ def refit_parallelism(
 
 _FLAG_FIELDS: list[ConfigField] = [
     same_answer.field(EngineKind.vllm),
+    ConfigField(
+        key=vllm_container.KEY_SOURCE,
+        label="Run vLLM from",
+        description=(
+            "Choose the official container image or your own vLLM.\n\n"
+            "The container image is pulled on this machine's Engines page and runs with "
+            "Docker or Podman. The container gets the model's folder, read only, and a "
+            "cache of its own; nothing else on this machine. Your own vLLM is the program "
+            "in `vllmBinary`, or this runtime's `binary`."
+        ),
+        category="container",
+        valueType=ConfigValueType.enum,
+        enumValues=[vllm_container.SOURCE_CONTAINER, vllm_container.SOURCE_BINARY],
+        enumLabels=["Official container image", "My own vLLM"],
+        unsetMeans=(
+            "The container image when it is pulled on this machine and no vLLM program "
+            "is set (`vllmBinary`, or this runtime's `binary`); otherwise your own vLLM."
+        ),
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key=vllm_container.KEY_SHM,
+        label="Shared memory (GiB)",
+        description=(
+            "Shared memory for the container (`--shm-size`).\n\n"
+            "vLLM keeps buffers in `/dev/shm`, and Prompt cache in system memory needs "
+            "room there too. Used only when vLLM runs from its container."
+        ),
+        category="container",
+        valueType=ConfigValueType.number,
+        minimum=1,
+        maximum=1024,
+        unsetMeans=f"{vllm_container.DEFAULT_SHM_GIB} GiB.",
+        requiresRestart=True,
+    ),
     ConfigField(
         key=speculation.REUSE_TEXT_KEY,
         label="Reuse repeated text",
@@ -1266,6 +1345,48 @@ _EXIT_EXPLANATIONS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _explain_container(tail: str) -> str | None:
+    """What `docker run` (or `podman run`) said when it could not start the
+    container (row 42), in its own words where we have no better ones."""
+    from .. import container_runtime
+
+    lowered = tail.lower()
+    if "could not select device driver" in lowered:
+        return (
+            "Docker cannot give this container the GPU: the NVIDIA Container Toolkit is not "
+            f"installed or not set up for Docker. Install it ({container_runtime.TOOLKIT_GUIDE}), "
+            "restart Docker, then start this model again."
+        )
+    if (
+        "unable to find image" in lowered
+        or "no such image" in lowered
+        or "image not known" in lowered
+    ):
+        return (
+            "The vLLM container image is not on this machine. Pull it on this machine's "
+            "Engines page (vLLM, Install container), then start this model again."
+        )
+    if "is already in use by container" in lowered:
+        return (
+            "A container from an earlier start of this model is still there. Start the model "
+            "again: Eugene removes it first."
+        )
+    if "permission denied" in lowered and "docker" in lowered and "sock" in lowered:
+        return (
+            "This account may not use Docker. Add this account to the docker group, then "
+            "restart Eugene."
+        )
+    if "cannot connect to the docker daemon" in lowered or "error during connect" in lowered:
+        return "Docker is not running. Start Docker, then start this model again."
+    daemon = _DAEMON_ERROR_RE.search(tail)
+    if daemon:
+        return f"Docker could not start the container: {daemon.group(1).strip()}"
+    return None
+
+
+_DAEMON_ERROR_RE = re.compile(r"Error response from daemon: (.+)")
+
+
 # vLLM 0.30.0's own words when the offload buffer does not fit in `/dev/shm`
 # (`vllm/distributed/device_communicators/shm_broadcast.py`, `check_shm_free_space`).
 _SHM_SPACE_RE = re.compile(r"Insufficient space in /dev/shm: (\d+) MiB required, (\d+) MiB free")
@@ -1305,6 +1426,53 @@ def _supported_long_flags(binary: Path) -> frozenset[str] | None:
     if not found:
         return None
     _help_flags_cache[key] = found
+    return found
+
+
+#: Row 42: the same help, read once per image from a container that has no
+#: network and no mounts.
+_container_help_cache: dict[tuple[str, str], frozenset[str]] = {}
+_CONTAINER_HELP_TIMEOUT_SECONDS = 180.0
+
+
+def container_long_flags(cli: str, image: str) -> frozenset[str] | None:
+    """Every `--long-flag` the image's `vllm serve --help=all` lists, or None
+    when it could not be asked."""
+    key = (cli, image)
+    cached = _container_help_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            [
+                cli,
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--network",
+                "none",
+                "--entrypoint",
+                "vllm",
+                image,
+                "serve",
+                "--help=all",
+            ],
+            capture_output=True,
+            env=child_environment(),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_CONTAINER_HELP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        log.debug("help probe in %s failed: %s", image, e)
+        return None
+    found = frozenset(_LONG_FLAG_RE.findall((proc.stdout or "") + (proc.stderr or "")))
+    if not found or proc.returncode != 0:
+        return None
+    _container_help_cache[key] = found
     return found
 
 

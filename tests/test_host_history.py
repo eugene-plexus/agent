@@ -394,6 +394,23 @@ def test_linux_nvidia_reads_nvml_and_eugenes_share_by_process(tmp_path: Path) ->
     probe.close()
 
 
+def test_an_engine_in_docker_desktops_vm_is_unknown_not_zero() -> None:
+    """Row 42: the container's processes are in Docker Desktop's VM; no pid
+    here holds its memory, and the reading says so instead of reading 0."""
+    reason = "Docker Desktop runs this machine's vLLM containers in a virtual machine"
+    probe = HostProbe(
+        devices=lambda: fake_devices(),
+        adapters=lambda: [],
+        runtimes=lambda: RuntimeCounts(1, 0, (4242,), unattributed=reason),
+        folders=lambda: [],
+        nvml=lambda: _FakeNvml({4242: 6 * 1024**3}),  # type: ignore[arg-type,return-value]
+        platform="linux",
+    )
+    eugene = _values(probe.sample())["gpu:cuda:0:gpuMemoryEugene"]
+    assert eugene.value is None and eugene.unavailable == reason
+    probe.close()
+
+
 def test_a_driver_without_per_process_memory_says_so() -> None:
     reason = "this driver does not report each process's memory"
     probe = HostProbe(

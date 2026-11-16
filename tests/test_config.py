@@ -20,6 +20,8 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "securityMode",
         "maxTrustBundleAgeHours",
         "vllmBinary",
+        # Row 42: the image vLLM runs from (expert).
+        "vllmContainerImage",
         "mlxBinary",
         "kevPython",
         "strataServer",
@@ -209,3 +211,31 @@ def test_an_integer_field_refuses_what_is_not_a_whole_number(authed_client: Test
         assert body["applied"] == [], bad_value
     negative = authed_client.patch("/v1/config", json={"modelCopyMinFreeGb": -1}).json()
     assert negative["rejected"][0]["message"] == "must not be negative"
+
+
+def test_the_vllm_image_setting_says_what_is_in_effect(
+    authed_client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    """Row 42: unset names the pinned image and the one in use; a tag that can
+    move is flagged, because it is never pulled or run."""
+    from eugene_plexus_agent.engines.container_images import ImageStore
+
+    monkeypatch.setenv("EUGENE_PLEXUS_AGENT_ENGINE_ROOT", str(tmp_path / "engines"))
+    ImageStore(tmp_path / "engines").record_pull(
+        image="vllm/vllm-openai@sha256:" + "d" * 64,
+        digest="sha256:" + "a" * 64,
+        version="0.33.0",
+        variant="cuda",
+    )
+    body = authed_client.get("/v1/config/schema").json()
+    field = next(f for f in body["fields"] if f["key"] == "vllmContainerImage")
+    assert "In use now" in field["unsetMeans"] and "0.33.0" in field["unsetMeans"]
+    assert authed_client.patch(
+        "/v1/config", json={"vllmContainerImage": "me/vllm:latest"}
+    ).is_success
+    field = next(
+        f
+        for f in authed_client.get("/v1/config/schema").json()["fields"]
+        if f["key"] == "vllmContainerImage"
+    )
+    assert "by digest" in field["status"]["text"]

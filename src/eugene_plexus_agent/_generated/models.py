@@ -3955,7 +3955,7 @@ class EngineInstallRequest(BaseModel):
     )
     variant: str | None = Field(
         None,
-        description="Install this build variant instead of the one chosen for\nthis host, e.g. `win-sycl-x64` for an Intel Arc through\noneAPI rather than Vulkan, or `win-cpu-x64` to rule the GPU\nout while diagnosing. Omit it for the default, which is what\n`EngineAcquisition.variant` names. It must be one of\n`EngineAcquisition.alternatives` (a variant the release\npublishes for this operating system and CPU); anything else\nis a 422 that lists them.\n\nThis is the expert's way past a default chosen for hardware\nnobody on the project has run, which is most of it. It does\nnot change how this host's devices are reported: those\nfollow the default build, so a model is still scored against\nthe card the default would use.\n",
+        description="Install this build variant instead of the one chosen for\nthis host, e.g. `win-sycl-x64` for an Intel Arc through\noneAPI rather than Vulkan, or `win-cpu-x64` to rule the GPU\nout while diagnosing. Omit it for the default, which is what\n`EngineAcquisition.variant` names. It must be one of\n`EngineAcquisition.alternatives` (a variant the release\npublishes for this operating system and CPU); anything else\nis a 422 that lists them.\n\nThis is the expert's way past a default chosen for hardware\nnobody on the project has run, which is most of it. It does\nnot change how this host's devices are reported: those\nfollow the default build, so a model is still scored against\nthe card the default would use.\n\n`container` (vLLM, row 42) pulls `EngineDescriptor.container.image`\nwith Docker or Podman instead: 422 when no container runtime can\nbe used here, naming why.\n",
     )
 
 
@@ -4135,6 +4135,71 @@ class Origin(StrEnum):
     managed = 'managed'
     configured = 'configured'
     path = 'path'
+
+
+class ContainerImageSource(StrEnum):
+    """
+    * `pinned` - the image this release pins.
+    * `configured` - the owner's `vllmContainerImage` (expert).
+
+    """
+
+    pinned = 'pinned'
+    configured = 'configured'
+
+
+class ManagedImage(BaseModel):
+    """
+    A container image this agent pulled, kept as an engine build is: the
+    image in use and the one before it (`previousVersion`), so a bad
+    image has a way back with no download.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    version: str = Field(
+        ...,
+        description='The engine version in the image, or its short digest when unknown.',
+    )
+    image: str = Field(..., description='The reference it was pulled by.')
+    digest: str | None = Field(
+        None,
+        description='The local image ID (`sha256:...`) the container runtime reported.',
+    )
+    variant: str | None = None
+    installedAt: AwareDatetime | None = None
+    sizeBytes: int | None = None
+    previousVersion: str | None = Field(
+        None, description='The image in use before this one, still on this machine.'
+    )
+    previousImage: str | None = None
+
+
+class ContainerRuntimeKind(StrEnum):
+    docker = 'docker'
+    podman = 'podman'
+
+
+class RuntimeContainer(BaseModel):
+    """
+    Row 42: the container this runtime runs in. Present only for a
+    runtime started from a container image.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., description="The container's name, `ep-<agent>-<runtime>`.")
+    id: str | None = Field(
+        None, description="The container's ID, once the container runtime reported it."
+    )
+    image: str = Field(..., description='The image reference it was started from.')
+    digest: str | None = Field(
+        None, description='The local image ID (`sha256:...`) it runs.'
+    )
 
 
 class FrameworkAccelerator(StrEnum):
@@ -6877,6 +6942,87 @@ class EngineAcquisition(BaseModel):
     )
 
 
+class EngineContainer(BaseModel):
+    """
+    Row 42 (`docs/design/rows/row-42.md`): an engine run from its
+    official container image with Docker or Podman, instead of a Python
+    environment the owner installs. `POST /v1/engines/{engine}/install`
+    with `variant: container` pulls `image`, with progress; a runtime
+    whose `source` flag is `container` (the default where the image is
+    pulled) runs in it.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    image: str = Field(
+        ...,
+        description="What a pull fetches now, always by digest\n(`vllm/vllm-openai@sha256:...`): the agent's\n`vllmContainerImage` when the owner set one, else the image this\nrelease pins for this machine's GPUs.\n",
+    )
+    version: str | None = Field(
+        None, description='The engine version in `image`, when this release pins it.'
+    )
+    source: ContainerImageSource | None = None
+    variant: str | None = Field(
+        None,
+        description="Which pinned image fits this machine: `cuda` (a driver for CUDA\n13), `cuda12` (a driver for CUDA 12), `rocm` (AMD), or `custom`\nfor the owner's own image.\n",
+    )
+    untested: bool | None = Field(
+        None,
+        description="Nobody on the project has run this image on this kind of GPU\n(AMD's `rocm/vllm`). It is offered and never blocked.\n",
+    )
+    installable: bool = Field(
+        ..., description='Whether a pull can start on this machine now.'
+    )
+    reason: str | None = Field(
+        None,
+        description='Why a pull cannot start here, with the fix. Absent when it can.',
+    )
+    pulled: ManagedImage | None = None
+
+
+class ContainerRuntime(BaseModel):
+    """
+    Row 42: Docker or Podman on this machine, as the agent found it at
+    start and every 10 minutes. The Engines page shows it: "Docker 27.3,
+    GPUs available", or why it cannot be used, with the fix.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    kind: ContainerRuntimeKind | None = None
+    version: str | None = Field(
+        None, description="The server's version, as the runtime reports it."
+    )
+    usable: bool = Field(
+        ..., description="Whether this agent's account can run containers here."
+    )
+    gpus: bool = Field(
+        ...,
+        description="Whether GPUs reach containers: Docker lists the `nvidia` runtime\nor CDI devices `nvidia.com/gpu`, or runs on Docker Desktop with\nWSL 2 on a machine whose GPU is NVIDIA's. False is not a\nrefusal: a container then runs without a GPU, and the engine\nsays what it found.\n",
+    )
+    gpuNote: str | None = Field(
+        None,
+        description="Why GPUs do not reach containers here, when the agent knows\n(an AMD or Intel GPU under Docker Desktop, which passes only\nNVIDIA's). Absent when GPUs reach containers or nothing is known.\n",
+    )
+    desktop: bool | None = Field(
+        None,
+        description='Docker Desktop: containers run in a virtual machine, so their\nprocesses and GPU memory are not attributed to this machine\'s\nprocesses ("unknown", never zero).\n',
+    )
+    insideContainer: bool | None = Field(
+        None,
+        description='Eugene itself runs in a container. No container runtime socket\nis ever mounted for it by Eugene.\n',
+    )
+    error: str | None = Field(
+        None, description='Why it cannot be used, in its own words. Absent when usable.'
+    )
+    fix: str | None = Field(None, description='What to do about `error`.')
+    checkedAt: AwareDatetime | None = None
+
+
 class PythonEngine(BaseModel):
     """
     The environment a Python-package engine was found in.
@@ -8249,6 +8395,7 @@ class Runtime(BaseModel):
         description='Requests occupying the engine now, from every client of it, as the\nengine counts them (row 14, M4-LOAD). Only vLLM says: its `GET /load`\nanswers `{"server_load": n}`, read every 2 s while the runtime is\n`ready`. llama.cpp has no such number, so the field is null there, and\nnull when the engine did not answer the last read or is not `ready`.\nIt is never a 0 for an engine that said nothing. A gateway counts only\nits own requests, so this is where another door\'s use shows. Observed,\nnever declared.\n',
         ge=0,
     )
+    container: RuntimeContainer | None = None
 
 
 class LibraryFolderReach(BaseModel):
@@ -8563,6 +8710,10 @@ class EngineDescriptor(BaseModel):
         None,
         description='Present when this engine is a Python package rather than a\nself-contained binary, describing the environment it lives\nin. Absent for llama.cpp.\n',
     )
+    container: EngineContainer | None = Field(
+        None,
+        description="Row 42: this engine run from its official container image\n(vLLM only). Absent for an engine that has none. When an image\nis pulled and a container runtime can be used, `available` is\ntrue and `version` is the image's.\n",
+    )
 
 
 class RuntimeList(BaseModel):
@@ -8626,6 +8777,10 @@ class EligibilityRequest(BaseModel):
 
 class EngineList(BaseModel):
     engines: list[EngineDescriptor]
+    containerRuntime: ContainerRuntime | None = Field(
+        None,
+        description='Row 42: Docker or Podman on this machine, for engines that run\nfrom a container image. Absent from an agent older than row 42.\n',
+    )
 
 
 class Message(BaseModel):

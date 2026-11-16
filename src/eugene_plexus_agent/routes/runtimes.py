@@ -25,6 +25,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from .. import (
+    container_runtime,
     disk_prompt_cache,
     engine_rollout,
     install_proxy,
@@ -89,6 +90,7 @@ from ..dependencies import (
 from ..engines import run_mode
 from ..engines.acquisition import AcquisitionError, Unavailable, engine_root
 from ..engines.base import EngineUnavailableError
+from ..engines.container_images import ImageInstaller, ImagePlan, ImageStore
 from ..engines.devices import detect_devices
 from ..engines.llama_cpp import LlamaCppAdapter, places_by_itself
 from ..engines.strata import StrataAdapter
@@ -619,7 +621,9 @@ async def list_engines(request: Request) -> EngineList:
     rollouts = engine_rollout.manager(request.app)
     for descriptor in engines:
         descriptor.rollout = rollouts.get(descriptor.engine)
-    return EngineList(engines=engines)
+    # Row 42: Docker or Podman here, read with the engines (cached 10 minutes).
+    found = await asyncio.to_thread(container_runtime.current)
+    return EngineList(engines=engines, containerRuntime=found.view())
 
 
 def _refuse_during_rollout(request: Request, kind: EngineKind) -> None:
@@ -700,11 +704,13 @@ async def install_engine(
     # Same thread treatment as the listing above, for the same reason:
     # this resolves the host and may reach upstream, and the operator
     # who pressed Install is not the only person using this agent.
+    state: AgentState = request.app.state.agent_state
     plan = await asyncio.to_thread(
         plan_for,
         kind,
         version=body.version if body else None,
         variant=body.variant if body else None,
+        get_config=state.get_config,
     )
     if isinstance(plan, Unavailable):
         # 422, not 404 or 500: the request was well-formed and the engine
@@ -718,8 +724,16 @@ async def install_engine(
             detail=plan.reason,
         )
 
+    if isinstance(plan, ImagePlan) is not isinstance(installer, ImageInstaller):
+        # Row 42: vLLM's one install is its image, and only vLLM has one.
+        raise _problem(
+            code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            slug="nothing-installable",
+            title="Nothing installable for this host",
+            detail=f"{engine} has no install of that kind.",
+        )
     try:
-        return installer.start(plan)
+        return installer.start(plan)  # type: ignore[arg-type]
     except AcquisitionError as e:
         raise _problem(
             code=status.HTTP_409_CONFLICT,
@@ -940,6 +954,10 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
         # Synchronous intentionally: no start/install request can interleave
         # between the in-use check and removal on this agent's event loop.
         adapter.managed_store().remove_builds()
+        if kind is EngineKind.vllm:
+            # Row 42: the container images this agent pulled, and only those.
+            found = container_runtime.current()
+            ImageStore(engine_root()).remove_all(found.cli if found.usable else None)
         # Its preparations' folders on this node go with it (LS10, B107):
         # what they made is in the Library folders.
         shutil.rmtree(engine_root() / "preparing" / kind.value, ignore_errors=True)
