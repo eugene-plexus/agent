@@ -200,6 +200,12 @@ def inspect_image(cli: str, image: str) -> tuple[str, int | None] | None:
     return first["Id"], int(size) if isinstance(size, int) else None
 
 
+def remove_images(cli: str, records: list[ImageRecord]) -> None:
+    """Remove these recorded images (blocking)."""
+    for record in records:
+        _remove_image(cli, record.digest)
+
+
 def _remove_image(cli: str, digest: str) -> None:
     try:
         answer = _run(cli, "image", "rm", digest)
@@ -368,4 +374,5 @@ __all__ = [
     "ImageStore",
     "inspect_image",
     "registry_words",
+    "remove_images",
 ]

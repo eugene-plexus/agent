@@ -90,7 +90,7 @@ from ..dependencies import (
 from ..engines import run_mode
 from ..engines.acquisition import AcquisitionError, Unavailable, engine_root
 from ..engines.base import EngineUnavailableError
-from ..engines.container_images import ImageInstaller, ImagePlan, ImageStore
+from ..engines.container_images import ImageInstaller, ImagePlan, ImageStore, remove_images
 from ..engines.devices import detect_devices
 from ..engines.llama_cpp import LlamaCppAdapter, places_by_itself
 from ..engines.strata import StrataAdapter
@@ -954,10 +954,9 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
         # Synchronous intentionally: no start/install request can interleave
         # between the in-use check and removal on this agent's event loop.
         adapter.managed_store().remove_builds()
-        if kind is EngineKind.vllm:
-            # Row 42: the container images this agent pulled, and only those.
-            found = container_runtime.current()
-            ImageStore(engine_root()).remove_all(found.cli if found.usable else None)
+        # Row 42: the container images this agent pulled, and only those: the
+        # record goes now, the images below, off the event loop.
+        dropped = ImageStore(engine_root()).remove_all(None) if kind is EngineKind.vllm else []
         # Its preparations' folders on this node go with it (LS10, B107):
         # what they made is in the Library folders.
         shutil.rmtree(engine_root() / "preparing" / kind.value, ignore_errors=True)
@@ -965,6 +964,10 @@ async def uninstall_engine(request: Request, engine: str) -> Response:
         raise _problem(
             code=409, slug="engine-removal-failed", title="Engine removal failed", detail=str(exc)
         ) from exc
+    if dropped:
+        found = await asyncio.to_thread(container_runtime.current)
+        if found.usable and found.cli is not None:
+            await asyncio.to_thread(remove_images, found.cli, dropped)
     return Response(status_code=204)
 
 

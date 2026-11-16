@@ -212,3 +212,14 @@ def test_the_routes_report_docker_and_pull_the_image(
     assert vllm["container"]["source"] == "configured"
     assert vllm["container"]["pulled"]["digest"] == local
     runtimes._INSTALLERS.pop(EngineKind.vllm, None)
+
+
+def test_uninstall_removes_the_pulled_images_and_only_those(
+    docker: FakeCli, tmp_path: Path, authed_client
+) -> None:
+    store = ImageStore(tmp_path / "engines")
+    store.record_pull(image=IMAGE, digest=IMAGE_ID, version="0.33.0", variant="cuda")
+    container_runtime.forget()
+    assert authed_client.post("/v1/engines/vllm/uninstall").status_code == 204
+    assert [c for c in docker.calls() if c[:2] == ["image", "rm"]] == [["image", "rm", IMAGE_ID]]
+    assert store.current() is None
