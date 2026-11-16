@@ -451,3 +451,32 @@ def test_a_standalone_agent_refuses_a_usage_allowance(authed_client):
     key = c.post("/v1/auth/client-keys", json={"name": "y"}).json()["key"]["id"]
     edited = c.put(f"/v1/auth/client-keys/{key}/limits", json={"limits": {"costPerMonthMicros": 5}})
     assert edited.status_code == 422 and "control root" in edited.text
+
+
+def test_an_enrolled_agent_forwards_a_cleared_allowance_and_leaves_out_the_rest(app, client):
+    """Row 40 review S2: on an edit, an allowance left out keeps the root's value
+    and null clears it, so the forward must keep both exactly as sent."""
+    import json
+
+    import httpx
+
+    from tests.test_acting_for_operator import _enrolled, _root
+
+    root = _enrolled(app)
+    answer = {
+        "id": "k1",
+        "name": "metered",
+        "tail": "abcdef",
+        "createdAt": "2026-11-16T00:00:00Z",
+        "expiresAt": "2027-11-16T00:00:00Z",
+    }
+    seen = _root(app, lambda request: httpx.Response(200, json=answer))
+    session = root.session("node:gpu-box", "control")
+    edited = client.put(
+        "/v1/auth/client-keys/k1/limits",
+        json={"limits": {"requestsPerMinute": 30, "tokensPerDay": None}},
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert edited.status_code == 200, edited.text
+    sent = json.loads(seen[0].content)["limits"]
+    assert sent["tokensPerDay"] is None and "costPerMonthMicros" not in sent
