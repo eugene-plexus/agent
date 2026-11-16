@@ -335,6 +335,21 @@ def test_a_name_another_program_holds_is_reported_and_never_trusted(
             assert server.holder == holder
         finally:
             server.stop()
+        # The squatter opens its next instance after the probe's connection; the
+        # call below must meet a listening one, not the moment between (seen on
+        # CI 2026-11-16 as "absent"). Wait for that, observed through the pipe.
+        import pywintypes
+        import win32pipe
+
+        deadline = time.perf_counter() + 10
+        while True:
+            try:
+                win32pipe.WaitNamedPipe(name, 200)
+                break
+            except pywintypes.error:
+                if time.perf_counter() > deadline:
+                    raise
+                time.sleep(0.05)
         # The tray, expecting this process as the service, refuses the squatter.
         reply = tray_pipe.call("pause", port=port, service_name="none", expected_pid=os.getpid())
         assert reply.status == "imposter"

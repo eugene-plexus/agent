@@ -1,6 +1,11 @@
-"""vLLM adapter — drives the operator's own `vllm serve`.
+"""vLLM adapter — drives the operator's own `vllm serve`, or its official image.
 
-We never install vLLM. Its unit of installation is a Python environment
+**Row 42:** the agent does pull vLLM's official container image (by
+digest, as an install with progress) and runs it with Docker or Podman
+(`vllm_container.py`, `container_images.py`); the same `serve` arguments
+(`_serve_args`) go to both. What follows is about the Python environment.
+
+We never install vLLM's Python environment. Its unit of installation is a Python environment
 (an interpreter of a version we do not control, several GB per copy,
 three of six targets on a non-default package index, Apple silicon on a
 separate project entirely, and no single digest that verifies the
