@@ -255,6 +255,39 @@ def test_an_enrolled_agent_passes_on_the_roots_queue_band(app, client):
     assert seen[0].url.path == "/v1/auth/client-keys/admission"
 
 
+def test_an_enrolled_agent_passes_on_the_persons_routing_and_models(app, client):
+    """Row 37: the root answers a verified person's `roleRouting`,
+    `routingGroup` and `modelLimits`. An agent whose models predate them
+    fails the whole forward with a 503 (closed, never open); this one passes
+    them on unchanged, for the gateway to route and refuse by."""
+    import httpx
+
+    from tests.test_acting_for_operator import _enrolled, _root
+
+    root = _enrolled(app)
+    answer = {
+        "keyId": "k1",
+        "keyName": "app:workbench@gpu-box",
+        "personId": "p1",
+        "appClientId": "c1",
+        "roleRouting": {"chat": ["m2", "m1"]},
+        "routingGroup": {"id": "g1", "name": "Sales"},
+        "modelLimits": [{"group": {"id": "g1", "name": "Sales"}, "models": ["m1", "m2"]}],
+    }
+    _root(app, lambda request: httpx.Response(200, json=answer))
+    session = root.session("node:gpu-box", "control")
+    forwarded = client.post(
+        "/v1/auth/client-keys/admission",
+        json={"action": "check", "keyId": "k1", "requestId": "r1", "personToken": "proof"},
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert forwarded.status_code == 200, forwarded.text
+    body = forwarded.json()
+    assert body["roleRouting"] == {"chat": ["m2", "m1"]}
+    assert body["routingGroup"] == {"id": "g1", "name": "Sales"}
+    assert body["modelLimits"] == answer["modelLimits"]
+
+
 def test_an_enrolled_agent_passes_on_why_the_root_refused(app, client):
     """Row 11: the gateway keeps a request refused for `concurrency` in its
     queue and refuses one refused for `rate`, so the forward passes the root's

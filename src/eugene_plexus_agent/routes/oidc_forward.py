@@ -52,6 +52,8 @@ _PASSED_BACK = (
     "content-security-policy",
     "x-frame-options",
     "referrer-policy",
+    # Row 37 review: a 429 or 503 from the root says when to try again.
+    "retry-after",
 )
 #: What the caller sends that the root needs: the client's secret or the
 #: bearer, and what the body is.

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import re
 import time
 from datetime import datetime
 from typing import Any
@@ -47,15 +46,32 @@ def model_permitted(allowed: list[str], model: str) -> bool:
     it to the list of models a key can see; components share schemas, not
     code, so the few lines are duplicated rather than imported.
     """
-    for pattern in allowed:
-        if "*" not in pattern:
-            if pattern == model:
-                return True
+    return any(pattern_matches(pattern, model) for pattern in allowed)
+
+
+def pattern_matches(pattern: str, value: str) -> bool:
+    """One entry against one name, in time linear in their lengths (row 37
+    review): the parts between `*` are found left to right, each as early as
+    it can be, which is exact for a pattern whose only wildcard is `*`. A
+    regular expression of `.*` runs backtracked for a minute on a 26-character
+    pattern of many stars against a 40-character name."""
+    if "*" not in pattern:
+        return pattern == value
+    parts = pattern.split("*")
+    first, last = parts[0], parts[-1]
+    if len(value) < len(first) + len(last):
+        return False
+    if not value.startswith(first) or not value.endswith(last):
+        return False
+    position, end = len(first), len(value) - len(last)
+    for part in parts[1:-1]:
+        if not part:
             continue
-        parts = [re.escape(part) for part in pattern.split("*")]
-        if re.fullmatch(".*".join(parts), model, flags=re.DOTALL) is not None:
-            return True
-    return False
+        found = value.find(part, position, end)
+        if found < 0:
+            return False
+        position = found + len(part)
+    return True
 
 
 class AdmissionRefusal(Exception):

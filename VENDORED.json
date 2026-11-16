@@ -13,7 +13,7 @@
       "sha256": "291d6e51414837e02dc776428d9952f1b181440c7f3b2a20ce88f0f6fcdbeb53"
     },
     "src/eugene_plexus_agent/client_admission.py": {
-      "sha256": "3d6dbf719ba630c5b67e3cbb7e25f3f85f15633b18b35fd10d716c53a012b51c"
+      "sha256": "7425bc55392905cce54c1b85042f018c003d134b28977ad5a7a5575982e0b0ae"
     },
     "src/eugene_plexus_agent/engines/gpu_probe.py": {
       "sha256": "4cfc268ebe5fbdd4315c209d8c5d4652f6458155bf1c81a8ae3824e469d3e083"

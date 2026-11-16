@@ -57,3 +57,34 @@ async def test_shared_pool_keeps_visitors_separate_and_forwards_only_sign_in_coo
                 "/oidc/account", headers={"cookie": "ep-signin=second; ep-signin-flow=second-flow"}
             )
             assert seen[2].headers["cookie"] == "ep-signin=second; ep-signin-flow=second-flow"
+
+
+@pytest.mark.asyncio
+async def test_the_roots_retry_after_reaches_the_caller():
+    """Row 37 review: the root answers `/oidc/active-group` 429 with
+    `Retry-After` (and row 5's passphrase change 503 with one); an app that
+    reaches the root through a machine's agent must be told when to retry."""
+
+    def root(request):
+        return httpx.Response(
+            429,
+            json={"error": "slow_down", "error_description": "Try again in 42 seconds."},
+            headers={"Retry-After": "42"},
+        )
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.node_identity = SimpleNamespace(
+        record=SimpleNamespace(enrolled=True, control_url="http://root.test")
+    )
+    app.state.auth_state = SimpleNamespace(
+        trust=SimpleNamespace(agent_token=lambda _: "node-token")
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(root)) as pool:
+        app.state.oidc_forward_client = pool
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://agent.test"
+        ) as caller:
+            answer = await caller.post("/oidc/active-group", json={"group": None})
+    assert answer.status_code == 429
+    assert answer.headers["Retry-After"] == "42"
