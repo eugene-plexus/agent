@@ -120,7 +120,7 @@ class StubRuntimeSupervisor(RuntimeSupervisor):
             # Mirrors the real supervisor: a start clears why it was stopped.
             self._stop_reasons.pop(spec.name, None)
 
-    async def remove_and_stop(self, name: str) -> None:
+    async def remove_and_stop(self, name: str, *, keep_conversations: bool = False) -> None:
         self.calls.append(("remove_and_stop", name))
         self.started.discard(name)
 

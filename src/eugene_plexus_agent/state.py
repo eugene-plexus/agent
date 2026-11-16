@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 
 import yaml
 
-from . import model_copies, model_paths, ports, share_credentials
+from . import disk_prompt_cache, model_copies, model_paths, ports, share_credentials
 from ._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -456,6 +456,43 @@ CONFIG_FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.integer,
         default=model_copies.DEFAULT_MIN_FREE_GB,
     ),
+    # Row 15 (DI2, call DI-C4): on for llama.cpp, kept 3 days, a 20 GiB cap that is a setting.
+    ConfigField(
+        key=disk_prompt_cache.ENABLED_KEY,
+        label="Keep the prompt cache on disk across restarts",
+        description=(
+            "Saves what a llama.cpp model holds of each chat when Eugene stops it, and reads "
+            "it back when it starts.\n\n"
+            "The next turn then does not reread the whole chat. The files are copies of the "
+            "chats, in this machine's private Eugene folder, and are never shown as text. A "
+            "crash saves nothing. Turning this off deletes them."
+        ),
+        category=disk_prompt_cache.CATEGORY,
+        valueType=ConfigValueType.boolean,
+        default=disk_prompt_cache.DEFAULT_ENABLED,
+    ),
+    ConfigField(
+        key=disk_prompt_cache.DAYS_KEY,
+        label="Delete a saved conversation unused for (days)",
+        description="Counted from the last time a model read it back or saved it.",
+        category=disk_prompt_cache.CATEGORY,
+        valueType=ConfigValueType.integer,
+        default=disk_prompt_cache.DEFAULT_DAYS,
+        minimum=1,
+        maximum=365,
+    ),
+    ConfigField(
+        key=disk_prompt_cache.CAP_KEY,
+        label="Use at most (GiB)",
+        description=(
+            "Above this size, the saved conversations used least recently are deleted first."
+        ),
+        category=disk_prompt_cache.CATEGORY,
+        valueType=ConfigValueType.integer,
+        default=disk_prompt_cache.DEFAULT_CAP_GIB,
+        minimum=1,
+        maximum=100000,
+    ),
 ]
 CONFIG_FIELDS += [
     ConfigField(
@@ -583,6 +620,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "node": "Node",
     "storage": "Library",
     "modelStorage": "Model storage",
+    "promptCache": "Prompt cache on disk",
     "apps": "Apps",
     "hostHistory": "Host history",
 }

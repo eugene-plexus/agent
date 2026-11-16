@@ -4338,6 +4338,61 @@ class PromptCacheSource(StrEnum):
     unsupported = 'unsupported'
 
 
+class RuntimeDiskPromptCache(BaseModel):
+    """
+    The prompt cache on disk for this runtime (row 15,
+    `GET /v1/prompt-cache`): whether this run saves its conversations at
+    a planned stop and reads them back at its next start, read from the
+    command line it was started with and this machine's setting now, and
+    what is saved for it. Absent for a runtime that does not run on
+    llama.cpp, and for a search model.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    saving: bool = Field(
+        ...,
+        description="True when a planned stop of this run saves its conversations and\nits next start reads them back. False when the setting is off,\nthe engine was started without Eugene's folder (an older start,\na build without `--slot-save-path`, an engine other machines can\nreach, or a folder set by hand), and `note` says which.\n",
+    )
+    conversations: int = Field(
+        ...,
+        description='Saved conversations its next start would read back (the engine\nreads back at most one per slot).\n',
+        ge=0,
+    )
+    bytes: int = Field(..., description='Their size on disk.', ge=0)
+    note: str | None = Field(
+        None, description='Why it does not save, or what applies at the next start.'
+    )
+
+
+class PromptCacheOnDiskRuntime(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    runtime: str
+    conversations: int = Field(..., ge=0)
+    bytes: int = Field(..., ge=0)
+
+
+class PromptCacheOnDiskCleared(BaseModel):
+    """
+    What `DELETE /v1/prompt-cache` deleted.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    conversations: int = Field(..., description='Files deleted.', ge=0)
+    bytesFreed: int = Field(..., ge=0)
+    notDeleted: int = Field(..., description='Files the system would not delete.', ge=0)
+    reason: str | None = Field(
+        None,
+        description='The first cause a file was not deleted, as the system gave it.',
+    )
+
+
 class RuntimeSpeculation(BaseModel):
     """
     Speculative decoding as this runtime was started with it, and how
@@ -6871,6 +6926,50 @@ class RuntimePromptCache(BaseModel):
     )
 
 
+class PromptCacheOnDisk(BaseModel):
+    """
+    What this machine keeps of its engines' prompt caches on disk, and
+    the limits it keeps them under (`GET /v1/prompt-cache`). Counts,
+    sizes and dates only; never what the conversations say.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    enabled: bool = Field(
+        ..., description='The setting `diskPromptCache` now. Off deletes every file.'
+    )
+    days: int = Field(
+        ...,
+        description='A file not used for this many days is deleted (`diskPromptCacheDays`).',
+        ge=1,
+    )
+    capBytes: int = Field(
+        ...,
+        description='Above this size the least recently used files are deleted\n(`diskPromptCacheGib`).\n',
+        ge=0,
+    )
+    bytes: int = Field(..., ge=0)
+    conversations: int = Field(
+        ..., description='Saved conversations, one file each.', ge=0
+    )
+    oldest: AwareDatetime | None = Field(
+        None,
+        description='When the least recently used file was last used. Null with no files.',
+    )
+    newest: AwareDatetime | None = Field(
+        None,
+        description='When the most recently used file was last used. Null with no files.',
+    )
+    folder: str | None = Field(
+        None, description='The folder on this machine. Null when this agent has none.'
+    )
+    runtimes: list[PromptCacheOnDiskRuntime] = Field(
+        ..., description='One entry per runtime with saved conversations.'
+    )
+
+
 class ModelCopyClearResult(BaseModel):
     """
     What `POST /v1/model-copies/clear` managed to delete, and what it
@@ -7986,6 +8085,7 @@ class Runtime(BaseModel):
     loadProgress: LoadProgress | None = None
     speculation: RuntimeSpeculation | None = None
     promptCache: RuntimePromptCache | None = None
+    diskPromptCache: RuntimeDiskPromptCache | None = None
     engineLoad: int | None = Field(
         None,
         description='Requests occupying the engine now, from every client of it, as the\nengine counts them (row 14, M4-LOAD). Only vLLM says: its `GET /load`\nanswers `{"server_load": n}`, read every 2 s while the runtime is\n`ready`. llama.cpp has no such number, so the field is null there, and\nnull when the engine did not answer the last read or is not `ready`.\nIt is never a 0 for an engine that said nothing. A gateway counts only\nits own requests, so this is where another door\'s use shows. Observed,\nnever declared.\n',

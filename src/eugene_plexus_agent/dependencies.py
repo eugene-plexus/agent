@@ -135,6 +135,8 @@ FROZEN_TRUST_CHANGES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/v1/entrypoint/apply"),
         ("POST", "/v1/logs"),
         ("POST", "/v1/model-copies/clear"),
+        # Row 15: deletes the saved conversations.
+        ("DELETE", "/v1/prompt-cache"),
         ("POST", "/v1/node/enroll"),
         ("DELETE", "/v1/node/history"),
         ("DELETE", "/v1/node/machine-key"),

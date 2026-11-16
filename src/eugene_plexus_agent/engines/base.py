@@ -23,13 +23,14 @@ from __future__ import annotations
 import abc
 import itertools
 import shutil
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 
+from .. import disk_prompt_cache
 from .._generated.models import (
     ConfigSchema,
     EngineFitModel,
@@ -751,6 +752,36 @@ class EngineAdapter(abc.ABC):
         (row 14, M4-LOAD). None when the engine has no such number or did not
         answer: an engine that says nothing is never reported as idle."""
         return None
+
+    # --- the prompt cache on disk (row 15) ------------------------------------
+
+    def with_disk_cache(
+        self,
+        spec: RuntimeSpec,
+        argv: list[str],
+        env: dict[str, str],
+        binary: DiscoveredBinary,
+        *,
+        root: Path | None,
+        settings: disk_prompt_cache.Settings,
+    ) -> tuple[list[str], disk_prompt_cache.Launch | None]:
+        """The command line with the folder this launch saves its conversations to, and
+        what that means; `(argv, None)` for an engine that cannot save them."""
+        return argv, None
+
+    async def save_slots(
+        self, base_url: str, filename_for: Callable[[int], str], *, budget: float
+    ) -> disk_prompt_cache.SlotSaves:
+        """Save each slot that ran a conversation and is not answering now."""
+        return disk_prompt_cache.SlotSaves(saves=[], error=None)
+
+    async def restore_slot(
+        self, base_url: str, slot: int, filename: str, *, budget: float
+    ) -> disk_prompt_cache.SlotRestore:
+        """Read one saved conversation back into `slot`."""
+        return disk_prompt_cache.SlotRestore(
+            slot=slot, tokens=None, error="this engine cannot read one back", refused=False
+        )
 
     def validate_flags(self, flags: dict[str, object]) -> list[str]:
         """Return the flag keys this adapter does not recognise.

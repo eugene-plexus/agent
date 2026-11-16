@@ -25,6 +25,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from .. import (
+    disk_prompt_cache,
     engine_rollout,
     install_proxy,
     library_folders,
@@ -48,6 +49,9 @@ from .._generated.models import (
     ModelCopySkipped,
     PreparedInspectRequest,
     PreparedProvenance,
+    PromptCacheOnDisk,
+    PromptCacheOnDiskCleared,
+    PromptCacheOnDiskRuntime,
     Runtime,
     RuntimeAutoStart,
     RuntimeDrain,
@@ -1214,7 +1218,9 @@ async def update_runtime(request: Request, name: str, body: RuntimeSpec) -> Runt
         # again; the standing promise is stale in size and right in
         # kind, and dropping it would reopen the defect for exactly as
         # long as the restart takes.
-        await supervisor.remove_and_stop(name)
+        # Row 15: an edit keeps the conversations the engine holds; the next launch reads
+        # them back when nothing that shapes them changed.
+        await supervisor.remove_and_stop(name, keep_conversations=True)
         supervisor.add_and_start(updated)
     return _compose(updated, supervisor)
 
@@ -1476,4 +1482,56 @@ async def clear_model_copies(request: Request) -> ModelCopyClearResult:
             ModelCopySkipped(path=s.path, runtime=s.runtime, reason=s.reason)
             for s in result.skipped
         ],
+    )
+
+
+@router.get(
+    "/v1/prompt-cache",
+    response_model=PromptCacheOnDisk,
+    tags=["runtimes"],
+    dependencies=_write_auth,
+)
+async def get_prompt_cache_on_disk(request: Request) -> PromptCacheOnDisk:
+    """Row 15: what this machine keeps of its engines' prompt caches on disk.
+
+    Counts, sizes and dates only: the files are copies of people's chats, and no route
+    reads them. Operator-only, like the folder it names."""
+    supervisor = _supervisor(request)
+    root = supervisor.prompt_cache_root if supervisor is not None else None
+    state: AgentState = request.app.state.agent_state
+    settings = disk_prompt_cache.settings_from_config(state.get_config)
+    names = [spec.name for spec in state.list_runtime_specs()]
+    found = await asyncio.to_thread(disk_prompt_cache.usage, root, names)
+    return PromptCacheOnDisk(
+        enabled=settings.enabled,
+        days=settings.days,
+        capBytes=settings.cap_bytes,
+        bytes=found.bytes,
+        conversations=found.conversations,
+        oldest=found.oldest,
+        newest=found.newest,
+        folder=str(root) if root is not None else None,
+        runtimes=[
+            PromptCacheOnDiskRuntime(runtime=name, conversations=count, bytes=size)
+            for name, (count, size) in sorted(found.by_runtime.items())
+        ],
+    )
+
+
+@router.delete(
+    "/v1/prompt-cache",
+    response_model=PromptCacheOnDiskCleared,
+    tags=["runtimes"],
+    dependencies=_write_auth,
+)
+async def clear_prompt_cache_on_disk(request: Request) -> PromptCacheOnDiskCleared:
+    """Row 15: delete every saved conversation. Stops nothing and switches nothing off."""
+    supervisor = _supervisor(request)
+    root = supervisor.prompt_cache_root if supervisor is not None else None
+    cleared = await asyncio.to_thread(disk_prompt_cache.clear, root)
+    return PromptCacheOnDiskCleared(
+        conversations=cleared.conversations,
+        bytesFreed=cleared.bytes_freed,
+        notDeleted=cleared.not_deleted,
+        reason=cleared.reason,
     )

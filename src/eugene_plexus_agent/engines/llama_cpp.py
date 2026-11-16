@@ -11,10 +11,13 @@ import json
 import logging
 import re
 import subprocess
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 
+from .. import disk_prompt_cache
 from .._generated.models import (
     Accelerator,
     Arch,
@@ -619,6 +622,135 @@ class LlamaCppAdapter(EngineAdapter):
             return None
         return speculation.parse_metrics(response.text)
 
+    # --- the prompt cache on disk (row 15, DI2) --------------------------------
+
+    def with_disk_cache(
+        self,
+        spec: RuntimeSpec,
+        argv: list[str],
+        env: dict[str, str],
+        binary: DiscoveredBinary,
+        *,
+        root: Path | None,
+        settings: disk_prompt_cache.Settings,
+    ) -> tuple[list[str], disk_prompt_cache.Launch | None]:
+        """`--slot-save-path` in this launch's own folder, when the build lists it."""
+        embeds, reranks = run_mode.started_as(argv, env)
+        return disk_prompt_cache.plan(
+            runtime=spec.name,
+            host=spec.host,
+            argv=argv,
+            env=env,
+            extra_args=spec.extraArgs,
+            root=root,
+            settings=settings,
+            search=embeds or reranks,
+            offered=_supported_long_flags(binary.path),
+        )
+
+    async def save_slots(
+        self, base_url: str, filename_for: Callable[[int], str], *, budget: float
+    ) -> disk_prompt_cache.SlotSaves:
+        """`GET /slots`, then `POST /slots/{id}?action=save` for each slot that ran a
+        conversation and is not answering now.
+
+        A slot read back at this start and not used since reports no task, and a slot the
+        engine moved to its RAM cache reports no tokens: neither is saved again. Only the
+        id, `is_processing` and `n_prompt_tokens` are read; the slot list also carries the
+        last prompt's text, which is never kept or logged."""
+        url = base_url.rstrip("/")
+        started = time.perf_counter()
+        try:
+            response = await _probe_client().get(f"{url}/slots", timeout=min(budget, 10.0))
+        except httpx.HTTPError as e:
+            return disk_prompt_cache.SlotSaves([], f"its slot list did not answer: {e}")
+        if not response.is_success:
+            return disk_prompt_cache.SlotSaves(
+                [], f"its slot list answered {response.status_code}: {_error_text(response)}"
+            )
+        try:
+            slots = response.json()
+        except ValueError:
+            return disk_prompt_cache.SlotSaves([], "its slot list was not JSON")
+        if not isinstance(slots, list):
+            return disk_prompt_cache.SlotSaves([], "its slot list was not a list")
+        saves: list[disk_prompt_cache.SlotSave] = []
+        for item in slots:
+            if not isinstance(item, dict):
+                continue
+            slot, tokens = item.get("id"), item.get("n_prompt_tokens")
+            if not isinstance(slot, int) or isinstance(slot, bool) or slot < 0:
+                continue
+            if item.get("is_processing") is True:
+                continue
+            if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens <= 0:
+                continue
+            left = budget - (time.perf_counter() - started)
+            if left <= 0:
+                saves.append(
+                    disk_prompt_cache.SlotSave(slot, None, tokens, None, "no time was left")
+                )
+                continue
+            filename = filename_for(slot)
+            try:
+                answer = await _probe_client().post(
+                    f"{url}/slots/{slot}",
+                    params={"action": "save"},
+                    json={"filename": filename},
+                    timeout=left,
+                )
+            except httpx.HTTPError as e:
+                saves.append(
+                    disk_prompt_cache.SlotSave(slot, None, tokens, None, str(e) or "timed out")
+                )
+                continue
+            if not answer.is_success:
+                saves.append(
+                    disk_prompt_cache.SlotSave(
+                        slot, None, tokens, None, f"{answer.status_code}: {_error_text(answer)}"
+                    )
+                )
+                continue
+            body = _json_object(answer)
+            written = body.get("n_written")
+            saved = body.get("n_saved")
+            saves.append(
+                disk_prompt_cache.SlotSave(
+                    slot,
+                    filename,
+                    saved if isinstance(saved, int) else tokens,
+                    written if isinstance(written, int) else None,
+                    None,
+                )
+            )
+        return disk_prompt_cache.SlotSaves(saves, None)
+
+    async def restore_slot(
+        self, base_url: str, slot: int, filename: str, *, budget: float
+    ) -> disk_prompt_cache.SlotRestore:
+        """`POST /slots/{slot}?action=restore`. A 4xx is the engine refusing the file
+        (another layout, a cut-short or damaged file): `refused`, so it is deleted."""
+        try:
+            answer = await _probe_client().post(
+                f"{base_url.rstrip('/')}/slots/{slot}",
+                params={"action": "restore"},
+                json={"filename": filename},
+                timeout=budget,
+            )
+        except httpx.HTTPError as e:
+            return disk_prompt_cache.SlotRestore(slot, None, str(e) or "timed out", refused=False)
+        if not answer.is_success:
+            return disk_prompt_cache.SlotRestore(
+                slot,
+                None,
+                f"{answer.status_code}: {_error_text(answer)}",
+                refused=400 <= answer.status_code < 500 and answer.status_code != 404,
+            )
+        restored = _json_object(answer).get("n_restored")
+        return disk_prompt_cache.SlotRestore(
+            slot, restored if isinstance(restored, int) else None, None, refused=False
+        )
+
     def accepts_mode(self, mode: RuntimeMode) -> bool:
         """llama.cpp is the one engine that starts a model as a search model."""
         return True
@@ -800,6 +932,26 @@ def _status_text(response: httpx.Response) -> str | None:
         if isinstance(status, str):
             return status
     return None
+
+
+def _json_object(response: httpx.Response) -> dict:
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _error_text(response: httpx.Response) -> str:
+    """llama-server's own words for a refusal (`{"error": {"message": ...}}`), else the
+    start of the body."""
+    error = _json_object(response).get("error")
+    message = error.get("message") if isinstance(error, dict) else None
+    if isinstance(message, str):
+        return message
+    if isinstance(error, str):
+        return error
+    return response.text[:200] or "no reason given"
 
 
 # --------------------------------------------------------------------------- #

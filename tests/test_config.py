@@ -41,6 +41,10 @@ def test_get_config_schema_lists_expected_fields(authed_client: TestClient) -> N
         "hostHistoryMinuteDays",
         "hostHistoryHourDays",
         "modelCopyMinFreeGb",
+        # Row 15: the prompt cache on disk.
+        "diskPromptCache",
+        "diskPromptCacheDays",
+        "diskPromptCacheGib",
         "uvBinary",
         "allowCustomApps",
         "updateChecks",

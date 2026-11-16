@@ -59,6 +59,7 @@ from .auth_state import AuthState
 from .client_key_registry import ClientKeyRegistry
 from .client_keys import KEYS_FILE, ClientKeyStore
 from .dependencies import require_operator_session
+from .disk_prompt_cache import FOLDER_NAME as PROMPT_CACHE_FOLDER
 from .library_folders import FOLDERS_FILE, LibraryFolderCache
 from .routes import apps as apps_routes
 from .routes import auth as auth_routes
@@ -373,6 +374,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             inherited_rules=folders_cache.inherited_rules,
             library_roots=lambda: [folder.path for folder in folders_cache.folders or []],
             stop_memory=state,
+            # Row 15: the prompt cache on disk, in this agent's own private folder.
+            prompt_cache_root=settings.config_file.resolve().parent / PROMPT_CACHE_FOLDER,
         )
         owns_runtimes = True
     else:

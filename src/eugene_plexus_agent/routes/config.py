@@ -16,7 +16,14 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from .. import enrollment, keyring_store, library_folders, model_paths, share_credentials
+from .. import (
+    disk_prompt_cache,
+    enrollment,
+    keyring_store,
+    library_folders,
+    model_paths,
+    share_credentials,
+)
 from .._generated.common_models import (
     ConfigDocument,
     ConfigField,
@@ -124,7 +131,17 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         "copy_enabled": state.get_config("modelCopyEnabled") is True,
         "copy_dir": state.get_config("modelCopyDir"),
         "history_bytes": _history_bytes(request),
+        "prompt_cache": _prompt_cache_usage(request, state),
     }
+
+
+def _prompt_cache_usage(request: Request, state: AgentState) -> disk_prompt_cache.Usage | None:
+    """Row 15: what the prompt cache on disk holds now; None when this agent keeps none."""
+    supervisor = getattr(request.app.state, "runtime_supervisor", None)
+    root = getattr(supervisor, "prompt_cache_root", None)
+    if root is None:
+        return None
+    return disk_prompt_cache.usage(root, [spec.name for spec in state.list_runtime_specs()])
 
 
 def _history_bytes(request: Request) -> int | None:
@@ -202,6 +219,19 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
             if found is not None:
                 level, text = found
                 update["status"] = ConfigFieldStatus(level=ConfigFieldStatusLevel(level), text=text)
+    elif key == disk_prompt_cache.ENABLED_KEY:
+        kept = live["prompt_cache"]
+        if kept is not None:
+            count = kept.conversations
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.info,
+                text=(
+                    f"{count} saved conversation{'s take' if count != 1 else ' takes'} "
+                    f"{kept.bytes / 1024**2:.1f} MiB on disk now."
+                    if count
+                    else "No conversation is saved on disk now."
+                ),
+            )
     elif key in _HISTORY_RETENTION_KEYS:
         size = live["history_bytes"]
         update["status"] = ConfigFieldStatus(

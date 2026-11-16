@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import exec_approvals, exec_trust, model_copies, ports
+from . import disk_prompt_cache, exec_approvals, exec_trust, model_copies, ports
 from ._generated.models import (
     CopyProgress,
     EngineAcquisition,
@@ -41,6 +41,7 @@ from ._generated.models import (
     Policy,
     Runtime,
     RuntimeCapabilities,
+    RuntimeDiskPromptCache,
     RuntimeLocalPathSource,
     RuntimeMode,
     RuntimePromptCache,
@@ -99,6 +100,14 @@ log = logging.getLogger(__name__)
 _READINESS_POLL_SECONDS = 2.0
 #: How often a speculating engine's `/metrics` is read (SD1).
 _SPECULATION_READ_SECONDS = 10.0
+#: Row 15: how long a planned stop waits for an engine to save its conversations, and how
+#: long a start reads them back before the runtime is reported ready anyway. An agent that
+#: is itself stopping gets less: a service manager waits about 20 s in all.
+_SAVE_SECONDS = 60.0
+_SHUTDOWN_SAVE_SECONDS = 10.0
+_READ_BACK_SECONDS = 120.0
+#: How often the limits (days, size) are applied while nothing else applies them.
+_SWEEP_SECONDS = 3600.0
 
 
 def _companions(spec: RuntimeSpec) -> tuple[str, ...]:
@@ -184,8 +193,12 @@ class _RuntimePlanner:
         get_config: ConfigGetter | None = None,
         inherited_rules: RulesProvider | None = None,
         library_roots: Callable[[], Sequence[str]] | None = None,
+        prompt_cache_root: Path | None = None,
     ) -> None:
         self.spec = spec
+        self._prompt_cache_root = prompt_cache_root
+        self.disk_launch: disk_prompt_cache.Launch | None = None
+        """Row 15: what the last plan does with the prompt cache on disk."""
         self._adapter = adapter
         self._log = log
         self._get_config = get_config
@@ -331,6 +344,18 @@ class _RuntimePlanner:
             raise SpawnPlanError(str(e)) from e
         if search is not None:
             env["PATH"] = search
+
+        # Row 15: the folder this launch saves its conversations to, in front of the
+        # runtime's own extra arguments. From the final environment, so a variable that
+        # names one by hand is seen.
+        argv, self.disk_launch = self._adapter.with_disk_cache(
+            launch_spec,
+            argv,
+            env,
+            binary,
+            root=self._prompt_cache_root,
+            settings=disk_prompt_cache.settings_from_config(self._get_config),
+        )
 
         cwd = self._adapter.working_directory(launch_spec, binary)
         try:
@@ -525,8 +550,18 @@ class RuntimeSupervisor:
         inherited_rules: RulesProvider | None = None,
         stop_memory: StopMemory | None = None,
         library_roots: Callable[[], Sequence[str]] | None = None,
+        prompt_cache_root: Path | None = None,
     ) -> None:
         self._log = log or logging.getLogger(__name__)
+        #: Row 15: this agent's private folder for the prompt cache on disk; None keeps none.
+        self.prompt_cache_root = prompt_cache_root
+        #: The run whose saved conversations were read back (or had none), by runtime.
+        self._read_back: dict[str, _Run] = {}
+        self._reading_back: dict[str, tuple[_Run, asyncio.Task[None]]] = {}
+        self._last_sweep: float | None = None
+        self._swept_with: disk_prompt_cache.Settings | None = None
+        #: Slots per runtime, from the engine's last ready answer.
+        self._engine_slots: dict[str, int | None] = {}
         # A person's Stop outlives the agent: before agent#11 every runtime
         # with `autoStart` came back at the next boot, so a model stopped to
         # free the GPU took it back after every update and reboot.
@@ -673,6 +708,7 @@ class RuntimeSupervisor:
             self._get_config,
             inherited_rules=self._inherited_rules,
             library_roots=self._library_roots,
+            prompt_cache_root=self.prompt_cache_root,
         )
         planner.before_start = self._check_cards
         planner.after_start = lambda launch: self.device_memory.record(spec, launch)
@@ -887,8 +923,14 @@ class RuntimeSupervisor:
         self._engine_load.pop(name, None)
         self._load_progress.forget(name)
 
-    async def remove_and_stop(self, name: str) -> None:
+    async def remove_and_stop(self, name: str, *, keep_conversations: bool = False) -> None:
+        """Stop the engine and forget the runtime. Its saved conversations (row 15) go with
+        it, unless `keep_conversations`: a declaration replaced by an edit saves them first
+        and keeps them, and its next launch reads them back when nothing that shapes them
+        changed."""
         await self._cancel_copy(name)
+        if keep_conversations:
+            await self.save_conversations(name)
         sp = self._processes.pop(name, None)
         self._planners.pop(name, None)
         self._readiness.pop(name, None)
@@ -899,8 +941,11 @@ class RuntimeSupervisor:
         self._forget_stop(name)
         self._copy_notes.pop(name, None)
         self._load_progress.forget(name)
+        self._forget_read_back(name)
         if sp is not None:
             await sp.stop()
+        if not keep_conversations:
+            await asyncio.to_thread(disk_prompt_cache.remove_runtime, self.prompt_cache_root, name)
 
     async def restart(self, name: str) -> bool:
         sp = self._processes.get(name)
@@ -918,6 +963,8 @@ class RuntimeSupervisor:
             await self.stop_one(name, reason=StopReason.operator)
             self.add_and_start(planner.spec.model_copy(update={"autoStart": True}))
             return True
+        await self.save_conversations(name)
+        self._forget_read_back(name)
         self._readiness.pop(name, None)
         self._proved_ready.pop(name, None)
         await sp.restart()
@@ -946,6 +993,9 @@ class RuntimeSupervisor:
         await self._cancel_copy(name)
         sp = self._processes.get(name)
         if sp is not None:
+            # Row 15: a planned stop keeps the conversations it holds for the next start.
+            await self.save_conversations(name)
+            self._forget_read_back(name)
             await sp.stop()
             if self._processes.get(name) is not sp:
                 return
@@ -966,6 +1016,17 @@ class RuntimeSupervisor:
             self._poll_task = None
         for name in list(self._copy_jobs):
             await self._cancel_copy(name)
+        # Row 15: an agent stopping (an update, a reboot) keeps its engines' conversations
+        # too, in the little time a service manager allows.
+        await asyncio.gather(
+            *(
+                self.save_conversations(name, budget=_SHUTDOWN_SAVE_SECONDS)
+                for name in list(self._processes)
+            ),
+            return_exceptions=True,
+        )
+        for name in list(self._reading_back):
+            self._forget_read_back(name)
         await asyncio.gather(
             *(sp.stop() for sp in self._processes.values()),
             return_exceptions=True,
@@ -1227,6 +1288,7 @@ class RuntimeSupervisor:
             speculation=self._speculation_for(spec, adapter, argv, status),
             engineLoad=self._engine_load_for(name, sp, status),
             promptCache=self._prompt_cache_for(spec, adapter, argv, status),
+            diskPromptCache=self._disk_cache_for(spec, adapter, argv, status, readiness),
             lastDevices=[LastDevice(d) for d in self.device_memory.observed(spec)[0]] or None,
             startedOnFewerCards=self.device_memory.observed(spec)[1],
         )
@@ -1256,6 +1318,283 @@ class RuntimeSupervisor:
         if adapter is None or status not in _MEMORY_HOLDING:
             return None
         return adapter.prompt_cache_view(spec, argv)
+
+    # --- the prompt cache on disk (row 15) ---------------------------------
+
+    def disk_settings(self) -> disk_prompt_cache.Settings:
+        if self.prompt_cache_root is None:
+            return disk_prompt_cache.Settings(False, disk_prompt_cache.DEFAULT_DAYS, 0)
+        return disk_prompt_cache.settings_from_config(self._get_config)
+
+    def _managed_folder(self, sp: SupervisedProcess | None) -> Path | None:
+        """The folder this run saves to, when it is one this agent made."""
+        if sp is None or not sp.last_argv:
+            return None
+        folder = disk_prompt_cache.folder_of(sp.last_argv)
+        return folder if disk_prompt_cache.is_managed(self.prompt_cache_root, folder) else None
+
+    def active_cache_folders(self) -> list[Path]:
+        """The folders running engines save to: never removed under them."""
+        return [
+            folder
+            for sp in self._processes.values()
+            if sp.supervising and (folder := self._managed_folder(sp)) is not None
+        ]
+
+    def _slot_count(self, name: str) -> int:
+        """The engine's slots, as its last ready answer said (`/props`); 1 when unknown."""
+        slots = self._engine_slots.get(name)
+        return slots if isinstance(slots, int) and slots >= 1 else 1
+
+    def _disk_cache_for(
+        self,
+        spec: RuntimeSpec,
+        adapter: EngineAdapter | None,
+        argv: list[str],
+        status: RuntimeStatus,
+        readiness: Loading | Ready | None,
+    ) -> RuntimeDiskPromptCache | None:
+        """What this run does with its conversations at a planned stop, from the command
+        line it was started with and the setting now (settings never lie)."""
+        if (
+            adapter is None
+            or spec.engine is not EngineKind.llama_cpp
+            or status not in _PROCESS_RUNNING
+            or not argv
+        ):
+            return None
+        started = adapter.search_flags(argv, spec.env)
+        if started is not None and any(started):
+            return None
+        settings = self.disk_settings()
+        folder = disk_prompt_cache.folder_of(argv)
+        if folder is not None and not disk_prompt_cache.is_managed(self.prompt_cache_root, folder):
+            return RuntimeDiskPromptCache(
+                saving=False,
+                conversations=0,
+                bytes=0,
+                note=(
+                    f"Saving is set by hand ({disk_prompt_cache.FLAG}), so Eugene does not save "
+                    "conversations or read them back."
+                ),
+            )
+        if folder is None:
+            planner = self._planners.get(spec.name)
+            launch = planner.disk_launch if planner is not None else None
+            note = launch.note if launch is not None else None
+            if settings.enabled and (note is None or note == disk_prompt_cache.NOTE_OFF):
+                note = "Turned on after this run started: it applies at the next start."
+            return RuntimeDiskPromptCache(saving=False, conversations=0, bytes=0, note=note)
+        count, size = disk_prompt_cache.folder_usage(folder, slots=self._slot_count(spec.name))
+        if not settings.enabled:
+            return RuntimeDiskPromptCache(
+                saving=False,
+                conversations=count,
+                bytes=size,
+                note="Turned off: this run saves nothing, and its saved conversations are deleted.",
+            )
+        return RuntimeDiskPromptCache(saving=True, conversations=count, bytes=size, note=None)
+
+    async def save_conversations(self, name: str, *, budget: float = _SAVE_SECONDS) -> int:
+        """Before a planned stop: the conversations a ready engine holds, to its folder.
+
+        Only a ready engine with Eugene's folder, while the setting is on. A slot that is
+        answering is skipped rather than waited for. Never raises: a stop never fails for a
+        save. The number saved."""
+        sp = self._processes.get(name)
+        planner = self._planners.get(name)
+        folder = self._managed_folder(sp)
+        if (
+            sp is None
+            or planner is None
+            or sp.pid is None
+            or folder is None
+            or not isinstance(self._readiness.get(name), Ready)
+        ):
+            return 0
+        settings = self.disk_settings()
+        if not settings.enabled:
+            return 0
+        adapter = adapter_for(planner.spec.engine)
+        if adapter is None:
+            return 0
+        spec = planner.spec
+        base = f"http://{spec.host or '127.0.0.1'}:{spec.port}"
+        names: dict[int, str] = {}
+
+        def filename_for(slot: int) -> str:
+            names[slot] = disk_prompt_cache.new_name(slot)
+            return disk_prompt_cache.part_name(names[slot])
+
+        started = time.perf_counter()
+        try:
+            await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
+            result = await adapter.save_slots(base, filename_for, budget=budget)
+        except Exception as exc:  # a stop never fails for a save
+            self._log.warning("runtime %s: saved no conversations to disk: %s", name, exc)
+            return 0
+        if result.error is not None:
+            self._log.warning("runtime %s: saved no conversations to disk: %s", name, result.error)
+            return 0
+        kept = size = 0
+        for save in result.saves:
+            if save.error is not None or save.filename is None:
+                self._log.warning(
+                    "runtime %s: the conversation in slot %d was not saved: %s",
+                    name,
+                    save.slot,
+                    save.error,
+                )
+                if save.slot in names:
+                    disk_prompt_cache.discard(
+                        folder / disk_prompt_cache.part_name(names[save.slot])
+                    )
+                continue
+            path = await asyncio.to_thread(disk_prompt_cache.finish, folder, names[save.slot])
+            if path is not None:
+                kept += 1
+                with contextlib.suppress(OSError):
+                    size += path.stat().st_size
+        await asyncio.to_thread(disk_prompt_cache.prune, folder, self._slot_count(name))
+        await asyncio.to_thread(
+            disk_prompt_cache.sweep,
+            self.prompt_cache_root,
+            settings,
+            active=self.active_cache_folders(),
+        )
+        if result.saves:
+            self._log.info(
+                "runtime %s: saved %d conversation(s) to disk (%.1f MiB) in %.1f s",
+                name,
+                kept,
+                size / 1024**2,
+                time.perf_counter() - started,
+            )
+        return kept
+
+    def _forget_read_back(self, name: str) -> None:
+        self._read_back.pop(name, None)
+        self._engine_slots.pop(name, None)
+        running = self._reading_back.pop(name, None)
+        if running is not None and not running[1].done():
+            running[1].cancel()
+
+    def _reading_back_now(
+        self, spec: RuntimeSpec, sp: SupervisedProcess, run: _Run, adapter: EngineAdapter
+    ) -> Loading | None:
+        """While a ready engine's saved conversations are read back, it stays `loading`, so
+        no gateway sends it a turn first. None once done, or when there is nothing to read."""
+        name = spec.name
+        if self._read_back.get(name) == run:
+            return None
+        running = self._reading_back.get(name)
+        if running is not None and running[0] == run:
+            return Loading(detail="Reading saved conversations back from disk")
+        folder = self._managed_folder(sp)
+        if (
+            folder is None
+            or not self.disk_settings().enabled
+            or not disk_prompt_cache.saved(folder)
+        ):
+            self._read_back[name] = run
+            return None
+        base = f"http://{spec.host or '127.0.0.1'}:{spec.port}"
+        task = asyncio.create_task(
+            self._read_back_into(name, run, adapter, base, folder), name=f"read-back:{name}"
+        )
+        self._reading_back[name] = (run, task)
+        return Loading(detail="Reading saved conversations back from disk")
+
+    async def _read_back_into(
+        self, name: str, run: _Run, adapter: EngineAdapter, base: str, folder: Path
+    ) -> None:
+        """The newest saved conversations into the slots, one each (`restore_order`)."""
+        started = time.perf_counter()
+        done = tried = 0
+        try:
+            # The limits first, so an expired file is never read back.
+            await asyncio.to_thread(
+                disk_prompt_cache.sweep,
+                self.prompt_cache_root,
+                self.disk_settings(),
+                active=self.active_cache_folders(),
+            )
+            files = await asyncio.to_thread(disk_prompt_cache.saved, folder)
+            for slot, item in disk_prompt_cache.restore_order(files, self._slot_count(name)):
+                left = _READ_BACK_SECONDS - (time.perf_counter() - started)
+                if left <= 0:
+                    self._log.warning(
+                        "runtime %s: stopped reading saved conversations back after %.0f s",
+                        name,
+                        _READ_BACK_SECONDS,
+                    )
+                    break
+                tried += 1
+                result = await adapter.restore_slot(base, slot, item.path.name, budget=left)
+                if result.error is None:
+                    done += 1
+                    await asyncio.to_thread(disk_prompt_cache.touch, item.path)
+                elif result.refused:
+                    # The engine said the file is not one it can use: never tried again.
+                    await asyncio.to_thread(disk_prompt_cache.discard, item.path)
+                    self._log.warning(
+                        "runtime %s: deleted saved conversation %s, which the engine refused: %s",
+                        name,
+                        item.path.name,
+                        result.error,
+                    )
+                else:
+                    self._log.warning(
+                        "runtime %s: could not read saved conversation %s back: %s",
+                        name,
+                        item.path.name,
+                        result.error,
+                    )
+            if tried:
+                self._log.info(
+                    "runtime %s: read %d of %d saved conversation(s) back in %.1f s",
+                    name,
+                    done,
+                    tried,
+                    time.perf_counter() - started,
+                )
+        except Exception:
+            self._log.exception("runtime %s: reading saved conversations back failed", name)
+        finally:
+            current = self._reading_back.get(name)
+            if current is not None and current[0] == run:
+                self._reading_back.pop(name, None)
+                self._read_back[name] = run
+
+    async def sweep_prompt_cache(self, declared: Sequence[str] | None) -> None:
+        """Apply the limits now (`disk_prompt_cache.sweep`)."""
+        if self.prompt_cache_root is None:
+            return
+        settings = self.disk_settings()
+        self._last_sweep = time.perf_counter()
+        self._swept_with = settings
+        await asyncio.to_thread(
+            disk_prompt_cache.sweep,
+            self.prompt_cache_root,
+            settings,
+            declared=declared,
+            active=self.active_cache_folders(),
+        )
+
+    async def _sweep_when_due(self, specs: list[RuntimeSpec]) -> None:
+        """At start, every hour, and as soon as a limit or the switch changes."""
+        if self.prompt_cache_root is None:
+            return
+        due = (
+            self._last_sweep is None
+            or time.perf_counter() - self._last_sweep > _SWEEP_SECONDS
+            or self.disk_settings() != self._swept_with
+        )
+        if due:
+            await self.sweep_prompt_cache([s.name for s in specs])
+
+    def clear_prompt_cache(self) -> disk_prompt_cache.Cleared:
+        return disk_prompt_cache.clear(self.prompt_cache_root)
 
     def _speculation_for(
         self,
@@ -1323,6 +1662,8 @@ class RuntimeSupervisor:
             while True:
                 specs: list[RuntimeSpec] = get_specs()  # type: ignore[operator]
                 await self._reconcile_copies_if_changed(specs)
+                with contextlib.suppress(Exception):
+                    await self._sweep_when_due(specs)
                 await asyncio.gather(
                     *(self._probe_one(s) for s in specs),
                     return_exceptions=True,
@@ -1385,6 +1726,15 @@ class RuntimeSupervisor:
             process_alive=sp.pid is not None,
             elapsed_seconds=elapsed,
         )
+        if isinstance(outcome, Ready):
+            self._engine_slots[spec.name] = (
+                outcome.capabilities.parallelSlots if outcome.capabilities is not None else None
+            )
+            # Row 15: its saved conversations go back into its slots before any gateway
+            # is told it is ready.
+            reading = self._reading_back_now(spec, sp, started_at, adapter)
+            if reading is not None:
+                outcome = reading
         sp.observe_readiness(isinstance(outcome, Ready))
         if isinstance(outcome, Ready) and started_at[0] is not None:
             self._proved_ready[spec.name] = started_at
