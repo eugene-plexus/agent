@@ -23,6 +23,19 @@ DEFAULT_MAX_QUEUED = 8
 #: The limits the gateway's queue reads and a running request is not bound
 #: to: changing them never cuts a request in flight (`decide`'s digest).
 QUEUE_LIMITS = ("band", "maxQueuedRequests")
+#: Row 40: a key's usage allowances (tokens a UTC day and a calendar month,
+#: money a month in millionths of a dollar). Counted and enforced by the
+#: control root, which keeps the counters. Like the queue's limits they are
+#: not part of the policy a running request is bound to, so a changed
+#: allowance never cuts a request, and they are never sent in an admission
+#: answer: a gateway a release behind refuses a field it does not know.
+USAGE_LIMITS = ("tokensPerDay", "tokensPerMonth", "costPerMonthMicros")
+#: The largest value of each, as `ClientKeyLimits` bounds them.
+USAGE_MAXIMA = {
+    "tokensPerDay": 10**12,
+    "tokensPerMonth": 10**15,
+    "costPerMonthMicros": 10**15,
+}
 
 
 def model_permitted(allowed: list[str], model: str) -> bool:
@@ -47,7 +60,8 @@ def model_permitted(allowed: list[str], model: str) -> bool:
 
 class AdmissionRefusal(Exception):
     """A refused admission. `reason` says which limit a 429 is (row 11):
-    `concurrency` or `rate`, sent as `X-Eugene-Refusal-Reason`."""
+    `concurrency`, `rate` or (row 40) `allowance`, sent as
+    `X-Eugene-Refusal-Reason`."""
 
     def __init__(
         self, status: int, detail: str, retry: int | None = None, reason: str | None = None
@@ -77,6 +91,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         "writeLogs",
         "readMetrics",
         *QUEUE_LIMITS,
+        *USAGE_LIMITS,
     }:
         raise ValueError("invalid client limits")
     allowed = value.get("allowedModels")
@@ -116,6 +131,7 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
     queued = value.get("maxQueuedRequests", DEFAULT_MAX_QUEUED)
     if type(queued) is not int or not 0 <= queued <= 64:
         raise ValueError("invalid queued request limit")
+    allowances = validate_allowances(value)
     return {
         **({"localOnly": True} if value.get("localOnly") else {}),
         "allowedModels": allowed,
@@ -128,15 +144,42 @@ def validate_limits(value: Any) -> dict[str, Any] | None:
         # band keeps the shape an older root or standby reads.
         **({"band": band} if band != DEFAULT_BAND else {}),
         **({"maxQueuedRequests": queued} if queued != DEFAULT_MAX_QUEUED else {}),
+        # Row 40: written down only when set, so a key without an allowance
+        # keeps the shape an older root or standby reads.
+        **allowances,
     }
+
+
+def validate_allowances(value: dict[str, Any]) -> dict[str, int]:
+    """The usage allowances in `value` that are set (row 40). Absent or null is
+    no limit. A token allowance is at least 1; a money allowance may be 0,
+    which allows only models that cost nothing."""
+    out: dict[str, int] = {}
+    for name in USAGE_LIMITS:
+        amount = value.get(name)
+        if amount is None:
+            continue
+        floor = 0 if name == "costPerMonthMicros" else 1
+        if type(amount) is not int or not floor <= amount <= USAGE_MAXIMA[name]:
+            raise ValueError(f"invalid {name}")
+        out[name] = amount
+    return out
 
 
 def bound_policy(limits: dict[str, Any] | None) -> dict[str, Any] | None:
     """The limits a running request is bound to: all but the queue's own
-    (`QUEUE_LIMITS`), so a new band or queue bound never cuts a request."""
+    (`QUEUE_LIMITS`) and the usage allowances (`USAGE_LIMITS`), so a new band,
+    queue bound or allowance never cuts a request."""
     if limits is None:
         return None
-    return {k: v for k, v in limits.items() if k not in QUEUE_LIMITS}
+    return {k: v for k, v in limits.items() if k not in QUEUE_LIMITS and k not in USAGE_LIMITS}
+
+
+def answered_limits(limits: dict[str, Any]) -> dict[str, Any]:
+    """The limits an admission answer carries: all but the usage allowances,
+    which only the authority reads (row 40). A gateway or agent a release
+    behind refuses a field it does not know, so they never leave it."""
+    return {k: v for k, v in limits.items() if k not in USAGE_LIMITS}
 
 
 def clean_buckets(buckets: dict[str, Any], now: float) -> dict[str, Any]:
@@ -246,7 +289,7 @@ def decide(
         # A scraper reads numbers: it takes no lease and names no model.
         raise AdmissionRefusal(403, "Metrics access only permits checking the key's grants.")
     if limits is not None:
-        result["limits"] = limits
+        result["limits"] = answered_limits(limits)
     buckets = clean_buckets(ledger["buckets"], now)
     bucket = buckets.setdefault(lineage_of(key, key_id), {})
     existing = bucket.get(request_id)

@@ -391,3 +391,63 @@ def test_a_default_key_is_answered_without_the_queue_fields(authed_client):
         json={"action": "check", "keyId": shaped, "requestId": "two", "model": "m"},
     ).json()["limits"]
     assert answer["band"] == "background" and answer["maxQueuedRequests"] == 3
+
+
+def test_an_enrolled_agent_passes_on_usage_and_the_allowance_refusal(app, client):
+    """Row 40: the release's usage and the acquire's price hint reach the root
+    as the gateway sent them, and the root's `allowance` refusal comes back
+    with its sentence, its reason and its time until the reset."""
+    import json
+
+    import httpx
+
+    from tests.test_acting_for_operator import _enrolled, _root
+
+    root = _enrolled(app)
+    sentence = "This key used 1,050 of its 1,000 tokens for 16 November."
+
+    def answer(request):
+        body = json.loads(request.content)
+        if body["action"] == "acquire":
+            return httpx.Response(
+                429,
+                json={"detail": sentence},
+                headers={"Retry-After": "3600", "X-Eugene-Refusal-Reason": "allowance"},
+            )
+        return httpx.Response(200, json={"keyId": "k1", "keyName": "metered"})
+
+    seen = _root(app, answer)
+    session = root.session("node:gpu-box", "control")
+    hint = {
+        "locality": "external",
+        "providerPrice": {"inputPerMillionMicros": 3, "outputPerMillionMicros": 15},
+    }
+    refused = client.post(
+        "/v1/auth/client-keys/admission",
+        json={"action": "acquire", "keyId": "k1", "requestId": "r", "model": "m", "price": hint},
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert refused.status_code == 429
+    assert refused.headers["X-Eugene-Refusal-Reason"] == "allowance"
+    assert refused.headers["Retry-After"] == "3600"
+    assert sentence in refused.text
+    used = {"model": "m", "promptTokens": 7, "completionTokens": 3, "price": hint}
+    released = client.post(
+        "/v1/auth/client-keys/admission",
+        json={"action": "release", "keyId": "k1", "requestId": "r", "model": "m", "usage": used},
+        headers={"Authorization": f"Bearer {session}"},
+    )
+    assert released.status_code == 200, released.text
+    assert json.loads(seen[0].content)["price"] == hint
+    assert json.loads(seen[1].content)["usage"] == used
+
+
+def test_a_standalone_agent_refuses_a_usage_allowance(authed_client):
+    """Row 40: only a control root counts usage, so a machine that joined no
+    install refuses an allowance rather than show one it would not hold."""
+    c = authed_client
+    made = c.post("/v1/auth/client-keys", json={"name": "x", "limits": {"tokensPerDay": 100}})
+    assert made.status_code == 422 and "control root" in made.text
+    key = c.post("/v1/auth/client-keys", json={"name": "y"}).json()["key"]["id"]
+    edited = c.put(f"/v1/auth/client-keys/{key}/limits", json={"limits": {"costPerMonthMicros": 5}})
+    assert edited.status_code == 422 and "control root" in edited.text

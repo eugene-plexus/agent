@@ -84,7 +84,7 @@ from .._generated.models import (
 )
 from .._http import internal_client
 from ..auth_state import AuthState
-from ..client_admission import AdmissionRefusal, validate_limits
+from ..client_admission import USAGE_LIMITS, AdmissionRefusal, validate_limits
 from ..client_key_registry import registry
 from ..client_keys import ClientKeyStore
 from ..dependencies import (
@@ -1346,7 +1346,9 @@ async def mint_client_key(
                 created_at=float(issued_at),
                 expires_at=float(expires_at),
                 limits=validate_limits(
-                    (body.limits or ClientKeyLimits()).model_dump(exclude_none=True)
+                    _standalone_limits(
+                        (body.limits or ClientKeyLimits()).model_dump(exclude_none=True)
+                    )
                 ),
             )
         )
@@ -1584,7 +1586,9 @@ async def set_client_key_limits(
             )
         )
     try:
-        record = _keys(request).set_limits(key_id, body.limits.model_dump(exclude_none=True))
+        record = _keys(request).set_limits(
+            key_id, _standalone_limits(body.limits.model_dump(exclude_none=True))
+        )
     except ValueError as exc:
         raise _problem(422, "Invalid limits", str(exc)) from exc
     except OSError as exc:
@@ -1592,6 +1596,18 @@ async def set_client_key_limits(
     if record is None:
         raise _problem(404, "No such key", "This key is not in the registry.")
     return _to_model(record)
+
+
+def _standalone_limits(limits: dict[str, Any]) -> dict[str, Any]:
+    """Row 40: a usage allowance is counted and enforced by the control root,
+    across every gateway. A machine that has joined no install has no root to
+    count it, so it refuses one rather than keep a limit it would not hold."""
+    if any(limits.get(name) is not None for name in USAGE_LIMITS):
+        raise ValueError(
+            "Usage allowances need a control root to count them. Join this machine to an "
+            "install, or start one here, to set a token or money allowance."
+        )
+    return limits
 
 
 @router.post(
