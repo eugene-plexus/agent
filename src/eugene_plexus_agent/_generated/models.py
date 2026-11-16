@@ -4354,7 +4354,7 @@ class RuntimeDiskPromptCache(BaseModel):
     )
     saving: bool = Field(
         ...,
-        description="True when a planned stop of this run saves its conversations and\nits next start reads them back. False when the setting is off,\nthe engine was started without Eugene's folder (an older start,\na build without `--slot-save-path`, an engine other machines can\nreach, or a folder set by hand), and `note` says which.\n",
+        description="True when a planned stop of this run saves its conversations and\nits next start reads them back. False when the setting is off,\nthe engine was started without Eugene's folder (an older start,\na build without `--slot-save-path`, an engine other machines can\nreach by its last `--host`, slot routes turned off or behind an\nAPI key, or a folder set by hand), and `note` says which. While\nit saves, `note` says why the last stop kept less than it held\n(no room above the free-space floor or the cap, no time, the\nengine's refusal). Never a path.\n",
     )
     conversations: int = Field(
         ...,
@@ -6955,12 +6955,10 @@ class PromptCacheOnDisk(BaseModel):
         ..., description='Saved conversations, one file each.', ge=0
     )
     oldest: AwareDatetime | None = Field(
-        None,
-        description='When the least recently used file was last used. Null with no files.',
+        None, description='When the oldest file was saved. Null with no files.'
     )
     newest: AwareDatetime | None = Field(
-        None,
-        description='When the most recently used file was last used. Null with no files.',
+        None, description='When the newest file was saved. Null with no files.'
     )
     folder: str | None = Field(
         None, description='The folder on this machine. Null when this agent has none.'
