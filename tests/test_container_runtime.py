@@ -196,3 +196,21 @@ def test_no_orphans_runs_nothing_destructive(path_dir: Path) -> None:
     docker.rules([{"args": ["info"], "out": docker_info()}, {"args": ["ps"], "out": ""}])
     assert container_runtime.sweep_orphans(container_runtime.detect(), "abc123abc123") == []
     assert not [c for c in docker.calls() if c[:1] == ["rm"]]
+
+
+def test_eugenes_own_account_runs_only_a_trusted_docker(
+    path_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Row 8's rule for every engine program holds for the container CLI too."""
+    from eugene_plexus_agent import exec_trust
+
+    FakeCli(path_dir, "docker").rules([{"args": ["info"], "out": docker_info()}])
+    monkeypatch.setattr(exec_trust, "own_account", lambda: True)
+
+    def refused(path: object, **_: object) -> Path:
+        raise exec_trust.Untrusted(f"{path} can be changed by another account")
+
+    monkeypatch.setattr(exec_trust, "trusted_program", refused)
+    found = container_runtime.detect()
+    assert not found.usable and found.cli is None
+    assert "can be changed by another account" in (found.error or "")

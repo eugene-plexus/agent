@@ -232,10 +232,20 @@ def detect() -> Found:
     found with its refusal, else why nothing is here."""
     inside = _inside_a_container()
     first: Found | None = None
+    from . import exec_trust
+
     for kind in (ContainerRuntimeKind.docker, ContainerRuntimeKind.podman):
         cli = shutil.which(kind.value)
         if cli is None:
             continue
+        if exec_trust.own_account():
+            # Run as Eugene's own account, only a program nobody else can
+            # change (row 8), as for every engine program.
+            try:
+                cli = str(exec_trust.trusted_program(cli))
+            except exec_trust.Untrusted as exc:
+                first = first or Found(kind=kind, cli=None, error=str(exc))
+                continue
         found = _detect_one(kind, cli)
         if found.usable:
             return _with_inside(found, inside)
