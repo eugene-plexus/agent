@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -231,6 +232,30 @@ async def test_the_owners_own_certificate_replaces_the_install_leaf_and_gives_wa
     app.state.config.clear()
     tls.check_supplied()
     assert tls.status()["error"] is None and tls.status()["source"] == "installCa"
+
+
+async def test_a_supplied_file_rewritten_within_one_clock_tick_is_still_read_again(
+    tmp_path: Path,
+) -> None:
+    # Windows stamps a write with a coarse clock, so two writes close together can carry
+    # one modification time (agent#45). The change is seen in the content, not the stamp.
+    _, key = _key_pem()
+    app = _app(key)
+    tls = client_tls.ClientTls(tmp_path, app, client_doors.Doors())
+    await tls.request("first", transport=_root([]))
+    cert_path, key_path = _self_signed(tmp_path)
+    app.state.config.update(clientCertificateFile=str(cert_path), clientKeyFile=str(key_path))
+    tls.check_supplied()
+    assert tls.status()["source"] == "supplied"
+    stamp = key_path.stat().st_mtime_ns
+    # Same length as the key it replaces, so neither the stamp nor the size can tell.
+    broken = key_path.read_text(encoding="utf-8").replace("PRIVATE", "PRIVATX")
+    key_path.write_text(broken, encoding="utf-8")
+    os.utime(key_path, ns=(stamp, stamp))
+    assert key_path.stat().st_mtime_ns == stamp
+    tls.check_supplied()
+    assert tls.status()["source"] == "installCa"
+    assert "could not be loaded" in str(tls.status()["error"])
 
 
 async def test_apps_get_a_bundle_with_the_install_ca(tmp_path: Path) -> None:

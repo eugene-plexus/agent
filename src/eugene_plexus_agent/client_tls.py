@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import socket
@@ -306,7 +307,12 @@ class ClientTls:
             return
         paths = (Path(str(cert)), Path(str(key)))
         try:
-            seen: tuple[Any, ...] = tuple((str(p), p.stat().st_mtime_ns) for p in paths)
+            # The content, not the modification time: Windows stamps writes with a coarse
+            # clock, so a file rewritten within one tick keeps its stamp (agent#45). Both
+            # files are small and this runs once per step.
+            seen: tuple[Any, ...] = tuple(
+                (str(p), hashlib.sha256(p.read_bytes()).digest()) for p in paths
+            )
         except OSError as exc:
             seen = (str(exc),)
         if seen == self._supplied_seen:
