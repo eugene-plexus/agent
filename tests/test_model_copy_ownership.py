@@ -10,6 +10,7 @@ every other file is left alone and counted.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -641,3 +642,90 @@ def test_s5_a_dot_dot_in_the_model_path_never_writes_outside_the_copy_folder(
     rule = PathRule("/models", str(mount))
 
     assert mc.plan_for("/models/../escaped/x.gguf", [rule], conf) is None
+
+
+# --- second look at agent#54 ----------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_n4_an_overlap_that_begins_after_copies_exist_deletes_nothing(
+    tmp_path: Path,
+) -> None:
+    """A Library folder added later, a mapping, or an upgrade onto a saved
+    overlap: copying stops, and as with the toggle off every copy stays."""
+    from .test_model_copy_lifecycle import MODEL as RUNNING_MODEL
+    from .test_model_copy_lifecycle import file_exists, spec, supervisor_for
+
+    rule = _share(tmp_path, RUNNING_MODEL)
+    sup = supervisor_for(tmp_path, rule)
+    roots: list[str] = []
+    sup._library_roots = lambda: roots
+    sup.add_and_start(spec())
+    await asyncio.wait_for(asyncio.shield(sup._copy_jobs["qwen"].task), timeout=10)
+    copy = sup.compose(spec()).localPath
+    assert copy is not None and file_exists(copy)
+
+    roots.append(str(tmp_path / "copies"))  # the person adds the copy folder to the Library
+    assert mc.copy_dir_overlap(sup.copy_settings(), sup._rules())
+    sup.reconcile_copies([spec()])
+    sup.reconcile_copies([])
+
+    assert file_exists(copy)
+    # A running runtime's copy stays protected, even from the person's Delete.
+    result = sup.clear_copies()
+    assert result.deleted == [] and [s.runtime for s in result.skipped] == ["qwen"]
+    assert file_exists(copy)
+    # And the runtime says why it reads from the Library now.
+    note = sup.compose(spec()).localPathNote
+    assert note is not None
+    assert note.startswith(f"Copying is off: the copy folder {tmp_path / 'copies'} is the Library")
+
+
+def test_n4_the_status_and_plan_for_agree_on_a_mapped_folder(
+    authed_client: TestClient, tmp_path: Path
+) -> None:
+    """A mapping's target is a Library folder even before the folder list
+    is read: copying is off there, and the setting says so."""
+    library = tmp_path / "nas"
+    copies = library / "copies"
+    copies.mkdir(parents=True)
+    authed_client.patch("/v1/config", json={"modelCopyDir": str(copies)})
+    authed_client.patch(
+        "/v1/config", json={"pathMappings": [{"from": "/models", "to": str(library)}]}
+    )
+    rule = PathRule("/models", str(library))
+    conf = mc.CopySettings(True, str(copies), 0)
+
+    body = authed_client.get("/v1/config/schema").json()
+    status = next(f for f in body["fields"] if f["key"] == "modelCopyDir")["status"]
+
+    assert mc.plan_for("/models/a/m.gguf", [rule], conf) is None
+    assert (
+        f"Copying is off: this folder is inside the Library folder {library}." in (status["text"])
+    )
+
+
+def test_n3_a_failed_rename_never_puts_an_orphans_record_beside_a_new_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rule = _share(tmp_path, MODEL)
+    conf = _settings(tmp_path)
+    plan = _copy(rule, conf, MODEL)
+    os.remove(plan.destination)  # an orphan record stays
+    real = mc.os.replace
+
+    def a_file_lands_first(src: str, dst: str) -> None:
+        if dst == plan.destination:
+            Path(dst).write_bytes(b"P" * 1024)  # a person's file, the model's size
+            raise PermissionError("the file is in use")
+        real(src, dst)
+
+    monkeypatch.setattr(mc.os, "replace", a_file_lands_first)
+    with pytest.raises(OSError):
+        mc.copy_file(plan, conf, mc.CopyState(plan.destination, 1024))
+    monkeypatch.undo()
+
+    assert not os.path.exists(plan.destination + mc.SOURCE_SUFFIX)
+    assert not mc.is_eugenes_copy(plan.destination)
+    mc.remove_unwanted(conf.directory, [])
+    assert Path(plan.destination).read_bytes() == b"P" * 1024

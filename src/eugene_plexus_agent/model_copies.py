@@ -179,14 +179,19 @@ def library_roots_here(
     *,
     expand: Callable[[str], str] = os.path.expanduser,
 ) -> list[str]:
-    """Every Library folder (`settings.folder_roots`) where this machine
-    opens it, through the effective rules; a folder this machine has no
-    form of (the other OS's shape, no mount here) is left out."""
+    """Every Library folder where this machine opens it: each of
+    `settings.folder_roots` through the effective rules, and each rule's
+    own target (a mapped folder is one, whether or not the folder list was
+    read). A path this machine has no form of (the other OS's shape, no
+    mount here) is left out."""
     windows = os.name == "nt"
     out: list[str] = []
-    for folder in settings.folder_roots:
-        local = resolve_model_path(folder, rules, expand=expand).local_path
-        if is_windows_shaped(local) == windows:
+    candidates = [
+        resolve_model_path(f, rules, expand=expand).local_path for f in settings.folder_roots
+    ]
+    candidates += [expand(rule.target) for rule in rules]
+    for local in candidates:
+        if is_windows_shaped(local) == windows and local not in out:
             out.append(local)
     return out
 
@@ -198,7 +203,10 @@ def copy_dir_overlap(
     expand: Callable[[str], str] = os.path.expanduser,
 ) -> str | None:
     """How the copy folder overlaps a Library folder this machine opens, as
-    `library_overlap` says it, or None. While it does, nothing is copied."""
+    `library_overlap` says it, or None. While it does, nothing is copied and
+    nothing is cleaned up but by the person's own Delete (agent#54 review).
+    The one rule: `plan_for`, the supervisor's reconcile, the runtime's note
+    and the setting's status all ask this."""
     if not settings.directory:
         return None
     return library_overlap(settings.directory, library_roots_here(settings, rules, expand=expand))
@@ -378,9 +386,14 @@ def plan_for(
     *,
     expand: Callable[[str], str] = os.path.expanduser,
     companions: Sequence[str] = (),
+    allow_overlap: bool = False,
 ) -> CopyPlan | None:
     """Where this node would keep its copy of `declared`, or None when
     it would not keep one at all.
+
+    `allow_overlap` answers where the copy is even while the copy folder
+    overlaps a Library folder, for protecting a copy a runtime still holds;
+    nothing is copied by such a plan.
 
     `companions` are files beside the model that the declaration also
     loads (SD1: a drafting companion), declared as the model is. They join
@@ -423,10 +436,7 @@ def plan_for(
             folders, key=lambda folder: len(_parts(folder, windows=is_windows_shaped(folder))[0])
         )
         root = resolve_model_path(folder, rules, expand=expand).local_path
-    matched_root = [root] if folders or resolution.rule is not None else []
-    if library_overlap(
-        settings.directory, [*matched_root, *library_roots_here(settings, rules, expand=expand)]
-    ):
+    if not allow_overlap and copy_dir_overlap(settings, rules, expand=expand):
         # Review S4: a copy folder in, equal to or above a Library folder
         # copies nothing, whatever let the value be saved.
         return None
@@ -1075,7 +1085,11 @@ def _mark(member: CopyMember, members: Sequence[str], partial: str) -> dict[str,
     On failure the partial is removed and the cause given, since a copy
     with no record could never be cleaned up."""
     _refuse_a_file_not_ours(member, partial)
-    previous = _record(member.destination)
+    # The record to put back if the rename fails: only that of a copy that
+    # was there now and that it proves (review N3). An orphan's record must
+    # never end up beside a file that lands at the name meanwhile.
+    held = _record(member.destination)
+    previous = held if _proves(held, member.destination) else None
     source = _stat(member.source)
     written = _stat(partial)
     if source is None or written is None:

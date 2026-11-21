@@ -670,6 +670,21 @@ class StopMemory(Protocol):
     def forget_stop(self, name: str) -> None: ...
 
 
+def _copy_off_note(settings: model_copies.CopySettings, rules: list[PathRule]) -> str | None:
+    """The runtime's note while copying is off because the copy folder
+    overlaps a Library folder (agent#54 review), by the rule `plan_for`
+    applies; None otherwise."""
+    if not settings.usable:
+        return None
+    why = model_copies.copy_dir_overlap(settings, rules)
+    if why is None:
+        return None
+    return (
+        f"Copying is off: the copy folder {settings.directory} {why}. "
+        "Choose a folder outside every Library folder."
+    )
+
+
 class RuntimeSupervisor:
     """Owns every engine process plus a background readiness-poll task."""
 
@@ -973,8 +988,14 @@ class RuntimeSupervisor:
             planner = self._planners.get(name)
             if planner is None:
                 continue
+            # `allow_overlap`: a runtime started from its copy before the
+            # folder overlapped a Library folder still holds that copy.
             plan = model_copies.plan_for(
-                planner.spec.modelPath, rules, settings, companions=_companions(planner.spec)
+                planner.spec.modelPath,
+                rules,
+                settings,
+                companions=_companions(planner.spec),
+                allow_overlap=True,
             )
             if plan is not None:
                 for destination in plan.destinations:
@@ -1042,6 +1063,12 @@ class RuntimeSupervisor:
         """
         settings = self.copy_settings()
         if not settings.usable:
+            return
+        if model_copies.copy_dir_overlap(settings, self._rules()):
+            # agent#54 review N4: under an overlap no copy is planned, so
+            # every copy would look unwanted and none in use. Copying is off,
+            # and as with the toggle off the copies stay; only the person's
+            # own "Delete the local copies" removes them.
             return
         keep = [
             destination
@@ -1342,7 +1369,10 @@ class RuntimeSupervisor:
         # crept past 100% would be worse than no bar. `starting` counts:
         # llama.cpp opens its socket before it has read anything, so the
         # first seconds of a read are spent in that status.
-        resolved = resolve_local_path(spec.modelPath, self._rules(), self.copy_settings())
+        copy_settings = self.copy_settings()
+        copy_rules = self._rules()
+        resolved = resolve_local_path(spec.modelPath, copy_rules, copy_settings)
+        copy_off = _copy_off_note(copy_settings, copy_rules)
         local_path = resolved.path
         load_progress: LoadProgress | None = None
         in_container = getattr(planner, "container", None) is not None
@@ -1379,7 +1409,9 @@ class RuntimeSupervisor:
             # runtime would train the operator to ignore the one that
             # matters.
             localPathNote=(
-                self._copy_notes.get(name)
+                copy_off
+                if copy_off is not None and not resolved.is_copy
+                else self._copy_notes.get(name)
                 if not resolved.is_copy
                 or self._copy_notes.get(name, "").startswith("Started from this machine's copy.")
                 else None
