@@ -54,7 +54,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import httpx
@@ -249,6 +249,9 @@ def validate_manifest(manifest: AppManifest) -> None:
     """Refuse what the schema lets through and a start could not honour,
     naming it. Run on every shipped entry and every custom one (C4).
 
+    * a version that is not one plain folder name (`.`, `..`, a leading dot,
+      or more than one path part): the store joins it into a path and the
+      installer removes that path (agent#55);
     * a `pypi` entry whose version is not one exact release;
     * a placeholder the launcher does not fill in, which would otherwise
       surface as a crash at the app's first start rather than here;
@@ -260,6 +263,17 @@ def validate_manifest(manifest: AppManifest) -> None:
       app's own, which could point it at another app's key or override
       what the agent hands it.
     """
+    version = manifest.version
+    if (
+        not version
+        or version.startswith(".")
+        or PurePosixPath(version).name != version
+        or PureWindowsPath(version).name != version
+    ):
+        raise ValueError(
+            f"version {version!r} cannot name a folder. A version is one plain name that "
+            "does not start with a dot, such as 1.2.0."
+        )
     if bool(manifest.provides) != bool(manifest.providesPath):
         raise ValueError("provides and providesPath must be paired")
     if manifest.source.strip() == PYPI:

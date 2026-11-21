@@ -368,6 +368,35 @@ def test_custom_apps_are_off_until_someone_turns_them_on(
     assert authed_client.post("/v1/app-catalogue/custom", json=missing).status_code == 422
 
 
+@pytest.mark.parametrize("version", [".", "..", ".hidden", "...", ".1"])
+def test_a_version_that_is_not_one_plain_folder_name_is_refused(version: str) -> None:
+    """Issue 55: the schema's pattern lets dots through, `version_dir` joins the
+    version into a path and the installer removes that path, so `..` named the
+    app's own folder's parent."""
+    with pytest.raises(ValueError, match=rf"version {version!r}"):
+        apps.validate_manifest(_manifest(version=version))
+
+
+@pytest.mark.parametrize("version", ["v1", "1.0.0", "2026.11.21+build-5", "1..2", "a.b"])
+def test_an_ordinary_version_is_still_accepted(version: str) -> None:
+    apps.validate_manifest(_manifest(version=version))
+
+
+def test_the_custom_app_route_names_a_version_that_is_not_a_folder_name(
+    authed_client: TestClient,
+) -> None:
+    assert authed_client.patch("/v1/config", json={"allowCustomApps": True}).status_code == 200
+    body = _manifest().model_dump(mode="json", exclude_none=True)
+    refused = authed_client.post("/v1/app-catalogue/custom", json=dict(body, version=".."))
+    assert refused.status_code == 422  # the contract's status for an unusable entry
+    assert "version '..'" in refused.json()["detail"]["detail"]
+
+
+def test_the_shipped_catalogue_still_loads_with_the_version_check() -> None:
+    catalogue = apps.load_catalogue()
+    assert [m.id for m in catalogue] == ["workbench", "open-webui", "hindsight"]
+
+
 # --------------------------------------------------------------------------- #
 # the key
 # --------------------------------------------------------------------------- #
