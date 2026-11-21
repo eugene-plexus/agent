@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from eugene_plexus_agent import process_signals
@@ -1095,3 +1096,98 @@ async def test_a_cli_killed_after_its_stop_removes_the_container(
     sp, proc = await _container_run(monkeypatch, stops, cli_exits=False, removes=removes)
     await sp.stop()
     assert proc.killed and removes == ["ep-abc-qwen"]
+
+
+class _HealthAnswers:
+    """A health client whose answer the test sets, standing in for `/healthz`."""
+
+    def __init__(self) -> None:
+        self.status = 200
+        self.body: dict[str, Any] = {"safeMode": False}
+
+    async def get(self, _url: str) -> httpx.Response:
+        return httpx.Response(self.status, json=self.body)
+
+
+async def _crash_after_ready_run(
+    entry: ComponentEntry,
+    monkeypatch: pytest.MonkeyPatch,
+    health: _HealthAnswers,
+    crashes: int,
+) -> tuple[list[int], Supervisor]:
+    """Crash a component `crashes` times, each time after a stable, polled run.
+
+    Returns the crash count read after every crash, and the supervisor. The
+    stable time is patched to 50 ms so no test waits a real minute.
+    """
+    monkeypatch.setattr("eugene_plexus_agent.supervisor._STABLE_READY_SECONDS", 0.05)
+    processes: list[_FakeProcess] = []
+
+    async def fake_create(*_args: Any, **_kwargs: Any) -> _FakeProcess:
+        proc = _FakeProcess()
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(seconds: float) -> None:
+        await original_sleep(min(seconds, 0.01))
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    sup = Supervisor(log=logging.getLogger("test"))
+    sup._health_client = health  # type: ignore[assignment]
+    sup.add_and_start(entry)
+    counts: list[int] = []
+    for n in range(crashes):
+        for _ in range(300):
+            await original_sleep(0.01)
+            if len(processes) > n:
+                break
+        else:
+            pytest.fail(f"spawn {n + 1} never happened")
+        await sup._poll_one(entry)  # the health loop's poll, once
+        await original_sleep(0.1)  # longer than the stable time
+        await sup._poll_one(entry)  # still answering
+        processes[n]._finish(1)
+        for _ in range(300):
+            await original_sleep(0.01)
+            if len(processes) > n + 1 or n == crashes - 1:
+                break
+        counts.append(sup._processes[entry.name]._consecutive_crashes)
+    return counts, sup
+
+
+async def test_a_component_that_ran_ready_for_the_stable_time_starts_its_count_again(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 55: components never reported readiness, so the stable-run reset
+    never fired and five crashes spread over any time reached safe mode."""
+    counts, sup = await _crash_after_ready_run(driver_entry, monkeypatch, _HealthAnswers(), 6)
+    degraded = sup._processes[driver_entry.name].degraded
+    await sup.stop_all()
+    # Every crash follows a stable run, so the count is 1 each time, never 2.
+    assert counts == [1] * 6
+    assert degraded is False
+
+
+async def test_a_component_that_only_answers_in_safe_mode_keeps_its_count(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Safe mode answers /healthz, but the normal config has not recovered."""
+    health = _HealthAnswers()
+    health.body = {"safeMode": True}
+    counts, sup = await _crash_after_ready_run(driver_entry, monkeypatch, health, 3)
+    await sup.stop_all()
+    assert counts == [1, 2, 3]
+
+
+async def test_a_component_whose_health_check_fails_keeps_its_count(
+    driver_entry: ComponentEntry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    health = _HealthAnswers()
+    health.status = 503
+    counts, sup = await _crash_after_ready_run(driver_entry, monkeypatch, health, 3)
+    await sup.stop_all()
+    assert counts == [1, 2, 3]

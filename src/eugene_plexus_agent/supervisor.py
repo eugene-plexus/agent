@@ -1631,6 +1631,7 @@ class Supervisor:
             response = await client.get(url)
         except httpx.HTTPError:
             self._reachable[entry.name] = False
+            self._report_readiness(entry.name, False)
             return
         finally:
             # Defensive: an unexpectedly slow probe shouldn't cascade
@@ -1649,3 +1650,20 @@ class Supervisor:
             with contextlib.suppress(ValueError):
                 body = response.json()
                 self._safe_mode_observed[entry.name] = bool(body.get("safeMode"))
+        # A component that answers only in safe mode has not recovered: its
+        # normal config is still the thing that crashes, so that uptime must
+        # not reset the crash count.
+        self._report_readiness(
+            entry.name,
+            response.is_success and not self._safe_mode_observed.get(entry.name, False),
+        )
+
+    def _report_readiness(self, name: str, ready: bool) -> None:
+        """Tell a spawned component's loop whether it is ready, as runtimes and apps do.
+
+        Without it a component's `_ready_since` is never set, so the "ready for
+        60 s, then a crash starts the count again" rule never fires.
+        """
+        sp = self._processes.get(name)
+        if sp is not None:
+            sp.observe_readiness(ready)
