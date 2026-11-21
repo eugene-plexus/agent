@@ -202,10 +202,133 @@ OWNER_SPEC_FIELDS: dict[str, str] = {
     "extraArgs": "extra command-line arguments",
 }
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-#: A flag that names a file or folder on this machine.
+
+# agent#53: what an engine flag is, for an operations token, comes from what
+# the engine adapter declares about it (`flag_schema()`), never from the key's
+# spelling alone. Every declared flag is in exactly one class;
+# `tests/test_operations_flags.py` walks every registered engine and fails on
+# a flag in none, so a new flag is classified before it ships.
+
+#: Flags only the owner turns on, with what each is, for the refusal. A value
+#: the declaration already had is left alone -- for the same model only.
+OWNER_FLAGS: dict[str, str] = {
+    # MLX and vLLM `--trust-remote-code`: a model folder's own Python runs
+    # in the agent's account.
+    "trustRemoteCode": "running code that comes with a model",
+}
+#: Declared value types that name files or folders on this machine.
+PATH_VALUE_TYPES = frozenset({"file_path", "path_list"})
+#: Flags declared as text that name a file, folder or model: for an
+#: operations token each must lie inside a Library folder, as `modelPath`
+#: does, so a Hugging Face Hub id is refused too.
+PATH_FLAG_KEYS = frozenset(
+    {
+        "adapterPath",  # mlx --adapter-path: LoRA weights
+        "chatTemplateFile",  # llama.cpp --chat-template-file
+        "draftModel",  # mlx --draft-model: a folder or a Hub id
+        "draftModelPath",  # llama.cpp --model-draft, vLLM speculative model
+        "fallback",  # kev --fallback: a checkpoint folder
+        "projectorPath",  # llama.cpp --mmproj
+    }
+)
+#: The reviewed flags an operations token may set: sizes, counts, choices
+#: and switches that change how a model runs on this machine, and nothing
+#: that names a file, a program, an address or a secret.
+OPERATIONS_FLAGS = frozenset(
+    {
+        # every engine that has them
+        "sameAnswerEveryTime",
+        "reuseRepeatedText",
+        "draftWith",
+        "draftTokens",
+        "missingCard",
+        # llama.cpp
+        "contextSize",
+        "gpuLayers",
+        "parallelSlots",
+        "batchSize",
+        "ubatchSize",
+        "threads",
+        "flashAttention",
+        "cacheType",
+        "memoryMargin",
+        "cacheRam",
+        "cacheReuse",
+        "ctxCheckpoints",
+        "continuousBatching",
+        "slotPinning",
+        "mainGpu",
+        "devices",  # GPU names, checked against this machine's cards
+        "splitMode",
+        "tensorSplit",
+        "mlock",
+        "noMmap",
+        "projectorOnCpu",
+        # vLLM
+        "source",  # this release's pinned image or the owner's own vLLM
+        "shmSizeGiB",
+        "maxModelLen",
+        "gpuMemoryUtilization",
+        "kvCacheDtype",
+        "tensorParallelSize",
+        "pipelineParallelSize",
+        "maxNumSeqs",
+        "maxNumBatchedTokens",
+        "dtype",
+        "enforceEager",
+        "quantization",  # a method name from vLLM's own closed list
+        "kvOffloadGb",
+        # MLX
+        "maxTokens",
+        "promptCacheSize",
+        "promptCacheBytes",
+        "decodeConcurrency",
+        "promptConcurrency",
+        "prefillStepSize",
+        "numDraftTokens",
+        # mlx-lm 0.32.0 passes --chat-template to the tokenizer as the
+        # template's own text (`chat_template=`), never as a file name, and
+        # transformers renders it in a sandbox.
+        "chatTemplate",
+        # Strata
+        "speedProjection",
+        "gpus",
+        "layerSplit",
+    }
+)
+#: The second net, never the only one: a key that ends this way names a file
+#: or folder whatever its declaration says.
 PATH_FLAG = re.compile(r"(Path|File|Dir|Directory)$")
-#: Flags that name one whose key does not say so (agent#48): vLLM's tokenizer.
-PATH_FLAG_KEYS = frozenset({"tokenizer"})
+
+
+def flag_class(field: Any) -> str | None:
+    """What a declared engine flag is for an operations token: `owner`,
+    `path`, `operations` (reviewed as safe), or None when nobody has
+    classified it. The key's ending is not consulted here (see `PATH_FLAG`)."""
+    key = getattr(field, "key", None)
+    value_type = getattr(getattr(field, "valueType", None), "value", None)
+    if key in OWNER_FLAGS:
+        return "owner"
+    if value_type in PATH_VALUE_TYPES or key in PATH_FLAG_KEYS:
+        return "path"
+    if key in OPERATIONS_FLAGS:
+        return "operations"
+    return None
+
+
+def _declared_flags(engine: Any) -> dict[str, Any]:
+    """The flags `engine`'s adapter declares, by key; none for an engine this
+    build has no adapter for."""
+    from .engines import ADAPTERS
+
+    adapter = ADAPTERS.get(engine) if engine is not None else None
+    if adapter is None:
+        return {}
+    return {field.key: field for field in adapter.flag_schema().fields}
+
+
+def _is_on(value: Any) -> bool:
+    return value not in (None, False, "")
 
 
 def owner_field(field: str, what: str) -> HTTPException:
@@ -222,10 +345,14 @@ def refuse_owner_fields(
     """Review B1: an operations token may declare or change a runtime, but
     not what reaches past running a model: environment variables, the
     working directory, the program, extra arguments, an address other
-    machines can reach, or a file outside the Library's folders. A value
-    the declaration already had is left alone. The owner is never checked
-    here. `folders` is the Library folder cache; None or unread refuses
-    every path, since nothing then says where the Library is."""
+    machines can reach, a file outside the Library's folders, or running
+    code that comes with a model. Engine flags are judged by what the
+    engine declares (`flag_class`); a flag nobody classified is refused. A
+    value the declaration already had is left alone, except that a kept
+    owner flag does not follow a new model or a new file. The owner is
+    never checked here. `folders` is the Library folder cache; None or
+    unread refuses every path, since nothing then says where the Library
+    is."""
     if operations_claims(request) is None:
         return
 
@@ -247,12 +374,32 @@ def refuse_owner_fields(
         raise owner_field("modelPath", "a model outside the Library's folders")
     flags = getattr(spec, "flags", None) or {}
     before = (getattr(previous, "flags", None) or {}) if previous is not None else {}
+    declared = _declared_flags(getattr(spec, "engine", None))
+    model_moved = not kept("modelPath")
     for key, value in flags.items():
-        names_a_path = PATH_FLAG.search(key) or key in PATH_FLAG_KEYS
-        if not names_a_path or value in (None, "") or before.get(key) == value:
+        if value in (None, "") or before.get(key) == value:
             continue
-        if not in_library(value):
-            raise owner_field(f"flags.{key}", "a file outside the Library's folders")
+        found = declared.get(key)
+        kind = flag_class(found) if found is not None else None
+        if kind is None and key in OWNER_FLAGS:
+            kind = "owner"
+        if kind == "path" or PATH_FLAG.search(key):
+            values = value if isinstance(value, list) else [value]
+            if not values or not all(in_library(v) for v in values):
+                raise owner_field(f"flags.{key}", "a file outside the Library's folders")
+            model_moved = True
+        elif kind == "owner":
+            if _is_on(value):
+                raise owner_field(f"flags.{key}", OWNER_FLAGS[key])
+        elif kind != "operations":
+            # Declared by no engine, or by one nobody has classified yet.
+            raise owner_field(f"flags.{key}", "an engine setting this engine does not declare")
+    # A kept owner flag was the owner's choice for this model and these
+    # files; another model, tokenizer or draft needs the owner again.
+    if model_moved:
+        for key, what in OWNER_FLAGS.items():
+            if _is_on(flags.get(key)):
+                raise owner_field(f"flags.{key}", what)
 
 
 _SEPARATORS = re.compile(r"[\\/]")

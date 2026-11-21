@@ -587,3 +587,61 @@ def test_models_cannot_point_vllms_tokenizer_outside_the_library(
         "/v1/runtimes", json={**spec, "flags": {"tokenizer": str(folder / "tok")}}, headers=dana
     )
     assert inside.status_code == 201, inside.text
+
+
+@pytest.mark.parametrize(
+    ("engine", "flags", "field"),
+    [
+        ("mlx", {"draftModel": "mlx-community/Qwen3-0.6B-4bit"}, "flags.draftModel"),
+        ("mlx", {"trustRemoteCode": True}, "flags.trustRemoteCode"),
+        ("vllm", {"trustRemoteCode": True}, "flags.trustRemoteCode"),
+        ("kev", {"fallback": "runs/smoke"}, "flags.fallback"),
+    ],
+)
+def test_models_cannot_set_engine_flags_that_reach_past_running_a_model(
+    app: FastAPI,
+    client: TestClient,
+    root: FakeRoot,
+    tmp_path: Path,
+    engine: str,
+    flags: dict[str, Any],
+    field: str,
+) -> None:
+    """agent#53: decided from each engine's declared flags, not the key's ending."""
+    _library_at(app, tmp_path / "lib")
+    folder = tmp_path / "lib" / "model"
+    folder.mkdir(parents=True)
+    dana = _bearer(_operations_token(root, MODELS))
+    spec = {"name": "q", "engine": engine, "modelPath": str(folder), "flags": flags}
+    refused = client.post("/v1/runtimes", json=spec, headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert f"({field})" in refused.json()["detail"]["detail"]
+    assert client.get("/v1/runtimes", headers=dana).json()["runtimes"] == []
+
+
+def test_models_keeps_the_owners_trust_and_cannot_move_it_to_another_model(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    _library_at(app, tmp_path / "lib")
+    first = tmp_path / "lib" / "Qwen3-8B"
+    second = tmp_path / "lib" / "Qwen3-0.6B"
+    first.mkdir(parents=True)
+    second.mkdir()
+    owner = _bearer(_owner(client, root))
+    dana = _bearer(_operations_token(root, MODELS))
+    spec = {
+        "name": "q",
+        "engine": "vllm",
+        "modelPath": str(first),
+        "autoStart": False,
+        "flags": {"trustRemoteCode": True},
+    }
+    made = client.post("/v1/runtimes", json=spec, headers=owner)
+    assert made.status_code == 201, made.text
+    kept = {**spec, "flags": {"trustRemoteCode": True, "maxModelLen": 8192}}
+    changed = client.patch("/v1/runtimes/q", json=kept, headers=dana)
+    assert changed.status_code == 200, changed.text
+    moved = {**kept, "modelPath": str(second)}
+    refused = client.patch("/v1/runtimes/q", json=moved, headers=dana)
+    assert refused.status_code == 403, refused.text
+    assert "(flags.trustRemoteCode)" in refused.json()["detail"]["detail"]
