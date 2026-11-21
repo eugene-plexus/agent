@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ from .. import (
     enrollment,
     keyring_store,
     library_folders,
+    model_copies,
     model_paths,
     share_credentials,
 )
@@ -110,6 +112,8 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         restart = False
     uv = apps.find_uv(None)
     trust = request.app.state.auth_state.trust
+    copy_dir = state.get_config(model_copies.DIR_KEY)
+    copy_dir = copy_dir.strip() if isinstance(copy_dir, str) and copy_dir.strip() else None
     return {
         "enrolled": record.enrolled,
         "trust_limit": max_age_hours(state.get_config(MAX_AGE_HOURS_KEY)),
@@ -132,6 +136,11 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         "mode": state.get_config("securityMode"),
         "copy_enabled": state.get_config("modelCopyEnabled") is True,
         "copy_dir": state.get_config("modelCopyDir"),
+        # agent#54: a folder saved before the check, and the files Eugene leaves alone.
+        "copy_overlap": _copy_dir_overlap(request, state, copy_dir) if copy_dir else None,
+        "copy_others": (
+            model_copies.files_not_copied(os.path.expanduser(copy_dir)) if copy_dir else 0
+        ),
         "history_bytes": _history_bytes(request),
         "prompt_cache": _prompt_cache_usage(request, state),
     }
@@ -243,14 +252,9 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
                 text="Copying is on, but with no folder nothing is copied.",
             )
         elif live["copy_dir"]:
-            # Which drive the folder is on (LS7): the point of a copy is a
-            # fast local drive, and Strata reads from it while it answers.
-            from .. import drives
-
-            found = drives.copy_folder_status(str(live["copy_dir"]))
-            if found is not None:
-                level, text = found
-                update["status"] = ConfigFieldStatus(level=ConfigFieldStatusLevel(level), text=text)
+            status = _copy_dir_status(live)
+            if status is not None:
+                update["status"] = status
     elif key == disk_prompt_cache.ENABLED_KEY:
         kept = live["prompt_cache"]
         if kept is not None:
@@ -297,6 +301,44 @@ def _with_live_facts(field: ConfigField, live: dict[str, Any]) -> ConfigField:
                 text=frozen_refusal(live["trust_frozen"]),
             )
     return field.model_copy(update=update) if update else field
+
+
+def _copy_dir_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
+    """The copy folder's line: a Library folder it overlaps (a value saved
+    before agent#54), which drive it is on, and the files in it that are not
+    Eugene's copies. The most serious level wins; the sentences join."""
+    from .. import drives
+
+    parts: list[tuple[str, str]] = []
+    if live["copy_overlap"]:
+        parts.append(
+            (
+                "warning",
+                f"This folder {live['copy_overlap']}. Choose a folder outside every Library "
+                "folder.",
+            )
+        )
+    # Which drive the folder is on (LS7): the point of a copy is a fast local
+    # drive, and Strata reads from it while it answers.
+    found = drives.copy_folder_status(str(live["copy_dir"]))
+    if found is not None:
+        parts.append(found)
+    others = live["copy_others"]
+    if others:
+        parts.append(
+            (
+                "info",
+                f"{others} files here are not marked as Eugene's copies. Eugene leaves them alone."
+                if others != 1
+                else "1 file here is not marked as Eugene's copy. Eugene leaves it alone.",
+            )
+        )
+    if not parts:
+        return None
+    level = "warning" if any(level == "warning" for level, _ in parts) else "info"
+    return ConfigFieldStatus(
+        level=ConfigFieldStatusLevel(level), text=" ".join(text for _, text in parts)
+    )
 
 
 def _operators_file_problem(path: Path, state: AgentState) -> str | None:
@@ -585,10 +627,13 @@ async def patch_config(request: Request, body: ConfigUpdateRequest) -> ConfigUpd
     prior_mode = state.get_config("securityMode")
     prior_advertise = state.get_config("advertiseUrl")
     body, folder_rejection = await _check_overrides_name_folders(request, body)
+    body, copy_dir_rejection = await _check_copy_dir_outside_library(request, body)
     body, credential_rejection = _seal_share_credentials(request, body)
     result = state.apply_config_patch(body)
     if folder_rejection is not None:
         result.rejected.append(folder_rejection)
+    if copy_dir_rejection is not None:
+        result.rejected.append(copy_dir_rejection)
     if credential_rejection is not None:
         result.rejected.append(credential_rejection)
     new_mode = state.get_config("securityMode")
@@ -762,6 +807,68 @@ async def _check_overrides_name_folders(
                 ),
             )
     return body, None
+
+
+def _library_roots_here(request: Request, overrides: list[model_paths.PathRule]) -> list[str]:
+    """Every Library folder as this machine opens it: a folder's own path
+    when it has this machine's shape, its mounts of that shape, and the
+    targets of the effective overrides (`overrides`, then the inherited
+    mounts). Read from the folder cache; nothing is fetched or opened."""
+    cache = folder_cache_for(request)
+    windows = library_folders.host_is_windows()
+    roots: list[str] = []
+    for folder in (cache.folders if cache is not None else None) or []:
+        roots.extend(
+            path
+            for path in (folder.path, *folder.mounts)
+            if model_paths.is_windows_shaped(path) == windows
+        )
+    inherited = cache.inherited_rules() if cache is not None else ()
+    roots.extend(
+        rule.target
+        for rule in library_folders.effective_rules(overrides, inherited)
+        if model_paths.is_windows_shaped(rule.target) == windows
+    )
+    return list(dict.fromkeys(roots))
+
+
+def _copy_dir_overlap(request: Request, state: AgentState, directory: str) -> str | None:
+    overrides = model_paths.parse_rules(state.get_config(model_paths.CONFIG_KEY))
+    return model_copies.library_overlap(directory, _library_roots_here(request, overrides))
+
+
+async def _check_copy_dir_outside_library(
+    request: Request, body: ConfigUpdateRequest
+) -> tuple[ConfigUpdateRequest, ConfigFieldError | None]:
+    """agent#54: a copy folder is never a Library folder, inside one, or
+    above one. Copies would land in the Library, and the folder would mix
+    the person's models with Eugene's copies. Checked against every Library
+    folder this machine knows (the folder cache, which a Library that cannot
+    be reached leaves as last read, and the overrides, the patched ones when
+    the patch carries them). The rest of the patch still applies."""
+    patch = body.model_dump(exclude_unset=True)
+    raw = patch.get(model_copies.DIR_KEY)
+    if not isinstance(raw, str) or not raw.strip():
+        return body, None
+    await refresh_library_folders(request)
+    state: AgentState = request.app.state.agent_state
+    overrides = model_paths.parse_rules(
+        patch[model_paths.CONFIG_KEY]
+        if model_paths.CONFIG_KEY in patch
+        else state.get_config(model_paths.CONFIG_KEY)
+    )
+    chosen = raw.strip()
+    why = model_copies.library_overlap(chosen, _library_roots_here(request, overrides))
+    if why is None:
+        return body, None
+    del patch[model_copies.DIR_KEY]
+    return ConfigUpdateRequest.model_validate(patch), ConfigFieldError(
+        key=model_copies.DIR_KEY,
+        message=(
+            f"{chosen} {why}. Choose a folder outside every Library folder: Eugene never "
+            "writes model copies into the Library."
+        ),
+    )
 
 
 @router.post("/v1/library/folders/check", response_model=LibraryFolderReach)

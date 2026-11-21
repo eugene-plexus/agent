@@ -33,7 +33,9 @@ def copied(tmp_path: Path) -> tuple[PathRule, mc.CopyPlan, mc.CopySettings]:
     return rule, plan, settings
 
 
-def test_copy_completion_records_source_and_an_old_copy_gets_a_record(tmp_path: Path) -> None:
+def test_copy_completion_records_source_and_an_old_copy_is_used_but_not_claimed(
+    tmp_path: Path,
+) -> None:
     rule, plan, settings = copied(tmp_path)
     record = Path(plan.destination + ".source.json")
     raw = json.loads(record.read_text(encoding="utf-8"))
@@ -41,7 +43,9 @@ def test_copy_completion_records_source_and_an_old_copy_gets_a_record(tmp_path: 
     assert raw["mtime"] and raw["copiedAt"]
     record.unlink()
     assert mc.resolve_local_path(MODEL, [rule], settings).is_copy
-    assert record.is_file()
+    # agent#54: size and time cannot prove Eugene made a file, so a file with
+    # no record is never given one, and cleanup leaves it alone.
+    assert not record.exists()
 
 
 @pytest.mark.parametrize("blocked", [False, True])

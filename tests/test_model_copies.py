@@ -376,6 +376,7 @@ def test_a_partial_is_never_reported_as_a_copy(tmp_path: Path) -> None:
     copies = tmp_path / "copies"
     copies.mkdir()
     (copies / "m.gguf").write_bytes(b"x")
+    (copies / ("m.gguf" + mc.SOURCE_SUFFIX)).write_text('{"source": "/m.gguf"}', "utf-8")
     (copies / ("m.gguf" + mc.PARTIAL_SUFFIX)).write_bytes(b"x")
     assert [Path(p).name for p in mc.copies_on_disk(str(copies))] == ["m.gguf"]
 
@@ -461,11 +462,25 @@ def test_a_directory_a_copy_is_about_to_fill_is_not_pruned(tmp_path: Path) -> No
     assert os.path.isdir(os.path.dirname(plan.destination))
 
 
-def test_an_empty_directory_nothing_wants_is_still_pruned(tmp_path: Path) -> None:
+def test_an_empty_folder_eugene_did_not_empty_is_left_alone(tmp_path: Path) -> None:
+    """agent#54: only a folder that deleting a copy left empty is removed."""
     conf = settings(tmp_path)
-    stale = Path(conf.directory or "") / "someone-elses-folder"
-    stale.mkdir(parents=True)
+    theirs = Path(conf.directory or "") / "someone-elses-folder"
+    theirs.mkdir(parents=True)
 
     mc.remove_unwanted(conf.directory, [])
 
-    assert not stale.exists()
+    assert theirs.is_dir()
+
+
+def test_a_folder_a_deleted_copy_left_empty_is_pruned(tmp_path: Path) -> None:
+    rule = share(tmp_path, MODEL)
+    conf = settings(tmp_path)
+    plan = mc.plan_for(MODEL, [rule], conf)
+    assert plan is not None
+    mc.copy_file(plan, conf, mc.CopyState(plan.destination, 1024))
+
+    mc.remove_unwanted(conf.directory, [])
+
+    assert not os.path.exists(os.path.dirname(plan.destination))
+    assert os.path.isdir(conf.directory or "")

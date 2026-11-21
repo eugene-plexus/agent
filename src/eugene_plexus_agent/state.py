@@ -451,8 +451,8 @@ CONFIG_FIELDS: list[ConfigField] = [
             "The folder on this machine's own disk where model copies go; pick the "
             "fastest drive with room to spare.\n\n"
             "Copies keep the model's name and folder structure, so they stay readable "
-            "without Eugene. Eugene may delete anything in this folder, so do not "
-            "point it at a folder that holds anything else."
+            "without Eugene. Eugene deletes only the copies it made here and leaves "
+            "every other file alone. The folder cannot be in or above a Library folder."
         ),
         category="modelStorage",
         valueType=ConfigValueType.file_path,
