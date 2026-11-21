@@ -371,6 +371,67 @@ async def test_the_agents_own_supervisor_refuses_such_a_start_and_tries_again(
     assert process._consecutive_crashes >= 1
 
 
+async def test_start_runs_an_app_whose_supervision_gave_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue 55: after five crashes the loop ends but the process object stayed,
+    `is_running` said yes, and Start returned early. Only Restart worked."""
+    original_sleep = asyncio.sleep
+
+    async def quick(seconds: float) -> None:
+        await original_sleep(min(seconds, 0.001))
+
+    monkeypatch.setattr(asyncio, "sleep", quick)
+    store = _store(tmp_path)
+    record = _record()
+    asked = 0
+
+    def refusing_planner() -> apps._AppPlanner:
+        def gateway() -> None:
+            nonlocal asked
+            asked += 1
+
+        _planner(store, record)  # makes the interpreter file the planner looks for
+        return apps._AppPlanner(
+            record,
+            store=store,
+            gateway_url=gateway,
+            bind_host=lambda: None,
+            gateway_detail=lambda: GATEWAY_WHY,
+        )
+
+    supervisor = apps.AppSupervisor()
+    try:
+        supervisor.start(refusing_planner())
+        first = supervisor._processes["fake"]
+        for _ in range(500):
+            if not first.supervising:
+                break
+            await original_sleep(0.01)
+        assert not first.supervising, "the loop never gave up"
+        assert first.state == ProcessState.crashed
+        assert supervisor.is_running("fake") is False
+        asked_at_give_up = asked
+
+        supervisor.start(refusing_planner())
+
+        second = supervisor._processes["fake"]
+        assert second is not first, "Start did nothing for an app that gave up"
+        assert second._consecutive_crashes < 5, "the crash count was not cleared"
+        for _ in range(500):
+            if asked > asked_at_give_up:
+                break
+            await original_sleep(0.01)
+        assert asked > asked_at_give_up, "the new supervision never tried to spawn"
+        # A start while it is supervised is still ignored.
+        if second.supervising:
+            assert supervisor.is_running("fake") is True
+            supervisor.start(refusing_planner())
+            assert supervisor._processes["fake"] is second
+    finally:
+        await supervisor.stop_all()
+
+
 def test_an_app_in_its_own_account_exits_with_the_words(tmp_path: Path) -> None:
     """The launcher's way of running an app: it exits, and the words reach the
     Logs page through its own forwarding, with the agent's reason in them."""
@@ -778,6 +839,8 @@ class _Process:
     def __init__(self, planner: Any, log: Any) -> None:
         self.state = ProcessState.starting
         self.last_error = self.last_restart = self.pid = self.last_bind_host = None
+
+    supervising = True
 
     def start(self) -> None:
         return None

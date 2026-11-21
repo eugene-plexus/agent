@@ -1228,8 +1228,10 @@ class AppSupervisor:
 
     def start(self, planner: _AppPlanner) -> None:
         app_id = planner.record.id
-        if app_id in self._processes:
+        if self.is_running(app_id):
             return
+        # A process whose loop gave up (the crash limit) is replaced, not kept:
+        # a new one starts with no crashes counted, as after a Restart.
         process = SupervisedProcess(planner, log)
         self._processes[app_id] = process
         self._planners[app_id] = planner
@@ -1250,7 +1252,12 @@ class AppSupervisor:
         self._reachable.pop(app_id, None)
 
     def is_running(self, app_id: str) -> bool:
-        return app_id in self._processes
+        """Whether the agent still supervises the app. A loop that gave up
+        leaves its process in `_processes` so its last error can be read, but
+        nothing of the app runs (agent#55): the same rule as the own-account
+        supervisor's `_exited`."""
+        process = self._processes.get(app_id)
+        return process is not None and process.supervising
 
     def admin_token(self, app_id: str) -> str | None:
         planner = self._planners.get(app_id)

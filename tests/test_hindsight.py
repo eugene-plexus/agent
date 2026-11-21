@@ -352,6 +352,8 @@ async def test_failed_process_stop_keeps_the_supervisor_observation() -> None:
     supervisor = apps.AppSupervisor()
 
     class Process:
+        supervising = True  # its stop failed, so its loop was never cancelled
+
         async def stop(self) -> None:
             raise OSError("process 42 still alive")
 
