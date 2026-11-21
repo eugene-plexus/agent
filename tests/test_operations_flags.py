@@ -71,6 +71,8 @@ def test_the_reviewed_lists_name_only_declared_flags_and_no_flag_twice() -> None
         for second in names[i + 1 :]:
             both = lists[first] & lists[second]
             assert not both, f"{both} is in both {first} and {second}"
+    contained = set(operations.CONTAINED_FLAGS)
+    assert contained <= declared, f"CONTAINED_FLAGS names undeclared flags: {contained}"
 
 
 @pytest.mark.parametrize(
@@ -283,3 +285,44 @@ def test_the_owner_is_never_checked(library: tuple[Any, Path]) -> None:
     # token; the owner's request carries none, and nothing is refused.
     operations.refuse_owner_fields(_request(None), spec, None, folders=None)
     operations.refuse_owner_fields(_request(None), spec, _spec(lib), folders=folders)
+
+
+@pytest.mark.parametrize(
+    "after",
+    [{"source": "binary"}, {}],
+    ids=["to-binary", "source-removed"],
+)
+def test_a_kept_trust_does_not_follow_the_model_out_of_the_container(
+    library: tuple[Any, Path], after: dict[str, Any]
+) -> None:
+    """Review of library#22: the container gives a model's code only the
+    model's folder, read only; vLLM on the host runs it in the agent's
+    account. An unset `source` may mean the host (`unsetMeans`), so removing
+    it leaves the container too."""
+    folders, lib = library
+    before = _spec(lib, "vllm", trustRemoteCode=True, source="container")
+    said = _refused(_spec(lib, "vllm", trustRemoteCode=True, **after), folders, before)
+    assert said is not None and "(flags.trustRemoteCode)" in said
+    assert "outside the container" in said
+    # Without the owner's flag, the move is the operator's.
+    assert _refused(_spec(lib, "vllm", **after), folders, before) is None
+
+
+@pytest.mark.parametrize(
+    ("first", "then"),
+    [
+        ({"source": "container"}, {"source": "container", "maxModelLen": 8192}),
+        ({}, {"source": "container"}),
+        ({"source": "binary"}, {}),
+        ({"source": "binary"}, {"source": "container"}),
+    ],
+    ids=["same", "unset-to-container", "binary-to-unset", "binary-to-container"],
+)
+def test_a_kept_trust_stays_where_the_code_reaches_no_further(
+    library: tuple[Any, Path], first: dict[str, Any], then: dict[str, Any]
+) -> None:
+    """The owner allowed the code where it could already run on the host (an
+    unset `source` or `binary`); the container reaches less, so it stays."""
+    folders, lib = library
+    before = _spec(lib, "vllm", trustRemoteCode=True, **first)
+    assert _refused(_spec(lib, "vllm", trustRemoteCode=True, **then), folders, before) is None

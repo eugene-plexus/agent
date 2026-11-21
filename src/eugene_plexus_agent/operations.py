@@ -306,6 +306,14 @@ _OPERATIONS_BY_ENGINE: dict[str, tuple[str, ...]] = {
 OPERATIONS_FLAGS: frozenset[tuple[str, str]] = frozenset(
     (engine, key) for engine, keys in _OPERATIONS_BY_ENGINE.items() for key in keys
 )
+#: Flags whose value runs the engine in a container, with that value. A kept
+#: owner flag does not follow a move away from it: vLLM's container gives a
+#: model's code only the model's folder, read only, and vLLM on the host runs
+#: it in the agent's account. An unset `source` is not the container: it
+#: means the host whenever the image is not pulled or a vLLM program is set
+#: (the flag's `unsetMeans`), so the owner's trust under it already covered
+#: the host, and only leaving an explicit "container" counts.
+CONTAINED_FLAGS: dict[tuple[str, str], str] = {("vllm", "source"): "container"}
 #: The second net, never the only one: a key that ends this way names a file
 #: or folder whatever its declaration says.
 PATH_FLAG = re.compile(r"(Path|File|Dir|Directory)$")
@@ -445,13 +453,30 @@ def refuse_owner_fields(
         elif kind != "operations":
             # Declared, but nobody has classified it for this engine yet.
             raise refuse(f"flags.{key}", "this engine setting")
-    # A kept owner flag was the owner's choice for this model and these
-    # files; another model, tokenizer or draft needs the owner again.
-    if model_moved:
+    # A kept owner flag was the owner's choice for this model, these files
+    # and this way of running; another model, tokenizer or draft, or a move
+    # out of a container, needs the owner again.
+    left = next(
+        (
+            key
+            for (name, key), inside in CONTAINED_FLAGS.items()
+            if name == engine and before.get(key) == inside and flags.get(key) != inside
+        ),
+        None,
+    )
+    if model_moved or left is not None:
         for key, value in flags.items():
             trusted = OWNER_FLAGS.get((engine, key))
-            if trusted is not None and _is_on(value):
+            if trusted is None or not _is_on(value):
+                continue
+            if model_moved:
                 raise refuse(f"flags.{key}", trusted)
+            raise _problem(
+                status.HTTP_403_FORBIDDEN,
+                "Owner only",
+                f"Only the owner can set {trusted} (flags.{key}) outside the container "
+                f"(flags.{left}). Keep the container, or ask the owner.",
+            )
 
 
 _SEPARATORS = re.compile(r"[\\/]")
