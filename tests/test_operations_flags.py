@@ -35,7 +35,7 @@ def test_every_engine_flag_is_classified_for_operations_tokens() -> None:
     unclassified = [
         f"{engine}.{field.key}"
         for engine, field in _declared()
-        if operations.flag_class(field) is None
+        if operations.flag_class(engine, field) is None
     ]
     assert unclassified == [], (
         "classify these engine flags in operations.py (OWNER_FLAGS, PATH_FLAG_KEYS "
@@ -43,8 +43,22 @@ def test_every_engine_flag_is_classified_for_operations_tokens() -> None:
     )
 
 
+def test_a_safe_key_on_another_engine_is_not_classified() -> None:
+    """Review: the lists are per engine, so an engine that adds a flag under a
+    key another engine has (vLLM's `--chat-template` takes a file, MLX's takes
+    text) fails the walk until someone classifies it for that engine."""
+    from eugene_plexus_agent._generated.models import ConfigField, ConfigValueType
+
+    field = ConfigField(
+        key="chatTemplate", label="x", category="model", valueType=ConfigValueType.string
+    )
+    assert operations.flag_class("mlx", field) == "operations"
+    assert operations.flag_class("vllm", field) is None
+    assert operations.flag_class(EngineKind.vllm, field) is None
+
+
 def test_the_reviewed_lists_name_only_declared_flags_and_no_flag_twice() -> None:
-    declared = {field.key for _, field in _declared()}
+    declared = {(engine, field.key) for engine, field in _declared()}
     lists = {
         "OWNER_FLAGS": set(operations.OWNER_FLAGS),
         "PATH_FLAG_KEYS": set(operations.PATH_FLAG_KEYS),
@@ -77,7 +91,7 @@ def test_the_reviewed_lists_name_only_declared_flags_and_no_flag_twice() -> None
 )
 def test_the_flags_that_reach_past_running_a_model(engine: str, key: str, kind: str) -> None:
     field = next(f for e, f in _declared() if e == engine and f.key == key)
-    assert operations.flag_class(field) == kind
+    assert operations.flag_class(engine, field) == kind
 
 
 # ------------------------------------------------------------- the check alone
@@ -196,10 +210,56 @@ def test_a_kept_trust_does_not_carry_over_to_another_model(library: tuple[Any, P
     assert said is not None and "(flags.trustRemoteCode)" in said
 
 
-def test_a_flag_no_engine_declares_is_the_owners(library: tuple[Any, Path]) -> None:
+def test_a_flag_this_engine_does_not_declare_is_left_to_the_spec_check(
+    library: tuple[Any, Path],
+) -> None:
+    """Review: an undeclared flag (a typo) is not an owner's setting. The spec
+    check that follows refuses it with the same 400 the owner gets, which
+    names only flags `GET /v1/engines` already shows an operations token."""
     folders, lib = library
-    said = _refused(_spec(lib, notAFlag="x"), folders)
-    assert said is not None and "(flags.notAFlag)" in said
+    assert _refused(_spec(lib, "llama_cpp", contextSze=4096), folders) is None
+
+
+def test_an_engine_change_needs_the_owners_fields_again(library: tuple[Any, Path]) -> None:
+    """Review: a changed engine is a changed model. What the owner set for one
+    engine (code that comes with a model, the environment, extra arguments)
+    does not carry over to another."""
+    folders, lib = library
+    before = _spec(lib, "vllm", trustRemoteCode=True)
+    said = _refused(_spec(lib, "mlx", trustRemoteCode=True), folders, before)
+    assert said is not None and "(flags.trustRemoteCode)" in said
+    assert "another engine" in said
+    with_env = _spec(lib, "vllm").model_copy(update={"env": {"HF_TOKEN": "x"}})
+    moved = _spec(lib, "mlx").model_copy(update={"env": {"HF_TOKEN": "x"}})
+    said = _refused(moved, folders, with_env)
+    assert said is not None and "(env)" in said and "another engine" in said
+    # Without the owner's fields, the engine change is the operator's.
+    assert _refused(_spec(lib, "mlx"), folders, with_env) is None
+
+
+@pytest.mark.parametrize(
+    ("engine", "flags", "field"),
+    [
+        ("mlx", {"promptCacheBytes": "--trust-remote-code"}, "flags.promptCacheBytes"),
+        ("mlx", {"chatTemplate": " -x"}, "flags.chatTemplate"),
+        ("llama_cpp", {"tensorSplit": "-1,2"}, "flags.tensorSplit"),
+        ("strata", {"gpus": ["0", "--x"]}, "flags.gpus"),
+    ],
+)
+def test_a_value_that_starts_with_a_dash_is_the_owners(
+    library: tuple[Any, Path], engine: str, flags: dict[str, Any], field: str
+) -> None:
+    folders, lib = library
+    said = _refused(_spec(lib, engine, **flags), folders)
+    assert said is not None and f"({field})" in said and 'starts with "-"' in said
+
+
+def test_a_negative_number_written_as_text_is_not_a_dash_value(
+    library: tuple[Any, Path],
+) -> None:
+    folders, lib = library
+    assert _refused(_spec(lib, "llama_cpp", tensorSplit="-1"), folders) is None
+    assert _refused(_spec(lib, "llama_cpp", mainGpu=-1), folders) is None
 
 
 def test_the_name_ending_still_catches_a_path(library: tuple[Any, Path]) -> None:

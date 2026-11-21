@@ -619,6 +619,22 @@ def test_models_cannot_set_engine_flags_that_reach_past_running_a_model(
     assert client.get("/v1/runtimes", headers=dana).json()["runtimes"] == []
 
 
+def test_a_mistyped_flag_gets_the_same_answer_as_the_owners(
+    app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
+) -> None:
+    """Review: a typo is not an owner's setting; it is a flag this engine does
+    not have, said the same way to an operations token and to the owner."""
+    _library_at(app, tmp_path / "lib")
+    spec = _spec(tmp_path, flags={"contextSze": 4096})
+    answers = [
+        client.post("/v1/runtimes", json=spec, headers=_bearer(token))
+        for token in (_operations_token(root, MODELS), _owner(client, root))
+    ]
+    for answer in answers:
+        assert answer.status_code == 400, answer.text
+        assert "unknown flag(s) for llama_cpp: contextSze" in answer.json()["detail"]["detail"]
+
+
 def test_models_keeps_the_owners_trust_and_cannot_move_it_to_another_model(
     app: FastAPI, client: TestClient, root: FakeRoot, tmp_path: Path
 ) -> None:

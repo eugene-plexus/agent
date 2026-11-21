@@ -205,44 +205,46 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 # agent#53: what an engine flag is, for an operations token, comes from what
 # the engine adapter declares about it (`flag_schema()`), never from the key's
-# spelling alone. Every declared flag is in exactly one class;
+# spelling alone. Every declared (engine, key) pair is in exactly one class;
 # `tests/test_operations_flags.py` walks every registered engine and fails on
-# a flag in none, so a new flag is classified before it ships.
+# a pair in none. The classes are per engine, so a new engine flag fails the
+# walk even when another engine has a safe flag under the same key.
 
 #: Flags only the owner turns on, with what each is, for the refusal. A value
-#: the declaration already had is left alone -- for the same model only.
-OWNER_FLAGS: dict[str, str] = {
-    # MLX and vLLM `--trust-remote-code`: a model folder's own Python runs
-    # in the agent's account.
-    "trustRemoteCode": "running code that comes with a model",
+#: the declaration already had is left alone -- for the same engine, model and
+#: files only.
+OWNER_FLAGS: dict[tuple[str, str], str] = {
+    # `--trust-remote-code`: a model folder's own Python runs in the agent's
+    # account.
+    ("mlx", "trustRemoteCode"): "running code that comes with a model",
+    ("vllm", "trustRemoteCode"): "running code that comes with a model",
 }
 #: Declared value types that name files or folders on this machine.
 PATH_VALUE_TYPES = frozenset({"file_path", "path_list"})
 #: Flags declared as text that name a file, folder or model: for an
 #: operations token each must lie inside a Library folder, as `modelPath`
 #: does, so a Hugging Face Hub id is refused too.
-PATH_FLAG_KEYS = frozenset(
+PATH_FLAG_KEYS: frozenset[tuple[str, str]] = frozenset(
     {
-        "adapterPath",  # mlx --adapter-path: LoRA weights
-        "chatTemplateFile",  # llama.cpp --chat-template-file
-        "draftModel",  # mlx --draft-model: a folder or a Hub id
-        "draftModelPath",  # llama.cpp --model-draft, vLLM speculative model
-        "fallback",  # kev --fallback: a checkpoint folder
-        "projectorPath",  # llama.cpp --mmproj
+        ("llama_cpp", "chatTemplateFile"),  # --chat-template-file
+        ("llama_cpp", "draftModelPath"),  # --model-draft
+        ("llama_cpp", "projectorPath"),  # --mmproj
+        ("vllm", "draftModelPath"),  # the speculative model
+        ("mlx", "adapterPath"),  # --adapter-path: LoRA weights
+        ("mlx", "draftModel"),  # --draft-model: a folder or a Hub id
+        ("kev", "fallback"),  # --fallback: a checkpoint folder
     }
 )
-#: The reviewed flags an operations token may set: sizes, counts, choices
-#: and switches that change how a model runs on this machine, and nothing
-#: that names a file, a program, an address or a secret.
-OPERATIONS_FLAGS = frozenset(
-    {
-        # every engine that has them
+#: The reviewed flags an operations token may set, per engine: sizes, counts,
+#: choices and switches that change how a model runs on this machine, and
+#: nothing that names a file, a program, an address or a secret.
+_OPERATIONS_BY_ENGINE: dict[str, tuple[str, ...]] = {
+    "llama_cpp": (
         "sameAnswerEveryTime",
         "reuseRepeatedText",
         "draftWith",
         "draftTokens",
-        "missingCard",
-        # llama.cpp
+        "projectorOnCpu",
         "contextSize",
         "gpuLayers",
         "parallelSlots",
@@ -263,10 +265,15 @@ OPERATIONS_FLAGS = frozenset(
         "tensorSplit",
         "mlock",
         "noMmap",
-        "projectorOnCpu",
-        # vLLM
+        "missingCard",
+    ),
+    "vllm": (
+        "sameAnswerEveryTime",
         "source",  # this release's pinned image or the owner's own vLLM
         "shmSizeGiB",
+        "reuseRepeatedText",
+        "draftWith",
+        "draftTokens",
         "maxModelLen",
         "gpuMemoryUtilization",
         "kvCacheDtype",
@@ -278,7 +285,9 @@ OPERATIONS_FLAGS = frozenset(
         "enforceEager",
         "quantization",  # a method name from vLLM's own closed list
         "kvOffloadGb",
-        # MLX
+        "missingCard",
+    ),
+    "mlx": (
         "maxTokens",
         "promptCacheSize",
         "promptCacheBytes",
@@ -290,28 +299,38 @@ OPERATIONS_FLAGS = frozenset(
         # template's own text (`chat_template=`), never as a file name, and
         # transformers renders it in a sandbox.
         "chatTemplate",
-        # Strata
-        "speedProjection",
-        "gpus",
-        "layerSplit",
-    }
+    ),
+    "kev": (),
+    "strata": ("speedProjection", "gpus", "layerSplit"),
+}
+OPERATIONS_FLAGS: frozenset[tuple[str, str]] = frozenset(
+    (engine, key) for engine, keys in _OPERATIONS_BY_ENGINE.items() for key in keys
 )
 #: The second net, never the only one: a key that ends this way names a file
 #: or folder whatever its declaration says.
 PATH_FLAG = re.compile(r"(Path|File|Dir|Directory)$")
+#: A negative number written as text: the one value starting with `-` that
+#: an argument parser reads as a value, not as an option.
+_NEGATIVE_NUMBER = re.compile(r"-(\d+(\.\d*)?|\.\d+)")
 
 
-def flag_class(field: Any) -> str | None:
-    """What a declared engine flag is for an operations token: `owner`,
+def _engine_name(engine: Any) -> str | None:
+    found = getattr(engine, "value", engine)
+    return found if isinstance(found, str) else None
+
+
+def flag_class(engine: Any, field: Any) -> str | None:
+    """What one engine's declared flag is for an operations token: `owner`,
     `path`, `operations` (reviewed as safe), or None when nobody has
-    classified it. The key's ending is not consulted here (see `PATH_FLAG`)."""
-    key = getattr(field, "key", None)
+    classified it for this engine. The key's ending is not consulted here
+    (see `PATH_FLAG`)."""
+    pair = (_engine_name(engine) or "", getattr(field, "key", None) or "")
     value_type = getattr(getattr(field, "valueType", None), "value", None)
-    if key in OWNER_FLAGS:
+    if pair in OWNER_FLAGS:
         return "owner"
-    if value_type in PATH_VALUE_TYPES or key in PATH_FLAG_KEYS:
+    if value_type in PATH_VALUE_TYPES or pair in PATH_FLAG_KEYS:
         return "path"
-    if key in OPERATIONS_FLAGS:
+    if pair in OPERATIONS_FLAGS:
         return "operations"
     return None
 
@@ -331,12 +350,27 @@ def _is_on(value: Any) -> bool:
     return value not in (None, False, "")
 
 
-def owner_field(field: str, what: str) -> HTTPException:
-    return _problem(
-        status.HTTP_403_FORBIDDEN,
-        "Owner only",
-        f"Only the owner can set {what} ({field}). Leave it as it was, or ask the owner.",
-    )
+def _starts_with_a_dash(value: Any) -> bool:
+    """A text value an engine's argument parser could read as an option."""
+    items = value if isinstance(value, list) else [value]
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text.startswith("-") and not _NEGATIVE_NUMBER.fullmatch(text):
+            return True
+    return False
+
+
+def owner_field(field: str, what: str, *, engine_changed: bool = False) -> HTTPException:
+    if engine_changed:
+        detail = (
+            f"Only the owner can set {what} ({field}) for another engine. "
+            "Change the engine without it, or ask the owner."
+        )
+    else:
+        detail = f"Only the owner can set {what} ({field}). Leave it as it was, or ask the owner."
+    return _problem(status.HTTP_403_FORBIDDEN, "Owner only", detail)
 
 
 def refuse_owner_fields(
@@ -347,31 +381,44 @@ def refuse_owner_fields(
     working directory, the program, extra arguments, an address other
     machines can reach, a file outside the Library's folders, or running
     code that comes with a model. Engine flags are judged by what the
-    engine declares (`flag_class`); a flag nobody classified is refused. A
-    value the declaration already had is left alone, except that a kept
-    owner flag does not follow a new model or a new file. The owner is
-    never checked here. `folders` is the Library folder cache; None or
-    unread refuses every path, since nothing then says where the Library
-    is."""
+    engine declares (`flag_class`); a declared flag nobody classified is
+    the owner's, and an undeclared one is left to `validate_spec`, which
+    refuses it for everyone alike. A text value that starts with `-` is
+    the owner's. A value the declaration already had is left alone, except
+    that nothing is kept across an engine change, and a kept owner flag
+    does not follow a new model or a new file. The owner is never checked
+    here. `folders` is the Library folder cache; None or unread refuses
+    every path, since nothing then says where the Library is."""
     if operations_claims(request) is None:
         return
+    # A changed engine is a changed model: what the owner set for one engine
+    # is sent again by the owner for another.
+    engine_changed = previous is not None and getattr(previous, "engine", None) != getattr(
+        spec, "engine", None
+    )
+    if engine_changed:
+        previous = None
+
+    def refuse(field: str, what: str) -> HTTPException:
+        return owner_field(field, what, engine_changed=engine_changed)
 
     def kept(field: str) -> bool:
         return previous is not None and getattr(previous, field, None) == getattr(spec, field)
 
     for field, what in OWNER_SPEC_FIELDS.items():
         if getattr(spec, field, None) and not kept(field):
-            raise owner_field(field, what)
+            raise refuse(field, what)
     host = getattr(spec, "host", None)
     if host and host not in LOOPBACK_HOSTS and not kept("host"):
-        raise owner_field("host", "an address other machines can reach")
+        raise refuse("host", "an address other machines can reach")
     known = folders is not None and getattr(folders, "known", False)
 
     def in_library(path: Any) -> bool:
         return isinstance(path, str) and known and inside_library_folder(folders, path)
 
     if not in_library(getattr(spec, "modelPath", None)) and not kept("modelPath"):
-        raise owner_field("modelPath", "a model outside the Library's folders")
+        raise refuse("modelPath", "a model outside the Library's folders")
+    engine = _engine_name(getattr(spec, "engine", None)) or ""
     flags = getattr(spec, "flags", None) or {}
     before = (getattr(previous, "flags", None) or {}) if previous is not None else {}
     declared = _declared_flags(getattr(spec, "engine", None))
@@ -380,26 +427,31 @@ def refuse_owner_fields(
         if value in (None, "") or before.get(key) == value:
             continue
         found = declared.get(key)
-        kind = flag_class(found) if found is not None else None
-        if kind is None and key in OWNER_FLAGS:
-            kind = "owner"
+        if found is None and not PATH_FLAG.search(key):
+            # This engine has no such flag (a typo, another engine's flag):
+            # `validate_spec` refuses it with the 400 the owner gets too.
+            continue
+        if _starts_with_a_dash(value):
+            raise refuse(f"flags.{key}", 'a value that starts with "-"')
+        kind = flag_class(engine, found) if found is not None else None
         if kind == "path" or PATH_FLAG.search(key):
             values = value if isinstance(value, list) else [value]
             if not values or not all(in_library(v) for v in values):
-                raise owner_field(f"flags.{key}", "a file outside the Library's folders")
+                raise refuse(f"flags.{key}", "a file outside the Library's folders")
             model_moved = True
         elif kind == "owner":
             if _is_on(value):
-                raise owner_field(f"flags.{key}", OWNER_FLAGS[key])
+                raise refuse(f"flags.{key}", OWNER_FLAGS[(engine, key)])
         elif kind != "operations":
-            # Declared by no engine, or by one nobody has classified yet.
-            raise owner_field(f"flags.{key}", "an engine setting this engine does not declare")
+            # Declared, but nobody has classified it for this engine yet.
+            raise refuse(f"flags.{key}", "this engine setting")
     # A kept owner flag was the owner's choice for this model and these
     # files; another model, tokenizer or draft needs the owner again.
     if model_moved:
-        for key, what in OWNER_FLAGS.items():
-            if _is_on(flags.get(key)):
-                raise owner_field(f"flags.{key}", what)
+        for key, value in flags.items():
+            trusted = OWNER_FLAGS.get((engine, key))
+            if trusted is not None and _is_on(value):
+                raise refuse(f"flags.{key}", trusted)
 
 
 _SEPARATORS = re.compile(r"[\\/]")
