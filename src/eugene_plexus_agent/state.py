@@ -452,7 +452,10 @@ CONFIG_FIELDS: list[ConfigField] = [
             "fastest drive with room to spare.\n\n"
             "Copies keep the model's name and folder structure, so they stay readable "
             "without Eugene. Eugene deletes only the copies it made here and leaves "
-            "every other file alone. The folder cannot be in or above a Library folder."
+            "every other file alone. The folder cannot be in or above a Library folder. "
+            # Remove this sentence when specs#136 lands: the uninstaller's purge
+            # option still deletes the whole copy folder.
+            + model_copies.UNINSTALL_PURGE_WARNING
         ),
         category="modelStorage",
         valueType=ConfigValueType.file_path,

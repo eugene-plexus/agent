@@ -72,6 +72,15 @@ MIN_FREE_GB_KEY = "modelCopyMinFreeGb"
 
 DEFAULT_MIN_FREE_GB = 50
 
+#: What the copy folder's help and status say about uninstalling. Remove it
+#: when specs#136 lands: until then the uninstaller's purge option (install.sh
+#: `--purge-downloads`, install.ps1 `-PurgeDownloads`, the macOS dialog's
+#: downloads choice) deletes the whole copy folder, not only Eugene's copies.
+UNINSTALL_PURGE_WARNING = (
+    "Uninstalling Eugene with the option to delete downloads removes this whole folder, "
+    "so keep no other files in it."
+)
+
 #: Suffix for bytes in flight. Deliberately not a name any engine would
 #: open, and deliberately in the destination directory rather than a
 #: temp dir, so the rename is on one filesystem and therefore atomic.
@@ -162,6 +171,44 @@ def library_overlap(directory: str, library_roots: Iterable[str]) -> str | None:
         if _within(folder, chosen):
             return f"holds the Library folder {root}"
     return None
+
+
+def library_roots_here(
+    settings: CopySettings,
+    rules: Sequence[PathRule],
+    *,
+    expand: Callable[[str], str] = os.path.expanduser,
+) -> list[str]:
+    """Every Library folder (`settings.folder_roots`) where this machine
+    opens it, through the effective rules; a folder this machine has no
+    form of (the other OS's shape, no mount here) is left out."""
+    windows = os.name == "nt"
+    out: list[str] = []
+    for folder in settings.folder_roots:
+        local = resolve_model_path(folder, rules, expand=expand).local_path
+        if is_windows_shaped(local) == windows:
+            out.append(local)
+    return out
+
+
+def copy_dir_overlap(
+    settings: CopySettings,
+    rules: Sequence[PathRule],
+    *,
+    expand: Callable[[str], str] = os.path.expanduser,
+) -> str | None:
+    """How the copy folder overlaps a Library folder this machine opens, as
+    `library_overlap` says it, or None. While it does, nothing is copied."""
+    if not settings.directory:
+        return None
+    return library_overlap(settings.directory, library_roots_here(settings, rules, expand=expand))
+
+
+def _inside_copy_dir(path: str, directory: str) -> bool:
+    return _within(
+        os.path.normcase(os.path.abspath(path)),
+        os.path.normcase(os.path.abspath(os.path.expanduser(directory))),
+    )
 
 
 # --- where a copy goes --------------------------------------------------------
@@ -348,12 +395,17 @@ def plan_for(
     if not settings.usable:
         return None
     assert settings.directory is not None
-    source = resolve_model_path(declared, rules, expand=expand).local_path
+    resolution = resolve_model_path(declared, rules, expand=expand)
+    source = resolution.local_path
     relative = relative_name(declared, rules)
     if not relative:
         return None
     destination = os.path.join(settings.directory, *relative.split("/"))
     if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(destination)):
+        return None
+    if not _inside_copy_dir(destination, settings.directory):
+        # A `..` in the declared path (review S5): never write outside the
+        # folder the operator chose.
         return None
     depth = len(relative.split("/"))
     parents = (PureWindowsPath if is_windows_shaped(source) else PurePosixPath)(source).parents
@@ -371,6 +423,13 @@ def plan_for(
             folders, key=lambda folder: len(_parts(folder, windows=is_windows_shaped(folder))[0])
         )
         root = resolve_model_path(folder, rules, expand=expand).local_path
+    matched_root = [root] if folders or resolution.rule is not None else []
+    if library_overlap(
+        settings.directory, [*matched_root, *library_roots_here(settings, rules, expand=expand)]
+    ):
+        # Review S4: a copy folder in, equal to or above a Library folder
+        # copies nothing, whatever let the value be saved.
+        return None
     try:
         files = _bounded(source + ":members", lambda: members_of(source))
     except (OSError, TimeoutError):
@@ -394,12 +453,18 @@ def plan_for(
     # folder root must answer before a missing member means removal.
     members: list[CopyMember] = []
     for path in files:
-        inside = os.path.relpath(path, layout_root)
+        try:
+            inside = os.path.relpath(path, layout_root)
+        except ValueError:  # on another drive (review S3)
+            return None
         if os.path.isabs(inside) or inside == ".." or inside.startswith(".." + os.sep):
             # A file outside the model's Library folder cannot keep its
             # place in the copy: the model runs from where it is.
             return None
-        members.append(CopyMember(path, os.path.join(settings.directory, inside)))
+        member_destination = os.path.join(settings.directory, inside)
+        if not _inside_copy_dir(member_destination, settings.directory):
+            return None
+        members.append(CopyMember(path, member_destination))
     return CopyPlan(
         declared=declared, source=source, destination=destination, members=tuple(members), root=root
     )
@@ -503,11 +568,24 @@ def _record(destination: str) -> dict[str, Any] | None:
         return _read_record(destination)
 
 
+#: The most of a record that is read. A record holds one path, two numbers,
+#: a time and the model's member list, so even a prepared model of tens of
+#: thousands of files stays far below this; the cap bounds what a file put
+#: in the copy folder can make every walk read (agent#54 review).
+RECORD_MAX_BYTES = 4 * 1024 * 1024
+
+
 def _read_record(destination: str) -> dict[str, Any] | None:
+    """The record beside `destination`, or None when there is none or it
+    is not one: too big, not JSON, nested deeper than the parser goes."""
     try:
-        raw = json.loads(Path(destination + SOURCE_SUFFIX).read_text(encoding="utf-8"))
+        with open(destination + SOURCE_SUFFIX, "rb") as stream:
+            data = stream.read(RECORD_MAX_BYTES + 1)
+        if len(data) > RECORD_MAX_BYTES:
+            return None
+        raw = json.loads(data.decode("utf-8"))
         return raw if isinstance(raw, dict) else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
 
 
@@ -516,16 +594,35 @@ def _names_a_source(record: dict[str, Any] | None) -> bool:
     return isinstance(source, str) and bool(source.strip())
 
 
+def _proves(record: dict[str, Any] | None, path: str) -> bool:
+    """`record` names a source and the size it records is the size of the
+    file at `path` now. Every record is written with the size of the bytes
+    about to take the name (`_mark`) or of a copy that matches its source
+    (`check_copy`), so a size that differs means the file is not the copy
+    the record was written for."""
+    if not _names_a_source(record):
+        return False
+    assert record is not None
+    size = record.get("size")
+    if not isinstance(size, int) or isinstance(size, bool):
+        return False
+    try:
+        return os.path.getsize(path) == size
+    except OSError:
+        return False
+
+
 def is_eugenes_copy(path: str) -> bool:
     """Whether Eugene made the file at `path` (agent#54).
 
     The one proof: the record Eugene writes beside every file it copies,
-    before the file takes its name, is there and names the file it copies.
-    Size, time and name prove nothing -- a person who copied a model with
-    its timestamp has a file that matches all three -- so a file without
-    the record is never deleted, replaced or claimed.
+    before the file takes its name, is there, names the file it copies,
+    and records this file's size. Size, time and name alone prove nothing
+    -- a person who copied a model with its timestamp has a file that
+    matches all three -- so a file without the record is never deleted,
+    replaced or claimed.
     """
-    return _names_a_source(_record(path))
+    return _proves(_record(path), path)
 
 
 def _save_source(member: CopyMember, source: Stat, members: Sequence[str] = ()) -> str | None:
@@ -554,7 +651,13 @@ def _write_source(member: CopyMember, source: Stat, members: Sequence[str]) -> s
     }
     if members:
         payload["members"] = list(members)
-    path = member.destination + SOURCE_SUFFIX
+    return _write_record(member.destination, payload)
+
+
+def _write_record(destination: str, payload: dict[str, Any]) -> str | None:
+    """Write `payload` as the record beside `destination`, whole or not at
+    all; the OS's reason when it could not, else None."""
+    path = destination + SOURCE_SUFFIX
     partial = path + PARTIAL_SUFFIX
     try:
         with open(partial, "w", encoding="utf-8") as stream:
@@ -564,7 +667,7 @@ def _write_source(member: CopyMember, source: Stat, members: Sequence[str]) -> s
         os.replace(partial, path)
     except OSError as exc:
         _remove_quietly(partial)
-        log.warning("could not record the source of %s: %s", member.destination, exc)
+        log.warning("could not record the source of %s: %s", destination, exc)
         return str(exc)
     return None
 
@@ -645,7 +748,7 @@ def check_copy(plan: CopyPlan, *, mtime_tolerance: float = 2.0) -> CopyCheck:
     for member, source in zip(plan.files, sources, strict=True):
         assert source is not None
         saved_record = _record(member.destination)
-        if not _names_a_source(saved_record):
+        if not _proves(saved_record, member.destination):
             # A file with no record may be opened, since it is the same
             # file, but is never claimed: Eugene did not copy it, or cannot
             # prove it did (agent#54).
@@ -853,11 +956,13 @@ def copy_file(
         state.files_copied += 1
     for member in files:
         # Refresh Eugene's own records (the set may have grown a member);
-        # a current file without one stays unclaimed (agent#54).
+        # a current file without one stays unclaimed (agent#54). Only while
+        # the source still has the copy's size, so the record keeps proving it.
         if not is_eugenes_copy(member.destination):
             continue
         source = _stat(member.source)
-        if source is not None:
+        held = _stat(member.destination)
+        if source is not None and held is not None and source.size == held.size:
             _save_source(member, source, members)
 
 
@@ -876,28 +981,27 @@ def _copy_one(
     replaced (agent#54), and the record that proves the copy is Eugene's
     is written before the copy takes its name, so no whole file is ever
     left without it."""
-    if os.path.lexists(member.destination) and not is_eugenes_copy(member.destination):
-        raise CopyAborted(
-            f"not copied to this machine: {member.destination} is already there and is not "
-            "a copy Eugene made, so Eugene leaves it alone"
-        )
+    _refuse_a_file_not_ours(member)
     os.makedirs(os.path.dirname(member.destination) or ".", exist_ok=True)
     partial = member.partial
     blob = matching_ollama_blob(member.source)
     if blob is not None:
+        previous: dict[str, Any] | None = None
+        marked = False
         try:
             if should_cancel is not None and should_cancel():
                 raise CopyAborted("the copy was cancelled")
             os.link(blob, partial)
-            _mark(member, members, partial)
+            previous = _mark(member, members, partial)
+            marked = True
             os.replace(partial, member.destination)
             copied += os.path.getsize(member.source)
             state.note(copied, time.perf_counter())
             return copied
         except OSError:
             _remove_quietly(partial)
-            if not os.path.lexists(member.destination):
-                _remove_quietly(member.destination + SOURCE_SUFFIX)
+            if marked:
+                _unmark(member, previous)
     started = time.perf_counter()
     first = copied
     try:
@@ -930,14 +1034,12 @@ def _copy_one(
     # a copy that claims to be newer than its source is a lie about a
     # file the operator may well go looking at in a file manager.
     shutil.copystat(member.source, partial)
-    _mark(member, members, partial)
+    previous = _mark(member, members, partial)
     try:
         os.replace(partial, member.destination)
     except OSError:
         _remove_quietly(partial)
-        if not os.path.lexists(member.destination):
-            # A record with no copy could later vouch for a file put there.
-            _remove_quietly(member.destination + SOURCE_SUFFIX)
+        _unmark(member, previous)
         raise
     state.note(copied, time.perf_counter())
     log.info(
@@ -950,20 +1052,61 @@ def _copy_one(
     return copied
 
 
-def _mark(member: CopyMember, members: Sequence[str], partial: str) -> None:
+def _refuse_a_file_not_ours(member: CopyMember, partial: str | None = None) -> None:
+    """Abort when a file that is not Eugene's copy is at the destination,
+    removing `partial` if given; the file itself is left alone (agent#54)."""
+    if os.path.lexists(member.destination) and not is_eugenes_copy(member.destination):
+        if partial is not None:
+            _remove_quietly(partial)
+        raise CopyAborted(
+            f"not copied to this machine: {member.destination} is already there and is not "
+            "a copy Eugene made, so Eugene leaves it alone"
+        )
+
+
+def _mark(member: CopyMember, members: Sequence[str], partial: str) -> dict[str, Any] | None:
     """Write the record that makes `member` Eugene's copy, while its bytes
-    are still under the partial name; on failure, remove the partial and
-    say why, since a copy with no record could never be cleaned up."""
+    are still under the partial name, and answer the record it replaced.
+
+    The destination is checked again first: a copy takes minutes, and a
+    file put there meanwhile is not replaced (review S2). The record's size
+    is the partial's, so it proves exactly the bytes about to take the
+    name; a source that changed size while it was copied stops the copy.
+    On failure the partial is removed and the cause given, since a copy
+    with no record could never be cleaned up."""
+    _refuse_a_file_not_ours(member, partial)
+    previous = _record(member.destination)
     source = _stat(member.source)
-    error = (
-        "its source could not be read" if source is None else _save_source(member, source, members)
-    )
+    written = _stat(partial)
+    if source is None or written is None:
+        error: str | None = "its source could not be read"
+    elif source.size != written.size:
+        error = "the source changed while it was copied"
+    else:
+        error = _save_source(member, source, members)
     if error is not None:
         _remove_quietly(partial)
         raise CopyAborted(
             f"not copied to this machine: the record that marks {member.destination} as "
             f"Eugene's copy could not be written: {error}"
         )
+    return previous
+
+
+def _unmark(member: CopyMember, previous: dict[str, Any] | None) -> None:
+    """Undo `_mark` after the rename failed. A record with no copy could
+    later vouch for a file put there, so it goes; the record of a copy
+    still in place (a running engine holds it open) is put back, or that
+    copy would stop being provably Eugene's."""
+    record = member.destination + SOURCE_SUFFIX
+    if (
+        os.path.lexists(member.destination)
+        and previous is not None
+        and _write_record(member.destination, previous) is None
+    ):
+        return
+    if not _remove_quietly(record):
+        log.warning("could not remove %s after the copy failed", record)
 
 
 def _remove_quietly(path: str) -> bool:
@@ -994,33 +1137,58 @@ class ClearResult:
     skipped: list[Skipped] = field(default_factory=list)
     #: Files in the copy directory that are not Eugene's copies, left alone.
     left_alone: int = 0
+    #: Eugene's records whose copy was gone, removed (review S1).
+    records_removed: list[str] = field(default_factory=list)
 
 
 def _key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
-def _walk(directory: str | None) -> tuple[list[str], int]:
-    """Eugene's copies under `directory`, and how many other files are there.
+@dataclass
+class _Found:
+    copies: list[str] = field(default_factory=list)
+    others: int = 0
+    #: Destinations whose record is Eugene's but whose file is gone.
+    orphans: list[str] = field(default_factory=list)
+
+
+def _walk(directory: str | None) -> _Found:
+    """Eugene's copies under `directory`, how many other files are there,
+    and the records left beside nothing.
 
     Partials and records are Eugene's own working files and neither. A file
     is a copy only by `is_eugenes_copy` (agent#54): the folder is the
-    operator's choice and can hold their own models.
+    operator's choice and can hold their own models. A record whose file is
+    gone could vouch for a file put at that name later, so it is found to
+    be removed (review S1).
     """
+    found = _Found()
     if not directory or not os.path.isdir(directory):
-        return [], 0
-    copies: list[str] = []
-    others = 0
+        return found
     for root, _dirs, files in os.walk(directory):
         for name in files:
-            if name.endswith((PARTIAL_SUFFIX, SOURCE_SUFFIX)):
+            if name.endswith(PARTIAL_SUFFIX):
                 continue
             path = os.path.join(root, name)
+            if name.endswith(SOURCE_SUFFIX):
+                destination = path[: -len(SOURCE_SUFFIX)]
+                if not os.path.lexists(destination) and _is_our_record(destination):
+                    found.orphans.append(destination)
+                continue
             if is_eugenes_copy(path):
-                copies.append(path)
+                found.copies.append(path)
             else:
-                others += 1
-    return sorted(copies), others
+                found.others += 1
+    found.copies.sort()
+    found.orphans.sort()
+    return found
+
+
+def _is_our_record(destination: str) -> bool:
+    """The record beside `destination` has the shape Eugene writes."""
+    record = _record(destination)
+    return _names_a_source(record) and bool(record and record.get("copiedAt"))
 
 
 def copies_on_disk(directory: str | None) -> list[str]:
@@ -1031,19 +1199,19 @@ def copies_on_disk(directory: str | None) -> list[str]:
     case where the two disagree, and the disk is the honest answer. Only
     files with Eugene's record are listed: nothing else is ours to delete.
     """
-    return _walk(directory)[0]
+    return _walk(directory).copies
 
 
 def files_not_copied(directory: str | None) -> int:
     """How many files in the copy directory are not Eugene's copies; the
     setting says so, and cleanup leaves every one of them alone."""
-    return _walk(directory)[1]
+    return _walk(directory).others
 
 
 def _delete_copy(path: str, result: ClearResult) -> bool:
     """Delete one of Eugene's copies and its record, noting the outcome."""
     if not is_eugenes_copy(path):
-        # Its record went since the walk: no longer provably ours.
+        # Its record went or changed since the walk: no longer provably ours.
         result.left_alone += 1
         return False
     st = _stat(path)
@@ -1052,10 +1220,28 @@ def _delete_copy(path: str, result: ClearResult) -> bool:
     except OSError as exc:
         result.skipped.append(Skipped(path=path, reason=str(exc)))
         return False
-    _remove_quietly(path + SOURCE_SUFFIX)
+    if not _remove_quietly(path + SOURCE_SUFFIX):
+        log.warning(
+            "deleted the copy %s, but not its record; the next cleanup removes the record", path
+        )
     result.deleted.append(path)
     result.bytes_freed += st.size if st is not None else 0
     return True
+
+
+def _remove_orphans(found: _Found, protected: Iterable[str], result: ClearResult) -> None:
+    """Remove the records whose copy is gone, except for a destination a
+    caller is about to fill or a runtime holds: a copy in flight writes its
+    record before its file takes the name."""
+    spared = {_key(p) for p in protected}
+    for destination in found.orphans:
+        if _key(destination) in spared or os.path.lexists(destination):
+            continue
+        record = destination + SOURCE_SUFFIX
+        if _remove_quietly(record):
+            result.records_removed.append(record)
+        else:
+            log.warning("could not remove %s, a record whose copy is gone", record)
 
 
 def clear(
@@ -1079,8 +1265,9 @@ def clear(
     """
     result = ClearResult()
     held = {_key(p): r for p, r in (in_use or {}).items()}
-    copies, result.left_alone = _walk(directory)
-    for path in copies:
+    found = _walk(directory)
+    result.left_alone = found.others
+    for path in found.copies:
         runtime = held.get(_key(path))
         if runtime is not None:
             result.skipped.append(
@@ -1088,7 +1275,10 @@ def clear(
             )
             continue
         _delete_copy(path, result)
-    _prune_empty_dirs(directory, keep=list(in_use or {}), removed=result.deleted)
+    _remove_orphans(found, in_use or {}, result)
+    _prune_empty_dirs(
+        directory, keep=list(in_use or {}), removed=[*result.deleted, *result.records_removed]
+    )
     return result
 
 
@@ -1113,9 +1303,12 @@ def evict_for_headroom(
     keep = list(keep)
     protected = {_key(p) for p in keep}
     held = {_key(p): r for p, r in (in_use or {}).items()}
-    copies, result.left_alone = _walk(directory)
+    found = _walk(directory)
+    result.left_alone = found.others
     candidates = [
-        (os.stat(p).st_mtime, p) for p in copies if _key(p) not in protected and os.path.exists(p)
+        (os.stat(p).st_mtime, p)
+        for p in found.copies
+        if _key(p) not in protected and os.path.exists(p)
     ]
     for _mtime, path in sorted(candidates):
         free = free_bytes(directory)
@@ -1128,7 +1321,12 @@ def evict_for_headroom(
             )
             continue
         _delete_copy(path, result)
-    _prune_empty_dirs(directory, keep=[*keep, *(in_use or {})], removed=result.deleted)
+    _remove_orphans(found, [*keep, *(in_use or {})], result)
+    _prune_empty_dirs(
+        directory,
+        keep=[*keep, *(in_use or {})],
+        removed=[*result.deleted, *result.records_removed],
+    )
     return result
 
 
@@ -1149,8 +1347,9 @@ def remove_unwanted(
     wanted_paths = {_key(p) for p in keep}
     result = ClearResult()
     held = {_key(p): r for p, r in (in_use or {}).items()}
-    copies, result.left_alone = _walk(directory)
-    for path in copies:
+    found = _walk(directory)
+    result.left_alone = found.others
+    for path in found.copies:
         key = _key(path)
         if key in wanted_paths:
             continue
@@ -1161,7 +1360,12 @@ def remove_unwanted(
             continue
         if _delete_copy(path, result):
             log.info("removed local copy %s: no runtime points at it any more", path)
-    _prune_empty_dirs(directory, keep=[*keep, *(in_use or {})], removed=result.deleted)
+    _remove_orphans(found, [*keep, *(in_use or {})], result)
+    _prune_empty_dirs(
+        directory,
+        keep=[*keep, *(in_use or {})],
+        removed=[*result.deleted, *result.records_removed],
+    )
     return result
 
 
@@ -1276,6 +1480,7 @@ __all__ = [
     "Skipped",
     "clear",
     "copies_on_disk",
+    "copy_dir_overlap",
     "copy_file",
     "copy_is_current",
     "evict_for_headroom",
@@ -1284,6 +1489,7 @@ __all__ = [
     "headroom_shortfall",
     "is_eugenes_copy",
     "library_overlap",
+    "library_roots_here",
     "plan_for",
     "relative_name",
     "remove_unwanted",

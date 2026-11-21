@@ -42,7 +42,12 @@ from .._generated.models import LibraryFolderCheckRequest, LibraryFolderReach
 from ..admission import model_size_bytes
 from ..state import AgentState
 from ..trust import MAX_AGE_HOURS_KEY, NOT_ENFORCED, frozen_refusal, max_age_hours
-from .runtimes import folder_cache_for, library_client_for, refresh_library_folders
+from .runtimes import (
+    effective_rules_for,
+    folder_cache_for,
+    library_client_for,
+    refresh_library_folders,
+)
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +119,19 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
     trust = request.app.state.auth_state.trust
     copy_dir = state.get_config(model_copies.DIR_KEY)
     copy_dir = copy_dir.strip() if isinstance(copy_dir, str) and copy_dir.strip() else None
+    # agent#54: a folder that overlaps a Library folder, and the files Eugene
+    # leaves alone. Guarded as `restart` is: a status line never fails the schema.
+    copy_overlap: str | None = None
+    copy_others = 0
+    if copy_dir:
+        try:
+            copy_overlap = _copy_dir_overlap(request, copy_dir)
+        except Exception:  # pragma: no cover - see above
+            log.exception("could not check the copy folder against the Library folders")
+        try:
+            copy_others = model_copies.files_not_copied(os.path.expanduser(copy_dir))
+        except Exception:  # pragma: no cover - see above
+            log.exception("could not count the files in the copy folder")
     return {
         "enrolled": record.enrolled,
         "trust_limit": max_age_hours(state.get_config(MAX_AGE_HOURS_KEY)),
@@ -136,11 +154,8 @@ def _live_facts(request: Request, state: AgentState) -> dict[str, Any]:
         "mode": state.get_config("securityMode"),
         "copy_enabled": state.get_config("modelCopyEnabled") is True,
         "copy_dir": state.get_config("modelCopyDir"),
-        # agent#54: a folder saved before the check, and the files Eugene leaves alone.
-        "copy_overlap": _copy_dir_overlap(request, state, copy_dir) if copy_dir else None,
-        "copy_others": (
-            model_copies.files_not_copied(os.path.expanduser(copy_dir)) if copy_dir else 0
-        ),
+        "copy_overlap": copy_overlap,
+        "copy_others": copy_others,
         "history_bytes": _history_bytes(request),
         "prompt_cache": _prompt_cache_usage(request, state),
     }
@@ -314,8 +329,8 @@ def _copy_dir_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
         parts.append(
             (
                 "warning",
-                f"This folder {live['copy_overlap']}. Choose a folder outside every Library "
-                "folder.",
+                f"Copying is off: this folder {live['copy_overlap']}. Choose a folder "
+                "outside every Library folder.",
             )
         )
     # Which drive the folder is on (LS7): the point of a copy is a fast local
@@ -328,9 +343,15 @@ def _copy_dir_status(live: dict[str, Any]) -> ConfigFieldStatus | None:
         parts.append(
             (
                 "info",
-                f"{others} files here are not marked as Eugene's copies. Eugene leaves them alone."
-                if others != 1
-                else "1 file here is not marked as Eugene's copy. Eugene leaves it alone.",
+                (
+                    f"{others} files here are not marked as Eugene's copies. Eugene leaves them "
+                    "alone."
+                    if others != 1
+                    else "1 file here is not marked as Eugene's copy. Eugene leaves it alone."
+                )
+                # Remove this sentence when specs#136 lands: the uninstaller's
+                # purge option still deletes the whole copy folder.
+                + f" {model_copies.UNINSTALL_PURGE_WARNING}",
             )
         )
     if not parts:
@@ -832,9 +853,18 @@ def _library_roots_here(request: Request, overrides: list[model_paths.PathRule])
     return list(dict.fromkeys(roots))
 
 
-def _copy_dir_overlap(request: Request, state: AgentState, directory: str) -> str | None:
-    overrides = model_paths.parse_rules(state.get_config(model_paths.CONFIG_KEY))
-    return model_copies.library_overlap(directory, _library_roots_here(request, overrides))
+def _copy_dir_overlap(request: Request, directory: str) -> str | None:
+    """How the saved copy folder overlaps a Library folder, by the rule the
+    supervisor's `plan_for` applies, so a status that says copying is off
+    is true (review S4)."""
+    cache = folder_cache_for(request)
+    settings = model_copies.CopySettings(
+        enabled=True,
+        directory=os.path.expanduser(directory),
+        min_free_bytes=0,
+        folder_roots=tuple(f.path for f in (cache.folders if cache is not None else None) or []),
+    )
+    return model_copies.copy_dir_overlap(settings, effective_rules_for(request))
 
 
 async def _check_copy_dir_outside_library(

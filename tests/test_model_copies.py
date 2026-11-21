@@ -172,7 +172,9 @@ def test_a_partial_copy_never_carries_the_final_name(tmp_path: Path, monkeypatch
 
     def watched(*args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
         handle = real_read(*args, **kwargs)
-        if not str(args[0]).endswith(mc.SOURCE_SUFFIX + mc.PARTIAL_SUFFIX):
+        # Records are read and written around the rename; only the model's
+        # own bytes are watched.
+        if not str(args[0]).endswith((mc.SOURCE_SUFFIX, mc.SOURCE_SUFFIX + mc.PARTIAL_SUFFIX)):
             seen.append(os.path.exists(plan.destination))
         return handle
 
@@ -376,7 +378,7 @@ def test_a_partial_is_never_reported_as_a_copy(tmp_path: Path) -> None:
     copies = tmp_path / "copies"
     copies.mkdir()
     (copies / "m.gguf").write_bytes(b"x")
-    (copies / ("m.gguf" + mc.SOURCE_SUFFIX)).write_text('{"source": "/m.gguf"}', "utf-8")
+    (copies / ("m.gguf" + mc.SOURCE_SUFFIX)).write_text('{"source": "/m.gguf", "size": 1}', "utf-8")
     (copies / ("m.gguf" + mc.PARTIAL_SUFFIX)).write_bytes(b"x")
     assert [Path(p).name for p in mc.copies_on_disk(str(copies))] == ["m.gguf"]
 
